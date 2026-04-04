@@ -34,6 +34,23 @@ class ControllerConfig:
     # fec_timeout = frame_period_ms * timeout_fraction
     timeout_fraction: float = 0.5
 
-    # Update gating
-    k_hysteresis: int = 2          # k must change by >= this to trigger update
-    min_update_interval: float = 0.5  # seconds between FEC updates
+    # Asymmetric gating — fast increase, slow decrease.
+    # Under-protection (k too low) causes frame loss; over-protection
+    # (k too high) only wastes bandwidth.  Mirror of TCP AIMD.
+    k_hysteresis_up: int = 1          # min k increase to trigger update
+    k_hysteresis_down: int = 3        # min k decrease to trigger update
+    min_interval_up: float = 0.1      # seconds between FEC increases
+    min_interval_down: float = 2.0    # seconds between FEC decreases
+
+    # Peak tracking — sliding window of recent frame sizes (in frames,
+    # not time) used as a floor for k computation.  Ensures a single
+    # large frame immediately raises k without waiting for EWMA.
+    peak_window: int = 32    # >= one GOP at typical settings (30 frames)
+
+    # Oscillation detector — if more than `oscillation_threshold` FEC
+    # updates fire within `oscillation_window_s`, the decrease cooldown
+    # is multiplied by `oscillation_backoff`.  Auto-resolves when updates
+    # slow down.
+    oscillation_window_s: float = 5.0
+    oscillation_threshold: int = 4
+    oscillation_backoff: float = 3.0
