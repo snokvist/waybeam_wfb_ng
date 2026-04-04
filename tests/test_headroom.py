@@ -69,3 +69,71 @@ class TestHeadroomTracker:
         tracker = self._make_tracker()
         tracker.update(0.0)
         assert tracker.headroom == 1.05
+
+
+class TestHeadroomEdgeCases:
+    """Boundary conditions for C port safety."""
+
+    def test_negative_frame_size(self):
+        """Negative frame: _avg < 1 guard returns floor."""
+        tracker = HeadroomTracker(time_fn=lambda: 0.0)
+        tracker.update(-5000.0)
+        assert tracker.headroom == 1.05
+
+    def test_negative_after_positive(self):
+        """Negative frame after positive: still computes valid headroom."""
+        t = [0.0]
+        tracker = HeadroomTracker(time_fn=lambda: t[0])
+        tracker.update(5000.0)
+        t[0] = 0.1
+        tracker.update(-1000.0)
+        hr = tracker.headroom
+        assert hr >= 1.05
+        assert hr <= 1.40
+
+    def test_very_small_window(self):
+        """Tiny window: samples expire almost immediately."""
+        t = [0.0]
+        tracker = HeadroomTracker(window_s=0.001, time_fn=lambda: t[0])
+        tracker.update(5000.0)
+        t[0] = 0.01
+        tracker.update(5000.0)
+        assert tracker.headroom >= 1.05
+
+    def test_margin_zero(self):
+        """margin=0 collapses ratio to 0 -> floor returned."""
+        t = [0.0]
+        tracker = HeadroomTracker(margin=0.0, time_fn=lambda: t[0])
+        tracker.update(5000.0)
+        t[0] = 0.1
+        tracker.update(10000.0)
+        assert tracker.headroom == 1.05
+
+    def test_margin_very_large(self):
+        """Large margin -> capped at ceiling."""
+        tracker = HeadroomTracker(margin=100.0, time_fn=lambda: 0.0)
+        tracker.update(5000.0)
+        assert tracker.headroom == 1.40
+
+    def test_avg_exactly_one(self):
+        """_avg=1.0 is just above the < 1 guard."""
+        tracker = HeadroomTracker(time_fn=lambda: 0.0)
+        tracker.update(1.0)
+        assert tracker.headroom == 1.05
+
+    def test_floor_greater_than_ceiling(self):
+        """Inverted floor/ceiling: floor always wins."""
+        tracker = HeadroomTracker(floor=2.0, ceiling=1.0, time_fn=lambda: 0.0)
+        tracker.update(5000.0)
+        assert tracker.headroom == 2.0
+
+    def test_alpha_zero_avg_static(self):
+        """Internal alpha=0: EWMA never moves from initial value."""
+        t = [0.0]
+        tracker = HeadroomTracker(time_fn=lambda: t[0])
+        tracker._alpha = 0.0
+        tracker.update(5000.0)
+        assert tracker._avg == 5000.0
+        t[0] = 0.1
+        tracker.update(50000.0)
+        assert tracker._avg == 5000.0

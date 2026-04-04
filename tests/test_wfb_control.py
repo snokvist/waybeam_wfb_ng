@@ -95,6 +95,65 @@ class TestWfbTxControl:
             ctrl.close()
             receiver.close()
 
+    def test_send_fec_overflow_clamped(self):
+        """k/n > 255 clamped to 255 (u8 wire format)."""
+        receiver = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        receiver.bind(("127.0.0.1", 0))
+        port = receiver.getsockname()[1]
+        receiver.settimeout(2.0)
+
+        try:
+            ctrl = WfbTxControl("127.0.0.1", port)
+            assert ctrl.send_fec(300, 400) is True
+            data, _ = receiver.recvfrom(256)
+            parsed = _REQ_SET_FEC.unpack(data)
+            assert parsed[2] == 255  # k clamped
+            assert parsed[3] == 255  # n clamped
+        finally:
+            ctrl.close()
+            receiver.close()
+
+    def test_send_fec_negative_clamped(self):
+        """Negative k/n clamped to 0."""
+        receiver = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        receiver.bind(("127.0.0.1", 0))
+        port = receiver.getsockname()[1]
+        receiver.settimeout(2.0)
+
+        try:
+            ctrl = WfbTxControl("127.0.0.1", port)
+            assert ctrl.send_fec(-1, -5) is True
+            data, _ = receiver.recvfrom(256)
+            parsed = _REQ_SET_FEC.unpack(data)
+            assert parsed[2] == 0
+            assert parsed[3] == 0
+        finally:
+            ctrl.close()
+            receiver.close()
+
+    def test_reconnect_after_close(self):
+        """Close then send_fec should reconnect automatically."""
+        receiver = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        receiver.bind(("127.0.0.1", 0))
+        port = receiver.getsockname()[1]
+        receiver.settimeout(2.0)
+
+        try:
+            ctrl = WfbTxControl("127.0.0.1", port)
+            ctrl.send_fec(8, 12)
+            receiver.recvfrom(256)  # drain
+            ctrl.close()
+            assert ctrl._sock is None
+            # Should reconnect
+            assert ctrl.send_fec(4, 7) is True
+            data, _ = receiver.recvfrom(256)
+            parsed = _REQ_SET_FEC.unpack(data)
+            assert parsed[2] == 4
+            assert parsed[3] == 7
+        finally:
+            ctrl.close()
+            receiver.close()
+
     def test_network_byte_order(self):
         """Verify packet is in network (big-endian) byte order."""
         receiver = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)

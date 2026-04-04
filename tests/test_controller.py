@@ -185,6 +185,85 @@ class TestUpdateGating:
         assert p.n > p.k
 
 
+class TestBoundaryConditions:
+    """Boundary conditions critical for C port safety."""
+
+    def setup_method(self):
+        self._time = 0.0
+        self.ctrl = FECController(time_fn=lambda: self._time)
+
+    def test_compute_params_zero_fps(self):
+        """fps=0 must not crash (division by zero guarded)."""
+        p = self.ctrl.compute_params(5000, 0.0, 1.15)
+        assert p.fec_timeout_ms >= 1
+        assert p.k > 0
+        assert p.n > p.k
+
+    def test_compute_params_negative_fps(self):
+        """Negative fps treated same as zero."""
+        p = self.ctrl.compute_params(5000, -60.0, 1.15)
+        assert p.fec_timeout_ms >= 1
+        assert p.k > 0
+
+    def test_compute_params_zero_frame_size(self):
+        """frame_size=0 -> k clamped to min_k=1."""
+        p = self.ctrl.compute_params(0.0, 60, 1.15)
+        assert p.k == 1
+        assert p.n >= 2
+
+    def test_compute_params_negative_frame_size(self):
+        """Negative frame_size -> k clamped to min_k."""
+        p = self.ctrl.compute_params(-5000, 60, 1.15)
+        assert p.k >= 1
+        assert p.n > p.k
+
+    def test_compute_params_huge_frame_size(self):
+        """Very large frame -> k clamped to max_k."""
+        p = self.ctrl.compute_params(1e8, 60, 1.15)
+        assert p.k == 48
+        assert p.n <= 72
+
+    def test_compute_params_zero_headroom(self):
+        """headroom=0 -> target_size=0 -> k=min_k."""
+        p = self.ctrl.compute_params(5000, 60, 0.0)
+        assert p.k == 1
+        assert p.n >= 2
+
+    def test_compute_params_huge_headroom(self):
+        """Extreme headroom -> k clamped to max_k."""
+        p = self.ctrl.compute_params(5000, 60, 100.0)
+        assert p.k == 48
+        assert p.n <= 72
+
+    def test_compute_params_redundancy_near_100_percent(self):
+        """Custom curve with redundancy=0.99 must not divide by zero."""
+        cfg = ControllerConfig(redundancy_curve=[(1, 0.99), (48, 0.99)])
+        ctrl = FECController(config=cfg, time_fn=lambda: 0.0)
+        p = ctrl.compute_params(5000, 60, 1.15)
+        assert p.k >= 1
+        assert p.n > p.k
+        assert p.n <= 72  # clamped
+
+    def test_compute_params_redundancy_100_percent(self):
+        """redundancy=1.0 guarded: clamped to 0.99, no crash."""
+        cfg = ControllerConfig(redundancy_curve=[(1, 1.0), (48, 1.0)])
+        ctrl = FECController(config=cfg, time_fn=lambda: 0.0)
+        p = ctrl.compute_params(5000, 60, 1.15)
+        assert p.n > p.k
+
+    def test_update_zero_frame_size(self):
+        """update() with frame_size=0 must not crash."""
+        result = self.ctrl.update(0, 60)
+        assert result is not None
+        assert result.k >= 1
+
+    def test_update_zero_fps(self):
+        """update() with fps=0 must not crash."""
+        result = self.ctrl.update(5000, 0.0)
+        assert result is not None
+        assert result.fec_timeout_ms >= 1
+
+
 class TestReferenceTable:
     """Verify key reference table values from the spec."""
 

@@ -213,6 +213,77 @@ class TestFrameRoundtrip:
         assert frame.frames_since_idr == 300
 
 
+class TestMalformedPackets:
+    """Malformed packet handling critical for C port safety."""
+
+    def test_enc_info_flag_but_short_data(self):
+        """FLAG_ENC_INFO set but data < 64 bytes: trailer silently skipped."""
+        base = pack_frame_base(seq_count=4)
+        data = bytearray(base)
+        data[7] = FLAG_ENC_INFO  # set flag manually on 52-byte packet
+        frame = parse_frame(bytes(data))
+        assert frame is not None
+        assert frame.has_enc_info is False  # too short for trailer
+        assert frame.seq_count == 4
+
+    def test_truncated_at_every_boundary(self):
+        """Truncation at various offsets: None or graceful degradation."""
+        full = pack_frame(frame_size_bytes=5000)
+        # Below base size: always None
+        for length in [0, 1, 6, 10, 30, 51]:
+            assert parse_frame(full[:length]) is None, f"len={length}"
+        # Exactly base size with enc_info flag: parses base, no trailer
+        frame_52 = parse_frame(full[:52])
+        assert frame_52 is not None
+        assert frame_52.has_enc_info is False
+        # Between base and ext: parses base, no trailer
+        frame_55 = parse_frame(full[:55])
+        assert frame_55 is not None
+        assert frame_55.has_enc_info is False
+        # Full ext: trailer parsed
+        frame_64 = parse_frame(full[:64])
+        assert frame_64 is not None
+        assert frame_64.has_enc_info is True
+        assert frame_64.frame_size_bytes == 5000
+
+    def test_extra_trailing_data(self):
+        """Extra bytes after 64-byte frame are ignored."""
+        data = pack_frame(frame_size_bytes=5000) + b"\xFF" * 100
+        frame = parse_frame(data)
+        assert frame is not None
+        assert frame.has_enc_info is True
+        assert frame.frame_size_bytes == 5000
+
+    def test_all_zero_packet(self):
+        """All-zero packet: magic=0 -> rejected."""
+        assert parse_frame(b"\x00" * 64) is None
+
+    def test_all_zero_fields_valid_header(self):
+        """Valid header but all payload fields zero."""
+        data = pack_frame(
+            ssrc=0, rtp_timestamp=0, frame_id=0, frame_ready_us=0,
+            seq_first=0, seq_count=0, capture_us=0, last_pkt_send_us=0,
+            frame_size_bytes=0, frame_type=0, qp=0,
+        )
+        frame = parse_frame(data)
+        assert frame is not None
+        assert frame.ssrc == 0
+        assert frame.seq_count == 0
+        assert frame.frame_size_bytes == 0
+
+    def test_wrong_magic_in_full_frame(self):
+        """Full 64-byte frame with corrupted magic."""
+        data = bytearray(pack_frame(frame_size_bytes=5000))
+        data[0] = 0xFF  # corrupt magic
+        assert parse_frame(bytes(data)) is None
+
+    def test_wrong_version_in_full_frame(self):
+        """Full 64-byte frame with wrong version."""
+        data = bytearray(pack_frame(frame_size_bytes=5000))
+        data[4] = 99  # corrupt version
+        assert parse_frame(bytes(data)) is None
+
+
 class TestNetworkByteOrder:
     """Verify network byte order (big-endian) encoding."""
 

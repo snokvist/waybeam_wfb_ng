@@ -41,10 +41,15 @@ class WfbTxControl:
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
     def send_fec(self, k: int, n: int) -> bool:
-        """Send CMD_SET_FEC to wfb_tx. Returns True on successful send."""
+        """Send CMD_SET_FEC to wfb_tx. Returns True on successful send.
+
+        k and n are clamped to [0, 255] (uint8 wire format).
+        """
         if not self._sock:
             self.connect()
         try:
+            k = max(0, min(255, k))
+            n = max(0, min(255, n))
             self._req_id = (self._req_id + 1) & 0xFFFFFFFF
             pkt = _REQ_SET_FEC.pack(self._req_id, CMD_SET_FEC, k, n)
             self._sock.sendto(pkt, (self.host, self.port))

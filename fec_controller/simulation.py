@@ -74,9 +74,9 @@ def simulate_stream(
 
         is_iframe = i % gop_interval == 0
         jitter = random.gauss(1.0, 0.03)
-        frame_size = int(
+        frame_size = max(1, int(
             current_base * (i_frame_multiplier if is_iframe else 1.0) * jitter
-        )
+        ))
         frame_type = FRAME_TYPE_I if is_iframe else FRAME_TYPE_P
         seq_count = max(1, math.ceil(frame_size / mtu))
 

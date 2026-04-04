@@ -196,6 +196,106 @@ class TestServiceFrameHandling:
         assert p.n > p.k
 
 
+class TestFPSEstimatorEdgeCases:
+    """FPS estimator boundary conditions for C port safety."""
+
+    def test_backward_timestamp(self):
+        """Decreasing timestamp (time jump backward) — ignored gracefully."""
+        est = FPSEstimator(alpha=1.0, default_fps=60.0)
+        est.update(100_000)
+        fps = est.update(50_000)  # backward jump
+        assert fps == 60.0  # default, no valid interval
+
+    def test_same_timestamp_repeated(self):
+        """Same timestamp twice — zero interval ignored."""
+        est = FPSEstimator(default_fps=30.0)
+        est.update(100_000)
+        fps = est.update(100_000)
+        assert fps == 30.0
+
+    def test_very_large_timestamp_gap(self):
+        """Huge gap between frames — very low fps."""
+        est = FPSEstimator(alpha=1.0)
+        est.update(0)
+        fps = est.update(10_000_000)  # 10 second gap
+        assert fps == pytest.approx(0.1, rel=0.01)
+
+    def test_timestamp_zero_start(self):
+        """Starting from timestamp 0 is valid."""
+        est = FPSEstimator(alpha=1.0)
+        fps = est.update(0)
+        assert fps == 60.0  # default before second sample
+        fps = est.update(8_333)
+        assert fps == pytest.approx(120.0, rel=0.02)
+
+
+class TestServiceEdgeCases:
+    """Service edge cases for C port safety."""
+
+    def _make_service(self, **kwargs):
+        config = ControllerConfig()
+        return FECControllerService(config, dry_run=True, **kwargs)
+
+    def test_handle_frame_zero_seq_count_base_only(self):
+        """Base frame with seq_count=0 -> frame_size=0 -> controller handles it."""
+        service = self._make_service()
+        for i in range(5):
+            data = pack_frame_base(
+                frame_ready_us=i * 16_667,
+                seq_count=0,
+            )
+            service._handle_frame(data)
+        assert service._frame_count == 5
+        p = service.controller.get_current()
+        assert p is not None
+        assert p.k >= 1
+
+    def test_handle_frame_zero_frame_size_in_trailer(self):
+        """Enc trailer with frame_size_bytes=0 — controller handles gracefully."""
+        service = self._make_service()
+        for i in range(5):
+            data = pack_frame(
+                frame_ready_us=i * 16_667,
+                frame_size_bytes=0,
+                seq_count=4,
+            )
+            service._handle_frame(data)
+        assert service._frame_count == 5
+        p = service.controller.get_current()
+        assert p is not None
+        assert p.k >= 1
+
+    def test_handle_frame_single_packet_frame(self):
+        """Tiny frame that fits in one packet."""
+        service = self._make_service()
+        for i in range(10):
+            data = pack_frame(
+                frame_ready_us=i * 16_667,
+                frame_size_bytes=100,
+                seq_count=1,
+            )
+            service._handle_frame(data)
+        p = service.controller.get_current()
+        assert p is not None
+        assert p.k == 1
+        assert p.n >= 2
+
+    def test_handle_frame_max_size(self):
+        """Very large frame near k/n limits."""
+        service = self._make_service()
+        for i in range(10):
+            data = pack_frame(
+                frame_ready_us=i * 8_333,
+                frame_size_bytes=100_000,
+                seq_count=70,
+            )
+            service._handle_frame(data)
+        p = service.controller.get_current()
+        assert p is not None
+        assert p.k == 48  # clamped at max_k
+        assert p.n <= 72
+
+
 class TestServiceIntegration:
 
     @pytest.mark.asyncio

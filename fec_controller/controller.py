@@ -73,12 +73,15 @@ class FECController:
         k = max(self.cfg.min_k, min(self.cfg.max_k, packets_per_frame))
 
         redundancy = self._interpolate_redundancy(k)
+        # Guard: redundancy >= 1.0 causes division by zero
+        redundancy = min(redundancy, 0.99)
         n = math.ceil(k / (1.0 - redundancy))
         n = max(self.cfg.min_n, min(self.cfg.max_n, n))
         if n <= k:
             n = k + 1
 
-        frame_period_ms = 1000.0 / fps
+        # Guard: fps <= 0 causes division by zero
+        frame_period_ms = 1000.0 / fps if fps > 0 else 1000.0
         fec_timeout_ms = max(1, int(frame_period_ms * self.cfg.timeout_fraction))
 
         return FECParams(
