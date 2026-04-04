@@ -161,38 +161,14 @@ real sidecar FRAME protocol — no mock formats.
 
 ### Near-term
 
-- **wfb\_tx session announce on FEC change** — Currently when the FEC
-  controller changes k/n, the receiver takes ~1s to detect the new
-  parameters via its existing session negotiation. A wfb\_tx patch to
-  force a session announce packet on FEC change would make receiver
-  convergence immediate. This is the most impactful improvement for
-  perceived quality during bitrate transitions.
-
-- **Sidecar multiplexer** — The venc sidecar tracks one subscriber at a
-  time. Running `rtp_timing_probe` and `fec_controller` simultaneously
-  requires a local relay that subscribes once and fans out FRAME messages
-  to multiple consumers on localhost.
-
-- **Integration testing on hardware** — Verify `set_fec k n` command
-  format against the actual wfb\_tx build's control socket. The protocol
-  is text-over-UDP but the exact command name should be confirmed against
-  the wfb\_tx source (may be `set_fec` or `fec` depending on version).
+- **Integration testing on hardware** — Deploy to device and verify
+  `CMD_SET_FEC` binary commands are accepted by wfb\_tx's control socket.
 
 - **Packaging** — Add `pyproject.toml` for pip-installable package with
   console\_scripts entry point.
 
 ### Future enhancements
 
-- **Loss-rate-driven redundancy adjustment** — Use receiver loss
-  feedback to increase redundancy beyond the baseline curve when the
-  channel is lossy. Deliberately excluded from v1 to keep the controller
-  stateless and predictable.
-
 - **Packet aggregation on high-MTU links** — When the radio MTU allows
   larger packets, aggregate multiple small RTP packets per FEC symbol to
   reduce FEC overhead. Independent of the adaptive k/n logic.
-
-- **Dual-stream FEC** — Different k/n for I-frames vs P-frames. The
-  encoder trailer's `frame_type` field is already parsed; the controller
-  could maintain two parameter sets and switch per-frame. Requires
-  wfb\_tx support for per-block FEC parameters.
