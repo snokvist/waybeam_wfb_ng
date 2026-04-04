@@ -14,8 +14,8 @@ The FEC controller acts as a sidecar consumer: it sends SUBSCRIBE to keep
 the subscription alive and parses incoming FRAME messages for frame_size,
 frame_type, and timing (to derive fps from frame_ready_us intervals).
 
-A lightweight 8-byte stat packet format is also retained for simulation
-and standalone testing where the full sidecar is not available.
+The FEC controller uses the real sidecar FRAME messages for all paths
+including simulation and testing.
 """
 
 import struct
@@ -233,31 +233,3 @@ def pack_frame_base(
         ssrc, rtp_timestamp, frame_id, frame_ready_us,
         seq_first, seq_count, capture_us, last_pkt_send_us,
     )
-
-
-# ---------------------------------------------------------------------------
-# Legacy 8-byte stat packet (for simulation / standalone testing)
-# ---------------------------------------------------------------------------
-# Per-frame, little-endian:
-#   u32  frame_size     (bytes)
-#   u16  fps_x10        (fps * 10, e.g. 1200 = 120.0 fps)
-#   u8   frame_type     (0=P, 1=I)
-#   u8   reserved
-
-STAT_FMT = "<IHBx"
-STAT_SIZE = struct.calcsize(STAT_FMT)  # 8 bytes
-
-
-def unpack_stat(data: bytes) -> dict:
-    """Unpack a legacy 8-byte stat packet into a dict."""
-    frame_size, fps_x10, frame_type = struct.unpack(STAT_FMT, data[:STAT_SIZE])
-    return {
-        "frame_size": frame_size,
-        "fps": fps_x10 / 10.0,
-        "frame_type": frame_type,
-    }
-
-
-def pack_stat(frame_size: int, fps: float, frame_type: int = 0) -> bytes:
-    """Pack a legacy 8-byte stat packet."""
-    return struct.pack(STAT_FMT, frame_size, int(fps * 10), frame_type)

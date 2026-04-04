@@ -1,11 +1,9 @@
 """
 Async FEC controller service.
 
-Supports two input modes:
-  1. Sidecar mode (default): subscribes to the venc sidecar, receives FRAME
-     messages, derives fps from frame_ready_us intervals, uses frame_size_bytes
-     from the encoder trailer when available.
-  2. Legacy stat mode: receives 8-byte stat packets with explicit fps field.
+Subscribes to the venc sidecar, receives FRAME messages, derives fps from
+frame_ready_us intervals, uses frame_size_bytes from the encoder trailer
+when available (falls back to seq_count * MTU for base-only frames).
 
 Designed to run as a waybeam-hub module.
 """
@@ -17,17 +15,11 @@ import logging
 from fec_controller.config import ControllerConfig
 from fec_controller.controller import FECController, FECParams
 from fec_controller.protocol import (
-    STAT_SIZE,
     FRAME_BASE_SIZE,
-    SIDECAR_MAGIC,
-    SIDECAR_VERSION,
     MSG_FRAME,
-    HDR_SIZE,
-    SidecarFrame,
     pack_subscribe,
     parse_frame,
     parse_header,
-    unpack_stat,
 )
 from fec_controller.wfb_control import WfbTxControl
 
@@ -86,7 +78,7 @@ class FPSEstimator:
 
 
 class FECControllerService:
-    """Async service: receives sidecar stats, drives FEC updates."""
+    """Async service: receives sidecar FRAME messages, drives FEC updates."""
 
     def __init__(
         self,
@@ -95,14 +87,12 @@ class FECControllerService:
         wfb_control_host: str = "127.0.0.1",
         wfb_control_port: int = 0,
         dry_run: bool = False,
-        sidecar_mode: bool = True,
         sidecar_host: str = "",
         sidecar_port: int = 0,
     ):
         self.config = config
         self.stat_port = stat_port
         self.dry_run = dry_run
-        self.sidecar_mode = sidecar_mode
         self.sidecar_host = sidecar_host
         self.sidecar_port = sidecar_port
 
@@ -130,7 +120,7 @@ class FECControllerService:
         else:
             self.wfb_tx.send_fec(params.k, params.n)
 
-    def _handle_sidecar_frame(self, data: bytes) -> None:
+    def _handle_frame(self, data: bytes) -> None:
         """Process a sidecar FRAME message."""
         frame = parse_frame(data)
         if frame is None:
@@ -154,29 +144,11 @@ class FECControllerService:
 
         self._periodic_log()
 
-    def _handle_stat(self, data: bytes) -> None:
-        """Process a legacy 8-byte stat packet."""
-        if len(data) < STAT_SIZE:
-            return
-
-        stat = unpack_stat(data)
-        self._frame_count += 1
-
-        result = self.controller.update(stat["frame_size"], stat["fps"])
-        if result is not None:
-            self._apply_update(result)
-
-        self._periodic_log()
-
     def _handle_packet(self, data: bytes) -> None:
-        """Route incoming packet to the right handler based on content."""
-        if self.sidecar_mode:
-            # In sidecar mode, only process FRAME messages
-            hdr = parse_header(data)
-            if hdr is not None and hdr[2] == MSG_FRAME:
-                self._handle_sidecar_frame(data)
-        else:
-            self._handle_stat(data)
+        """Route incoming packet — only process FRAME messages."""
+        hdr = parse_header(data)
+        if hdr is not None and hdr[2] == MSG_FRAME:
+            self._handle_frame(data)
 
     def _periodic_log(self) -> None:
         now = time.monotonic()
@@ -184,7 +156,6 @@ class FECControllerService:
             p = self.controller.get_current()
             if p:
                 hr = self.controller.headroom_tracker.headroom
-                fps = self.fps_estimator.fps if self.sidecar_mode else (self.controller.current_fps or 0)
                 log.info(
                     "status: frames=%d avg=%.0fB hroom=%.2f k=%d n=%d "
                     "redun=%.0f%% fps=%.1f updates=%d",
@@ -194,7 +165,7 @@ class FECControllerService:
                     p.k,
                     p.n,
                     p.redundancy * 100,
-                    fps,
+                    self.fps_estimator.fps,
                     self.controller.update_count,
                 )
             self._last_log_time = now
@@ -202,7 +173,7 @@ class FECControllerService:
     async def _subscribe_loop(self) -> None:
         """Periodically send SUBSCRIBE to the venc sidecar."""
         if not self.sidecar_host or not self.sidecar_port:
-            log.warning("Sidecar mode enabled but no sidecar host/port configured")
+            log.warning("No sidecar host/port configured — not subscribing")
             return
 
         import socket
@@ -224,9 +195,8 @@ class FECControllerService:
             sock.close()
 
     async def run(self) -> None:
-        """Main async loop - listen for sidecar or stat packets."""
-        mode_str = "sidecar" if self.sidecar_mode else "legacy stat"
-        log.info("FEC controller starting (%s mode) on UDP :%d", mode_str, self.stat_port)
+        """Main async loop - listen for sidecar FRAME packets."""
+        log.info("FEC controller starting on UDP :%d", self.stat_port)
         log.info("wfb_tx control: %s:%d", self.wfb_tx.host, self.wfb_tx.port)
         log.info("MTU=%d dry_run=%s", self.config.mtu, self.dry_run)
 
@@ -240,11 +210,10 @@ class FECControllerService:
         )
         self._sidecar_transport = transport
 
-        log.info("Listening for %s packets...", mode_str)
+        log.info("Listening for sidecar FRAME packets...")
 
         try:
-            if self.sidecar_mode and self.sidecar_host and self.sidecar_port:
-                # Run subscribe loop concurrently
+            if self.sidecar_host and self.sidecar_port:
                 sub_task = asyncio.create_task(self._subscribe_loop())
                 try:
                     await asyncio.Event().wait()

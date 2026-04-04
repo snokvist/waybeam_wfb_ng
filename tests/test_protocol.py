@@ -1,11 +1,9 @@
-"""Tests for sidecar wire protocol and legacy stat packets."""
+"""Tests for sidecar wire protocol (rtp_sidecar.h)."""
 
 import struct
 import pytest
 
 from fec_controller.protocol import (
-    STAT_FMT,
-    STAT_SIZE,
     FRAME_BASE_SIZE,
     FRAME_EXT_SIZE,
     ENC_TRAILER_SIZE,
@@ -25,8 +23,6 @@ from fec_controller.protocol import (
     parse_frame,
     pack_frame,
     pack_frame_base,
-    pack_stat,
-    unpack_stat,
 )
 
 
@@ -186,6 +182,36 @@ class TestFrameRoundtrip:
         frame = parse_frame(data)
         assert frame.frame_type == FRAME_TYPE_IDR
 
+    def test_base_frame_fallback_no_enc_info(self):
+        """Base-only frame: seq_count available, no frame_size_bytes."""
+        data = pack_frame_base(seq_count=7)
+        frame = parse_frame(data)
+        assert frame.has_enc_info is False
+        assert frame.seq_count == 7
+        # Service would estimate frame_size = seq_count * MTU
+
+    def test_all_encoder_trailer_fields(self):
+        """Verify every encoder trailer field survives roundtrip."""
+        data = pack_frame(
+            frame_size_bytes=44000,
+            frame_type=FRAME_TYPE_IDR,
+            qp=22,
+            complexity=200,
+            scene_change=1,
+            gop_state=3,
+            idr_inserted=1,
+            frames_since_idr=300,
+        )
+        frame = parse_frame(data)
+        assert frame.frame_size_bytes == 44000
+        assert frame.frame_type == FRAME_TYPE_IDR
+        assert frame.qp == 22
+        assert frame.complexity == 200
+        assert frame.scene_change == 1
+        assert frame.gop_state == 3
+        assert frame.idr_inserted == 1
+        assert frame.frames_since_idr == 300
+
 
 class TestNetworkByteOrder:
     """Verify network byte order (big-endian) encoding."""
@@ -206,43 +232,10 @@ class TestNetworkByteOrder:
         assert data[10] == 0x03
         assert data[11] == 0x04
 
-
-class TestLegacyStatPacket:
-
-    def test_size_is_8_bytes(self):
-        assert STAT_SIZE == 8
-
-    def test_pack_unpack_roundtrip(self):
-        data = pack_stat(frame_size=5000, fps=120.0, frame_type=1)
-        assert len(data) == STAT_SIZE
-        stat = unpack_stat(data)
-        assert stat["frame_size"] == 5000
-        assert stat["fps"] == 120.0
-        assert stat["frame_type"] == 1
-
-    def test_pack_unpack_p_frame(self):
-        data = pack_stat(frame_size=3000, fps=60.0, frame_type=0)
-        stat = unpack_stat(data)
-        assert stat["frame_size"] == 3000
-        assert stat["fps"] == 60.0
-        assert stat["frame_type"] == 0
-
-    def test_fps_encoding_precision(self):
-        data = pack_stat(frame_size=1000, fps=120.5)
-        stat = unpack_stat(data)
-        assert stat["fps"] == pytest.approx(120.5)
-
-    def test_max_frame_size(self):
-        data = pack_stat(frame_size=0xFFFFFFFF, fps=30.0)
-        stat = unpack_stat(data)
-        assert stat["frame_size"] == 0xFFFFFFFF
-
-    def test_little_endian_format(self):
-        data = pack_stat(frame_size=1, fps=0.1, frame_type=0)
-        assert data[0] == 1
-        assert data[1] == 0
-
-    def test_unpack_ignores_extra_bytes(self):
-        data = pack_stat(frame_size=5000, fps=60.0) + b"\xff\xff\xff\xff"
-        stat = unpack_stat(data)
-        assert stat["frame_size"] == 5000
+    def test_frame_size_bytes_big_endian(self):
+        data = pack_frame(frame_size_bytes=0x00010000)
+        # Encoder trailer starts at offset 52
+        assert data[52] == 0x00
+        assert data[53] == 0x01
+        assert data[54] == 0x00
+        assert data[55] == 0x00

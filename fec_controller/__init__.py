@@ -2,20 +2,25 @@
 waybeam-hub adaptive FEC controller for wfb-ng.
 
 Dynamically adjusts wfb-ng FEC parameters (k/n) based on real-time
-video frame statistics from the encoding pipeline.
+video frame statistics from the encoding pipeline via the sidecar protocol.
 
 Architecture:
-  video encoder -> sidecar (per-frame UDP stats) -> fec_controller -> wfb_tx (UDP control port)
+  video encoder -> sidecar (FRAME messages) -> fec_controller -> wfb_tx (UDP control port)
 """
 
 from fec_controller.protocol import (
-    STAT_FMT,
-    STAT_SIZE,
     FRAME_BASE_SIZE,
     FRAME_EXT_SIZE,
+    SIDECAR_MAGIC,
+    SIDECAR_VERSION,
+    MSG_SUBSCRIBE,
+    MSG_FRAME,
+    FLAG_KEYFRAME,
+    FLAG_ENC_INFO,
+    FRAME_TYPE_P,
+    FRAME_TYPE_I,
+    FRAME_TYPE_IDR,
     SidecarFrame,
-    pack_stat,
-    unpack_stat,
     pack_subscribe,
     pack_frame,
     pack_frame_base,
@@ -29,13 +34,18 @@ from fec_controller.wfb_control import WfbTxControl
 from fec_controller.service import FECControllerService, FPSEstimator
 
 __all__ = [
-    "STAT_FMT",
-    "STAT_SIZE",
     "FRAME_BASE_SIZE",
     "FRAME_EXT_SIZE",
+    "SIDECAR_MAGIC",
+    "SIDECAR_VERSION",
+    "MSG_SUBSCRIBE",
+    "MSG_FRAME",
+    "FLAG_KEYFRAME",
+    "FLAG_ENC_INFO",
+    "FRAME_TYPE_P",
+    "FRAME_TYPE_I",
+    "FRAME_TYPE_IDR",
     "SidecarFrame",
-    "pack_stat",
-    "unpack_stat",
     "pack_subscribe",
     "pack_frame",
     "pack_frame_base",

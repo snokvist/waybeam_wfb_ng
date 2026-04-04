@@ -1,9 +1,22 @@
-"""Simulation utilities for testing FEC controller without real hardware."""
+"""
+Simulation utilities for testing FEC controller without real hardware.
 
+Generates synthetic sidecar FRAME messages and feeds them through the real
+protocol path: pack_frame → parse_frame → FPSEstimator → FECController.
+"""
+
+import math
 import random
 
 from fec_controller.config import ControllerConfig
 from fec_controller.controller import FECController
+from fec_controller.protocol import (
+    FRAME_TYPE_P,
+    FRAME_TYPE_I,
+    pack_frame,
+    parse_frame,
+)
+from fec_controller.service import FPSEstimator
 
 
 def simulate_stream(
@@ -13,17 +26,20 @@ def simulate_stream(
     gop_interval: int = 30,
     duration_s: float = 8.0,
     bitrate_events: list | None = None,
+    mtu: int = 1446,
 ) -> None:
     if bitrate_events is None:
         bitrate_events = [(3.0, base_frame_size * 3), (6.0, base_frame_size)]
 
     sim_time = [0.0]
     controller = FECController(
-        config=ControllerConfig(ewma_alpha=0.05),
+        config=ControllerConfig(ewma_alpha=0.05, mtu=mtu),
         time_fn=lambda: sim_time[0],
     )
+    fps_estimator = FPSEstimator(alpha=0.05, default_fps=float(fps))
 
     frame_period = 1.0 / fps
+    frame_period_us = int(frame_period * 1_000_000)
     total_frames = int(duration_s * fps)
 
     print(
@@ -45,10 +61,12 @@ def simulate_stream(
 
     current_base = base_frame_size
     event_idx = 0
+    rtp_seq = 0
 
     for i in range(total_frames):
         t = i * frame_period
         sim_time[0] = t
+        frame_ready_us = i * frame_period_us
 
         while event_idx < len(bitrate_events) and t >= bitrate_events[event_idx][0]:
             current_base = bitrate_events[event_idx][1]
@@ -59,10 +77,36 @@ def simulate_stream(
         frame_size = int(
             current_base * (i_frame_multiplier if is_iframe else 1.0) * jitter
         )
+        frame_type = FRAME_TYPE_I if is_iframe else FRAME_TYPE_P
+        seq_count = max(1, math.ceil(frame_size / mtu))
+
+        # Build a real sidecar FRAME message and parse it back
+        wire = pack_frame(
+            ssrc=0x01020304,
+            rtp_timestamp=frame_ready_us,
+            frame_id=i,
+            frame_ready_us=frame_ready_us,
+            seq_first=rtp_seq,
+            seq_count=seq_count,
+            capture_us=max(0, frame_ready_us - 4000),
+            last_pkt_send_us=frame_ready_us + 300,
+            frame_size_bytes=frame_size,
+            frame_type=frame_type,
+        )
+        rtp_seq = (rtp_seq + seq_count) & 0xFFFF
+
+        parsed = parse_frame(wire)
+        assert parsed is not None, f"Failed to parse frame {i}"
+        assert parsed.has_enc_info, f"Frame {i} missing encoder trailer"
+        assert parsed.frame_size_bytes == frame_size
+
+        # Derive fps from timing, just like the service does
+        estimated_fps = fps_estimator.update(parsed.frame_ready_us)
+
+        # Feed through controller
+        result = controller.update(parsed.frame_size_bytes, estimated_fps)
+
         ftype = "I" if is_iframe else "P"
-
-        result = controller.update(frame_size, fps)
-
         near_event = any(abs(t - ev[0]) < frame_period * 2 for ev in bitrate_events)
         if result is not None or i % fps == 0 or near_event:
             p = result or controller.get_current()
