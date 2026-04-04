@@ -7,6 +7,7 @@ import argparse
 from fec_controller.config import ControllerConfig
 from fec_controller.service import FECControllerService
 from fec_controller.simulation import simulate_stream, print_reference_table
+from fec_controller.benchmark import run_all, replay
 
 
 def main() -> None:
@@ -70,6 +71,26 @@ def main() -> None:
     # --- table ---
     sub.add_parser("table", help="Print reference table")
 
+    # --- benchmark ---
+    bench_p = sub.add_parser("benchmark", help="Run benchmark scenarios with KPIs")
+    bench_p.add_argument(
+        "--realtime",
+        action="store_true",
+        help="Run at wall-clock speed (slow but realistic timing)",
+    )
+    bench_p.add_argument(
+        "--replay",
+        type=str,
+        default="",
+        help="Path to CSV with recorded frame data (timestamp_us,frame_size,is_iframe)",
+    )
+    bench_p.add_argument(
+        "--csv-out",
+        type=str,
+        default="",
+        help="Write frame trace CSV to this path",
+    )
+
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -100,6 +121,26 @@ def main() -> None:
         )
     elif args.cmd == "table":
         print_reference_table()
+    elif args.cmd == "benchmark":
+        if args.replay:
+            results = [replay(
+                args.replay,
+                realtime=args.realtime,
+                scenario=args.replay,
+            )]
+        else:
+            results = run_all(realtime=args.realtime)
+        for r in results:
+            print(r.kpi.summary())
+            print()
+            if args.csv_out:
+                path = args.csv_out
+                if len(results) > 1:
+                    base, ext = path.rsplit(".", 1) if "." in path else (path, "csv")
+                    path = f"{base}_{r.kpi.scenario}.{ext}"
+                with open(path, "w") as f:
+                    f.write(r.to_csv())
+                print(f"  -> {path}")
     else:
         print_reference_table()
         print()

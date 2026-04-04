@@ -4,10 +4,16 @@ FEC controller core - computes optimal k/n from frame statistics.
 One video frame ~ one FEC block: k is sized so a full frame fits in one block.
 This avoids latency from a frame spanning multiple blocks where a partial last
 block stalls waiting for the next frame's packets.
+
+Uses asymmetric gating (fast increase, slow decrease) because the cost of
+under-protection (frame loss) is far higher than over-protection (wasted
+bandwidth).  A peak tracking window ensures immediate spike response without
+waiting for the EWMA to converge.
 """
 
 import math
 import time
+from collections import deque
 from dataclasses import dataclass
 from typing import Callable
 
@@ -50,6 +56,12 @@ class FECController:
             time_fn=self._time_fn,
         )
         self.cfg.redundancy_curve.sort(key=lambda x: x[0])
+
+        # Peak tracking: sliding window of recent frame sizes
+        self._peak_window: deque[int] = deque(maxlen=self.cfg.peak_window)
+
+        # Oscillation detector: timestamps of recent FEC updates
+        self._update_times: deque[float] = deque()
 
     def _interpolate_redundancy(self, k: int) -> float:
         curve = self.cfg.redundancy_curve
@@ -94,12 +106,32 @@ class FECController:
             headroom=headroom,
         )
 
+    @property
+    def peak_recent_size(self) -> int:
+        """Max frame size in the peak tracking window."""
+        return max(self._peak_window) if self._peak_window else 0
+
+    @property
+    def is_oscillating(self) -> bool:
+        """True if recent update rate exceeds the oscillation threshold."""
+        return len(self._update_times) >= self.cfg.oscillation_threshold
+
+    def _record_update(self, now: float) -> None:
+        """Record an update timestamp and expire old entries."""
+        self._update_times.append(now)
+        cutoff = now - self.cfg.oscillation_window_s
+        while self._update_times and self._update_times[0] < cutoff:
+            self._update_times.popleft()
+
     def update(self, frame_size: int, fps: float) -> FECParams | None:
         """Feed one frame observation. Returns FECParams if an update should be sent."""
         now = self._time_fn()
 
+        # Track peak and headroom
+        self._peak_window.append(frame_size)
         self.headroom_tracker.update(float(frame_size))
 
+        # EWMA of frame size
         if self.avg_frame_size is None:
             self.avg_frame_size = float(frame_size)
         else:
@@ -110,27 +142,65 @@ class FECController:
 
         self.current_fps = fps
         headroom = self.headroom_tracker.headroom
-        candidate = self.compute_params(self.avg_frame_size, fps, headroom)
+
+        # Compute k from EWMA + headroom (steady-state target)
+        candidate_avg = self.compute_params(self.avg_frame_size, fps, headroom)
+
+        # Compute k from peak window (spike protection floor)
+        k_peak = max(
+            self.cfg.min_k,
+            min(self.cfg.max_k, max(1, math.ceil(self.peak_recent_size / self.cfg.mtu))),
+        )
+
+        # Use the higher of the two for the candidate
+        if k_peak > candidate_avg.k:
+            candidate = self.compute_params(
+                float(self.peak_recent_size), fps, 1.0,
+            )
+        else:
+            candidate = candidate_avg
+
+        # Expire old oscillation records
+        self._record_update(now)
+        # Remove the speculative entry — only keep it if we actually emit
+        self._update_times.pop()
 
         # First update always emitted
         if self.current_params is None:
             self.current_params = candidate
             self.last_update_time = now
             self.update_count += 1
+            self._update_times.append(now)
             return candidate
 
-        # Hysteresis: k must change by >= threshold
-        k_delta = abs(candidate.k - self.current_params.k)
-        if k_delta < self.cfg.k_hysteresis:
-            return None
+        k_delta = candidate.k - self.current_params.k
+        elapsed = now - self.last_update_time
 
-        # Rate limiting
-        if now - self.last_update_time < self.cfg.min_update_interval:
+        # Effective decrease cooldown: widened during oscillation
+        effective_interval_down = self.cfg.min_interval_down
+        if self.is_oscillating:
+            effective_interval_down *= self.cfg.oscillation_backoff
+
+        if k_delta > 0:
+            # INCREASE path: fast response, low bar
+            if k_delta < self.cfg.k_hysteresis_up:
+                return None
+            if elapsed < self.cfg.min_interval_up:
+                return None
+        elif k_delta < 0:
+            # DECREASE path: slow response, high bar
+            if abs(k_delta) < self.cfg.k_hysteresis_down:
+                return None
+            if elapsed < effective_interval_down:
+                return None
+        else:
+            # No change in k
             return None
 
         self.current_params = candidate
         self.last_update_time = now
         self.update_count += 1
+        self._update_times.append(now)
         return candidate
 
     def get_current(self) -> FECParams | None:

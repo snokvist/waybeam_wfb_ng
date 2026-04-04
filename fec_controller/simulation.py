@@ -123,6 +123,187 @@ def simulate_stream(
                 )
 
 
+def simulate_step_up(fps: int = 120, mtu: int = 1446) -> list[dict]:
+    """Step-up stress test: 5KB -> 15KB, verify fast k increase.
+
+    Returns a list of update events for assertion in tests.
+    """
+    sim_time = [0.0]
+    controller = FECController(
+        config=ControllerConfig(mtu=mtu),
+        time_fn=lambda: sim_time[0],
+    )
+    fps_est = FPSEstimator(alpha=0.05, default_fps=float(fps))
+    frame_period = 1.0 / fps
+    events = []
+
+    # 1s of 5KB frames, then switch to 15KB
+    for i in range(fps * 3):
+        sim_time[0] = i * frame_period
+        size = 5000 if i < fps else 15000
+        wire = pack_frame(
+            frame_ready_us=int(sim_time[0] * 1_000_000),
+            frame_id=i,
+            frame_size_bytes=size,
+            seq_count=max(1, math.ceil(size / mtu)),
+        )
+        parsed = parse_frame(wire)
+        est_fps = fps_est.update(parsed.frame_ready_us)
+        result = controller.update(parsed.frame_size_bytes, est_fps)
+        if result:
+            events.append({
+                "time": sim_time[0],
+                "frame": i,
+                "k": result.k,
+                "n": result.n,
+                "size": size,
+            })
+    return events
+
+
+def simulate_step_down(fps: int = 120, mtu: int = 1446) -> list[dict]:
+    """Step-down test: 15KB -> 5KB, verify slow k decrease.
+
+    Returns a list of update events for assertion in tests.
+    """
+    sim_time = [0.0]
+    controller = FECController(
+        config=ControllerConfig(mtu=mtu),
+        time_fn=lambda: sim_time[0],
+    )
+    fps_est = FPSEstimator(alpha=0.05, default_fps=float(fps))
+    frame_period = 1.0 / fps
+    events = []
+
+    # 2s of 15KB frames, then switch to 5KB for 5s
+    total = fps * 7
+    for i in range(total):
+        sim_time[0] = i * frame_period
+        size = 15000 if sim_time[0] < 2.0 else 5000
+        wire = pack_frame(
+            frame_ready_us=int(sim_time[0] * 1_000_000),
+            frame_id=i,
+            frame_size_bytes=size,
+            seq_count=max(1, math.ceil(size / mtu)),
+        )
+        parsed = parse_frame(wire)
+        est_fps = fps_est.update(parsed.frame_ready_us)
+        result = controller.update(parsed.frame_size_bytes, est_fps)
+        if result:
+            events.append({
+                "time": sim_time[0],
+                "frame": i,
+                "k": result.k,
+                "n": result.n,
+                "size": size,
+            })
+    return events
+
+
+def simulate_rapid_oscillation(fps: int = 120, mtu: int = 1446) -> dict:
+    """Rapid oscillation: alternating 5KB/15KB every 0.5s.
+
+    Returns summary with k values during and after oscillation.
+    """
+    sim_time = [0.0]
+    controller = FECController(
+        config=ControllerConfig(mtu=mtu),
+        time_fn=lambda: sim_time[0],
+    )
+    fps_est = FPSEstimator(alpha=0.05, default_fps=float(fps))
+    frame_period = 1.0 / fps
+
+    k_during = []
+    k_after = []
+
+    # 1s steady at 5KB, 4s oscillation, 3s steady at 5KB
+    total = fps * 8
+    for i in range(total):
+        sim_time[0] = i * frame_period
+        t = sim_time[0]
+        if t < 1.0:
+            size = 5000
+        elif t < 5.0:
+            # Alternate every 0.5s
+            size = 15000 if int((t - 1.0) / 0.5) % 2 == 0 else 5000
+        else:
+            size = 5000
+
+        wire = pack_frame(
+            frame_ready_us=int(t * 1_000_000),
+            frame_id=i,
+            frame_size_bytes=size,
+            seq_count=max(1, math.ceil(size / mtu)),
+        )
+        parsed = parse_frame(wire)
+        est_fps = fps_est.update(parsed.frame_ready_us)
+        controller.update(parsed.frame_size_bytes, est_fps)
+
+        p = controller.get_current()
+        if p:
+            if 1.0 <= t < 5.0:
+                k_during.append(p.k)
+            elif t >= 6.0:
+                k_after.append(p.k)
+
+    return {
+        "k_during_min": min(k_during) if k_during else 0,
+        "k_during_max": max(k_during) if k_during else 0,
+        "k_after_min": min(k_after) if k_after else 0,
+        "k_after_max": max(k_after) if k_after else 0,
+    }
+
+
+def simulate_scene_change_cascade(fps: int = 120, mtu: int = 1446) -> list[dict]:
+    """Scene change cascade: 3 rapid bitrate changes in 1s.
+
+    Pattern: 5KB -> 20KB -> 8KB -> 30KB, then settle at 10KB.
+    Returns update events.
+    """
+    sim_time = [0.0]
+    controller = FECController(
+        config=ControllerConfig(mtu=mtu),
+        time_fn=lambda: sim_time[0],
+    )
+    fps_est = FPSEstimator(alpha=0.05, default_fps=float(fps))
+    frame_period = 1.0 / fps
+    events = []
+
+    total = fps * 5
+    for i in range(total):
+        sim_time[0] = i * frame_period
+        t = sim_time[0]
+        if t < 1.0:
+            size = 5000
+        elif t < 1.3:
+            size = 20000
+        elif t < 1.6:
+            size = 8000
+        elif t < 2.0:
+            size = 30000
+        else:
+            size = 10000
+
+        wire = pack_frame(
+            frame_ready_us=int(t * 1_000_000),
+            frame_id=i,
+            frame_size_bytes=size,
+            seq_count=max(1, math.ceil(size / mtu)),
+        )
+        parsed = parse_frame(wire)
+        est_fps = fps_est.update(parsed.frame_ready_us)
+        result = controller.update(parsed.frame_size_bytes, est_fps)
+        if result:
+            events.append({
+                "time": t,
+                "frame": i,
+                "k": result.k,
+                "n": result.n,
+                "size": size,
+            })
+    return events
+
+
 def print_reference_table() -> None:
     controller = FECController()
 

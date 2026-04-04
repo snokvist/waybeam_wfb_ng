@@ -47,6 +47,14 @@ python -m fec_controller table
 - SigmaStar Infinity6E, armv7l, OpenIPC Linux
 - Cross-compiler toolchain at `../toolchain/toolchain.sigmastar-infinity6e/`
 
+## FEC gating design
+
+Asymmetric gating — fast increase, slow decrease (mirror of TCP AIMD):
+- **Increase**: hysteresis=1, cooldown=0.1s, peak window (32 frames, >= 1 GOP) as floor
+- **Decrease**: hysteresis=3, cooldown=2.0s, EWMA-only (no peak)
+- **Oscillation detector**: >4 updates in 5s → decrease cooldown multiplied by 3x
+- Under-protection (lost frames) is far worse than over-protection (wasted bandwidth)
+
 ## Rules
 
 - All tests use the real sidecar protocol — no mock formats
