@@ -137,3 +137,15 @@ At 90 fps with an active subscriber:
 
 When no probe is subscribed, the sidecar socket exists but no packets
 are sent.
+
+### Adaptive FEC Controller (sidecar consumer)
+
+The `fec_controller` module (`fec_controller/`) subscribes to the sidecar
+and uses FRAME messages to dynamically adjust wfb-ng FEC parameters.
+
+It consumes the same sidecar channel as `rtp_timing_probe` — the venc
+tracks one subscriber at a time, so only one consumer can be active.
+If both the probe and FEC controller need to run simultaneously, a
+local relay/multiplexer would be needed (not yet implemented).
+
+See the top-level `README.md` for controller architecture and usage.
