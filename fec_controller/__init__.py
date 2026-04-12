@@ -32,6 +32,21 @@ from fec_controller.headroom import HeadroomTracker
 from fec_controller.controller import FECParams, FECController
 from fec_controller.wfb_control import WfbTxControl
 from fec_controller.service import FECControllerService, FPSEstimator
+from fec_controller.payload_sizer import (
+    Decision,
+    MAX_PAYLOAD_HARD_CAP,
+    choose_payload_size,
+)
+from fec_controller.frame_size_percentile import FrameSizePercentile
+from fec_controller.link_budget import LinkBudgetEstimator
+from fec_controller.encoder_sim import EncodedFrame, EncoderSim, SizeProfile
+from fec_controller.block_model import BlockStats, make_block, pack_frame_into_blocks
+from fec_controller.payload_benchmark import (
+    BenchmarkConfig as PayloadBenchmarkConfig,
+    PolicyStats,
+    compare_policies,
+    format_report,
+)
 
 __all__ = [
     "FRAME_BASE_SIZE",
@@ -58,4 +73,20 @@ __all__ = [
     "WfbTxControl",
     "FECControllerService",
     "FPSEstimator",
+    # Variable-payload sizer + supporting sim components
+    "Decision",
+    "MAX_PAYLOAD_HARD_CAP",
+    "choose_payload_size",
+    "FrameSizePercentile",
+    "LinkBudgetEstimator",
+    "EncodedFrame",
+    "EncoderSim",
+    "SizeProfile",
+    "BlockStats",
+    "make_block",
+    "pack_frame_into_blocks",
+    "PayloadBenchmarkConfig",
+    "PolicyStats",
+    "compare_policies",
+    "format_report",
 ]

@@ -54,3 +54,18 @@ class ControllerConfig:
     oscillation_window_s: float = 5.0
     oscillation_threshold: int = 4
     oscillation_backoff: float = 3.0
+
+    # Variable-payload sizer (P-first policy). Opt-in; the legacy k-first
+    # path above stays the default until sim numbers justify a migration.
+    # See docs/variable-payload.md.
+    enable_variable_payload: bool = False
+    min_payload: int = 800
+    mtu_override: int = 1500      # hard-capped at 3900 by the sizer
+    payload_hysteresis: float = 0.12
+    # Percentile window for S_ref feeding the sizer. P99 (not P95) because
+    # at typical GOP cadences (30-60 frames) IDRs are 1.5-3.3 % of frames
+    # — P95 lands on the P-frame band. See docs/variable-payload.md.
+    s_ref_window_s: float = 2.5
+    s_ref_quantile: float = 0.99
+    # Conservative fallback when pps_budget is unknown / stale.
+    pps_budget_fallback: float = 1500.0

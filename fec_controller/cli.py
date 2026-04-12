@@ -8,6 +8,12 @@ from fec_controller.config import ControllerConfig
 from fec_controller.service import FECControllerService
 from fec_controller.simulation import simulate_stream, print_reference_table
 from fec_controller.benchmark import run_all, replay
+from fec_controller.payload_benchmark import (
+    BenchmarkConfig as PayloadBenchmarkConfig,
+    compare_policies,
+    format_report,
+)
+from fec_controller.encoder_sim import SizeProfile
 
 
 def main() -> None:
@@ -71,6 +77,33 @@ def main() -> None:
     # --- table ---
     sub.add_parser("table", help="Print reference table")
 
+    # --- payload-benchmark (variable-P vs fixed-P) ---
+    pb_p = sub.add_parser(
+        "payload-benchmark",
+        help="Compare fixed-P vs variable-P sizing over a synthetic trace",
+    )
+    pb_p.add_argument("--fps", type=int, default=60)
+    pb_p.add_argument("--frames", type=int, default=600)
+    pb_p.add_argument("--fec-k", type=int, default=8)
+    pb_p.add_argument("--base", type=int, default=8000)
+    pb_p.add_argument("--i-mult", type=float, default=5.0)
+    pb_p.add_argument("--gop", type=int, default=30)
+    pb_p.add_argument("--jitter", type=float, default=0.03)
+    pb_p.add_argument("--pps-budget", type=float, default=3000.0)
+    pb_p.add_argument("--fixed-payload", type=int, default=1500)
+    pb_p.add_argument("--mtu-override", type=int, default=3000)
+    pb_p.add_argument("--min-payload", type=int, default=800)
+    pb_p.add_argument("--hysteresis", type=float, default=0.12)
+    pb_p.add_argument(
+        "--ramp-at", type=float, default=0.0,
+        help="If > 0, apply a bitrate ramp event at this time (seconds).",
+    )
+    pb_p.add_argument(
+        "--ramp-to", type=int, default=0,
+        help="Post-ramp frame size in bytes; requires --ramp-at > 0.",
+    )
+    pb_p.add_argument("--seed", type=int, default=0xC0FFEE)
+
     # --- benchmark ---
     bench_p = sub.add_parser("benchmark", help="Run benchmark scenarios with KPIs")
     bench_p.add_argument(
@@ -121,6 +154,31 @@ def main() -> None:
         )
     elif args.cmd == "table":
         print_reference_table()
+    elif args.cmd == "payload-benchmark":
+        events = []
+        if args.ramp_at > 0 and args.ramp_to > 0:
+            events.append((float(args.ramp_at), int(args.ramp_to)))
+        profile = SizeProfile(
+            base=args.base,
+            i_mult=args.i_mult,
+            gop_interval=args.gop,
+            jitter_sigma=args.jitter,
+            bitrate_events=events,
+        )
+        cfg = PayloadBenchmarkConfig(
+            fps=args.fps,
+            frames=args.frames,
+            fec_k=args.fec_k,
+            profile=profile,
+            pps_budget=args.pps_budget,
+            min_payload=args.min_payload,
+            fixed_payload=args.fixed_payload,
+            mtu_override=args.mtu_override,
+            hysteresis=args.hysteresis,
+            seed=args.seed,
+        )
+        result = compare_policies(cfg)
+        print(format_report(result))
     elif args.cmd == "benchmark":
         if args.replay:
             results = [replay(
