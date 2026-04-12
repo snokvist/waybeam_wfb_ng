@@ -14,6 +14,9 @@ import logging
 
 from fec_controller.config import ControllerConfig
 from fec_controller.controller import FECController, FECParams
+from fec_controller.frame_size_percentile import FrameSizePercentile
+from fec_controller.link_budget import LinkBudgetEstimator
+from fec_controller.payload_sizer import Decision, choose_payload_size
 from fec_controller.protocol import (
     FRAME_BASE_SIZE,
     MSG_FRAME,
@@ -89,6 +92,7 @@ class FECControllerService:
         dry_run: bool = False,
         sidecar_host: str = "",
         sidecar_port: int = 0,
+        link_budget_estimator: LinkBudgetEstimator | None = None,
     ):
         self.config = config
         self.stat_port = stat_port
@@ -99,6 +103,26 @@ class FECControllerService:
         self.controller = FECController(config)
         self.wfb_tx = WfbTxControl(wfb_control_host, wfb_control_port)
         self.fps_estimator = FPSEstimator(alpha=config.ewma_alpha)
+
+        # Variable-payload sizer — read-only observer in this slice.
+        # Decisions are logged; they do NOT yet drive FECController's k
+        # or generate any outbound MSG_SET_PAYLOAD to venc. That wiring
+        # arrives when the sidecar protocol extensions land.
+        self.frame_size_percentile: FrameSizePercentile | None = None
+        self.link_budget: LinkBudgetEstimator | None = None
+        self._last_payload_decision: Decision | None = None
+        self._prev_payload: int | None = None
+        if config.enable_variable_payload:
+            self.frame_size_percentile = FrameSizePercentile(
+                window_s=config.s_ref_window_s,
+                quantile=config.s_ref_quantile,
+                fallback=0.0,
+            )
+            self.link_budget = link_budget_estimator or LinkBudgetEstimator(
+                window_s=config.pps_window_s,
+                ttl_s=config.pps_ttl_s,
+                fallback=config.pps_budget_fallback,
+            )
 
         self._frame_count = 0
         self._last_log_time = 0.0
@@ -142,7 +166,54 @@ class FECControllerService:
         if result is not None:
             self._apply_update(result)
 
+        # Run the variable-payload sizer in parallel (read-only). Logs
+        # the chosen payload when it changes. Does not yet drive any
+        # outbound action — that comes when the sidecar SET message
+        # lands in venc.
+        if self.frame_size_percentile is not None and self.link_budget is not None:
+            self.frame_size_percentile.update(frame_size)
+            s_ref = self.frame_size_percentile.value() or float(frame_size)
+            if s_ref > 0 and fps > 0:
+                decision = choose_payload_size(
+                    s_ref=s_ref,
+                    fps=fps,
+                    pps_budget=self.link_budget.current(),
+                    fec_k=self.config.target_fec_k,
+                    min_payload=self.config.min_payload,
+                    mtu_override=self.config.mtu_override,
+                    prev=self._prev_payload,
+                    hysteresis=self.config.payload_hysteresis,
+                )
+                if (
+                    self._last_payload_decision is None
+                    or decision.payload != self._last_payload_decision.payload
+                ):
+                    log.info(
+                        "payload=%d (s_ref=%.0f pps=%.0f pf=%d/%d fits=%s reason=%s)",
+                        decision.payload,
+                        decision.s_ref,
+                        decision.pps_budget,
+                        decision.packets_per_frame,
+                        decision.fec_k,
+                        decision.fits_in_block,
+                        decision.reason,
+                    )
+                self._last_payload_decision = decision
+                self._prev_payload = decision.payload
+
         self._periodic_log()
+
+    def observe_link_budget(self, pps: float) -> None:
+        """Feed a pps_budget sample. Intended future entry point for a
+        MSG_LINK_BUDGET sidecar handler / mod_aalink bus hook. No-op
+        when variable_payload is disabled.
+        """
+        if self.link_budget is not None:
+            self.link_budget.observe(pps)
+
+    def current_payload_decision(self) -> Decision | None:
+        """Most recent sizer decision (or None if sizer disabled / no frames)."""
+        return self._last_payload_decision
 
     def _handle_packet(self, data: bytes) -> None:
         """Route incoming packet — only process FRAME messages."""

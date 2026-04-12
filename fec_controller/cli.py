@@ -68,6 +68,34 @@ def main() -> None:
         default=6666,
         help="Venc sidecar UDP port (default: 6666)",
     )
+    run_p.add_argument(
+        "--enable-variable-payload",
+        action="store_true",
+        help=(
+            "Run the P-first sizer as a read-only observer alongside the "
+            "legacy FEC controller. Logs chosen payload on change. Does "
+            "not yet drive venc or wfb_tx (awaits sidecar protocol "
+            "extensions)."
+        ),
+    )
+    run_p.add_argument(
+        "--target-fec-k",
+        type=int,
+        default=8,
+        help="Sizer's desired source-packet cap (default: 8)",
+    )
+    run_p.add_argument(
+        "--min-payload",
+        type=int,
+        default=800,
+        help="Sizer payload floor in bytes (default: 800)",
+    )
+    run_p.add_argument(
+        "--mtu-override",
+        type=int,
+        default=1500,
+        help="Sizer payload ceiling hint; hard-capped at 3900 (default: 1500)",
+    )
 
     # --- simulate ---
     sim_p = sub.add_parser("simulate", help="Run simulation")
@@ -145,6 +173,10 @@ def main() -> None:
         config = ControllerConfig(
             mtu=args.mtu,
             min_update_interval=args.min_update_interval,
+            enable_variable_payload=args.enable_variable_payload,
+            target_fec_k=args.target_fec_k,
+            min_payload=args.min_payload,
+            mtu_override=args.mtu_override,
         )
         service = FECControllerService(
             config=config,

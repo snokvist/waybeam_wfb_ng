@@ -69,3 +69,10 @@ class ControllerConfig:
     s_ref_quantile: float = 0.99
     # Conservative fallback when pps_budget is unknown / stale.
     pps_budget_fallback: float = 1500.0
+    # Target source-packet budget per FEC block for the sizer. Distinct
+    # from the legacy max_k (wfb-ng clamp) — this is the "desired" cap
+    # the sizer uses to keep one frame inside one FEC block.
+    target_fec_k: int = 8
+    # LinkBudgetEstimator parameters
+    pps_window_s: float = 1.0
+    pps_ttl_s: float = 2.0

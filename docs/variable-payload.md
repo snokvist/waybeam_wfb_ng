@@ -137,6 +137,33 @@ freshness TTL end-to-end. Example: a MCS drop at t=2s then recovery at
 t=4s is expressed as `LinkBudgetProfile(events=[(0, 3000), (2, 600), (4, 3000)])`
 or via the CLI flag `--budget-schedule 0:3000,2:600,4:3000`.
 
+## Wiring into `FECControllerService`
+
+The sizer runs alongside the legacy `FECController` when
+`ControllerConfig.enable_variable_payload = True`. It is **read-only**
+in this slice: every FRAME message feeds `FrameSizePercentile`,
+`choose_payload_size()` runs, and decisions that change from the prior
+frame are logged via `log.info("payload=... (s_ref=... pps=... pf=X/Y fits=... reason=...)")`.
+No outbound action is taken yet — `MSG_SET_PAYLOAD` to venc and
+`MSG_LINK_BUDGET` from `mod_aalink` are the next integration steps and
+live outside this repo.
+
+Programmatic hooks the future sidecar consumer will use:
+
+- `FECControllerService.observe_link_budget(pps)` — feed a
+  pps_budget sample into the internal `LinkBudgetEstimator`.
+- `FECControllerService.current_payload_decision()` — returns the most
+  recent `Decision` for debug/telemetry.
+
+Opt-in via CLI:
+
+```bash
+python -m fec_controller run \
+  --wfb-port 8003 \
+  --sidecar-host 10.0.0.1 --sidecar-port 6666 \
+  --enable-variable-payload --target-fec-k 8 --mtu-override 3000
+```
+
 ## Out of scope for this slice
 
 - Wire-format changes to the sidecar (`MSG_LINK_BUDGET`, `MSG_SET_PAYLOAD`,
