@@ -42,11 +42,6 @@ class ControllerConfig:
     min_interval_up: float = 0.1      # seconds between FEC increases
     min_interval_down: float = 2.0    # seconds between FEC decreases
 
-    # Peak tracking — sliding window of recent frame sizes (in frames,
-    # not time) used as a floor for k computation.  Ensures a single
-    # large frame immediately raises k without waiting for EWMA.
-    peak_window: int = 32    # >= one GOP at typical settings (30 frames)
-
     # Oscillation detector — if more than `oscillation_threshold` FEC
     # updates fire within `oscillation_window_s`, the decrease cooldown
     # is multiplied by `oscillation_backoff`.  Auto-resolves when updates

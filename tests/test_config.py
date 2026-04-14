@@ -87,13 +87,12 @@ class TestConfigExtremes:
     def test_custom_config_overrides(self):
         """Verify custom values are preserved."""
         cfg = ControllerConfig(
-            mtu=1200, min_k=2, max_k=32, ewma_alpha=0.1, peak_window=16,
+            mtu=1200, min_k=2, max_k=32, ewma_alpha=0.1,
         )
         assert cfg.mtu == 1200
         assert cfg.min_k == 2
         assert cfg.max_k == 32
         assert cfg.ewma_alpha == 0.1
-        assert cfg.peak_window == 16
 
     def test_asymmetric_defaults_sensible(self):
         """Increase thresholds are lower/faster than decrease."""

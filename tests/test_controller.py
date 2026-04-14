@@ -20,7 +20,6 @@ class TestControllerConfig:
         assert cfg.k_hysteresis_down == 3
         assert cfg.min_interval_up == 0.1
         assert cfg.min_interval_down == 2.0
-        assert cfg.peak_window == 32
 
     def test_redundancy_curve_default(self):
         cfg = ControllerConfig()
@@ -140,7 +139,9 @@ class TestAsymmetricGating:
         self.ctrl.update(5000, 120)
         k_before = self.ctrl.current_params.k
         self._time += 0.15  # past min_interval_up (0.1s)
-        # Feed a much larger frame — peak window will bump candidate k
+        # A single large frame moves EWMA by alpha=0.05, and the headroom
+        # tracker's max-in-window jumps immediately — together enough to
+        # bump k by at least 1 past k_hysteresis_up.
         result = self.ctrl.update(30000, 120)
         assert result is not None
         assert result.k > k_before
@@ -203,48 +204,6 @@ class TestAsymmetricGating:
         # At minimum, the controller should not crash
         assert ctrl.current_params.k >= 1
 
-    def test_peak_window_tracks_recent_max(self):
-        """Peak window captures the largest recent frame."""
-        self.ctrl.update(5000, 120)
-        self.ctrl.update(5000, 120)
-        self.ctrl.update(20000, 120)  # spike
-        self.ctrl.update(5000, 120)
-        assert self.ctrl.peak_recent_size == 20000
-
-    def test_peak_window_slides(self):
-        """Old peaks expire from the window."""
-        window = self.ctrl.cfg.peak_window
-        # Fill window with large frames
-        for i in range(window):
-            self.ctrl.update(20000, 120)
-        assert self.ctrl.peak_recent_size == 20000
-
-        # Push enough small frames to fully replace the window
-        for i in range(window):
-            self.ctrl.update(3000, 120)
-        assert self.ctrl.peak_recent_size == 3000
-
-    def test_peak_drives_immediate_k_increase(self):
-        """Single large frame raises k immediately via peak, not EWMA."""
-        # Establish baseline with small frames
-        for i in range(20):
-            self._time += 1 / 120
-            self.ctrl.update(2000, 120)
-        k_low = self.ctrl.current_params.k
-
-        # One very large frame
-        self._time += 1 / 120 + 0.15  # ensure past increase cooldown
-        result = self.ctrl.update(40000, 120)
-        if result is not None:
-            assert result.k > k_low
-        else:
-            # Peak may have triggered earlier; check current k
-            # Feed one more to confirm
-            self._time += 0.15
-            result = self.ctrl.update(40000, 120)
-            assert result is not None
-            assert result.k > k_low
-
     def test_rapid_increases_allowed(self):
         """Multiple increases can fire in quick succession."""
         self.ctrl.update(2000, 120)
@@ -272,12 +231,11 @@ class TestAsymmetricGating:
             size = 15000 if i % 2 == 0 else 5000
             self.ctrl.update(size, 120)
 
-        # k should be at or above the level needed for 15KB frames
-        # (peak window always has 15KB in it during oscillation)
+        # EWMA converges to the mean (~10KB) and the headroom tracker's
+        # max-in-window lifts the target past k_baseline.  The decrease
+        # cooldown (2.0s) prevents k from yo-yoing back down.
         k_during = self.ctrl.current_params.k
         assert k_during > k_baseline
-        # k should NOT have dropped back to baseline during the oscillation
-        # The decrease cooldown (2.0s) prevents this
 
     def test_update_count_increments(self):
         assert self.ctrl.update_count == 0
@@ -467,10 +425,6 @@ class TestBoundaryConditions:
         result = self.ctrl.update(5000, 0.0)
         assert result is not None
         assert result.fec_timeout_ms >= 1
-
-    def test_peak_window_empty_at_start(self):
-        """peak_recent_size is 0 before any frames."""
-        assert self.ctrl.peak_recent_size == 0
 
 
 class TestReferenceTable:
