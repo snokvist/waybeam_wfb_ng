@@ -1,24 +1,24 @@
 diff --git a/src/tx.cpp b/src/tx.cpp
-index 0dec131..d5759e7 100644
+index 0dec131..e1ba9aa 100644
 --- a/src/tx.cpp
 +++ b/src/tx.cpp
 @@ -42,6 +42,12 @@
-
+ 
  #include "zfex.h"
-
+ 
 +// --- SHM ring input support (waybeam_venc) ---
 +extern "C" {
 +#include "venc_ring.h"
 +}
 +static venc_ring_t *g_shm_ring = NULL;
 +// --- end SHM ring ---
-
+ 
  using namespace std;
-
+ 
 @@ -739,10 +745,13 @@ uint32_t extract_rxq_overflow(struct msghdr *msg)
      return 0;
  }
-
+ 
 -void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd, int fec_timeout, bool mirror, int log_interval)
 +void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
 +                 int fec_timeout, bool mirror, int log_interval,
@@ -28,13 +28,13 @@ index 0dec131..d5759e7 100644
      int nfds = rx_fd.size();
 -    assert(nfds > 0);
 +    assert(use_shm || nfds > 0);
-
+ 
      struct pollfd fds[nfds + 1];
      memset(fds, '\0', sizeof(fds));
-@@ -769,6 +778,28 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
+@@ -769,6 +778,29 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
      uint32_t count_p_truncated = 0; // injected large packets that were truncated
      int start_fd_idx = 0;
-
+ 
 +    // --- SHM ring attach ---
 +    uint32_t shm_epoch = 0;
 +    if (shm_name && shm_name[0])
@@ -61,10 +61,10 @@ index 0dec131..d5759e7 100644
      for(;;)
      {
          uint64_t cur_ts = get_time_ms();
-@@ -779,7 +810,16 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
+@@ -779,7 +811,16 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
              poll_timeout = std::min(poll_timeout, (int)(fec_close_ts > cur_ts ? fec_close_ts - cur_ts : 0));
          }
-
+ 
 -        int rc = poll(fds, nfds + 1, poll_timeout);
 +        int rc;
 +        if (g_shm_ring)
@@ -76,22 +76,22 @@ index 0dec131..d5759e7 100644
 +        {
 +            rc = poll(fds, nfds + 1, poll_timeout);
 +        }
-
+ 
          if (rc < 0)
          {
-@@ -980,7 +1020,7 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
+@@ -980,7 +1021,7 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
              }
          }
-
+ 
 -        if (rc == 0) // poll timeout
 +        if (rc == 0 && !g_shm_ring) // poll timeout
          {
              // close fec only if no data packets and fec timeout expired
              if (fec_timeout > 0 && cur_ts >= fec_close_ts)
-@@ -994,6 +1034,82 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
+@@ -994,6 +1035,104 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
              continue;
          }
-
+ 
 +        // --- SHM ring read path ---
 +        if (g_shm_ring)
 +        {
@@ -149,6 +149,22 @@ index 0dec131..d5759e7 100644
 +
 +                t->send_packet(buf, rsize, 0);
 +
++                // Honor RTP marker bit: M=1 on the last packet of a frame
++                // (H.264/H.265 RTP payload format, RFC 3550 byte 1 bit 7).
++                // Close the FEC block at the frame boundary so one frame
++                // fits in one block, eliminating cross-frame contamination
++                // on block loss.  If fec_k exceeds the frame's packet
++                // count, the block is padded with zero-length FEC_ONLY
++                // fragments -- real airtime cost, so fec_controller should
++                // size k near typical frame packet count.  send_packet
++                // returns false once the block auto-emits and fragment_idx
++                // wraps to 0, terminating the loop.  fec_timeout remains a
++                // safety-net fallback for streams without M-bit markers.
++                if (rsize >= 2 && (buf[1] & 0x80))
++                {
++                    while(t->send_packet(NULL, 0, WFB_PACKET_FEC_ONLY));
++                }
++
 +                if (cur_ts >= log_send_ts)
 +                {
 +                    break; // go to outer loop for logging
@@ -177,10 +193,10 @@ index 0dec131..d5759e7 100644
          // rc > 0: events detected
          // start from last fd index and reset it to zero
          int _tmp = start_fd_idx;
-@@ -1526,6 +1642,52 @@ void local_loop_unix(int argc, char* const* argv, int optind, int rcv_buf, int l
+@@ -1526,6 +1665,52 @@ void local_loop_unix(int argc, char* const* argv, int optind, int rcv_buf, int l
  }
-
-
+ 
+ 
 +// --- SHM ring input mode ---
 +void local_loop_shm(int argc, char* const* argv, int optind, int log_interval,
 +                    const char *shm_name, int debug_port, int k, int n, const string &keypair,
@@ -230,7 +246,7 @@ index 0dec131..d5759e7 100644
  void distributor_loop(int argc, char* const* argv, int optind, int rcv_buf, int log_interval,
                        int udp_port, int k, int n, const string &keypair, int fec_timeout,
                        uint64_t epoch, uint32_t channel_id, uint32_t fec_delay, bool use_qdisc, uint32_t fwmark,
-@@ -1669,6 +1831,7 @@ int main(int argc, char * const *argv)
+@@ -1669,6 +1854,7 @@ int main(int argc, char * const *argv)
      int opt;
      uint8_t k=8, n=12, radio_port=0;
      uint32_t fec_delay = 0;
@@ -238,19 +254,19 @@ index 0dec131..d5759e7 100644
      uint32_t link_id = 0x0;
      uint64_t epoch = 0;
      int srv_port = 10000;
-@@ -1697,7 +1860,7 @@ int main(int argc, char * const *argv)
+@@ -1697,7 +1883,7 @@ int main(int argc, char * const *argv)
      uint32_t inject_retries = 0;
      uint32_t inject_retry_delay = 5000; // 5ms
-
+ 
 -    while ((opt = getopt(argc, argv, "dI:K:k:n:u:U:p:F:l:B:G:S:L:M:N:D:T:i:e:R:s:f:mVQP:C:J:E:")) != -1) {
 +    while ((opt = getopt(argc, argv, "dI:K:k:n:u:U:p:F:l:B:G:S:L:M:N:D:T:i:e:R:s:f:mVQP:C:J:E:H:")) != -1) {
          switch (opt) {
          case 'I':
              tx_mode = INJECTOR;
-@@ -1814,9 +1977,13 @@ int main(int argc, char * const *argv)
+@@ -1814,9 +2000,13 @@ int main(int argc, char * const *argv)
              inject_retry_delay = atoi(optarg);
              break;
-
+ 
 +        case 'H':
 +            shm_name = optarg;
 +            break;
@@ -262,7 +278,7 @@ index 0dec131..d5759e7 100644
                       "             [-F fec_delay] [-B bandwidth] [-G guard_interval] [-S stbc] [-L ldpc] [-M mcs_index] [-N VHT_NSS]\n"
                       "             [-T fec_timeout] [-l log_interval] [-e epoch] [-i link_id] [-f { data | rts }] [-m] [-V] [-Q]\n"
                       "             [-P fwmark] [-J inject_retries] [-E inject_retry_delay] [-C control_port] interface1 [interface2] ...\n",
-@@ -1882,6 +2049,14 @@ int main(int argc, char * const *argv)
+@@ -1882,6 +2072,14 @@ int main(int argc, char * const *argv)
                                  radiotap_header, frame_type, control_port, mirror,
                                  snd_buf, inject_retries, inject_retry_delay);
              }
