@@ -58,7 +58,10 @@ class TestSceneChanges:
         r = scenario_scene_changes(duration_s=60.0)
         _print_kpi(r)
         assert r.kpi.protection_rate >= 0.90
-        assert r.kpi.max_deficit <= 15
+        # Under k-for-average, sudden 3x scene-change I-frames briefly span
+        # many FEC blocks before the controller ramps k up. max_deficit
+        # captures that worst single-frame transient; bound it loosely.
+        assert r.kpi.max_deficit <= 30
         assert r.kpi.avg_reaction_frames < 30
         assert r.kpi.updates_per_second < 2.0
 
@@ -151,12 +154,12 @@ class TestMcsPlateaus:
         # Run just one 12s plateau at 8Mbps
         r = scenario_mcs_plateaus(duration_s=12.0)
         # During the first plateau (0-12s), only the initial update and
-        # early peak-window settling should fire — +-20% P-frame variance
-        # should NOT cause additional updates once settled.
+        # EWMA warm-up should fire — +-20% P-frame variance should NOT
+        # cause additional updates once the average settles.
         first_plateau_updates = [
             f for f in r.frames if f.update_fired and f.time < 11.0
         ]
-        # Initial + peak-window settling + I-frame adjustments
+        # Initial + EWMA warm-up + I-frame adjustments
         assert len(first_plateau_updates) <= 12, (
             f"Too many updates within first plateau: {len(first_plateau_updates)}")
 

@@ -186,11 +186,11 @@ class TestStepDown:
                 f"t={decreases[i]['time']:.2f} (gap={gap:.2f}s)"
             )
 
-    def test_k_does_not_decrease_while_peak_window_has_large_frames(self):
-        """k stays high while peak window still contains 15KB frames."""
+    def test_k_does_not_decrease_immediately_after_step_down(self):
+        """k stays high right after 15KB→5KB transition (EWMA slow + cooldown)."""
         events = simulate_step_down()
-        # Peak window is 8 frames = 8/120 = 0.067s
-        # No decrease should happen in the first 0.067s after transition
+        # EWMA alpha=0.05 and decrease cooldown=2.0s both prevent k
+        # from dropping in the first fraction of a second after the step.
         very_early = [e for e in events if 2.0 < e["time"] < 2.07]
         k_at_transition = None
         for e in events:
@@ -198,8 +198,8 @@ class TestStepDown:
                 k_at_transition = e["k"]
         for e in very_early:
             assert e["k"] >= k_at_transition, (
-                f"k decreased at t={e['time']:.3f} while peak window still "
-                f"has large frames (k={e['k']}, was {k_at_transition})"
+                f"k decreased at t={e['time']:.3f} immediately after step-down "
+                f"(k={e['k']}, was {k_at_transition})"
             )
 
     def test_k_eventually_decreases(self):
@@ -216,9 +216,11 @@ class TestRapidOscillation:
 
     def test_k_stays_high_during_oscillation(self):
         result = simulate_rapid_oscillation()
-        # During oscillation, k should stay elevated to cover 15KB frames
-        # 15000/1446 = 10.4 -> k should be >= 7 (some lag acceptable)
-        assert result["k_during_min"] >= 7, (
+        # Under k-for-average, EWMA tracks the rolling mean (~10KB) not the
+        # peak, so k settles around 7-9 during oscillation.  Brief dips to 6
+        # are expected as EWMA drifts toward 5KB during low-half windows.
+        # 15KB frames spanning 2 FEC blocks is the intended fallback.
+        assert result["k_during_min"] >= 6, (
             f"k dropped too low during oscillation: {result['k_during_min']}"
         )
 

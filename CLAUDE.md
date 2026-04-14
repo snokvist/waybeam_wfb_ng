@@ -8,7 +8,7 @@ Adaptive FEC controller for wfb-ng WiFi broadcast on SigmaStar Infinity6E (armv7
 
 - **Video path**: venc -> SHM ring (zero-copy) -> wfb_tx (patched `-H`) -> radio
 - **Control path**: venc sidecar FRAME msgs (UDP) -> fec_controller -> `set_fec k n` -> wfb_tx control port
-- **Design**: One frame ~ one FEC block. Learned headroom. Stateless (no loss feedback).
+- **Design**: k sized for average frame (EWMA + bounded headroom); I-frames span multiple FEC blocks. RTP M-bit honored by wfb_tx aligns every frame's final block to a frame boundary, so block loss never contaminates adjacent frames. Stateless (no loss feedback).
 
 ## Repository layout
 
@@ -50,10 +50,11 @@ python -m fec_controller table
 ## FEC gating design
 
 Asymmetric gating — fast increase, slow decrease (mirror of TCP AIMD):
-- **Increase**: hysteresis=1, cooldown=0.1s, peak window (32 frames, >= 1 GOP) as floor
-- **Decrease**: hysteresis=3, cooldown=2.0s, EWMA-only (no peak)
+- **Sizing**: k from EWMA × bounded headroom (1.05–1.40). I-frames exceeding k×MTU span multiple blocks; M-bit in wfb_tx closes each frame's final block cleanly.
+- **Increase**: hysteresis=1, cooldown=0.1s
+- **Decrease**: hysteresis=3, cooldown=2.0s
 - **Oscillation detector**: >4 updates in 5s → decrease cooldown multiplied by 3x
-- Under-protection (lost frames) is far worse than over-protection (wasted bandwidth)
+- Under-protection (lost frames) is far worse than over-protection (wasted bandwidth); airtime efficiency on P-frames beats "one frame = one block" guarantee
 
 ## Rules
 

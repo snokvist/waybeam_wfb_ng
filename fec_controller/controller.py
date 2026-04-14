@@ -1,14 +1,21 @@
 """
 FEC controller core - computes optimal k/n from frame statistics.
 
-One video frame ~ one FEC block: k is sized so a full frame fits in one block.
-This avoids latency from a frame spanning multiple blocks where a partial last
-block stalls waiting for the next frame's packets.
+k is sized for the *average* frame (EWMA + bounded headroom).  I-frames that
+exceed k*MTU span multiple FEC blocks; the RTP M-bit honored by wfb_tx closes
+each frame's final block cleanly at the frame boundary, so cross-frame
+contamination on block loss is impossible regardless of how k compares to any
+single frame's packet count.
+
+This trades "one frame ≈ one block" for "airtime efficiency on P-frames": a
+peak-sized k (matching I-frame packet count) would pad every P-frame's block
+with empty FEC_ONLY fragments.  Sizing for the average keeps P-frames cheap;
+the occasional 2-3 block I-frame costs a handful of extra FEC parities once
+per GOP.
 
 Uses asymmetric gating (fast increase, slow decrease) because the cost of
 under-protection (frame loss) is far higher than over-protection (wasted
-bandwidth).  A peak tracking window ensures immediate spike response without
-waiting for the EWMA to converge.
+bandwidth).
 """
 
 import math
@@ -57,9 +64,6 @@ class FECController:
         )
         self.cfg.redundancy_curve.sort(key=lambda x: x[0])
 
-        # Peak tracking: sliding window of recent frame sizes
-        self._peak_window: deque[int] = deque(maxlen=self.cfg.peak_window)
-
         # Oscillation detector: timestamps of recent FEC updates
         self._update_times: deque[float] = deque()
 
@@ -107,11 +111,6 @@ class FECController:
         )
 
     @property
-    def peak_recent_size(self) -> int:
-        """Max frame size in the peak tracking window."""
-        return max(self._peak_window) if self._peak_window else 0
-
-    @property
     def is_oscillating(self) -> bool:
         """True if recent update rate exceeds the oscillation threshold."""
         return len(self._update_times) >= self.cfg.oscillation_threshold
@@ -127,8 +126,6 @@ class FECController:
         """Feed one frame observation. Returns FECParams if an update should be sent."""
         now = self._time_fn()
 
-        # Track peak and headroom
-        self._peak_window.append(frame_size)
         self.headroom_tracker.update(float(frame_size))
 
         # EWMA of frame size
@@ -143,22 +140,10 @@ class FECController:
         self.current_fps = fps
         headroom = self.headroom_tracker.headroom
 
-        # Compute k from EWMA + headroom (steady-state target)
-        candidate_avg = self.compute_params(self.avg_frame_size, fps, headroom)
-
-        # Compute k from peak window (spike protection floor)
-        k_peak = max(
-            self.cfg.min_k,
-            min(self.cfg.max_k, max(1, math.ceil(self.peak_recent_size / self.cfg.mtu))),
-        )
-
-        # Use the higher of the two for the candidate
-        if k_peak > candidate_avg.k:
-            candidate = self.compute_params(
-                float(self.peak_recent_size), fps, 1.0,
-            )
-        else:
-            candidate = candidate_avg
+        # k sized for average frame (EWMA * bounded headroom).  I-frames that
+        # exceed k*MTU span multiple blocks; the M-bit in wfb_tx aligns every
+        # frame's final block to a frame boundary, so this is safe.
+        candidate = self.compute_params(self.avg_frame_size, fps, headroom)
 
         # Expire old oscillation records
         self._record_update(now)
