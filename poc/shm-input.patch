@@ -43,7 +43,7 @@ index 0dec131..99b98e4 100644
 +    uint64_t shm_watchdog_ts = 0;      // when write_idx last advanced
 +    const uint64_t SHM_STALL_MS = 3000; // detach if write_idx stuck this long
 +    const int SHM_DRAIN_MAX = 128;     // cap packets drained per outer iter
-+    const int SHM_FUTEX_MS = 2;        // futex wait when ring empty
++    const int SHM_FUTEX_MS = 10;       // idle-wait timeout only; producer wakes within us
 +    if (use_shm)
 +    {
 +        g_shm_ring = venc_ring_attach(shm_name);
