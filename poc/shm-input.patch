@@ -1,5 +1,5 @@
 diff --git a/src/tx.cpp b/src/tx.cpp
-index 0dec131..99b98e4 100644
+index 0dec131..9be3f16 100644
 --- a/src/tx.cpp
 +++ b/src/tx.cpp
 @@ -42,6 +42,12 @@
@@ -15,7 +15,107 @@ index 0dec131..99b98e4 100644
  
  using namespace std;
  
-@@ -739,10 +745,13 @@ uint32_t extract_rxq_overflow(struct msghdr *msg)
+@@ -724,6 +730,99 @@ bool Transmitter::send_packet(const uint8_t *buf, size_t size, uint8_t flags)
+     return true;
+ }
+ 
++// C3 variable-k close: emit the currently-open FEC block with only the
++// fragments actually written, trimmed parity count, and no zero-padded
++// data packets on the wire.
++//
++// Semantics: the block is still FEC-encoded with the session's fec_k so
++// the existing RX (which waits for fec_k fragments) decodes normally via
++// parity substitution; we simply skip the wire-inject of the padding
++// slots. Parity count is capped at (fec_n - fec_k) and floored at
++// (fec_k - actual_k) so the receiver always collects enough fragments
++// to trigger its FEC path.
++//
++// Savings vs. the padding-based close path:
++//   - no wire inject of (fec_k - actual_k) zero-padded data packets
++//   - no wire inject of (fec_n - fec_k - parity_count) skipped parity
++//   - RX behaviour unchanged: same session keys, same block_idx sequence,
++//     same apply_fec logic (reconstructs FEC_ONLY slots as zeros)
++//
++// Returns false if no block is open (fragment_idx == 0).
++bool Transmitter::close_block_early(uint8_t ratio)
++{
++    if (fragment_idx == 0)
++    {
++        return false;  // nothing open to close
++    }
++
++    uint8_t actual_k = fragment_idx;
++
++    // parity_count: at least (fec_k - actual_k) to let RX reach its
++    // has_fragments == fec_k trigger; at most (fec_n - fec_k) so we
++    // never exceed the session's configured parity budget; scaled by
++    // actual_k * ratio between those bounds.
++    int parity_min = fec_k - (int)actual_k;
++    int parity_max = fec_n - fec_k;
++    int parity_target = (int)actual_k * (int)ratio;
++    int parity_count = std::max(parity_min, std::min(parity_max, parity_target));
++
++    // Fill the remaining data slots with FEC_ONLY markers (flags + zero
++    // payload) so the FEC encoder sees a full k-input matrix. These slots
++    // are NOT transmitted on the wire; RX reconstructs them from parity.
++    while (fragment_idx < fec_k)
++    {
++        wpacket_hdr_t *packet_hdr = (wpacket_hdr_t*)block[fragment_idx];
++        packet_hdr->flags = WFB_PACKET_FEC_ONLY;
++        packet_hdr->packet_size = 0;
++        memset(block[fragment_idx] + sizeof(wpacket_hdr_t), '\0',
++               MAX_FEC_PAYLOAD - sizeof(wpacket_hdr_t));
++        fragment_idx += 1;
++    }
++
++    // FEC encode with the session's fec_k / fec_n (no change to the math)
++    zfex_status_code_t _rc = fec_encode_simd(fec_p, (const uint8_t**)block,
++                                             block + fec_k,
++                                             ZFEX_ROUND_UP_SIMD(max_packet_size));
++    assert(_rc == ZFEX_SC_OK);
++
++    set_mark(1);
++
++    // Emit only parity_count parity packets (fragment_idx fec_k .. fec_k+parity_count-1)
++    int emit_stop = fec_k + parity_count;
++    while (fragment_idx < emit_stop)
++    {
++        if (fec_delay > 0)
++        {
++            struct timespec t = { .tv_sec = (time_t)(fec_delay / 1000000),
++                                  .tv_nsec = (suseconds_t)(fec_delay % 1000000) * 1000 };
++            int rc = clock_nanosleep(CLOCK_MONOTONIC, 0, &t, NULL);
++            if(rc != 0 && rc != EINTR)
++            {
++                throw runtime_error(string_format("clock_nanosleep: %s", strerror(rc)));
++            }
++        }
++        send_block_fragment(max_packet_size);
++        fragment_idx += 1;
++    }
++
++    // Block emitted — reset counters for next block
++    block_idx += 1;
++    fragment_idx = 0;
++    max_packet_size = 0;
++
++    // Rotate session key periodically (same as send_packet's full-block close)
++    if (block_idx > MAX_BLOCK_IDX)
++    {
++        init_session(fec_k, fec_n);
++        for(int i = 0; i < fec_n - fec_k + 1; i++)
++        {
++            send_session_key();
++        }
++    }
++
++    return true;
++}
++
+ // Extract SO_RXQ_OVFL counter
+ uint32_t extract_rxq_overflow(struct msghdr *msg)
+ {
+@@ -739,10 +838,13 @@ uint32_t extract_rxq_overflow(struct msghdr *msg)
      return 0;
  }
  
@@ -31,7 +131,7 @@ index 0dec131..99b98e4 100644
  
      struct pollfd fds[nfds + 1];
      memset(fds, '\0', sizeof(fds));
-@@ -769,6 +778,43 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
+@@ -769,6 +871,43 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
      uint32_t count_p_truncated = 0; // injected large packets that were truncated
      int start_fd_idx = 0;
  
@@ -75,7 +175,7 @@ index 0dec131..99b98e4 100644
      for(;;)
      {
          uint64_t cur_ts = get_time_ms();
-@@ -779,7 +825,55 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
+@@ -779,7 +918,55 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
              poll_timeout = std::min(poll_timeout, (int)(fec_close_ts > cur_ts ? fec_close_ts - cur_ts : 0));
          }
  
@@ -132,7 +232,7 @@ index 0dec131..99b98e4 100644
  
          if (rc < 0)
          {
-@@ -980,7 +1074,7 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
+@@ -980,7 +1167,7 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
              }
          }
  
@@ -141,7 +241,7 @@ index 0dec131..99b98e4 100644
          {
              // close fec only if no data packets and fec timeout expired
              if (fec_timeout > 0 && cur_ts >= fec_close_ts)
-@@ -994,6 +1088,156 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
+@@ -994,6 +1181,159 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
              continue;
          }
  
@@ -224,16 +324,19 @@ index 0dec131..99b98e4 100644
 +                // (H.264/H.265 RTP payload format, RFC 3550 byte 1 bit 7).
 +                // Close the FEC block at the frame boundary so one frame
 +                // fits in one block, eliminating cross-frame contamination
-+                // on block loss.  If fec_k exceeds the frame's packet
-+                // count, the block is padded with zero-length FEC_ONLY
-+                // fragments -- real airtime cost, so fec_controller should
-+                // size k near typical frame packet count.  send_packet
-+                // returns false once the block auto-emits and fragment_idx
-+                // wraps to 0, terminating the loop.  fec_timeout remains a
-+                // safety-net fallback for streams without M-bit markers.
++                // on block loss.
++                //
++                // Uses close_block_early to avoid wire-injecting zero
++                // padding packets and to trim parity to scale with the
++                // actual number of data packets written.  Parity ratio
++                // defaults to 2 (matches the typical 12:6 parity:data
++                // ratio of the reference fec_controller config).  See
++                // close_block_early() for the parity_count formula.
++                // fec_timeout remains a safety-net fallback for streams
++                // without M-bit markers.
 +                if (rsize >= 2 && (buf[1] & 0x80))
 +                {
-+                    while(t->send_packet(NULL, 0, WFB_PACKET_FEC_ONLY));
++                    t->close_block_early(2);
 +                }
 +
 +                if (cur_ts >= log_send_ts)
@@ -298,7 +401,7 @@ index 0dec131..99b98e4 100644
          // rc > 0: events detected
          // start from last fd index and reset it to zero
          int _tmp = start_fd_idx;
-@@ -1526,6 +1770,52 @@ void local_loop_unix(int argc, char* const* argv, int optind, int rcv_buf, int l
+@@ -1526,6 +1866,52 @@ void local_loop_unix(int argc, char* const* argv, int optind, int rcv_buf, int l
  }
  
  
@@ -351,7 +454,7 @@ index 0dec131..99b98e4 100644
  void distributor_loop(int argc, char* const* argv, int optind, int rcv_buf, int log_interval,
                        int udp_port, int k, int n, const string &keypair, int fec_timeout,
                        uint64_t epoch, uint32_t channel_id, uint32_t fec_delay, bool use_qdisc, uint32_t fwmark,
-@@ -1669,6 +1959,7 @@ int main(int argc, char * const *argv)
+@@ -1669,6 +2055,7 @@ int main(int argc, char * const *argv)
      int opt;
      uint8_t k=8, n=12, radio_port=0;
      uint32_t fec_delay = 0;
@@ -359,7 +462,7 @@ index 0dec131..99b98e4 100644
      uint32_t link_id = 0x0;
      uint64_t epoch = 0;
      int srv_port = 10000;
-@@ -1697,7 +1988,7 @@ int main(int argc, char * const *argv)
+@@ -1697,7 +2084,7 @@ int main(int argc, char * const *argv)
      uint32_t inject_retries = 0;
      uint32_t inject_retry_delay = 5000; // 5ms
  
@@ -368,7 +471,7 @@ index 0dec131..99b98e4 100644
          switch (opt) {
          case 'I':
              tx_mode = INJECTOR;
-@@ -1814,9 +2105,13 @@ int main(int argc, char * const *argv)
+@@ -1814,9 +2201,13 @@ int main(int argc, char * const *argv)
              inject_retry_delay = atoi(optarg);
              break;
  
@@ -383,7 +486,7 @@ index 0dec131..99b98e4 100644
                       "             [-F fec_delay] [-B bandwidth] [-G guard_interval] [-S stbc] [-L ldpc] [-M mcs_index] [-N VHT_NSS]\n"
                       "             [-T fec_timeout] [-l log_interval] [-e epoch] [-i link_id] [-f { data | rts }] [-m] [-V] [-Q]\n"
                       "             [-P fwmark] [-J inject_retries] [-E inject_retry_delay] [-C control_port] interface1 [interface2] ...\n",
-@@ -1882,6 +2177,14 @@ int main(int argc, char * const *argv)
+@@ -1882,6 +2273,14 @@ int main(int argc, char * const *argv)
                                  radiotap_header, frame_type, control_port, mirror,
                                  snd_buf, inject_retries, inject_retry_delay);
              }
@@ -398,3 +501,21 @@ index 0dec131..99b98e4 100644
              else
              {
                  local_loop_udp(argc, argv, optind, rcv_buf, log_interval,
+diff --git a/src/tx.hpp b/src/tx.hpp
+index 39506e6..d40a28a 100644
+--- a/src/tx.hpp
++++ b/src/tx.hpp
+@@ -75,6 +75,13 @@ public:
+     Transmitter(int k, int n, const std::string &keypair, uint64_t epoch, uint32_t channel_id, uint32_t fec_delay, std::vector<tags_item_t> &tags);
+     virtual ~Transmitter();
+     bool send_packet(const uint8_t *buf, size_t size, uint8_t flags);
++    // Close current FEC block early with variable actual_k < fec_k.
++    // Emits only fragment_idx data packets (no zero padding on wire) plus
++    // parity_count parity packets, where parity_count scales with actual_k
++    // but always provides at least (fec_k - actual_k) to let the receiver
++    // reach its fec_k threshold. Returns false if no open block.
++    // ratio = parity-to-data multiplier (default 2 matches typical n/k = 3:1).
++    bool close_block_early(uint8_t ratio);
+     void send_session_key(void);
+     void init_session(int k, int n);
+     void get_fec(int &k, int &n) { k = fec_k; n = fec_n; }
