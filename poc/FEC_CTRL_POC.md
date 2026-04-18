@@ -134,6 +134,65 @@ We take the `ravg` field, aggregate the **max** across antennas within a
 has climb and drop thresholds with a ~4 dB hysteresis band, from MCS 0
 (−200, unreachable) through MCS 7 (−58 climb / −62 drop).
 
+### Ground client — `ground_rssi_forwarder.py`
+
+The RSSI is measured at the **ground station's** wfb_rx (the receiver of
+the video downlink). To get it back to the vehicle, we use a simple
+ground→vehicle chain over wfb-ng's existing uplink:
+
+```
+ VEHICLE (venc)                      GROUND (laptop)
+   │                                    │
+   │ video downlink                     │
+   └───────────► wfb_rx ──► stdout ──► ground_rssi_forwarder.py
+                                          │
+                                          │ UDP loopback (--target HOST:PORT)
+                                          ▼
+                                        wfb_tx -u PORT          (uplink)
+                                          │ over the air
+   ┌────────────◄ wfb_rx -u PORT  (on vehicle, decapsulates)
+   │ UDP loopback
+   ▼
+ fec_controller --rssi-udp PORT
+```
+
+The forwarder reads wfb_rx stdout from one of three sources:
+
+```bash
+# Pipe from an already-running wfb_rx:
+./wfb_rx -K drone.key -i 207 -x -p 0 wlan0 \
+  | python3 poc/ground_rssi_forwarder.py --target 127.0.0.1:5700
+
+# Spawn wfb_rx as a subprocess:
+python3 poc/ground_rssi_forwarder.py \
+  --spawn './wfb_rx -K drone.key -i 207 -x -p 0 wlan0' \
+  --target 127.0.0.1:5700
+
+# Tail a log file (when some other tool already runs wfb_rx):
+python3 poc/ground_rssi_forwarder.py \
+  --tail /var/log/wfb_rx.log --target 127.0.0.1:5700
+```
+
+The forwarder throttles to 4 Hz by default (`--throttle-hz 0` to disable)
+and sends each `RX_ANT` line verbatim as one UDP datagram.
+
+### Vehicle-side RSSI ingest
+
+`fec_controller` accepts either a text stream (`--rssi-stream`) or a UDP
+listener (`--rssi-udp`) — not both.
+
+```bash
+# On vehicle, RSSI arriving via wfb_rx uplink decapsulation:
+/tmp/fec_controller --mcs-enable --rssi-udp 5701
+
+# Or the ingest-less shortcut for testing: forward directly over the
+# LAN (no radios in the loop):
+python3 poc/ground_rssi_forwarder.py \
+  --target <vehicle_ip>:5701 < fake_rssi.txt
+```
+
+The second form was how the POC was integration-tested end-to-end.
+
 On an MCS drop, the controller arms a **parity boost**: for the next
 `--boost-s` seconds it inflates the FEC parity (`n-k`) by `--boost-mult`
 and force-emits `CMD_SET_FEC` past the normal hysteresis/cooldown, so
@@ -154,25 +213,9 @@ Every 5 s the controller logs one `hb:` line (always on, not behind
 
 ## Out of scope
 
-- RSSI transport — the POC reads a raw wfb_rx text stream; the actual
-  wire that gets RSSI from the ground station to the vehicle is *your*
-  existing wfb-ng setup (see "RSSI source" note below).
 - Persisting state across restarts.
 - Multiple streams.
 - TLS / auth on the venc HTTP API.
-
-### RSSI source note
-
-The scaler needs RSSI measured at the video **receiver** (ground
-station). The vehicle has no local access to that data; it must be
-shipped in. The POC is agnostic to how — it just tails a file, FIFO, or
-stdin. Typical wiring options:
-
-- **SSH pipe from ground**: `ssh root@star6e '/tmp/fec_controller … --rssi-stream -' < <(wfb_rx … 2>/dev/null)`
-- **FIFO fed by a separate shipper** that parses ground wfb_rx stdout
-  and forwards RX_ANT lines over a wfb-ng uplink wfb_tx channel.
-- **File tail** if an existing wfb-ng agent already writes RX_ANT lines
-  to a log file on the vehicle.
 
 ## Known gotchas
 

@@ -185,7 +185,8 @@ typedef struct {
 	bool     mcs_enable;
 	int      mcs_min;
 	int      mcs_max;
-	char     rssi_stream[256];   /* "" = disabled */
+	char     rssi_stream[256];   /* "" = disabled; text stream */
+	uint16_t rssi_udp_port;      /* 0 = disabled; UDP listener */
 	float    rssi_silence_s;
 	float    rssi_ewma_alpha;
 	float    mcs_climb_s;
@@ -614,20 +615,32 @@ static float phy_mbps(int mcs, int bw_mhz, int short_gi,
  *   34001586    RX_ANT    5745:5:20    1    1082:-30:-28:-28:24:31:34
  *   ts_ms       tag       freq:mcs:bw  ant  pkts:rmin:ravg:rmax:smin:savg:smax
  *
- * We tail a file/FIFO, parse RX_ANT lines, take the best (max) RSSI-avg
- * across antennas within a 250 ms aggregation window, and feed that into
- * an EWMA.
+ * Two transports:
+ *   - STREAM mode: tail a file/FIFO/stdin. Line-oriented read().
+ *   - UDP mode:    bind a UDP port, recv() datagrams. Each datagram contains
+ *                  one or more '\n'-terminated RX_ANT lines forwarded by the
+ *                  ground client (see poc/ground_rssi_forwarder.py).
  *
- * Open modes:
+ * Both transports converge on the same rssi_parse_line(): take max RSSI-avg
+ * across antennas in a 250 ms window, feed an EWMA.
+ *
+ * Stream open modes:
  *   - Regular file:   opened with O_NONBLOCK, start at end (tail -f style)
  *   - FIFO:           opened with O_NONBLOCK|O_RDONLY, no writer yet is OK
  *   - "-" (stdin):    fd 0, set non-blocking
  */
 
+typedef enum {
+	RSSI_SRC_NONE = 0,
+	RSSI_SRC_STREAM,
+	RSSI_SRC_UDP,
+} RssiSrcKind;
+
 typedef struct {
-	int      fd;                 /* -1 = disabled */
-	char     buf[4096];
-	size_t   buf_len;
+	int         fd;              /* -1 = disabled */
+	RssiSrcKind kind;
+	char        buf[4096];       /* STREAM only: line accumulator */
+	size_t      buf_len;
 
 	/* Per-window aggregate (rolled over on timeout). */
 	uint64_t window_start_us;
@@ -643,6 +656,7 @@ static int rssi_open(RssiSource *s, const char *path)
 {
 	memset(s, 0, sizeof(*s));
 	s->fd = -1;
+	s->kind = RSSI_SRC_NONE;
 	s->ewma_rssi = 0.0f;
 	if (!path || !*path) return 0;   /* disabled */
 
@@ -660,6 +674,35 @@ static int rssi_open(RssiSource *s, const char *path)
 			lseek(fd, 0, SEEK_END);
 	}
 	s->fd = fd;
+	s->kind = RSSI_SRC_STREAM;
+	return 0;
+}
+
+/* Open a UDP listener on INADDR_ANY:port. Each received datagram is parsed
+ * as one or more '\n'-terminated RX_ANT text lines. */
+static int rssi_open_udp(RssiSource *s, uint16_t port)
+{
+	memset(s, 0, sizeof(*s));
+	s->fd = -1;
+	s->kind = RSSI_SRC_NONE;
+	s->ewma_rssi = 0.0f;
+
+	int fd = socket(AF_INET, SOCK_DGRAM, 0);
+	if (fd < 0) return -1;
+	int one = 1;
+	setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+	struct sockaddr_in a = { .sin_family = AF_INET,
+	                         .sin_addr.s_addr = htonl(INADDR_ANY),
+	                         .sin_port = htons(port) };
+	if (bind(fd, (struct sockaddr*)&a, sizeof(a)) < 0) {
+		close(fd);
+		return -1;
+	}
+	int fl = fcntl(fd, F_GETFL, 0);
+	if (fl >= 0) fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+
+	s->fd = fd;
+	s->kind = RSSI_SRC_UDP;
 	return 0;
 }
 
@@ -667,6 +710,7 @@ static void rssi_close(RssiSource *s)
 {
 	if (s->fd > 0) close(s->fd);
 	s->fd = -1;
+	s->kind = RSSI_SRC_NONE;
 }
 
 /* Parse one line. Returns 0 if it was an RX_ANT line we used, -1 otherwise. */
@@ -729,10 +773,51 @@ static int rssi_parse_line(RssiSource *s, const char *line, uint64_t now,
 	return 0;
 }
 
+/* Split a NUL-terminated buffer on '\n' and feed each line to the parser.
+ * Modifies the buffer (writes NULs at line breaks). */
+static void rssi_feed_block(RssiSource *s, char *start, size_t len,
+                            uint64_t now, float alpha)
+{
+	char *end = start + len;
+	char *p = start;
+	while (p < end) {
+		char *nl = memchr(p, '\n', (size_t)(end - p));
+		if (!nl) {
+			/* Consume the trailing non-newlined chunk as a complete line for
+			 * UDP mode (callers guarantee terminated packets); STREAM mode's
+			 * buffering handles partial lines separately. */
+			if (*p) {
+				char save = *end;
+				*end = '\0';
+				(void)rssi_parse_line(s, p, now, alpha);
+				*end = save;
+			}
+			return;
+		}
+		*nl = '\0';
+		(void)rssi_parse_line(s, p, now, alpha);
+		p = nl + 1;
+	}
+}
+
 /* Drain any pending bytes, line-split, parse RX_ANT entries. */
 static void rssi_poll(RssiSource *s, uint64_t now, float alpha)
 {
 	if (s->fd < 0) return;
+
+	if (s->kind == RSSI_SRC_UDP) {
+		/* Datagram mode: each recv is one or more complete lines. */
+		char pkt[2048];
+		for (;;) {
+			ssize_t n = recv(s->fd, pkt, sizeof(pkt) - 1, 0);
+			if (n <= 0) break;
+			pkt[n] = '\0';
+			rssi_feed_block(s, pkt, (size_t)n, now, alpha);
+		}
+		return;
+	}
+
+	/* STREAM mode: line-buffered accumulator. */
 	for (;;) {
 		/* Paranoid bounds: cap writes to at most buf[0..sizeof-2] so the
 		 * trailing NUL fits. Re-normalize buf_len on each iteration so the
@@ -989,6 +1074,9 @@ static void usage(const char *prog)
 		"  --mcs-min N          floor MCS (default 1)\n"
 		"  --mcs-max N          ceiling MCS (default 3)\n"
 		"  --rssi-stream PATH   wfb_rx log/FIFO to tail (\"-\" = stdin)\n"
+		"  --rssi-udp PORT      bind UDP listener for RX_ANT text lines\n"
+		"                       (from poc/ground_rssi_forwarder.py over a\n"
+		"                       wfb_rx uplink)\n"
 		"  --rssi-silence F     stale-RSSI threshold, seconds (default 1.5)\n"
 		"  --mcs-climb F        dwell seconds required to climb (default 2.0)\n"
 		"  --mcs-drop F         dwell seconds required to drop (default 0.3)\n"
@@ -1050,6 +1138,7 @@ static void config_defaults(Config *c)
 	c->mcs_min = 1;
 	c->mcs_max = 3;
 	c->rssi_stream[0] = '\0';
+	c->rssi_udp_port = 0;
 	c->rssi_silence_s = 1.5f;
 	c->rssi_ewma_alpha = 0.3f;
 	c->mcs_climb_s = 2.0f;
@@ -1074,7 +1163,7 @@ int main(int argc, char **argv)
 		OPT_SIDECAR = 256, OPT_WFB, OPT_VENC, OPT_MTU, OPT_MINK, OPT_MAXK,
 		OPT_SAFETY, OPT_DRY_RUN,
 		OPT_MCS_ENABLE, OPT_MCS_MIN, OPT_MCS_MAX,
-		OPT_RSSI_STREAM, OPT_RSSI_SILENCE,
+		OPT_RSSI_STREAM, OPT_RSSI_UDP, OPT_RSSI_SILENCE,
 		OPT_MCS_CLIMB, OPT_MCS_DROP, OPT_MCS_COOLDOWN,
 		OPT_BOOST_S, OPT_BOOST_MULT,
 	};
@@ -1091,6 +1180,7 @@ int main(int argc, char **argv)
 		{"mcs-min",       required_argument, 0, OPT_MCS_MIN},
 		{"mcs-max",       required_argument, 0, OPT_MCS_MAX},
 		{"rssi-stream",   required_argument, 0, OPT_RSSI_STREAM},
+		{"rssi-udp",      required_argument, 0, OPT_RSSI_UDP},
 		{"rssi-silence",  required_argument, 0, OPT_RSSI_SILENCE},
 		{"mcs-climb",     required_argument, 0, OPT_MCS_CLIMB},
 		{"mcs-drop",      required_argument, 0, OPT_MCS_DROP},
@@ -1135,6 +1225,15 @@ int main(int argc, char **argv)
 			strncpy(cfg.rssi_stream, optarg, sizeof(cfg.rssi_stream) - 1);
 			cfg.rssi_stream[sizeof(cfg.rssi_stream) - 1] = '\0';
 			break;
+		case OPT_RSSI_UDP: {
+			int p = atoi(optarg);
+			if (p <= 0 || p > 65535) {
+				fprintf(stderr, "invalid --rssi-udp (1..65535)\n");
+				return 1;
+			}
+			cfg.rssi_udp_port = (uint16_t)p;
+			break;
+		}
 		case OPT_RSSI_SILENCE: cfg.rssi_silence_s = (float)atof(optarg); break;
 		case OPT_MCS_CLIMB:    cfg.mcs_climb_s    = (float)atof(optarg); break;
 		case OPT_MCS_DROP:     cfg.mcs_drop_s     = (float)atof(optarg); break;
@@ -1186,16 +1285,30 @@ int main(int argc, char **argv)
 	rssi_src.fd = -1;
 
 	if (cfg.mcs_enable) {
-		if (cfg.rssi_stream[0] == '\0') {
-			LOG("mcs: --mcs-enable requires --rssi-stream PATH; disabling scaler");
+		if (cfg.rssi_stream[0] == '\0' && cfg.rssi_udp_port == 0) {
+			LOG("mcs: --mcs-enable requires --rssi-stream or --rssi-udp; disabling scaler");
 			cfg.mcs_enable = false;
-		} else if (rssi_open(&rssi_src, cfg.rssi_stream) != 0) {
-			LOG("mcs: rssi-stream open failed: %s (%s); disabling scaler",
-			    cfg.rssi_stream, strerror(errno));
+		} else if (cfg.rssi_stream[0] != '\0' && cfg.rssi_udp_port != 0) {
+			LOG("mcs: --rssi-stream and --rssi-udp are mutually exclusive; disabling scaler");
 			cfg.mcs_enable = false;
+		} else if (cfg.rssi_udp_port != 0) {
+			if (rssi_open_udp(&rssi_src, cfg.rssi_udp_port) != 0) {
+				LOG("mcs: rssi-udp bind failed on :%u (%s); disabling scaler",
+				    cfg.rssi_udp_port, strerror(errno));
+				cfg.mcs_enable = false;
+			} else {
+				LOG("mcs: scaler enabled, ladder=[%d..%d] rssi=udp:%u",
+				    cfg.mcs_min, cfg.mcs_max, cfg.rssi_udp_port);
+			}
 		} else {
-			LOG("mcs: scaler enabled, ladder=[%d..%d] rssi=%s",
-			    cfg.mcs_min, cfg.mcs_max, cfg.rssi_stream);
+			if (rssi_open(&rssi_src, cfg.rssi_stream) != 0) {
+				LOG("mcs: rssi-stream open failed: %s (%s); disabling scaler",
+				    cfg.rssi_stream, strerror(errno));
+				cfg.mcs_enable = false;
+			} else {
+				LOG("mcs: scaler enabled, ladder=[%d..%d] rssi=%s",
+				    cfg.mcs_min, cfg.mcs_max, cfg.rssi_stream);
+			}
 		}
 	}
 
