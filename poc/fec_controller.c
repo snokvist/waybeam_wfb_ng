@@ -172,6 +172,7 @@ typedef struct {
 	int      k_hyst_down;
 	float    cooldown_up_s;
 	float    cooldown_down_s;
+	float    startup_grace_s;        /* suppress emits for the first N sec */
 
 	/* Link budget */
 	float    safety_margin;  /* fraction of phy_mbps usable after overhead */
@@ -352,6 +353,7 @@ typedef struct {
 	FecParams current;
 	bool      have_current;
 	uint64_t  last_update_us;
+	uint64_t  start_us;         /* first call into controller_update */
 	uint32_t  update_count;
 	/* Post-MCS-drop parity boost: while now < boost_until_us, parity
 	 * (n-k) is multiplied by cfg.boost_mult. Force-emit is edge-triggered
@@ -367,6 +369,9 @@ static bool controller_update(Controller *c, const Config *cfg,
                               uint32_t frame_size, HeadroomRing *ring,
                               uint64_t now, FecParams *out)
 {
+	/* Track first tick for startup grace window. */
+	if (c->start_us == 0) c->start_us = now;
+
 	/* Track frame size for headroom. */
 	ring_push(ring, now, frame_size);
 	uint64_t cutoff = now - (uint64_t)(cfg->headroom_window_s * 1e6);
@@ -405,7 +410,20 @@ static bool controller_update(Controller *c, const Config *cfg,
 		cand.redundancy = 1.0f - (float)cand.k / (float)cand.n;
 	}
 
+	/* Startup grace: during the first cfg->startup_grace_s seconds we let
+	 * the EWMA settle silently — no emits except for boost edges.
+	 * Without this, k ratchets up per-frame from the initial underestimate
+	 * to the steady-state value and fires 5+ SET_FECs in ~500 ms, each of
+	 * which restarts the wfb_tx session and drops packets. */
+	bool in_grace = (now - c->start_us) <
+	                (uint64_t)(cfg->startup_grace_s * 1e6f);
+
 	if (!c->have_current) {
+		if (in_grace) {
+			/* Suppress even the first commit during grace. Caller keeps
+			 * ticking; we'll commit when grace ends with settled params. */
+			return false;
+		}
 		c->current = cand;
 		c->have_current = true;
 		c->last_update_us = now;
@@ -425,6 +443,10 @@ static bool controller_update(Controller *c, const Config *cfg,
 		*out = cand;
 		return true;
 	}
+
+	/* Non-boost path: during grace we suppress every non-edge emit so the
+	 * EWMA can settle without hammering wfb_tx. */
+	if (in_grace) return false;
 
 	int k_delta = cand.k - c->current.k;
 	float elapsed = (float)(now - c->last_update_us) / 1e6f;
@@ -1124,10 +1146,11 @@ static void usage(const char *prog)
 		"  --mtu N              packet size budget (default 1446)\n"
 		"  --min-k N            min k (default 1)\n"
 		"  --max-k N            max k (default 48)\n"
-		"  --k-hyst-up N        min Δk to trigger an up-move (default 1)\n"
+		"  --k-hyst-up N        min Δk to trigger an up-move (default 2)\n"
 		"  --k-hyst-down N      min Δk to trigger a down-move (default 3)\n"
-		"  --cooldown-up F      min seconds between up-moves (default 0.1)\n"
+		"  --cooldown-up F      min seconds between up-moves (default 1.0)\n"
 		"  --cooldown-down F    min seconds between down-moves (default 2.0)\n"
+		"  --startup-grace F    suppress emits for first F seconds (default 2.0)\n"
 		"\n"
 		"Link budget:\n"
 		"  --safety F           fraction of PHY rate usable (default 0.6)\n"
@@ -1138,7 +1161,7 @@ static void usage(const char *prog)
 		"\n"
 		"MCS scaler (opt-in):\n"
 		"  --mcs-enable         enable RSSI-driven MCS scaler (default off)\n"
-		"  --mcs-min N          floor MCS (default 1)\n"
+		"  --mcs-min N          floor MCS (default 0 = most robust)\n"
 		"  --mcs-max N          ceiling MCS (default 3)\n"
 		"  --rssi-stream PATH   wfb_rx log/FIFO to tail (\"-\" = stdin)\n"
 		"  --rssi-udp PORT      bind UDP listener for RX_ANT text lines\n"
@@ -1193,10 +1216,11 @@ static void config_defaults(Config *c)
 	c->headroom_margin = 1.05f;
 	c->headroom_window_s = 2.5f;
 
-	c->k_hyst_up = 1;
+	c->k_hyst_up = 2;                /* require Δk≥2 to emit an up-move */
 	c->k_hyst_down = 3;
-	c->cooldown_up_s = 0.1f;
+	c->cooldown_up_s = 1.0f;         /* at most one up-move per second */
 	c->cooldown_down_s = 2.0f;
+	c->startup_grace_s = 2.0f;
 
 	c->safety_margin = 0.6f;
 	c->bitrate_min_kbps = 1000;
@@ -1208,7 +1232,7 @@ static void config_defaults(Config *c)
 	c->bitrate_poll_s = 1.0f;
 
 	c->mcs_enable = false;
-	c->mcs_min = 1;
+	c->mcs_min = 0;
 	c->mcs_max = 3;
 	c->rssi_stream[0] = '\0';
 	c->rssi_udp_port = 0;
@@ -1237,6 +1261,7 @@ int main(int argc, char **argv)
 	enum {
 		OPT_SIDECAR = 256, OPT_WFB, OPT_VENC, OPT_MTU, OPT_MINK, OPT_MAXK,
 		OPT_K_HYST_UP, OPT_K_HYST_DOWN, OPT_COOLDOWN_UP, OPT_COOLDOWN_DOWN,
+		OPT_STARTUP_GRACE,
 		OPT_SAFETY, OPT_BITRATE_MIN, OPT_BITRATE_MAX,
 		OPT_BITRATE_DESIRED, /* deprecated alias for --bitrate-max */
 		OPT_BITRATE_TOL, OPT_DRY_RUN,
@@ -1257,6 +1282,7 @@ int main(int argc, char **argv)
 		{"k-hyst-down",   required_argument, 0, OPT_K_HYST_DOWN},
 		{"cooldown-up",   required_argument, 0, OPT_COOLDOWN_UP},
 		{"cooldown-down", required_argument, 0, OPT_COOLDOWN_DOWN},
+		{"startup-grace", required_argument, 0, OPT_STARTUP_GRACE},
 		{"safety",        required_argument, 0, OPT_SAFETY},
 		{"bitrate-min",   required_argument, 0, OPT_BITRATE_MIN},
 		{"bitrate-max",   required_argument, 0, OPT_BITRATE_MAX},
@@ -1309,6 +1335,7 @@ int main(int argc, char **argv)
 		case OPT_K_HYST_DOWN:   cfg.k_hyst_down     = atoi(optarg); break;
 		case OPT_COOLDOWN_UP:   cfg.cooldown_up_s   = (float)atof(optarg); break;
 		case OPT_COOLDOWN_DOWN: cfg.cooldown_down_s = (float)atof(optarg); break;
+		case OPT_STARTUP_GRACE: cfg.startup_grace_s = (float)atof(optarg); break;
 		case OPT_SAFETY:        cfg.safety_margin   = (float)atof(optarg); break;
 		case OPT_BITRATE_MIN:   cfg.bitrate_min_kbps = atol(optarg); break;
 		case OPT_BITRATE_MAX:   cfg.bitrate_max_kbps = atol(optarg); break;

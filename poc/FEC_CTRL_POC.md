@@ -112,7 +112,7 @@ wfb_rx-formatted text stream. Off by default — enable with
 
 ```
 --mcs-enable                # explicit opt-in
---mcs-min N / --mcs-max N   # ladder floor/ceiling (defaults 1..3)
+--mcs-min N / --mcs-max N   # ladder floor/ceiling (defaults 0..3)
 --rssi-stream PATH          # file/FIFO/stdin to tail
 --rssi-silence F            # stale threshold (default 1.5 s)
 --mcs-climb F               # climb dwell (default 2.0 s)
@@ -121,6 +121,23 @@ wfb_rx-formatted text stream. Off by default — enable with
 --boost-s F                 # post-drop FEC-parity boost (default 3.0)
 --boost-mult F              # parity multiplier during boost (default 1.3)
 ```
+
+### FEC-emit gating
+
+Each `CMD_SET_FEC` re-inits the session key on wfb_tx and causes the
+receiver to briefly drop in-flight packets while the new announce
+propagates. To keep that cost low, the controller uses a conservative
+default:
+
+- `k_hyst_up = 2` — an up-move needs Δk ≥ 2 (a single-step wobble is ignored)
+- `cooldown_up_s = 1.0` — at most one up-move per second
+- `k_hyst_down = 3`, `cooldown_down_s = 2.0` — unchanged, asymmetric still favors fast drops
+- `startup_grace_s = 2.0` — **no emits for the first 2 s** so the EWMA
+  can settle before we commit. Eliminates the 5-per-second startup burst
+  observed in earlier runs.
+
+On a stable bench link, a 40 s run produces ~15 SET_FEC events, down
+from ~1/s in the pre-tuning baseline.
 
 **Expected input format** (mirrors `wfb_rx -x` stdout):
 

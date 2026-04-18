@@ -10,8 +10,12 @@ wfb_rx decapsulates and emits to fec_controller's --rssi-udp listener).
 
 Usage:
     # Pipe from an already-running wfb_rx:
-    ./wfb_rx -K key -i 207 -x -p 0 wlx40a5ef2f229b \
+    ./wfb_rx -K key -i 207 -x -p 0 wlx40a5ef2f229b 2>&1 \
       | python3 ground_rssi_forwarder.py --target 127.0.0.1:5700
+    #                                                 ^
+    # Use 2>&1 to also surface wfb_rx's "N packets lost" reports.
+    # Without it they go to the terminal; with it the forwarder
+    # logs them as WARNING lines.
 
     # Spawn wfb_rx as a subprocess:
     python3 ground_rssi_forwarder.py \
@@ -29,6 +33,7 @@ Set to 0 to disable throttling (ship everything).
 import argparse
 import logging
 import os
+import re
 import shlex
 import signal
 import socket
@@ -39,6 +44,7 @@ import time
 log = logging.getLogger("rssi_fwd")
 
 RX_ANT_TAG = "RX_ANT"
+PACKETS_LOST_RE = re.compile(r"^\s*(\d+)\s+packets\s+lost\b", re.IGNORECASE)
 
 
 def open_source(args):
@@ -167,11 +173,29 @@ def main():
     signal.signal(signal.SIGINT, on_sig)
     signal.signal(signal.SIGTERM, on_sig)
 
-    sent = skipped = 0
+    sent = skipped = lost_events = lost_total = 0
+    last_loss_log = 0.0
     try:
         for line in open_source(args):
             if stop["flag"]:
                 break
+
+            # Surface wfb_rx "N packets lost" reports so they're visible
+            # in the same stream as our own logs. Merge stderr via shell
+            # (e.g. `./wfb_rx ... 2>&1 | python3 ...`) for these to reach
+            # us when using the pipe form.
+            m = PACKETS_LOST_RE.match(line)
+            if m:
+                n = int(m.group(1))
+                lost_events += 1
+                lost_total += n
+                now_mono = time.monotonic()
+                if now_mono - last_loss_log >= 1.0:
+                    log.warning("wfb_rx: %d packets lost (total=%d across %d events)",
+                                n, lost_total, lost_events)
+                    last_loss_log = now_mono
+                continue
+
             if RX_ANT_TAG not in line:
                 continue
             now = time.monotonic()
@@ -190,7 +214,8 @@ def main():
                 log.warning("send failed: %s", e)
     finally:
         sock.close()
-        log.info("exit: sent=%d throttle_dropped=%d", sent, skipped)
+        log.info("exit: sent=%d throttle_dropped=%d packets_lost=%d (across %d events)",
+                 sent, skipped, lost_total, lost_events)
 
 
 if __name__ == "__main__":
