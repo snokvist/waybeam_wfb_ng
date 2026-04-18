@@ -205,21 +205,30 @@ policy range, the scaler issues an immediate `CMD_SET_RADIO` on first sync
 to bring the radio into the allowed band. Logged as
 `mcs: snap 5 -> 3 (outside policy [1..3])`.
 
-### Bitrate: bidirectional tracking
+### Bitrate: track the link budget
 
-The bitrate loop maintains `target = min(desired, safe)` where `desired` is
-the video0.bitrate latched on first query (or from `--bitrate-desired`).
-On every tick (`--bitrate-poll-s`, 1 s default) the live video0.bitrate
-is queried; if it differs from `target` by more than `--bitrate-tol`
-(5% default), the controller re-applies `/api/v1/set?video0.bitrate=target`.
-This runs in both directions:
+The controller **tracks** the safe link budget, not a fixed user-set
+value. Every `--bitrate-poll-s` seconds (1 s default) it computes
 
-- `clamp`: cur > target (MCS dropped → must shrink) → write down
-- `restore`: cur < target (MCS climbed → headroom available) → write up
+```
+safe   = phy_mbps * 1000 * (k/n) * --safety
+target = clamp(safe, --bitrate-min, --bitrate-max)
+```
 
-…and doubles as periodic drift correction for external changes
-(web UI edits, for example) — whatever the live venc bitrate is, it
-converges back to the controller's target within one poll.
+…and re-applies `video0.bitrate = target` whenever the live value drifts
+more than `--bitrate-tol` (5% default) from the target, in **either**
+direction. When MCS climbs the bitrate is pushed up to use the extra
+headroom; when MCS drops or the FEC parity grows, it's clamped back.
+
+Defaults: `--bitrate-min=1000`, `--bitrate-max=0` (unlimited, cap only by
+`safe`). The log tags moves as `bitrate up …` or `bitrate down …`.
+
+This also doubles as periodic drift correction for external changes —
+whatever the live venc bitrate is (web UI edit, curl from another
+terminal), it converges back to the controller's target within one poll.
+
+> `--bitrate-desired` is kept as a deprecated alias for `--bitrate-max`
+> so older scripts still work; it prints a deprecation notice.
 
 ### Heartbeat
 

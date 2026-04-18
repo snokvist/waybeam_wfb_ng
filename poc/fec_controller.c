@@ -175,7 +175,8 @@ typedef struct {
 
 	/* Link budget */
 	float    safety_margin;  /* fraction of phy_mbps usable after overhead */
-	long     bitrate_desired_kbps;   /* 0 = auto-detect (read on first poll) */
+	long     bitrate_min_kbps;       /* floor (default 1000) */
+	long     bitrate_max_kbps;       /* ceiling; 0 = unlimited (default) */
 	float    bitrate_tolerance;      /* fraction (default 0.05 = 5%) */
 
 	/* Tick intervals */
@@ -1127,8 +1128,10 @@ static void usage(const char *prog)
 		"\n"
 		"Link budget:\n"
 		"  --safety F           fraction of PHY rate usable (default 0.6)\n"
-		"  --bitrate-desired N  desired video0.bitrate in kbps (default 0 = read at start)\n"
+		"  --bitrate-min N      bitrate floor in kbps (default 1000)\n"
+		"  --bitrate-max N      bitrate ceiling in kbps (default 0 = unlimited)\n"
 		"  --bitrate-tol F      bitrate re-apply tolerance (default 0.05 = 5%%)\n"
+		"                       target = clamp(phy*k/n*safety, min, max)\n"
 		"\n"
 		"MCS scaler (opt-in):\n"
 		"  --mcs-enable         enable RSSI-driven MCS scaler (default off)\n"
@@ -1190,7 +1193,8 @@ static void config_defaults(Config *c)
 	c->cooldown_down_s = 2.0f;
 
 	c->safety_margin = 0.6f;
-	c->bitrate_desired_kbps = 0;     /* auto */
+	c->bitrate_min_kbps = 1000;
+	c->bitrate_max_kbps = 0;         /* 0 = unlimited */
 	c->bitrate_tolerance = 0.05f;
 
 	c->subscribe_s = 2.0f;
@@ -1225,7 +1229,9 @@ int main(int argc, char **argv)
 	enum {
 		OPT_SIDECAR = 256, OPT_WFB, OPT_VENC, OPT_MTU, OPT_MINK, OPT_MAXK,
 		OPT_K_HYST_UP, OPT_K_HYST_DOWN, OPT_COOLDOWN_UP, OPT_COOLDOWN_DOWN,
-		OPT_SAFETY, OPT_BITRATE_DESIRED, OPT_BITRATE_TOL, OPT_DRY_RUN,
+		OPT_SAFETY, OPT_BITRATE_MIN, OPT_BITRATE_MAX,
+		OPT_BITRATE_DESIRED, /* deprecated alias for --bitrate-max */
+		OPT_BITRATE_TOL, OPT_DRY_RUN,
 		OPT_MCS_ENABLE, OPT_MCS_MIN, OPT_MCS_MAX,
 		OPT_RSSI_STREAM, OPT_RSSI_UDP, OPT_RSSI_SILENCE,
 		OPT_MCS_CLIMB, OPT_MCS_DROP, OPT_MCS_COOLDOWN,
@@ -1243,6 +1249,8 @@ int main(int argc, char **argv)
 		{"cooldown-up",   required_argument, 0, OPT_COOLDOWN_UP},
 		{"cooldown-down", required_argument, 0, OPT_COOLDOWN_DOWN},
 		{"safety",        required_argument, 0, OPT_SAFETY},
+		{"bitrate-min",   required_argument, 0, OPT_BITRATE_MIN},
+		{"bitrate-max",   required_argument, 0, OPT_BITRATE_MAX},
 		{"bitrate-desired", required_argument, 0, OPT_BITRATE_DESIRED},
 		{"bitrate-tol",   required_argument, 0, OPT_BITRATE_TOL},
 		{"dry-run",       no_argument,       0, OPT_DRY_RUN},
@@ -1291,8 +1299,12 @@ int main(int argc, char **argv)
 		case OPT_COOLDOWN_UP:   cfg.cooldown_up_s   = (float)atof(optarg); break;
 		case OPT_COOLDOWN_DOWN: cfg.cooldown_down_s = (float)atof(optarg); break;
 		case OPT_SAFETY:        cfg.safety_margin   = (float)atof(optarg); break;
+		case OPT_BITRATE_MIN:   cfg.bitrate_min_kbps = atol(optarg); break;
+		case OPT_BITRATE_MAX:   cfg.bitrate_max_kbps = atol(optarg); break;
 		case OPT_BITRATE_DESIRED:
-			cfg.bitrate_desired_kbps = atol(optarg);
+			/* Deprecated alias — kept so older invocations still work. */
+			cfg.bitrate_max_kbps = atol(optarg);
+			fprintf(stderr, "[fec] --bitrate-desired is deprecated; use --bitrate-max\n");
 			break;
 		case OPT_BITRATE_TOL:   cfg.bitrate_tolerance = (float)atof(optarg); break;
 		case OPT_DRY_RUN:      cfg.dry_run        = true; break;
@@ -1509,6 +1521,14 @@ int main(int argc, char **argv)
 								LOG("mcs: snap SET_RADIO failed");
 						}
 						scaler.mcs = target;
+						/* Update local radio state so the downstream bitrate
+						 * poll in this same tick sees the post-snap phy_mbps
+						 * instead of the stale pre-snap value (which would
+						 * otherwise cause a one-tick bitrate overshoot). */
+						radio.mcs = target;
+						radio.phy_mbps = phy_mbps(radio.mcs, radio.bandwidth,
+						                          radio.short_gi, radio.vht_mode,
+						                          radio.vht_nss);
 					}
 				}
 				LOGV(&cfg, "radio: mcs=%d bw=%d gi=%s vht=%d nss=%d phy=%.1f Mbps",
@@ -1542,6 +1562,12 @@ int main(int argc, char **argv)
 							                       radio.vht_mode, radio.vht_nss) != 0)
 								LOG("mcs: set_radio send failed");
 						}
+						/* Refresh local radio state so the same-tick bitrate
+						 * poll sees the post-move phy_mbps, not the stale one. */
+						radio.mcs = new_mcs;
+						radio.phy_mbps = phy_mbps(radio.mcs, radio.bandwidth,
+						                          radio.short_gi, radio.vht_mode,
+						                          radio.vht_nss);
 						if (is_drop && cfg.boost_s > 0.0f) {
 							ctrl.boost_until_us = now + (uint64_t)(cfg.boost_s * 1e6f);
 							LOG("fec: parity boost armed for %.1fs (mult=%.2f)",
@@ -1554,14 +1580,14 @@ int main(int argc, char **argv)
 			next_radio_us = now + (uint64_t)(cfg.radio_poll_s * 1e6);
 		}
 
-		/* --- Bitrate budget check ---
+		/* --- Bitrate tracking ---
 		 *
-		 * target = min(desired, safe). If the live venc bitrate drifts from
-		 * target in either direction (beyond ±tolerance), re-apply. This
-		 * fixes the earlier one-way-ratchet bug where we only clamped DOWN
-		 * when the MCS dropped, never restoring UP when it climbed back. It
-		 * also serves as periodic drift correction — if something external
-		 * (web UI, etc.) changes video0.bitrate, we converge it back. */
+		 * The controller TRACKS the link budget, not a fixed user-set
+		 * target: target = clamp(safe, --bitrate-min, --bitrate-max).
+		 * With --bitrate-max=0 (default), the only ceiling is safe_kbps
+		 * itself, so when MCS climbs the bitrate is pushed up to use the
+		 * extra budget. Both directions re-apply (also catches drift
+		 * from external changes, e.g. the web UI). */
 		if (now >= next_bitrate_us && radio.valid && ctrl.have_current) {
 			float k = (float)ctrl.current.k;
 			float n = (float)ctrl.current.n;
@@ -1572,32 +1598,27 @@ int main(int argc, char **argv)
 			if (cur <= 0) {
 				LOGV(&cfg, "bitrate: venc HTTP query failed (is /api/v1/get reachable?)");
 			} else {
-				/* Latch desired on first successful query (unless set via CLI). */
-				if (cfg.bitrate_desired_kbps <= 0) {
-					cfg.bitrate_desired_kbps = cur;
-					LOG("bitrate: desired=%ld kbps (latched from first query)",
-					    cfg.bitrate_desired_kbps);
-				}
-
-				long target = cfg.bitrate_desired_kbps;
-				if (safe_kbps < target) target = safe_kbps;
-				if (target < 1) target = 1;
+				long target = safe_kbps;
+				if (cfg.bitrate_max_kbps > 0 && target > cfg.bitrate_max_kbps)
+					target = cfg.bitrate_max_kbps;
+				if (target < cfg.bitrate_min_kbps)
+					target = cfg.bitrate_min_kbps;
 
 				long dev = cur - target;
 				long adev = dev < 0 ? -dev : dev;
 				long tol = (long)((double)target * (double)cfg.bitrate_tolerance);
 				if (tol < 1) tol = 1;
 
-				LOGV(&cfg, "bitrate: cur=%ld target=%ld safe=%ld desired=%ld (phy=%.1f k/n=%d/%d)",
-				     cur, target, safe_kbps, cfg.bitrate_desired_kbps,
+				LOGV(&cfg, "bitrate: cur=%ld target=%ld safe=%ld min=%ld max=%ld (phy=%.1f k/n=%d/%d)",
+				     cur, target, safe_kbps,
+				     cfg.bitrate_min_kbps, cfg.bitrate_max_kbps,
 				     radio.phy_mbps, ctrl.current.k, ctrl.current.n);
 
 				if (adev > tol) {
-					const char *dir = (cur > target) ? "clamp" : "restore";
-					LOG("bitrate %s %ld -> %ld kbps (phy=%.1f Mbps, k/n=%d/%d, safe=%ld, desired=%ld)",
+					const char *dir = (cur > target) ? "down" : "up";
+					LOG("bitrate %s %ld -> %ld kbps (phy=%.1f Mbps, k/n=%d/%d, safe=%ld)",
 					    dir, cur, target, radio.phy_mbps,
-					    ctrl.current.k, ctrl.current.n,
-					    safe_kbps, cfg.bitrate_desired_kbps);
+					    ctrl.current.k, ctrl.current.n, safe_kbps);
 					if (!cfg.dry_run) {
 						if (venc_set_bitrate_kbps(&cfg, target) != 0)
 							LOG("bitrate: set failed");
