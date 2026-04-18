@@ -178,7 +178,12 @@ typedef struct {
 	float    safety_margin;  /* fraction of phy_mbps usable after overhead */
 	long     bitrate_min_kbps;       /* floor (default 1000) */
 	long     bitrate_max_kbps;       /* ceiling; 0 = unlimited (default) */
-	float    bitrate_tolerance;      /* fraction (default 0.05 = 5%) */
+	float    bitrate_tolerance;      /* fraction (default 0.15 = 15%) */
+	float    bitrate_grace_s;        /* suppress FEC emits for N s after
+	                                  * any bitrate write; breaks the
+	                                  * bitrate↔framesize↔k cascade by
+	                                  * letting venc settle before we
+	                                  * react to its new output */
 
 	/* Tick intervals */
 	float    subscribe_s;
@@ -362,6 +367,11 @@ typedef struct {
 	 * at per-frame rates. Zero = no active boost. */
 	uint64_t  boost_until_us;
 	bool      was_boosting;
+	/* Post-bitrate-write quiet window: after we move video0.bitrate we
+	 * give venc a moment to converge before reacting to its new output.
+	 * Without this, bitrate climb → bigger frames → k climbs → bitrate
+	 * climbs again, cascading into many SET_FECs. */
+	uint64_t  bitrate_grace_until_us;
 } Controller;
 
 /* Returns true if caller should emit the new params. */
@@ -410,13 +420,16 @@ static bool controller_update(Controller *c, const Config *cfg,
 		cand.redundancy = 1.0f - (float)cand.k / (float)cand.n;
 	}
 
-	/* Startup grace: during the first cfg->startup_grace_s seconds we let
-	 * the EWMA settle silently — no emits except for boost edges.
-	 * Without this, k ratchets up per-frame from the initial underestimate
-	 * to the steady-state value and fires 5+ SET_FECs in ~500 ms, each of
-	 * which restarts the wfb_tx session and drops packets. */
-	bool in_grace = (now - c->start_us) <
-	                (uint64_t)(cfg->startup_grace_s * 1e6f);
+	/* Grace windows during which we suppress non-edge FEC emits:
+	 *   - Startup: let EWMA settle before first commit.
+	 *   - Post-bitrate-write: let venc converge on the new target before
+	 *     we react to its new (bigger/smaller) frames. This breaks the
+	 *     bitrate↔framesize↔k cascade on MCS climbs. */
+	bool in_startup_grace = (now - c->start_us) <
+	                        (uint64_t)(cfg->startup_grace_s * 1e6f);
+	bool in_bitrate_grace = (c->bitrate_grace_until_us != 0 &&
+	                         now < c->bitrate_grace_until_us);
+	bool in_grace = in_startup_grace || in_bitrate_grace;
 
 	if (!c->have_current) {
 		if (in_grace) {
@@ -1156,7 +1169,9 @@ static void usage(const char *prog)
 		"  --safety F           fraction of PHY rate usable (default 0.6)\n"
 		"  --bitrate-min N      bitrate floor in kbps (default 1000)\n"
 		"  --bitrate-max N      bitrate ceiling in kbps (default 0 = unlimited)\n"
-		"  --bitrate-tol F      bitrate re-apply tolerance (default 0.05 = 5%%)\n"
+		"  --bitrate-tol F      bitrate re-apply tolerance (default 0.15 = 15%%)\n"
+		"  --bitrate-grace F    suppress FEC emits for F s after a bitrate write\n"
+		"                       (default 2.0; breaks bitrate↔framesize↔k cascade)\n"
 		"                       target = clamp(phy*k/n*safety, min, max)\n"
 		"\n"
 		"MCS scaler (opt-in):\n"
@@ -1222,10 +1237,11 @@ static void config_defaults(Config *c)
 	c->cooldown_down_s = 2.0f;
 	c->startup_grace_s = 2.0f;
 
-	c->safety_margin = 0.6f;
+	c->safety_margin = 0.5f;         /* leave 50% airtime for uplink + headroom */
 	c->bitrate_min_kbps = 1000;
 	c->bitrate_max_kbps = 0;         /* 0 = unlimited */
-	c->bitrate_tolerance = 0.05f;
+	c->bitrate_tolerance = 0.15f;
+	c->bitrate_grace_s = 2.0f;
 
 	c->subscribe_s = 2.0f;
 	c->radio_poll_s = 1.0f;
@@ -1237,7 +1253,7 @@ static void config_defaults(Config *c)
 	c->rssi_stream[0] = '\0';
 	c->rssi_udp_port = 0;
 	c->rssi_silence_s = 1.5f;
-	c->rssi_fallback_s = 5.0f;
+	c->rssi_fallback_s = 10.0f;
 	c->rssi_fallback_mcs = -1;        /* -1 = track mcs_min */
 	c->rssi_ewma_alpha = 0.3f;
 	c->mcs_climb_s = 2.0f;
@@ -1264,7 +1280,7 @@ int main(int argc, char **argv)
 		OPT_STARTUP_GRACE,
 		OPT_SAFETY, OPT_BITRATE_MIN, OPT_BITRATE_MAX,
 		OPT_BITRATE_DESIRED, /* deprecated alias for --bitrate-max */
-		OPT_BITRATE_TOL, OPT_DRY_RUN,
+		OPT_BITRATE_TOL, OPT_BITRATE_GRACE, OPT_DRY_RUN,
 		OPT_MCS_ENABLE, OPT_MCS_MIN, OPT_MCS_MAX,
 		OPT_RSSI_STREAM, OPT_RSSI_UDP, OPT_RSSI_SILENCE,
 		OPT_RSSI_FALLBACK_S, OPT_FALLBACK_MCS,
@@ -1288,6 +1304,7 @@ int main(int argc, char **argv)
 		{"bitrate-max",   required_argument, 0, OPT_BITRATE_MAX},
 		{"bitrate-desired", required_argument, 0, OPT_BITRATE_DESIRED},
 		{"bitrate-tol",   required_argument, 0, OPT_BITRATE_TOL},
+		{"bitrate-grace", required_argument, 0, OPT_BITRATE_GRACE},
 		{"dry-run",       no_argument,       0, OPT_DRY_RUN},
 		{"mcs-enable",    no_argument,       0, OPT_MCS_ENABLE},
 		{"mcs-min",       required_argument, 0, OPT_MCS_MIN},
@@ -1345,6 +1362,7 @@ int main(int argc, char **argv)
 			fprintf(stderr, "[fec] --bitrate-desired is deprecated; use --bitrate-max\n");
 			break;
 		case OPT_BITRATE_TOL:   cfg.bitrate_tolerance = (float)atof(optarg); break;
+		case OPT_BITRATE_GRACE: cfg.bitrate_grace_s = (float)atof(optarg); break;
 		case OPT_DRY_RUN:      cfg.dry_run        = true; break;
 		case OPT_MCS_ENABLE:   cfg.mcs_enable     = true; break;
 		case OPT_MCS_MIN:      cfg.mcs_min        = atoi(optarg); break;
@@ -1736,6 +1754,11 @@ int main(int argc, char **argv)
 						if (venc_set_bitrate_kbps(&cfg, target) != 0)
 							LOG("bitrate: set failed");
 					}
+					/* Arm grace window so the next FEC emits wait for
+					 * venc to converge on the new target. */
+					if (cfg.bitrate_grace_s > 0.0f)
+						ctrl.bitrate_grace_until_us =
+						    now + (uint64_t)(cfg.bitrate_grace_s * 1e6f);
 				}
 			}
 			next_bitrate_us = now + (uint64_t)(cfg.bitrate_poll_s * 1e6);
