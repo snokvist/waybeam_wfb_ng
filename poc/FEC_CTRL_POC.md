@@ -205,6 +205,26 @@ policy range, the scaler issues an immediate `CMD_SET_RADIO` on first sync
 to bring the radio into the allowed band. Logged as
 `mcs: snap 5 -> 3 (outside policy [1..3])`.
 
+**RSSI-loss fallback:** if RSSI goes silent for more than
+`--rssi-fallback-s` (default 4.0) seconds AFTER an EWMA has been
+established, the scaler snaps to `--fallback-mcs` (default = `mcs_min`;
+set to `0` for the most robust modulation). A parity boost is armed at
+the same time. When RSSI returns, the radio is snapped back to
+`mcs_min` and the normal ladder resumes:
+
+```
+[fec t=   9.150] rssi: FALLBACK — no RSSI for >4.0s, snapping mcs 5 -> 0
+[fec t=   9.150] fec: parity boost armed for 3.0s (mult=1.30) [fallback]
+[fec t=   9.152] bitrate down 23276 -> 2869 kbps (phy=6.5 Mbps, …)
+[fec t=  14.253] rssi: recovered (rssi=-50.0 dBm), exiting fallback -> mcs=1
+[fec t=  14.254] bitrate up 2340 -> 4680 kbps (phy=13.0 Mbps, …)
+[fec t=  17.305] mcs: 1 -> 2 (rssi=-50.0 dBm) CLIMB
+```
+
+The fallback is gated on `have_ewma` — it only fires once the controller
+has actually established an EWMA from real packets, so the subscribe
+warm-up period does not count as "RSSI lost".
+
 ### Bitrate: track the link budget
 
 The controller **tracks** the safe link budget, not a fixed user-set

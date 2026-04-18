@@ -191,6 +191,8 @@ typedef struct {
 	char     rssi_stream[256];   /* "" = disabled; text stream */
 	uint16_t rssi_udp_port;      /* 0 = disabled; UDP listener */
 	float    rssi_silence_s;
+	float    rssi_fallback_s;    /* age before falling back (default 5.0) */
+	int      rssi_fallback_mcs;  /* target MCS during fallback (-1 = mcs_min) */
 	float    rssi_ewma_alpha;
 	float    mcs_climb_s;
 	float    mcs_drop_s;
@@ -946,6 +948,7 @@ typedef struct {
 	bool     have_pending;
 	uint64_t pending_since_us;   /* when this pending target was first seen */
 	uint64_t last_change_us;     /* cooldown anchor */
+	bool     in_fallback;        /* RSSI lost long enough — snapped to fallback_mcs */
 } MCSScaler;
 
 /* Returns the new MCS if a move is committed, or the current one otherwise.
@@ -1142,6 +1145,9 @@ static void usage(const char *prog)
 		"                       (from poc/ground_rssi_forwarder.py over a\n"
 		"                       wfb_rx uplink)\n"
 		"  --rssi-silence F     stale-RSSI threshold, seconds (default 1.5)\n"
+		"  --rssi-fallback-s F  age before snapping to fallback MCS (default 5.0)\n"
+		"  --fallback-mcs N     fallback MCS on prolonged RSSI loss\n"
+		"                       (default -1 = use mcs_min; 0 = most robust)\n"
 		"  --mcs-climb F        dwell seconds required to climb (default 2.0)\n"
 		"  --mcs-drop F         dwell seconds required to drop (default 0.3)\n"
 		"  --mcs-cooldown F     seconds between any MCS change (default 3.0)\n"
@@ -1207,6 +1213,8 @@ static void config_defaults(Config *c)
 	c->rssi_stream[0] = '\0';
 	c->rssi_udp_port = 0;
 	c->rssi_silence_s = 1.5f;
+	c->rssi_fallback_s = 5.0f;
+	c->rssi_fallback_mcs = -1;        /* -1 = track mcs_min */
 	c->rssi_ewma_alpha = 0.3f;
 	c->mcs_climb_s = 2.0f;
 	c->mcs_drop_s  = 0.3f;
@@ -1234,6 +1242,7 @@ int main(int argc, char **argv)
 		OPT_BITRATE_TOL, OPT_DRY_RUN,
 		OPT_MCS_ENABLE, OPT_MCS_MIN, OPT_MCS_MAX,
 		OPT_RSSI_STREAM, OPT_RSSI_UDP, OPT_RSSI_SILENCE,
+		OPT_RSSI_FALLBACK_S, OPT_FALLBACK_MCS,
 		OPT_MCS_CLIMB, OPT_MCS_DROP, OPT_MCS_COOLDOWN,
 		OPT_BOOST_S, OPT_BOOST_MULT,
 	};
@@ -1260,6 +1269,8 @@ int main(int argc, char **argv)
 		{"rssi-stream",   required_argument, 0, OPT_RSSI_STREAM},
 		{"rssi-udp",      required_argument, 0, OPT_RSSI_UDP},
 		{"rssi-silence",  required_argument, 0, OPT_RSSI_SILENCE},
+		{"rssi-fallback-s", required_argument, 0, OPT_RSSI_FALLBACK_S},
+		{"fallback-mcs",  required_argument, 0, OPT_FALLBACK_MCS},
 		{"mcs-climb",     required_argument, 0, OPT_MCS_CLIMB},
 		{"mcs-drop",      required_argument, 0, OPT_MCS_DROP},
 		{"mcs-cooldown",  required_argument, 0, OPT_MCS_COOLDOWN},
@@ -1325,6 +1336,10 @@ int main(int argc, char **argv)
 			break;
 		}
 		case OPT_RSSI_SILENCE: cfg.rssi_silence_s = (float)atof(optarg); break;
+		case OPT_RSSI_FALLBACK_S: cfg.rssi_fallback_s = (float)atof(optarg); break;
+		case OPT_FALLBACK_MCS:
+			cfg.rssi_fallback_mcs = atoi(optarg);
+			break;
 		case OPT_MCS_CLIMB:    cfg.mcs_climb_s    = (float)atof(optarg); break;
 		case OPT_MCS_DROP:     cfg.mcs_drop_s     = (float)atof(optarg); break;
 		case OPT_MCS_COOLDOWN: cfg.mcs_cooldown_s = (float)atof(optarg); break;
@@ -1539,9 +1554,80 @@ int main(int argc, char **argv)
 				LOGV(&cfg, "radio: get_radio timed out");
 			}
 
-			/* --- MCS scaler tick (piggybacks on radio poll cadence) --- */
+			/* --- MCS scaler tick (piggybacks on radio poll cadence) ---
+			 *
+			 * Three states:
+			 *   normal   — RSSI is fresh, ladder acts on it
+			 *   stale    — RSSI silent < fallback_s, freeze current MCS
+			 *   fallback — RSSI silent ≥ fallback_s, snap to fallback_mcs
+			 *
+			 * The fallback is a safety net: without RSSI we can't make
+			 * sane climb decisions, and holding at a high MCS without
+			 * feedback is worse than dropping to a robust baseline. */
 			if (cfg.mcs_enable && radio.valid) {
-				if (rssi_is_stale(&rssi_src, now, cfg.rssi_silence_s)) {
+				bool stale = rssi_is_stale(&rssi_src, now, cfg.rssi_silence_s);
+				/* Fallback only once we've ESTABLISHED RSSI (committed EWMA)
+				 * and then lost it. `rssi_is_stale` returns true before the
+				 * first 250 ms aggregation window closes, which would
+				 * otherwise race the first incoming packet into an immediate
+				 * fallback. */
+				bool lost_after_had = rssi_src.have_ewma &&
+				    ((now - rssi_src.last_update_us) >
+				     (uint64_t)(cfg.rssi_fallback_s * 1e6f));
+				int fb_mcs = cfg.rssi_fallback_mcs >= 0
+				             ? cfg.rssi_fallback_mcs : cfg.mcs_min;
+
+				if (lost_after_had && !scaler.in_fallback) {
+					/* Transition INTO fallback. */
+					LOG("rssi: FALLBACK — no RSSI for >%.1fs, snapping mcs %d -> %d",
+					    cfg.rssi_fallback_s, scaler.mcs, fb_mcs);
+					if (!cfg.dry_run && radio.mcs != fb_mcs) {
+						if (wfb_send_set_radio(&cfg, fb_mcs,
+						                       radio.short_gi, radio.bandwidth,
+						                       radio.stbc, radio.ldpc,
+						                       radio.vht_mode, radio.vht_nss) != 0)
+							LOG("mcs: fallback set_radio failed");
+					}
+					radio.mcs = fb_mcs;
+					radio.phy_mbps = phy_mbps(radio.mcs, radio.bandwidth,
+					                          radio.short_gi, radio.vht_mode,
+					                          radio.vht_nss);
+					scaler.mcs = fb_mcs;
+					scaler.in_fallback = true;
+					scaler.last_change_us = now;
+					scaler.have_pending = false;
+					if (cfg.boost_s > 0.0f) {
+						ctrl.boost_until_us = now + (uint64_t)(cfg.boost_s * 1e6f);
+						LOG("fec: parity boost armed for %.1fs (mult=%.2f) [fallback]",
+						    cfg.boost_s, cfg.boost_mult);
+					}
+				} else if (!stale && scaler.in_fallback) {
+					/* Transition OUT of fallback — RSSI returned. Bring
+					 * radio back to mcs_min so the ladder can climb from
+					 * a defined starting point. */
+					LOG("rssi: recovered (rssi=%.1f dBm), exiting fallback -> mcs=%d",
+					    rssi_src.ewma_rssi, cfg.mcs_min);
+					if (!cfg.dry_run && radio.mcs != cfg.mcs_min) {
+						if (wfb_send_set_radio(&cfg, cfg.mcs_min,
+						                       radio.short_gi, radio.bandwidth,
+						                       radio.stbc, radio.ldpc,
+						                       radio.vht_mode, radio.vht_nss) != 0)
+							LOG("mcs: recovery set_radio failed");
+					}
+					radio.mcs = cfg.mcs_min;
+					radio.phy_mbps = phy_mbps(radio.mcs, radio.bandwidth,
+					                          radio.short_gi, radio.vht_mode,
+					                          radio.vht_nss);
+					scaler.mcs = cfg.mcs_min;
+					scaler.in_fallback = false;
+					scaler.last_change_us = now;
+					scaler.have_pending = false;
+				}
+
+				if (scaler.in_fallback) {
+					LOGV(&cfg, "mcs: in fallback (rssi stale >%.1fs, mcs=%d)",
+					     cfg.rssi_fallback_s, scaler.mcs);
+				} else if (stale) {
 					LOGV(&cfg, "mcs: rssi stale (>%.1fs), freezing at mcs=%d",
 					     cfg.rssi_silence_s, scaler.mcs);
 				} else {
