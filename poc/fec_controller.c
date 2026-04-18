@@ -203,6 +203,7 @@ typedef struct {
 	float    mcs_climb_s;
 	float    mcs_drop_s;
 	float    mcs_cooldown_s;
+	bool     mcs_fast_climb;         /* jump to highest eligible rung */
 
 	/* Post-MCS-drop FEC-parity boost */
 	float    boost_s;
@@ -998,11 +999,28 @@ static int mcs_scaler_tick(MCSScaler *m, const Config *cfg,
 	if (cur < lo) cur = lo;
 	if (cur > hi) cur = hi;
 
-	/* Propose a direction. */
+	/* Propose a direction.
+	 *
+	 * Climb: by default fast-climb to the highest rung whose climb
+	 * threshold is satisfied. This collapses a 0→1→2→3 cascade (three
+	 * CMD_SET_RADIO + three bitrate writes + three FEC updates, ~9s of
+	 * ramping) into a single step. With --no-mcs-fast-climb, behavior
+	 * reverts to one-rung-at-a-time.
+	 *
+	 * Drop: always one step at a time — safer, and the boost+fallback
+	 * paths already handle catastrophic drops. */
 	int target = cur;
-	if (cur < hi && rssi >= MCS_LADDER[cur + 1].climb_dbm)
-		target = cur + 1;
-	else if (cur > lo && rssi < MCS_LADDER[cur].drop_dbm)
+	if (cur < hi) {
+		int highest = cur;
+		for (int m = hi; m > cur; m--) {
+			if (rssi >= MCS_LADDER[m].climb_dbm) { highest = m; break; }
+		}
+		if (cfg->mcs_fast_climb)
+			target = highest;
+		else if (highest > cur)
+			target = cur + 1;
+	}
+	if (target == cur && cur > lo && rssi < MCS_LADDER[cur].drop_dbm)
 		target = cur - 1;
 
 	if (target == cur) {
@@ -1189,6 +1207,10 @@ static void usage(const char *prog)
 		"  --mcs-climb F        dwell seconds required to climb (default 2.0)\n"
 		"  --mcs-drop F         dwell seconds required to drop (default 0.3)\n"
 		"  --mcs-cooldown F     seconds between any MCS change (default 3.0)\n"
+		"  --no-mcs-fast-climb  disable fast-climb (step one MCS rung at a time)\n"
+		"                       default: fast-climb jumps directly to the highest\n"
+		"                       rung whose climb threshold is met, saving multiple\n"
+		"                       SET_RADIO + SET_FEC events on the climb cascade\n"
 		"\n"
 		"Post-MCS-drop FEC boost:\n"
 		"  --boost-s F          parity boost duration after MCS drop (default 3.0)\n"
@@ -1259,6 +1281,7 @@ static void config_defaults(Config *c)
 	c->mcs_climb_s = 2.0f;
 	c->mcs_drop_s  = 0.3f;
 	c->mcs_cooldown_s = 3.0f;
+	c->mcs_fast_climb = true;
 
 	c->boost_s = 3.0f;
 	c->boost_mult = 1.3f;
@@ -1284,7 +1307,7 @@ int main(int argc, char **argv)
 		OPT_MCS_ENABLE, OPT_MCS_MIN, OPT_MCS_MAX,
 		OPT_RSSI_STREAM, OPT_RSSI_UDP, OPT_RSSI_SILENCE,
 		OPT_RSSI_FALLBACK_S, OPT_FALLBACK_MCS,
-		OPT_MCS_CLIMB, OPT_MCS_DROP, OPT_MCS_COOLDOWN,
+		OPT_MCS_CLIMB, OPT_MCS_DROP, OPT_MCS_COOLDOWN, OPT_NO_MCS_FAST_CLIMB,
 		OPT_BOOST_S, OPT_BOOST_MULT,
 	};
 	static const struct option longopts[] = {
@@ -1317,6 +1340,7 @@ int main(int argc, char **argv)
 		{"mcs-climb",     required_argument, 0, OPT_MCS_CLIMB},
 		{"mcs-drop",      required_argument, 0, OPT_MCS_DROP},
 		{"mcs-cooldown",  required_argument, 0, OPT_MCS_COOLDOWN},
+		{"no-mcs-fast-climb", no_argument,  0, OPT_NO_MCS_FAST_CLIMB},
 		{"boost-s",       required_argument, 0, OPT_BOOST_S},
 		{"boost-mult",    required_argument, 0, OPT_BOOST_MULT},
 		{"verbose",       no_argument,       0, 'v'},
@@ -1388,6 +1412,7 @@ int main(int argc, char **argv)
 		case OPT_MCS_CLIMB:    cfg.mcs_climb_s    = (float)atof(optarg); break;
 		case OPT_MCS_DROP:     cfg.mcs_drop_s     = (float)atof(optarg); break;
 		case OPT_MCS_COOLDOWN: cfg.mcs_cooldown_s = (float)atof(optarg); break;
+		case OPT_NO_MCS_FAST_CLIMB: cfg.mcs_fast_climb = false; break;
 		case OPT_BOOST_S:      cfg.boost_s        = (float)atof(optarg); break;
 		case OPT_BOOST_MULT:   cfg.boost_mult     = (float)atof(optarg); break;
 		case 'v':              cfg.verbose        = 1; break;
