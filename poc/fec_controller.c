@@ -204,9 +204,23 @@ typedef struct {
 static volatile sig_atomic_t g_stop = 0;
 static void on_sigint(int s) { (void)s; g_stop = 1; }
 
+/* Monotonic timestamp prefix: "[fec t=  12.345] …"
+ * Set once at startup via log_init(); every line shows seconds since start,
+ * which makes it easy to see how fast we're reacting (intervals read off
+ * the column directly). */
+static uint64_t g_log_start_us = 0;
+static void log_init(void) { g_log_start_us = now_us(); }
+static double log_rel_s(void)
+{
+	return (double)(now_us() - g_log_start_us) / 1e6;
+}
+
 #define LOGV(cfg, fmt, ...) \
-	do { if ((cfg)->verbose) fprintf(stderr, "[fec] " fmt "\n", ##__VA_ARGS__); } while (0)
-#define LOG(fmt, ...) fprintf(stderr, "[fec] " fmt "\n", ##__VA_ARGS__)
+	do { if ((cfg)->verbose) \
+		fprintf(stderr, "[fec t=%8.3f] " fmt "\n", log_rel_s(), ##__VA_ARGS__); \
+	} while (0)
+#define LOG(fmt, ...) \
+	fprintf(stderr, "[fec t=%8.3f] " fmt "\n", log_rel_s(), ##__VA_ARGS__)
 
 /* ── Redundancy curve (k → redundancy fraction, linear interp) ───────── */
 
@@ -1248,6 +1262,7 @@ int main(int argc, char **argv)
 	signal(SIGINT, on_sigint);
 	signal(SIGTERM, on_sigint);
 
+	log_init();
 	LOG("sidecar=%s:%u wfb=%s:%u venc=%s:%u mtu=%d safety=%.2f dry_run=%d",
 	    cfg.sidecar_host, cfg.sidecar_port,
 	    cfg.wfb_host,     cfg.wfb_port,
