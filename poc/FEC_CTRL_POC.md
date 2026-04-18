@@ -194,10 +194,32 @@ python3 poc/ground_rssi_forwarder.py \
 The second form was how the POC was integration-tested end-to-end.
 
 On an MCS drop, the controller arms a **parity boost**: for the next
-`--boost-s` seconds it inflates the FEC parity (`n-k`) by `--boost-mult`
-and force-emits `CMD_SET_FEC` past the normal hysteresis/cooldown, so
-redundancy rises temporarily while goodput shrinks. On expiry it forces
-one more emission to restore natural parity.
+`--boost-s` seconds it inflates the FEC parity (`n-k`) by `--boost-mult`.
+The force-emit is **edge-triggered** — once on boost entry (to commit the
+inflated parity) and once on expiry (to restore natural parity). During
+the boost window, FEC updates follow the normal hysteresis/cooldown; this
+prevents per-frame `CMD_SET_FEC` floods when the EWMA wobbles k by ±1.
+
+**Startup snap-in:** if the hardware MCS is outside the `[mcs_min, mcs_max]`
+policy range, the scaler issues an immediate `CMD_SET_RADIO` on first sync
+to bring the radio into the allowed band. Logged as
+`mcs: snap 5 -> 3 (outside policy [1..3])`.
+
+### Bitrate: bidirectional tracking
+
+The bitrate loop maintains `target = min(desired, safe)` where `desired` is
+the video0.bitrate latched on first query (or from `--bitrate-desired`).
+On every tick (`--bitrate-poll-s`, 1 s default) the live video0.bitrate
+is queried; if it differs from `target` by more than `--bitrate-tol`
+(5% default), the controller re-applies `/api/v1/set?video0.bitrate=target`.
+This runs in both directions:
+
+- `clamp`: cur > target (MCS dropped → must shrink) → write down
+- `restore`: cur < target (MCS climbed → headroom available) → write up
+
+…and doubles as periodic drift correction for external changes
+(web UI edits, for example) — whatever the live venc bitrate is, it
+converges back to the controller's target within one poll.
 
 ### Heartbeat
 
