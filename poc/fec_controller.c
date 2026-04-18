@@ -19,6 +19,7 @@
 #define _GNU_SOURCE
 #include <arpa/inet.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <getopt.h>
 #include <math.h>
 #include <netinet/in.h>
@@ -30,6 +31,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
@@ -92,6 +94,7 @@ typedef struct {
 /* ── wfb_tx control protocol (matches poc/build/wfb-ng/src/tx_cmd.h) ───── */
 
 #define CMD_SET_FEC    1
+#define CMD_SET_RADIO  2
 #define CMD_GET_RADIO  4
 
 #pragma pack(push, 1)
@@ -100,6 +103,15 @@ typedef struct {
 	uint8_t  cmd_id;
 	union {
 		struct { uint8_t k, n; }                    set_fec;
+		struct {
+			uint8_t stbc;
+			uint8_t ldpc;
+			uint8_t short_gi;
+			uint8_t bandwidth;
+			uint8_t mcs_index;
+			uint8_t vht_mode;
+			uint8_t vht_nss;
+		}                                            set_radio;
 		struct { uint8_t pad; }                     get_radio;
 	} u;
 } CmdReq;
@@ -168,6 +180,21 @@ typedef struct {
 	float    subscribe_s;
 	float    radio_poll_s;
 	float    bitrate_poll_s;
+
+	/* MCS scaler */
+	bool     mcs_enable;
+	int      mcs_min;
+	int      mcs_max;
+	char     rssi_stream[256];   /* "" = disabled */
+	float    rssi_silence_s;
+	float    rssi_ewma_alpha;
+	float    mcs_climb_s;
+	float    mcs_drop_s;
+	float    mcs_cooldown_s;
+
+	/* Post-MCS-drop FEC-parity boost */
+	float    boost_s;
+	float    boost_mult;
 
 	bool     dry_run;
 	int      verbose;
@@ -446,6 +473,39 @@ static int wfb_send_set_fec(const Config *cfg, int k, int n)
 	return (s == 7) ? 0 : -1;
 }
 
+/* CMD_SET_RADIO: change mcs/bw/gi/stbc/ldpc/vht_nss on the running wfb_tx.
+ * Preserves stbc/ldpc/bw/vht_mode/vht_nss from the current radio state —
+ * the scaler only moves mcs_index and (optionally) short_gi. */
+static int wfb_send_set_radio(const Config *cfg, int mcs, int short_gi,
+                              int bandwidth, int stbc, int ldpc,
+                              int vht_mode, int vht_nss) __attribute__((unused));
+static int wfb_send_set_radio(const Config *cfg, int mcs, int short_gi,
+                              int bandwidth, int stbc, int ldpc,
+                              int vht_mode, int vht_nss)
+{
+	struct sockaddr_in dst;
+	if (resolve_ipv4(cfg->wfb_host, cfg->wfb_port, &dst) != 0) return -1;
+	int fd = socket(AF_INET, SOCK_DGRAM, 0);
+	if (fd < 0) return -1;
+
+	CmdReq req = {0};
+	req.req_id = htonl(g_req_id++);
+	req.cmd_id = CMD_SET_RADIO;
+	req.u.set_radio.stbc      = (uint8_t)stbc;
+	req.u.set_radio.ldpc      = (uint8_t)ldpc;
+	req.u.set_radio.short_gi  = (uint8_t)short_gi;
+	req.u.set_radio.bandwidth = (uint8_t)bandwidth;
+	req.u.set_radio.mcs_index = (uint8_t)mcs;
+	req.u.set_radio.vht_mode  = (uint8_t)vht_mode;
+	req.u.set_radio.vht_nss   = (uint8_t)vht_nss;
+
+	/* wire: req_id(4) + cmd_id(1) + 7-byte set_radio = 12 bytes */
+	ssize_t s = sendto(fd, &req, 12, 0,
+	                   (const struct sockaddr*)&dst, sizeof(dst));
+	close(fd);
+	return (s == 12) ? 0 : -1;
+}
+
 static int wfb_get_radio(const Config *cfg, CmdResp *out)
 {
 	struct sockaddr_in dst;
@@ -516,6 +576,255 @@ static float phy_mbps(int mcs, int bw_mhz, int short_gi,
 	int nss = (vht_mode && vht_nss > 0) ? vht_nss : 1;
 
 	return base * bw_scale * gi_scale * (float)nss;
+}
+
+/* ── RSSI source (tail wfb_rx text output) ───────────────────────────── */
+
+/*
+ * wfb_rx emits per-second lines like:
+ *   34001586    RX_ANT    5745:5:20    1    1082:-30:-28:-28:24:31:34
+ *   ts_ms       tag       freq:mcs:bw  ant  pkts:rmin:ravg:rmax:smin:savg:smax
+ *
+ * We tail a file/FIFO, parse RX_ANT lines, take the best (max) RSSI-avg
+ * across antennas within a 250 ms aggregation window, and feed that into
+ * an EWMA.
+ *
+ * Open modes:
+ *   - Regular file:   opened with O_NONBLOCK, start at end (tail -f style)
+ *   - FIFO:           opened with O_NONBLOCK|O_RDONLY, no writer yet is OK
+ *   - "-" (stdin):    fd 0, set non-blocking
+ */
+
+typedef struct {
+	int      fd;                 /* -1 = disabled */
+	char     buf[4096];
+	size_t   buf_len;
+
+	/* Per-window aggregate (rolled over on timeout). */
+	uint64_t window_start_us;
+	int      window_max_rssi;
+	int      window_have_rssi;
+
+	float    ewma_rssi;          /* dBm; 0 = unset */
+	uint64_t last_update_us;
+	bool     have_ewma;
+} RssiSource;
+
+static int rssi_open(RssiSource *s, const char *path)
+{
+	memset(s, 0, sizeof(*s));
+	s->fd = -1;
+	s->ewma_rssi = 0.0f;
+	if (!path || !*path) return 0;   /* disabled */
+
+	int fd;
+	if (strcmp(path, "-") == 0) {
+		fd = 0;
+		int fl = fcntl(fd, F_GETFL, 0);
+		if (fl >= 0) fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+	} else {
+		fd = open(path, O_RDONLY | O_NONBLOCK);
+		if (fd < 0) return -1;
+		/* Seek to end for regular files (skip historical noise). */
+		struct stat st;
+		if (fstat(fd, &st) == 0 && S_ISREG(st.st_mode))
+			lseek(fd, 0, SEEK_END);
+	}
+	s->fd = fd;
+	return 0;
+}
+
+static void rssi_close(RssiSource *s)
+{
+	if (s->fd > 0) close(s->fd);
+	s->fd = -1;
+}
+
+/* Parse one line. Returns 0 if it was an RX_ANT line we used, -1 otherwise. */
+static int rssi_parse_line(RssiSource *s, const char *line, uint64_t now,
+                           float alpha)
+{
+	/* Skip leading whitespace / timestamp, find "RX_ANT". */
+	const char *tag = strstr(line, "RX_ANT");
+	if (!tag) return -1;
+
+	/* Skip past "RX_ANT" and surrounding whitespace, then skip two
+	 * whitespace-delimited tokens (freq:mcs:bw, antenna index). */
+	const char *p = tag + 6;
+	for (int skip = 0; skip < 2; skip++) {
+		while (*p == ' ' || *p == '\t') p++;
+		while (*p && *p != ' ' && *p != '\t') p++;
+	}
+	while (*p == ' ' || *p == '\t') p++;
+	if (!*p) return -1;
+
+	/* Now at: "pkts:rmin:ravg:rmax:smin:savg:smax". We want ravg (field 2). */
+	long fields[7];
+	int  n_fields = 0;
+	const char *q = p;
+	for (int i = 0; i < 7 && *q; i++) {
+		char *end;
+		fields[i] = strtol(q, &end, 10);
+		if (end == q) break;
+		n_fields++;
+		if (*end == ':') q = end + 1;
+		else break;
+	}
+	if (n_fields < 3) return -1;
+
+	int rssi_avg = (int)fields[2];   /* negative dBm */
+
+	/* Aggregate over a 250 ms window: keep best (least negative). */
+	if (!s->window_have_rssi || s->window_start_us == 0) {
+		s->window_start_us = now;
+		s->window_max_rssi = rssi_avg;
+		s->window_have_rssi = 1;
+	} else {
+		if (rssi_avg > s->window_max_rssi)
+			s->window_max_rssi = rssi_avg;
+	}
+
+	/* Window closed? Commit to EWMA. */
+	if ((now - s->window_start_us) >= 250000ULL) {
+		float v = (float)s->window_max_rssi;
+		if (!s->have_ewma) {
+			s->ewma_rssi = v;
+			s->have_ewma = true;
+		} else {
+			s->ewma_rssi = alpha * v + (1.0f - alpha) * s->ewma_rssi;
+		}
+		s->last_update_us = now;
+		s->window_start_us = now;
+		s->window_max_rssi = rssi_avg;
+	}
+	return 0;
+}
+
+/* Drain any pending bytes, line-split, parse RX_ANT entries. */
+static void rssi_poll(RssiSource *s, uint64_t now, float alpha)
+{
+	if (s->fd < 0) return;
+	for (;;) {
+		/* Paranoid bounds: cap writes to at most buf[0..sizeof-2] so the
+		 * trailing NUL fits. Re-normalize buf_len on each iteration so the
+		 * fortify analyzer can see the invariant. */
+		if (s->buf_len > sizeof(s->buf) - 1)
+			s->buf_len = 0;
+		if (s->buf_len == sizeof(s->buf) - 1)
+			s->buf_len = 0;   /* full; drop and resync on next newline */
+		size_t want = (sizeof(s->buf) - 1) - s->buf_len;
+		if (want > sizeof(s->buf))
+			break;   /* unreachable; silences fortify */
+		ssize_t n = read(s->fd, &s->buf[s->buf_len], want);
+		if (n <= 0) break;
+		s->buf_len += (size_t)n;
+		s->buf[s->buf_len] = '\0';
+
+		/* Split on '\n' and parse each complete line. */
+		char *start = s->buf;
+		for (;;) {
+			char *nl = memchr(start, '\n', s->buf_len - (size_t)(start - s->buf));
+			if (!nl) break;
+			*nl = '\0';
+			(void)rssi_parse_line(s, start, now, alpha);
+			start = nl + 1;
+		}
+		/* Shift the residual partial line to the front. */
+		size_t used = (size_t)(start - s->buf);
+		if (used > 0 && used < s->buf_len) {
+			memmove(s->buf, start, s->buf_len - used);
+			s->buf_len -= used;
+		} else if (used == s->buf_len) {
+			s->buf_len = 0;
+		}
+	}
+}
+
+static bool rssi_is_stale(const RssiSource *s, uint64_t now, float silence_s)
+{
+	if (!s->have_ewma) return true;
+	uint64_t age = now - s->last_update_us;
+	return age > (uint64_t)(silence_s * 1e6f);
+}
+
+/* ── MCS ladder + scaler policy ──────────────────────────────────────── */
+
+typedef struct {
+	int   mcs;
+	float climb_dbm;   /* rssi_ewma must reach this (or above) to climb TO mcs */
+	float drop_dbm;    /* rssi_ewma below this to drop FROM mcs */
+} McsRung;
+
+/* HT20, LGI, single-stream. Conservative FPV thresholds.
+ * climb/drop hysteresis band is ~4 dB.
+ *
+ * drop_dbm for mcs=0 is unreachable (−∞) — we never drop below the floor. */
+static const McsRung MCS_LADDER[8] = {
+	{ 0, -200.0f, -200.0f },
+	{ 1,  -82.0f,  -85.0f },
+	{ 2,  -78.0f,  -82.0f },
+	{ 3,  -74.0f,  -78.0f },
+	{ 4,  -70.0f,  -74.0f },
+	{ 5,  -66.0f,  -70.0f },
+	{ 6,  -62.0f,  -66.0f },
+	{ 7,  -58.0f,  -62.0f },
+};
+
+typedef struct {
+	int      mcs;                /* current (last-known) MCS */
+	int      pending;            /* pending target (only valid if have_pending) */
+	bool     have_pending;
+	uint64_t pending_since_us;   /* when this pending target was first seen */
+	uint64_t last_change_us;     /* cooldown anchor */
+} MCSScaler;
+
+/* Returns the new MCS if a move is committed, or the current one otherwise.
+ * Sets *moved=true iff the caller should emit CMD_SET_RADIO. */
+static int mcs_scaler_tick(MCSScaler *m, const Config *cfg,
+                           float rssi, uint64_t now, bool *moved)
+{
+	*moved = false;
+	int cur = m->mcs;
+	int lo  = cfg->mcs_min;
+	int hi  = cfg->mcs_max;
+	if (cur < lo) cur = lo;
+	if (cur > hi) cur = hi;
+
+	/* Propose a direction. */
+	int target = cur;
+	if (cur < hi && rssi >= MCS_LADDER[cur + 1].climb_dbm)
+		target = cur + 1;
+	else if (cur > lo && rssi < MCS_LADDER[cur].drop_dbm)
+		target = cur - 1;
+
+	if (target == cur) {
+		/* Reset pending — candidate stopped matching. */
+		m->have_pending = false;
+		return cur;
+	}
+
+	/* Same pending target as before? Measure time-in-state. Otherwise reset. */
+	if (!m->have_pending || m->pending != target) {
+		m->have_pending = true;
+		m->pending = target;
+		m->pending_since_us = now;
+		return cur;
+	}
+
+	float needed_s = (target > cur) ? cfg->mcs_climb_s : cfg->mcs_drop_s;
+	float held_s = (float)(now - m->pending_since_us) / 1e6f;
+	if (held_s < needed_s) return cur;
+
+	/* Cooldown gate. */
+	float since_change = (float)(now - m->last_change_us) / 1e6f;
+	if (since_change < cfg->mcs_cooldown_s) return cur;
+
+	/* Commit. */
+	m->mcs = target;
+	m->last_change_us = now;
+	m->have_pending = false;
+	*moved = true;
+	return target;
 }
 
 /* ── venc HTTP client (tiny, blocking) ───────────────────────────────── */
@@ -646,8 +955,22 @@ static void usage(const char *prog)
 		"Link budget:\n"
 		"  --safety F           fraction of PHY rate usable (default 0.6)\n"
 		"\n"
+		"MCS scaler (opt-in):\n"
+		"  --mcs-enable         enable RSSI-driven MCS scaler (default off)\n"
+		"  --mcs-min N          floor MCS (default 1)\n"
+		"  --mcs-max N          ceiling MCS (default 3)\n"
+		"  --rssi-stream PATH   wfb_rx log/FIFO to tail (\"-\" = stdin)\n"
+		"  --rssi-silence F     stale-RSSI threshold, seconds (default 1.5)\n"
+		"  --mcs-climb F        dwell seconds required to climb (default 2.0)\n"
+		"  --mcs-drop F         dwell seconds required to drop (default 0.3)\n"
+		"  --mcs-cooldown F     seconds between any MCS change (default 3.0)\n"
+		"\n"
+		"Post-MCS-drop FEC boost:\n"
+		"  --boost-s F          parity boost duration after MCS drop (default 3.0)\n"
+		"  --boost-mult F       (n-k) parity multiplier during boost (default 1.3)\n"
+		"\n"
 		"Behavior:\n"
-		"  --dry-run            compute but do not call set_fec/set bitrate\n"
+		"  --dry-run            compute but do not call set_fec/set bitrate/set radio\n"
 		"  -v, --verbose        extra logs\n"
 		"  -h, --help           this message\n",
 		prog);
@@ -694,6 +1017,19 @@ static void config_defaults(Config *c)
 	c->radio_poll_s = 1.0f;
 	c->bitrate_poll_s = 1.0f;
 
+	c->mcs_enable = false;
+	c->mcs_min = 1;
+	c->mcs_max = 3;
+	c->rssi_stream[0] = '\0';
+	c->rssi_silence_s = 1.5f;
+	c->rssi_ewma_alpha = 0.3f;
+	c->mcs_climb_s = 2.0f;
+	c->mcs_drop_s  = 0.3f;
+	c->mcs_cooldown_s = 3.0f;
+
+	c->boost_s = 3.0f;
+	c->boost_mult = 1.3f;
+
 	c->dry_run = false;
 	c->verbose = 0;
 }
@@ -708,18 +1044,32 @@ int main(int argc, char **argv)
 	enum {
 		OPT_SIDECAR = 256, OPT_WFB, OPT_VENC, OPT_MTU, OPT_MINK, OPT_MAXK,
 		OPT_SAFETY, OPT_DRY_RUN,
+		OPT_MCS_ENABLE, OPT_MCS_MIN, OPT_MCS_MAX,
+		OPT_RSSI_STREAM, OPT_RSSI_SILENCE,
+		OPT_MCS_CLIMB, OPT_MCS_DROP, OPT_MCS_COOLDOWN,
+		OPT_BOOST_S, OPT_BOOST_MULT,
 	};
 	static const struct option longopts[] = {
-		{"sidecar", required_argument, 0, OPT_SIDECAR},
-		{"wfb",     required_argument, 0, OPT_WFB},
-		{"venc",    required_argument, 0, OPT_VENC},
-		{"mtu",     required_argument, 0, OPT_MTU},
-		{"min-k",   required_argument, 0, OPT_MINK},
-		{"max-k",   required_argument, 0, OPT_MAXK},
-		{"safety",  required_argument, 0, OPT_SAFETY},
-		{"dry-run", no_argument,       0, OPT_DRY_RUN},
-		{"verbose", no_argument,       0, 'v'},
-		{"help",    no_argument,       0, 'h'},
+		{"sidecar",       required_argument, 0, OPT_SIDECAR},
+		{"wfb",           required_argument, 0, OPT_WFB},
+		{"venc",          required_argument, 0, OPT_VENC},
+		{"mtu",           required_argument, 0, OPT_MTU},
+		{"min-k",         required_argument, 0, OPT_MINK},
+		{"max-k",         required_argument, 0, OPT_MAXK},
+		{"safety",        required_argument, 0, OPT_SAFETY},
+		{"dry-run",       no_argument,       0, OPT_DRY_RUN},
+		{"mcs-enable",    no_argument,       0, OPT_MCS_ENABLE},
+		{"mcs-min",       required_argument, 0, OPT_MCS_MIN},
+		{"mcs-max",       required_argument, 0, OPT_MCS_MAX},
+		{"rssi-stream",   required_argument, 0, OPT_RSSI_STREAM},
+		{"rssi-silence",  required_argument, 0, OPT_RSSI_SILENCE},
+		{"mcs-climb",     required_argument, 0, OPT_MCS_CLIMB},
+		{"mcs-drop",      required_argument, 0, OPT_MCS_DROP},
+		{"mcs-cooldown",  required_argument, 0, OPT_MCS_COOLDOWN},
+		{"boost-s",       required_argument, 0, OPT_BOOST_S},
+		{"boost-mult",    required_argument, 0, OPT_BOOST_MULT},
+		{"verbose",       no_argument,       0, 'v'},
+		{"help",          no_argument,       0, 'h'},
 		{0, 0, 0, 0},
 	};
 
@@ -744,12 +1094,25 @@ int main(int argc, char **argv)
 				fprintf(stderr, "invalid --venc\n"); return 1;
 			}
 			break;
-		case OPT_MTU:     cfg.mtu     = atoi(optarg); break;
-		case OPT_MINK:    cfg.min_k   = atoi(optarg); break;
-		case OPT_MAXK:    cfg.max_k   = atoi(optarg); break;
-		case OPT_SAFETY:  cfg.safety_margin = (float)atof(optarg); break;
-		case OPT_DRY_RUN: cfg.dry_run = true; break;
-		case 'v':         cfg.verbose = 1; break;
+		case OPT_MTU:          cfg.mtu            = atoi(optarg); break;
+		case OPT_MINK:         cfg.min_k          = atoi(optarg); break;
+		case OPT_MAXK:         cfg.max_k          = atoi(optarg); break;
+		case OPT_SAFETY:       cfg.safety_margin  = (float)atof(optarg); break;
+		case OPT_DRY_RUN:      cfg.dry_run        = true; break;
+		case OPT_MCS_ENABLE:   cfg.mcs_enable     = true; break;
+		case OPT_MCS_MIN:      cfg.mcs_min        = atoi(optarg); break;
+		case OPT_MCS_MAX:      cfg.mcs_max        = atoi(optarg); break;
+		case OPT_RSSI_STREAM:
+			strncpy(cfg.rssi_stream, optarg, sizeof(cfg.rssi_stream) - 1);
+			cfg.rssi_stream[sizeof(cfg.rssi_stream) - 1] = '\0';
+			break;
+		case OPT_RSSI_SILENCE: cfg.rssi_silence_s = (float)atof(optarg); break;
+		case OPT_MCS_CLIMB:    cfg.mcs_climb_s    = (float)atof(optarg); break;
+		case OPT_MCS_DROP:     cfg.mcs_drop_s     = (float)atof(optarg); break;
+		case OPT_MCS_COOLDOWN: cfg.mcs_cooldown_s = (float)atof(optarg); break;
+		case OPT_BOOST_S:      cfg.boost_s        = (float)atof(optarg); break;
+		case OPT_BOOST_MULT:   cfg.boost_mult     = (float)atof(optarg); break;
+		case 'v':              cfg.verbose        = 1; break;
 		case 'h': default: usage(argv[0]); return (ch == 'h') ? 0 : 1;
 		}
 	}
@@ -782,9 +1145,29 @@ int main(int argc, char **argv)
 	/* Last known radio state (for reporting + link budget). */
 	struct {
 		bool valid;
-		int  short_gi, bandwidth, mcs, vht_mode, vht_nss;
+		int  short_gi, bandwidth, mcs, vht_mode, vht_nss, stbc, ldpc;
 		float phy_mbps;
 	} radio = {0};
+
+	/* MCS scaler + RSSI source (enabled via --mcs-enable + --rssi-stream). */
+	MCSScaler scaler = {0};
+	RssiSource rssi_src;
+	memset(&rssi_src, 0, sizeof(rssi_src));
+	rssi_src.fd = -1;
+
+	if (cfg.mcs_enable) {
+		if (cfg.rssi_stream[0] == '\0') {
+			LOG("mcs: --mcs-enable requires --rssi-stream PATH; disabling scaler");
+			cfg.mcs_enable = false;
+		} else if (rssi_open(&rssi_src, cfg.rssi_stream) != 0) {
+			LOG("mcs: rssi-stream open failed: %s (%s); disabling scaler",
+			    cfg.rssi_stream, strerror(errno));
+			cfg.mcs_enable = false;
+		} else {
+			LOG("mcs: scaler enabled, ladder=[%d..%d] rssi=%s",
+			    cfg.mcs_min, cfg.mcs_max, cfg.rssi_stream);
+		}
+	}
 
 	while (!g_stop) {
 		uint64_t now = now_us();
@@ -801,11 +1184,17 @@ int main(int argc, char **argv)
 			next_subscribe_us = now + (uint64_t)(cfg.subscribe_s * 1e6);
 		}
 
+		/* --- Drain RSSI stream (non-blocking) --- */
+		if (rssi_src.fd >= 0)
+			rssi_poll(&rssi_src, now, cfg.rssi_ewma_alpha);
+
 		/* --- Poll radio params --- */
 		if (now >= next_radio_us) {
 			CmdResp resp;
 			if (wfb_get_radio(&cfg, &resp) == 0) {
 				radio.valid     = true;
+				radio.stbc      = resp.u.get_radio.stbc;
+				radio.ldpc      = resp.u.get_radio.ldpc;
 				radio.short_gi  = resp.u.get_radio.short_gi;
 				radio.bandwidth = resp.u.get_radio.bandwidth;
 				radio.mcs       = resp.u.get_radio.mcs_index;
@@ -814,6 +1203,11 @@ int main(int argc, char **argv)
 				radio.phy_mbps  = phy_mbps(radio.mcs, radio.bandwidth,
 				                           radio.short_gi, radio.vht_mode,
 				                           radio.vht_nss);
+				/* Seed scaler with current on-air MCS on first sync. */
+				if (cfg.mcs_enable && scaler.last_change_us == 0) {
+					scaler.mcs = radio.mcs;
+					scaler.last_change_us = now;
+				}
 				LOGV(&cfg, "radio: mcs=%d bw=%d gi=%s vht=%d nss=%d phy=%.1f Mbps",
 				     radio.mcs, radio.bandwidth,
 				     radio.short_gi ? "short" : "long",
@@ -821,6 +1215,25 @@ int main(int argc, char **argv)
 			} else {
 				LOGV(&cfg, "radio: get_radio timed out");
 			}
+
+			/* --- MCS scaler tick (piggybacks on radio poll cadence) --- */
+			if (cfg.mcs_enable && radio.valid) {
+				if (rssi_is_stale(&rssi_src, now, cfg.rssi_silence_s)) {
+					LOGV(&cfg, "mcs: rssi stale (>%.1fs), freezing at mcs=%d",
+					     cfg.rssi_silence_s, scaler.mcs);
+				} else {
+					bool moved = false;
+					int old_mcs = scaler.mcs;
+					int new_mcs = mcs_scaler_tick(&scaler, &cfg,
+					                               rssi_src.ewma_rssi, now, &moved);
+					if (moved) {
+						LOG("mcs: %d -> %d (rssi=%.1f dBm) [DRY-RUN]",
+						    old_mcs, new_mcs, rssi_src.ewma_rssi);
+						/* Patch 1: do not call CMD_SET_RADIO yet — logs only. */
+					}
+				}
+			}
+
 			next_radio_us = now + (uint64_t)(cfg.radio_poll_s * 1e6);
 		}
 
@@ -901,6 +1314,7 @@ int main(int argc, char **argv)
 	}
 
 	close(sfd);
+	rssi_close(&rssi_src);
 	LOG("stopped after %u FEC updates", ctrl.update_count);
 	return 0;
 }
