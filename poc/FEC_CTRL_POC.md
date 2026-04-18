@@ -104,13 +104,75 @@ Initial subscribe + radio discovery, then on every committed FEC change:
 [fec] clamp bitrate 12000 -> 8914 kbps (phy=26.0 Mbps, k/n=4/7, safety=0.60)
 ```
 
+## MCS scaler (opt-in)
+
+RSSI-driven MCS ladder that chooses a conservative-ish MCS based on a
+wfb_rx-formatted text stream. Off by default — enable with
+`--mcs-enable --rssi-stream PATH`.
+
+```
+--mcs-enable                # explicit opt-in
+--mcs-min N / --mcs-max N   # ladder floor/ceiling (defaults 1..3)
+--rssi-stream PATH          # file/FIFO/stdin to tail
+--rssi-silence F            # stale threshold (default 1.5 s)
+--mcs-climb F               # climb dwell (default 2.0 s)
+--mcs-drop F                # drop dwell  (default 0.3 s)
+--mcs-cooldown F            # min seconds between moves (default 3.0)
+--boost-s F                 # post-drop FEC-parity boost (default 3.0)
+--boost-mult F              # parity multiplier during boost (default 1.3)
+```
+
+**Expected input format** (mirrors `wfb_rx -x` stdout):
+
+```
+34001586    RX_ANT    5745:5:20    1    1082:-30:-28:-28:24:31:34
+ts_ms       tag       freq:mcs:bw  ant  pkts:rmin:ravg:rmax:smin:savg:smax
+```
+
+We take the `ravg` field, aggregate the **max** across antennas within a
+250 ms window, and EWMA it (α=0.3). The ladder (HT20, LGI, single-stream)
+has climb and drop thresholds with a ~4 dB hysteresis band, from MCS 0
+(−200, unreachable) through MCS 7 (−58 climb / −62 drop).
+
+On an MCS drop, the controller arms a **parity boost**: for the next
+`--boost-s` seconds it inflates the FEC parity (`n-k`) by `--boost-mult`
+and force-emits `CMD_SET_FEC` past the normal hysteresis/cooldown, so
+redundancy rises temporarily while goodput shrinks. On expiry it forces
+one more emission to restore natural parity.
+
+### Heartbeat
+
+Every 5 s the controller logs one `hb:` line (always on, not behind
+`-v`):
+
+```
+[fec] hb: k=15 n=25 avg=14.9kB fps=59.9 phy=39.0Mbps upd=9 rssi=-77.3 mcs=4 BOOST
+```
+
+`BOOST` is shown only while the parity-boost window is active. `rssi` /
+`mcs` fields appear only when the scaler is enabled.
+
 ## Out of scope
 
-- RSSI-driven MCS scaler (future: read per-link `wfb_rx` stats or driver
-  signal/noise, then choose a higher/lower MCS via `CMD_SET_RADIO`).
+- RSSI transport — the POC reads a raw wfb_rx text stream; the actual
+  wire that gets RSSI from the ground station to the vehicle is *your*
+  existing wfb-ng setup (see "RSSI source" note below).
 - Persisting state across restarts.
 - Multiple streams.
 - TLS / auth on the venc HTTP API.
+
+### RSSI source note
+
+The scaler needs RSSI measured at the video **receiver** (ground
+station). The vehicle has no local access to that data; it must be
+shipped in. The POC is agnostic to how — it just tails a file, FIFO, or
+stdin. Typical wiring options:
+
+- **SSH pipe from ground**: `ssh root@star6e '/tmp/fec_controller … --rssi-stream -' < <(wfb_rx … 2>/dev/null)`
+- **FIFO fed by a separate shipper** that parses ground wfb_rx stdout
+  and forwards RX_ANT lines over a wfb-ng uplink wfb_tx channel.
+- **File tail** if an existing wfb-ng agent already writes RX_ANT lines
+  to a log file on the vehicle.
 
 ## Known gotchas
 

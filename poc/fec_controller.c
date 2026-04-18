@@ -333,6 +333,10 @@ typedef struct {
 	bool      have_current;
 	uint64_t  last_update_us;
 	uint32_t  update_count;
+	/* Post-MCS-drop parity boost: while now < boost_until_us, parity
+	 * (n-k) is multiplied by cfg.boost_mult and the update is force-emitted
+	 * past the usual hysteresis/cooldown gates. Zero = no active boost. */
+	uint64_t  boost_until_us;
 } Controller;
 
 /* Returns true if caller should emit the new params. */
@@ -359,9 +363,37 @@ static bool controller_update(Controller *c, const Config *cfg,
 
 	FecParams cand = fec_compute(c->avg_frame_size, headroom, cfg);
 
+	/* Post-MCS-drop boost: inflate parity so the committed n is higher.
+	 * Detect the boost-expiry edge so we can force one emission to restore
+	 * the natural parity instead of leaving n pinned until k next changes. */
+	bool boost_active = (c->boost_until_us != 0 && now < c->boost_until_us);
+	bool boost_expired_now = (c->boost_until_us != 0 && !boost_active);
+	if (boost_expired_now) c->boost_until_us = 0;
+	if (boost_active) {
+		int parity = cand.n - cand.k;
+		if (parity < 1) parity = 1;
+		int boosted = cand.k + (int)ceilf((float)parity * cfg->boost_mult);
+		if (boosted > cfg->max_n) boosted = cfg->max_n;
+		if (boosted <= cand.k)    boosted = cand.k + 1;
+		cand.n = boosted;
+		/* Recompute observed redundancy from the new (k, n). */
+		cand.redundancy = 1.0f - (float)cand.k / (float)cand.n;
+	}
+
 	if (!c->have_current) {
 		c->current = cand;
 		c->have_current = true;
+		c->last_update_us = now;
+		c->update_count++;
+		*out = cand;
+		return true;
+	}
+
+	/* Boost force-emits on every tick so parity tracks the current k.
+	 * Same force-emit when boost just expired — restores natural parity. */
+	if (boost_active || boost_expired_now) {
+		if (cand.k == c->current.k && cand.n == c->current.n) return false;
+		c->current = cand;
 		c->last_update_us = now;
 		c->update_count++;
 		*out = cand;
@@ -476,9 +508,6 @@ static int wfb_send_set_fec(const Config *cfg, int k, int n)
 /* CMD_SET_RADIO: change mcs/bw/gi/stbc/ldpc/vht_nss on the running wfb_tx.
  * Preserves stbc/ldpc/bw/vht_mode/vht_nss from the current radio state —
  * the scaler only moves mcs_index and (optionally) short_gi. */
-static int wfb_send_set_radio(const Config *cfg, int mcs, int short_gi,
-                              int bandwidth, int stbc, int ldpc,
-                              int vht_mode, int vht_nss) __attribute__((unused));
 static int wfb_send_set_radio(const Config *cfg, int mcs, int short_gi,
                               int bandwidth, int stbc, int ldpc,
                               int vht_mode, int vht_nss)
@@ -1141,6 +1170,7 @@ int main(int argc, char **argv)
 	uint64_t next_subscribe_us = 0;
 	uint64_t next_radio_us     = 0;
 	uint64_t next_bitrate_us   = 0;
+	uint64_t next_heartbeat_us = 0;
 
 	/* Last known radio state (for reporting + link budget). */
 	struct {
@@ -1188,6 +1218,28 @@ int main(int argc, char **argv)
 		if (rssi_src.fd >= 0)
 			rssi_poll(&rssi_src, now, cfg.rssi_ewma_alpha);
 
+		/* --- 5 s heartbeat (always on) --- */
+		if (now >= next_heartbeat_us) {
+			if (ctrl.have_current && radio.valid) {
+				int k = ctrl.current.k, n = ctrl.current.n;
+				float fps_hz = fps_get(&fps);
+				bool boost = (ctrl.boost_until_us != 0 && now < ctrl.boost_until_us);
+				char rssi_buf[32];
+				if (cfg.mcs_enable && rssi_src.have_ewma)
+					snprintf(rssi_buf, sizeof(rssi_buf),
+					         " rssi=%.1f mcs=%d",
+					         rssi_src.ewma_rssi, scaler.mcs);
+				else
+					rssi_buf[0] = '\0';
+				LOG("hb: k=%d n=%d avg=%.1fkB fps=%.1f phy=%.1fMbps upd=%u%s%s",
+				    k, n,
+				    ctrl.avg_frame_size / 1024.0f, fps_hz, radio.phy_mbps,
+				    ctrl.update_count, rssi_buf,
+				    boost ? " BOOST" : "");
+			}
+			next_heartbeat_us = now + 5000000ULL;
+		}
+
 		/* --- Poll radio params --- */
 		if (now >= next_radio_us) {
 			CmdResp resp;
@@ -1227,9 +1279,23 @@ int main(int argc, char **argv)
 					int new_mcs = mcs_scaler_tick(&scaler, &cfg,
 					                               rssi_src.ewma_rssi, now, &moved);
 					if (moved) {
-						LOG("mcs: %d -> %d (rssi=%.1f dBm) [DRY-RUN]",
-						    old_mcs, new_mcs, rssi_src.ewma_rssi);
-						/* Patch 1: do not call CMD_SET_RADIO yet — logs only. */
+						bool is_drop = (new_mcs < old_mcs);
+						LOG("mcs: %d -> %d (rssi=%.1f dBm) %s%s",
+						    old_mcs, new_mcs, rssi_src.ewma_rssi,
+						    is_drop ? "DROP" : "CLIMB",
+						    cfg.dry_run ? " [DRY-RUN]" : "");
+						if (!cfg.dry_run) {
+							if (wfb_send_set_radio(&cfg, new_mcs,
+							                       radio.short_gi, radio.bandwidth,
+							                       radio.stbc, radio.ldpc,
+							                       radio.vht_mode, radio.vht_nss) != 0)
+								LOG("mcs: set_radio send failed");
+						}
+						if (is_drop && cfg.boost_s > 0.0f) {
+							ctrl.boost_until_us = now + (uint64_t)(cfg.boost_s * 1e6f);
+							LOG("fec: parity boost armed for %.1fs (mult=%.2f)",
+							    cfg.boost_s, cfg.boost_mult);
+						}
 					}
 				}
 			}
