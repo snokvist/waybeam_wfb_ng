@@ -664,6 +664,12 @@ typedef struct {
 	float    ewma_rssi;          /* dBm; 0 = unset */
 	uint64_t last_update_us;
 	bool     have_ewma;
+
+	/* Stats (for troubleshooting / heartbeat). */
+	uint64_t pkts_total;         /* RX_ANT lines successfully parsed */
+	uint64_t bytes_total;        /* total bytes recv'd (UDP) or read (stream) */
+	uint64_t first_pkt_us;       /* 0 until we see the first valid line */
+	char     first_peer[48];     /* UDP only: "ip:port" of first peer */
 } RssiSource;
 
 static int rssi_open(RssiSource *s, const char *path)
@@ -761,6 +767,10 @@ static int rssi_parse_line(RssiSource *s, const char *line, uint64_t now,
 
 	int rssi_avg = (int)fields[2];   /* negative dBm */
 
+	/* Stats */
+	s->pkts_total++;
+	if (s->first_pkt_us == 0) s->first_pkt_us = now;
+
 	/* Aggregate over a 250 ms window: keep best (least negative). */
 	if (!s->window_have_rssi || s->window_start_us == 0) {
 		s->window_start_us = now;
@@ -822,11 +832,26 @@ static void rssi_poll(RssiSource *s, uint64_t now, float alpha)
 	if (s->kind == RSSI_SRC_UDP) {
 		/* Datagram mode: each recv is one or more complete lines. */
 		char pkt[2048];
+		struct sockaddr_in peer;
+		socklen_t pl;
 		for (;;) {
-			ssize_t n = recv(s->fd, pkt, sizeof(pkt) - 1, 0);
+			pl = sizeof(peer);
+			ssize_t n = recvfrom(s->fd, pkt, sizeof(pkt) - 1, 0,
+			                     (struct sockaddr *)&peer, &pl);
 			if (n <= 0) break;
+			s->bytes_total += (uint64_t)n;
 			pkt[n] = '\0';
+			uint64_t pkts_before = s->pkts_total;
 			rssi_feed_block(s, pkt, (size_t)n, now, alpha);
+			if (s->pkts_total > pkts_before && s->first_peer[0] == '\0') {
+				char ip[INET_ADDRSTRLEN];
+				inet_ntop(AF_INET, &peer.sin_addr, ip, sizeof(ip));
+				snprintf(s->first_peer, sizeof(s->first_peer),
+				         "%s:%u", ip, (unsigned)ntohs(peer.sin_port));
+				fprintf(stderr,
+				        "[fec t=%8.3f] rssi: first packet from %s (%zd bytes)\n",
+				        log_rel_s(), s->first_peer, n);
+			}
 		}
 		return;
 	}
@@ -845,17 +870,25 @@ static void rssi_poll(RssiSource *s, uint64_t now, float alpha)
 			break;   /* unreachable; silences fortify */
 		ssize_t n = read(s->fd, &s->buf[s->buf_len], want);
 		if (n <= 0) break;
+		s->bytes_total += (uint64_t)n;
 		s->buf_len += (size_t)n;
 		s->buf[s->buf_len] = '\0';
 
 		/* Split on '\n' and parse each complete line. */
 		char *start = s->buf;
+		uint64_t pkts_before = s->pkts_total;
 		for (;;) {
 			char *nl = memchr(start, '\n', s->buf_len - (size_t)(start - s->buf));
 			if (!nl) break;
 			*nl = '\0';
 			(void)rssi_parse_line(s, start, now, alpha);
 			start = nl + 1;
+		}
+		if (s->pkts_total > pkts_before && s->first_peer[0] == '\0') {
+			snprintf(s->first_peer, sizeof(s->first_peer), "(stream)");
+			fprintf(stderr,
+			        "[fec t=%8.3f] rssi: first RX_ANT line parsed from stream\n",
+			        log_rel_s());
 		}
 		/* Shift the residual partial line to the front. */
 		size_t used = (size_t)(start - s->buf);
@@ -1299,32 +1332,49 @@ int main(int argc, char **argv)
 	memset(&rssi_src, 0, sizeof(rssi_src));
 	rssi_src.fd = -1;
 
-	if (cfg.mcs_enable) {
-		if (cfg.rssi_stream[0] == '\0' && cfg.rssi_udp_port == 0) {
-			LOG("mcs: --mcs-enable requires --rssi-stream or --rssi-udp; disabling scaler");
-			cfg.mcs_enable = false;
-		} else if (cfg.rssi_stream[0] != '\0' && cfg.rssi_udp_port != 0) {
-			LOG("mcs: --rssi-stream and --rssi-udp are mutually exclusive; disabling scaler");
-			cfg.mcs_enable = false;
-		} else if (cfg.rssi_udp_port != 0) {
-			if (rssi_open_udp(&rssi_src, cfg.rssi_udp_port) != 0) {
-				LOG("mcs: rssi-udp bind failed on :%u (%s); disabling scaler",
-				    cfg.rssi_udp_port, strerror(errno));
-				cfg.mcs_enable = false;
-			} else {
-				LOG("mcs: scaler enabled, ladder=[%d..%d] rssi=udp:%u",
-				    cfg.mcs_min, cfg.mcs_max, cfg.rssi_udp_port);
-			}
+	/* Open the RSSI source if requested. Source and scaler are independent:
+	 * a source can be open (heartbeat shows rssi + rx stats) without the
+	 * scaler acting on it. The scaler itself is gated behind --mcs-enable. */
+	bool src_requested = (cfg.rssi_stream[0] != '\0') || (cfg.rssi_udp_port != 0);
+	bool src_both_set  = (cfg.rssi_stream[0] != '\0') && (cfg.rssi_udp_port != 0);
+
+	if (src_both_set) {
+		LOG("rssi: --rssi-stream and --rssi-udp are mutually exclusive; ignoring both");
+		cfg.rssi_stream[0] = '\0';
+		cfg.rssi_udp_port = 0;
+		src_requested = false;
+	}
+
+	if (src_requested && cfg.rssi_udp_port != 0) {
+		if (rssi_open_udp(&rssi_src, cfg.rssi_udp_port) != 0) {
+			LOG("rssi: UDP bind failed on :%u (%s); source disabled",
+			    cfg.rssi_udp_port, strerror(errno));
 		} else {
-			if (rssi_open(&rssi_src, cfg.rssi_stream) != 0) {
-				LOG("mcs: rssi-stream open failed: %s (%s); disabling scaler",
-				    cfg.rssi_stream, strerror(errno));
-				cfg.mcs_enable = false;
-			} else {
-				LOG("mcs: scaler enabled, ladder=[%d..%d] rssi=%s",
-				    cfg.mcs_min, cfg.mcs_max, cfg.rssi_stream);
-			}
+			LOG("rssi: listening on udp:%u (awaiting first RX_ANT packet)",
+			    cfg.rssi_udp_port);
 		}
+	} else if (src_requested) {
+		if (rssi_open(&rssi_src, cfg.rssi_stream) != 0) {
+			LOG("rssi: stream open failed: %s (%s); source disabled",
+			    cfg.rssi_stream, strerror(errno));
+		} else {
+			LOG("rssi: tailing %s", cfg.rssi_stream);
+		}
+	}
+
+	if (cfg.mcs_enable) {
+		if (!src_requested) {
+			LOG("mcs: --mcs-enable requires --rssi-stream or --rssi-udp; scaler disabled");
+			cfg.mcs_enable = false;
+		} else if (rssi_src.fd < 0) {
+			LOG("mcs: RSSI source failed to open; scaler disabled");
+			cfg.mcs_enable = false;
+		} else {
+			LOG("mcs: scaler enabled, ladder=[%d..%d]",
+			    cfg.mcs_min, cfg.mcs_max);
+		}
+	} else if (src_requested && rssi_src.fd >= 0) {
+		LOG("rssi: source active but --mcs-enable not set; scaler will NOT adjust MCS");
 	}
 
 	while (!g_stop) {
@@ -1352,13 +1402,34 @@ int main(int argc, char **argv)
 				int k = ctrl.current.k, n = ctrl.current.n;
 				float fps_hz = fps_get(&fps);
 				bool boost = (ctrl.boost_until_us != 0 && now < ctrl.boost_until_us);
-				char rssi_buf[32];
-				if (cfg.mcs_enable && rssi_src.have_ewma)
-					snprintf(rssi_buf, sizeof(rssi_buf),
-					         " rssi=%.1f mcs=%d",
-					         rssi_src.ewma_rssi, scaler.mcs);
-				else
+
+				/* RSSI chunk: show whenever a source is configured, not just
+				 * when the scaler is enabled — so the user can see whether
+				 * feedback is arriving at all. */
+				char rssi_buf[96];
+				if (rssi_src.fd >= 0) {
+					static uint64_t hb_prev_pkts = 0;
+					uint64_t delta = rssi_src.pkts_total - hb_prev_pkts;
+					hb_prev_pkts = rssi_src.pkts_total;
+					char mcs_part[16] = "";
+					if (cfg.mcs_enable)
+						snprintf(mcs_part, sizeof(mcs_part), " mcs=%d", scaler.mcs);
+					if (rssi_src.have_ewma) {
+						snprintf(rssi_buf, sizeof(rssi_buf),
+						         " rssi=%.1f%s rx=%llu(+%llu/5s)",
+						         rssi_src.ewma_rssi, mcs_part,
+						         (unsigned long long)rssi_src.pkts_total,
+						         (unsigned long long)delta);
+					} else {
+						snprintf(rssi_buf, sizeof(rssi_buf),
+						         " rssi=(none)%s rx=%llu(+%llu/5s)",
+						         mcs_part,
+						         (unsigned long long)rssi_src.pkts_total,
+						         (unsigned long long)delta);
+					}
+				} else {
 					rssi_buf[0] = '\0';
+				}
 				LOG("hb: k=%d n=%d avg=%.1fkB fps=%.1f phy=%.1fMbps upd=%u%s%s",
 				    k, n,
 				    ctrl.avg_frame_size / 1024.0f, fps_hz, radio.phy_mbps,
