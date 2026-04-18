@@ -167,11 +167,9 @@ typedef struct {
 	float    headroom_margin;
 	float    headroom_window_s;
 
-	/* Gating */
+	/* Gating — up-moves only (k-down is MCS-triggered, not content-triggered) */
 	int      k_hyst_up;
-	int      k_hyst_down;
 	float    cooldown_up_s;
-	float    cooldown_down_s;
 	float    startup_grace_s;        /* suppress emits for the first N sec */
 
 	/* Link budget */
@@ -202,7 +200,7 @@ typedef struct {
 	char     rssi_stream[256];   /* "" = disabled; text stream */
 	uint16_t rssi_udp_port;      /* 0 = disabled; UDP listener */
 	float    rssi_silence_s;
-	float    rssi_fallback_s;    /* age before falling back (default 5.0) */
+	float    rssi_fallback_s;    /* age before falling back (default 10.0) */
 	int      rssi_fallback_mcs;  /* target MCS during fallback (-1 = mcs_min) */
 	float    rssi_ewma_alpha;
 	float    mcs_climb_s;
@@ -395,6 +393,26 @@ static void controller_arm_settle(Controller *c, uint64_t now, float secs)
 		c->bitrate_grace_until_us = new_end;
 }
 
+/* Commit a candidate as the new current params. All emit paths in
+ * controller_update() funnel through here. Returns true (caller uses the
+ * return value to forward to the outer caller). */
+static bool controller_commit(Controller *c, const FecParams *cand,
+                              uint64_t now, FecParams *out)
+{
+	c->current = *cand;
+	c->last_update_us = now;
+	c->update_count++;
+	*out = *cand;
+	return true;
+}
+
+/* Arm the post-MCS-drop parity boost; caller still logs its own reason. */
+static void controller_arm_boost(Controller *c, const Config *cfg, uint64_t now)
+{
+	if (cfg->boost_s > 0.0f)
+		c->boost_until_us = now + (uint64_t)(cfg->boost_s * 1e6f);
+}
+
 /* Returns true if caller should emit the new params. */
 static bool controller_update(Controller *c, const Config *cfg,
                               uint32_t frame_size, HeadroomRing *ring,
@@ -462,67 +480,45 @@ static bool controller_update(Controller *c, const Config *cfg,
 	bool settle_just_ended = c->was_in_grace && !in_settle_grace;
 	c->was_in_grace = in_settle_grace;
 
+	/* First commit: held off through startup grace, then emitted when the
+	 * EWMA has had a couple of seconds to settle. */
 	if (!c->have_current) {
-		if (in_grace) {
-			/* Suppress even the first commit during grace. Caller keeps
-			 * ticking; we'll commit when grace ends with settled params. */
-			return false;
-		}
-		c->current = cand;
+		if (in_grace) return false;
 		c->have_current = true;
-		c->last_update_us = now;
-		c->update_count++;
-		*out = cand;
-		return true;
+		return controller_commit(c, &cand, now, out);
 	}
 
-	/* Edge-triggered force emit: once on boost entry (inflate) and once on
-	 * boost expiry (restore natural parity). During the boost window we
-	 * fall through to the normal gating below. */
+	/* Boost edges (entry / expiry): commit exactly once in either case,
+	 * so inflated parity lands on entry and natural parity restores on
+	 * expiry. Idempotent on (k,n) — no-op if nothing actually changed. */
 	if (boost_entry || boost_expired_now) {
 		if (cand.k == c->current.k && cand.n == c->current.n) return false;
-		c->current = cand;
-		c->last_update_us = now;
-		c->update_count++;
-		*out = cand;
-		return true;
+		return controller_commit(c, &cand, now, out);
 	}
 
-	/* Non-boost path: during grace we suppress every non-edge emit so the
-	 * EWMA can settle without hammering wfb_tx. */
+	/* In any settling window (startup or post-MCS/bitrate), suppress
+	 * every non-edge emit so the EWMA can converge without us hammering
+	 * wfb_tx. */
 	if (in_grace) return false;
 
-	/* Settle-just-ended: commit once, regardless of direction. Used to
-	 * push the post-MCS-change k to its new steady-state value. */
+	/* Settle-just-ended edge: fire one commit (either direction allowed)
+	 * so the post-MCS-change k reflects the new steady state. This is
+	 * the ONLY path outside of boost/fallback where k can go down. */
 	if (settle_just_ended) {
 		if (cand.k == c->current.k && cand.n == c->current.n) return false;
-		c->current = cand;
-		c->last_update_us = now;
-		c->update_count++;
-		*out = cand;
-		return true;
+		return controller_commit(c, &cand, now, out);
 	}
 
+	/* Normal up-path: up-moves pass hysteresis + cooldown gating; down-
+	 * moves are not content-triggered (see the up-only rationale in the
+	 * scaler tick comment above). */
 	int k_delta = cand.k - c->current.k;
+	if (k_delta <= 0) return false;
+	if (k_delta < cfg->k_hyst_up) return false;
 	float elapsed = (float)(now - c->last_update_us) / 1e6f;
+	if (elapsed < cfg->cooldown_up_s) return false;
 
-	if (k_delta > 0) {
-		if (k_delta < cfg->k_hyst_up) return false;
-		if (elapsed < cfg->cooldown_up_s) return false;
-	} else {
-		/* Down-moves are NOT allowed from content/EWMA drift. Only MCS
-		 * changes (via the settle-just-ended edge) or fallbacks can
-		 * move k down. This prevents steady-state oscillation — the
-		 * cost is a slightly over-engineered k on easy content, which
-		 * is cheaper than re-keying the session repeatedly. */
-		return false;
-	}
-
-	c->current = cand;
-	c->last_update_us = now;
-	c->update_count++;
-	*out = cand;
-	return true;
+	return controller_commit(c, &cand, now, out);
 }
 
 /* ── FPS estimator ───────────────────────────────────────────────────── */
@@ -685,6 +681,12 @@ static const float VHT_20L_EXT[10] = {
 	78.0f, 86.7f   /* MCS9 officially N/A at BW20 NSS1 — kept for robustness */
 };
 
+typedef struct {
+	bool  valid;
+	int   short_gi, bandwidth, mcs, vht_mode, vht_nss, stbc, ldpc;
+	float phy_mbps;
+} RadioState;
+
 static float phy_mbps(int mcs, int bw_mhz, int short_gi,
                       int vht_mode, int vht_nss)
 {
@@ -710,6 +712,18 @@ static float phy_mbps(int mcs, int bw_mhz, int short_gi,
 	int nss = (vht_mode && vht_nss > 0) ? vht_nss : 1;
 
 	return base * bw_scale * gi_scale * (float)nss;
+}
+
+/* Refresh the local radio snapshot after an MCS write, so the same-tick
+ * bitrate calculation sees the new phy_mbps instead of the stale pre-move
+ * value. Shared by the four MCS-change sites (snap-in, fallback entry,
+ * recovery, normal climb/drop); each caller still invokes wfb_send_set_radio
+ * itself with its own reason-specific log. */
+static void radio_update_local(RadioState *r, int new_mcs)
+{
+	r->mcs = new_mcs;
+	r->phy_mbps = phy_mbps(r->mcs, r->bandwidth, r->short_gi,
+	                       r->vht_mode, r->vht_nss);
 }
 
 /* ── RSSI source (tail wfb_rx text output) ───────────────────────────── */
@@ -1247,13 +1261,13 @@ static void usage(const char *prog)
 		"  --min-k N            min k (default 1)\n"
 		"  --max-k N            max k (default 48)\n"
 		"  --k-hyst-up N        min Δk to trigger an up-move (default 2)\n"
-		"  --k-hyst-down N      min Δk to trigger a down-move (default 3)\n"
 		"  --cooldown-up F      min seconds between up-moves (default 1.0)\n"
-		"  --cooldown-down F    min seconds between down-moves (default 2.0)\n"
 		"  --startup-grace F    suppress emits for first F seconds (default 2.0)\n"
+		"                       (k-down is not content-triggered; only MCS\n"
+		"                        drops and fallbacks can lower k)\n"
 		"\n"
 		"Link budget:\n"
-		"  --safety F           fraction of PHY rate usable (default 0.6)\n"
+		"  --safety F           fraction of PHY rate usable (default 0.5)\n"
 		"  --bitrate-min N      bitrate floor in kbps (default 1000)\n"
 		"  --bitrate-max N      bitrate ceiling in kbps (default 0 = unlimited)\n"
 		"  --bitrate-tol F      bitrate re-apply tolerance (default 0.15 = 15%%)\n"
@@ -1273,7 +1287,7 @@ static void usage(const char *prog)
 		"                       (from poc/ground_rssi_forwarder.py over a\n"
 		"                       wfb_rx uplink)\n"
 		"  --rssi-silence F     stale-RSSI threshold, seconds (default 1.5)\n"
-		"  --rssi-fallback-s F  age before snapping to fallback MCS (default 5.0)\n"
+		"  --rssi-fallback-s F  age before snapping to fallback MCS (default 10.0)\n"
 		"  --fallback-mcs N     fallback MCS on prolonged RSSI loss\n"
 		"                       (default -1 = use mcs_min; 0 = most robust)\n"
 		"  --mcs-climb F        dwell seconds required to climb (default 2.0)\n"
@@ -1326,9 +1340,7 @@ static void config_defaults(Config *c)
 	c->headroom_window_s = 2.5f;
 
 	c->k_hyst_up = 2;                /* require Δk≥2 to emit an up-move */
-	c->k_hyst_down = 3;
 	c->cooldown_up_s = 1.0f;         /* at most one up-move per second */
-	c->cooldown_down_s = 2.0f;
 	c->startup_grace_s = 2.0f;
 
 	c->safety_margin = 0.5f;         /* leave 50% airtime for uplink + headroom */
@@ -1372,8 +1384,7 @@ int main(int argc, char **argv)
 
 	enum {
 		OPT_SIDECAR = 256, OPT_WFB, OPT_VENC, OPT_MTU, OPT_MINK, OPT_MAXK,
-		OPT_K_HYST_UP, OPT_K_HYST_DOWN, OPT_COOLDOWN_UP, OPT_COOLDOWN_DOWN,
-		OPT_STARTUP_GRACE,
+		OPT_K_HYST_UP, OPT_COOLDOWN_UP, OPT_STARTUP_GRACE,
 		OPT_SAFETY, OPT_BITRATE_MIN, OPT_BITRATE_MAX,
 		OPT_BITRATE_DESIRED, /* deprecated alias for --bitrate-max */
 		OPT_BITRATE_TOL, OPT_BITRATE_GRACE, OPT_MCS_SETTLE, OPT_DRY_RUN,
@@ -1391,9 +1402,7 @@ int main(int argc, char **argv)
 		{"min-k",         required_argument, 0, OPT_MINK},
 		{"max-k",         required_argument, 0, OPT_MAXK},
 		{"k-hyst-up",     required_argument, 0, OPT_K_HYST_UP},
-		{"k-hyst-down",   required_argument, 0, OPT_K_HYST_DOWN},
 		{"cooldown-up",   required_argument, 0, OPT_COOLDOWN_UP},
-		{"cooldown-down", required_argument, 0, OPT_COOLDOWN_DOWN},
 		{"startup-grace", required_argument, 0, OPT_STARTUP_GRACE},
 		{"safety",        required_argument, 0, OPT_SAFETY},
 		{"bitrate-min",   required_argument, 0, OPT_BITRATE_MIN},
@@ -1447,9 +1456,7 @@ int main(int argc, char **argv)
 		case OPT_MINK:          cfg.min_k           = atoi(optarg); break;
 		case OPT_MAXK:          cfg.max_k           = atoi(optarg); break;
 		case OPT_K_HYST_UP:     cfg.k_hyst_up       = atoi(optarg); break;
-		case OPT_K_HYST_DOWN:   cfg.k_hyst_down     = atoi(optarg); break;
 		case OPT_COOLDOWN_UP:   cfg.cooldown_up_s   = (float)atof(optarg); break;
-		case OPT_COOLDOWN_DOWN: cfg.cooldown_down_s = (float)atof(optarg); break;
 		case OPT_STARTUP_GRACE: cfg.startup_grace_s = (float)atof(optarg); break;
 		case OPT_SAFETY:        cfg.safety_margin   = (float)atof(optarg); break;
 		case OPT_BITRATE_MIN:   cfg.bitrate_min_kbps = atol(optarg); break;
@@ -1523,11 +1530,7 @@ int main(int argc, char **argv)
 	uint64_t next_heartbeat_us = 0;
 
 	/* Last known radio state (for reporting + link budget). */
-	struct {
-		bool valid;
-		int  short_gi, bandwidth, mcs, vht_mode, vht_nss, stbc, ldpc;
-		float phy_mbps;
-	} radio = {0};
+	RadioState radio = {0};
 
 	/* MCS scaler + RSSI source (enabled via --mcs-enable + --rssi-stream). */
 	MCSScaler scaler = {0};
@@ -1690,14 +1693,7 @@ int main(int argc, char **argv)
 								LOG("mcs: snap SET_RADIO failed");
 						}
 						scaler.mcs = target;
-						/* Update local radio state so the downstream bitrate
-						 * poll in this same tick sees the post-snap phy_mbps
-						 * instead of the stale pre-snap value (which would
-						 * otherwise cause a one-tick bitrate overshoot). */
-						radio.mcs = target;
-						radio.phy_mbps = phy_mbps(radio.mcs, radio.bandwidth,
-						                          radio.short_gi, radio.vht_mode,
-						                          radio.vht_nss);
+						radio_update_local(&radio, target);
 						controller_arm_settle(&ctrl, now, cfg.mcs_settle_s);
 					}
 				}
@@ -1743,20 +1739,16 @@ int main(int argc, char **argv)
 						                       radio.vht_mode, radio.vht_nss) != 0)
 							LOG("mcs: fallback set_radio failed");
 					}
-					radio.mcs = fb_mcs;
-					radio.phy_mbps = phy_mbps(radio.mcs, radio.bandwidth,
-					                          radio.short_gi, radio.vht_mode,
-					                          radio.vht_nss);
+					radio_update_local(&radio, fb_mcs);
 					scaler.mcs = fb_mcs;
 					scaler.in_fallback = true;
 					scaler.last_change_us = now;
 					scaler.have_pending = false;
 					controller_arm_settle(&ctrl, now, cfg.mcs_settle_s);
-					if (cfg.boost_s > 0.0f) {
-						ctrl.boost_until_us = now + (uint64_t)(cfg.boost_s * 1e6f);
+					controller_arm_boost(&ctrl, &cfg, now);
+					if (cfg.boost_s > 0.0f)
 						LOG("fec: parity boost armed for %.1fs (mult=%.2f) [fallback]",
 						    cfg.boost_s, cfg.boost_mult);
-					}
 				} else if (!stale && scaler.in_fallback) {
 					/* Transition OUT of fallback — RSSI returned. Bring
 					 * radio back to mcs_min so the ladder can climb from
@@ -1770,10 +1762,7 @@ int main(int argc, char **argv)
 						                       radio.vht_mode, radio.vht_nss) != 0)
 							LOG("mcs: recovery set_radio failed");
 					}
-					radio.mcs = cfg.mcs_min;
-					radio.phy_mbps = phy_mbps(radio.mcs, radio.bandwidth,
-					                          radio.short_gi, radio.vht_mode,
-					                          radio.vht_nss);
+					radio_update_local(&radio, cfg.mcs_min);
 					scaler.mcs = cfg.mcs_min;
 					scaler.in_fallback = false;
 					scaler.last_change_us = now;
@@ -1805,17 +1794,13 @@ int main(int argc, char **argv)
 							                       radio.vht_mode, radio.vht_nss) != 0)
 								LOG("mcs: set_radio send failed");
 						}
-						/* Refresh local radio state so the same-tick bitrate
-						 * poll sees the post-move phy_mbps, not the stale one. */
-						radio.mcs = new_mcs;
-						radio.phy_mbps = phy_mbps(radio.mcs, radio.bandwidth,
-						                          radio.short_gi, radio.vht_mode,
-						                          radio.vht_nss);
+						radio_update_local(&radio, new_mcs);
 						controller_arm_settle(&ctrl, now, cfg.mcs_settle_s);
-						if (is_drop && cfg.boost_s > 0.0f) {
-							ctrl.boost_until_us = now + (uint64_t)(cfg.boost_s * 1e6f);
-							LOG("fec: parity boost armed for %.1fs (mult=%.2f)",
-							    cfg.boost_s, cfg.boost_mult);
+						if (is_drop) {
+							controller_arm_boost(&ctrl, &cfg, now);
+							if (cfg.boost_s > 0.0f)
+								LOG("fec: parity boost armed for %.1fs (mult=%.2f)",
+								    cfg.boost_s, cfg.boost_mult);
 						}
 					}
 				}
