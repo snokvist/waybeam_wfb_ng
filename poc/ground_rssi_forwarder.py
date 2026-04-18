@@ -138,8 +138,15 @@ def main():
     ap.add_argument(
         "--throttle-hz",
         type=float,
-        default=4.0,
-        help="max RX_ANT lines forwarded per second (0 disables; default 4)",
+        default=10.0,
+        help=(
+            "max RX_ANT lines forwarded per second (0 disables; default 10). "
+            "Higher rates give UDP packet loss more redundancy: with 50-75%% "
+            "uplink loss at high video airtime, 4 Hz often leaves the "
+            "receiver below 2 Hz, which the 10 s fallback window can still "
+            "trip. 10 Hz gives roughly 2.5-5 Hz arriving through the same "
+            "loss, which survives brief bursts."
+        ),
     )
     ap.add_argument(
         "--verbose", "-v", action="store_true", help="log each forwarded line"

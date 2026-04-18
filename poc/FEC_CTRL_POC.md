@@ -190,8 +190,18 @@ python3 poc/ground_rssi_forwarder.py \
   --tail /var/log/wfb_rx.log --target 127.0.0.1:5700
 ```
 
-The forwarder throttles to 4 Hz by default (`--throttle-hz 0` to disable)
-and sends each `RX_ANT` line verbatim as one UDP datagram.
+The forwarder throttles to 10 Hz by default (`--throttle-hz 0` to
+disable) and sends each `RX_ANT` line verbatim as one UDP datagram.
+
+**Rate tradeoff.** The uplink shares airtime with the video downlink,
+and when video is at high MCS / high bitrate the uplink can drop 50-75%
+of our RSSI packets before they reach the vehicle. 10 Hz gives us
+enough redundancy that a brief loss burst still leaves ~2-5 Hz
+arriving, which keeps the 10 s fallback timer safe. 4 Hz is often
+too thin under pressure.
+
+For best effect, run `wfb_rx` with `-l 100` (or `-l 200`) so it emits
+RX_ANT lines fast enough for the forwarder to pick from.
 
 ### Vehicle-side RSSI ingest
 
