@@ -190,7 +190,10 @@ def main():
             # Surface wfb_rx "N packets lost" reports so they're visible
             # in the same stream as our own logs. Merge stderr via shell
             # (e.g. `./wfb_rx ... 2>&1 | python3 ...`) for these to reach
-            # us when using the pipe form.
+            # us when using the pipe form. Also forward them to the
+            # vehicle as a "LOST N" line so the fec_controller can log
+            # loss events inline with its FEC/MCS activity, making the
+            # cost of each session restart directly observable.
             m = PACKETS_LOST_RE.match(line)
             if m:
                 n = int(m.group(1))
@@ -201,6 +204,13 @@ def main():
                     log.warning("wfb_rx: %d packets lost (total=%d across %d events)",
                                 n, lost_total, lost_events)
                     last_loss_log = now_mono
+                # Not throttled — packet-loss reports are sparse (1 Hz at
+                # most on wfb_rx's default interval). Forward every one.
+                pkt = ("LOST %d\n" % n).encode("ascii")
+                try:
+                    sock.sendto(pkt, (host, port))
+                except OSError:
+                    pass
                 continue
 
             if RX_ANT_TAG not in line:

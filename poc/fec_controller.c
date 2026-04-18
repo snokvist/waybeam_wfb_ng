@@ -180,10 +180,15 @@ typedef struct {
 	long     bitrate_max_kbps;       /* ceiling; 0 = unlimited (default) */
 	float    bitrate_tolerance;      /* fraction (default 0.15 = 15%) */
 	float    bitrate_grace_s;        /* suppress FEC emits for N s after
-	                                  * any bitrate write; breaks the
-	                                  * bitrate↔framesize↔k cascade by
-	                                  * letting venc settle before we
-	                                  * react to its new output */
+	                                  * a bitrate write; short window to
+	                                  * absorb tiny venc transients */
+	float    mcs_settle_s;           /* suppress FEC emits for N s after
+	                                  * an MCS change; longer than
+	                                  * bitrate_grace_s because an MCS
+	                                  * change roughly doubles bitrate
+	                                  * and the EWMA takes 4-5 s to
+	                                  * fully track the new frame-size
+	                                  * distribution */
 
 	/* Tick intervals */
 	float    subscribe_s;
@@ -368,12 +373,27 @@ typedef struct {
 	 * at per-frame rates. Zero = no active boost. */
 	uint64_t  boost_until_us;
 	bool      was_boosting;
-	/* Post-bitrate-write quiet window: after we move video0.bitrate we
+	/* Post-change quiet window: after we move video0.bitrate (or MCS) we
 	 * give venc a moment to converge before reacting to its new output.
-	 * Without this, bitrate climb → bigger frames → k climbs → bitrate
-	 * climbs again, cascading into many SET_FECs. */
+	 * Armed for bitrate_grace_s on bitrate writes and for mcs_settle_s on
+	 * MCS changes (extended-only, never shortened). Edge-triggered commit
+	 * fires exactly once when the window expires. */
 	uint64_t  bitrate_grace_until_us;
+	bool      was_in_grace;
 } Controller;
+
+/* Arm the "post-change" settling window, extending only (never shortening)
+ * any in-flight window. We do NOT reset the EWMA — its old value is always
+ * closer to the new steady state than zero would be, and zeroing it out
+ * just causes it to re-seed from whichever transitional frame happens to
+ * land first, which empirically extends convergence rather than shortening
+ * it. Letting it drift over the settle window works better. */
+static void controller_arm_settle(Controller *c, uint64_t now, float secs)
+{
+	uint64_t new_end = now + (uint64_t)(secs * 1e6f);
+	if (new_end > c->bitrate_grace_until_us)
+		c->bitrate_grace_until_us = new_end;
+}
 
 /* Returns true if caller should emit the new params. */
 static bool controller_update(Controller *c, const Config *cfg,
@@ -421,16 +441,26 @@ static bool controller_update(Controller *c, const Config *cfg,
 		cand.redundancy = 1.0f - (float)cand.k / (float)cand.n;
 	}
 
-	/* Grace windows during which we suppress non-edge FEC emits:
-	 *   - Startup: let EWMA settle before first commit.
-	 *   - Post-bitrate-write: let venc converge on the new target before
-	 *     we react to its new (bigger/smaller) frames. This breaks the
-	 *     bitrate↔framesize↔k cascade on MCS climbs. */
+	/* Grace windows during which we suppress non-edge FEC emits. The
+	 * bitrate_grace_until_us timestamp is the earliest time we may emit
+	 * again; it's set (extended only, never shortened) by both bitrate
+	 * writes and MCS changes. MCS changes use the longer --mcs-settle-s
+	 * window because the EWMA takes longer to track the big frame-size
+	 * jump caused by a phy-rate change.
+	 *
+	 * Detect the settle-just-ended edge: at that moment we force one
+	 * commit (can go up or down) so the post-MCS-change k reflects the
+	 * new steady state. Outside that edge, k is only allowed to go UP —
+	 * the user's rule: "FEC step-down should generally be what an MCS
+	 * step-down triggers, not what content drift triggers. Slightly
+	 * over-engineered FEC is better than oscillating to chase perfection." */
 	bool in_startup_grace = (now - c->start_us) <
 	                        (uint64_t)(cfg->startup_grace_s * 1e6f);
-	bool in_bitrate_grace = (c->bitrate_grace_until_us != 0 &&
+	bool in_settle_grace  = (c->bitrate_grace_until_us != 0 &&
 	                         now < c->bitrate_grace_until_us);
-	bool in_grace = in_startup_grace || in_bitrate_grace;
+	bool in_grace = in_startup_grace || in_settle_grace;
+	bool settle_just_ended = c->was_in_grace && !in_settle_grace;
+	c->was_in_grace = in_settle_grace;
 
 	if (!c->have_current) {
 		if (in_grace) {
@@ -462,16 +492,29 @@ static bool controller_update(Controller *c, const Config *cfg,
 	 * EWMA can settle without hammering wfb_tx. */
 	if (in_grace) return false;
 
+	/* Settle-just-ended: commit once, regardless of direction. Used to
+	 * push the post-MCS-change k to its new steady-state value. */
+	if (settle_just_ended) {
+		if (cand.k == c->current.k && cand.n == c->current.n) return false;
+		c->current = cand;
+		c->last_update_us = now;
+		c->update_count++;
+		*out = cand;
+		return true;
+	}
+
 	int k_delta = cand.k - c->current.k;
 	float elapsed = (float)(now - c->last_update_us) / 1e6f;
 
 	if (k_delta > 0) {
 		if (k_delta < cfg->k_hyst_up) return false;
 		if (elapsed < cfg->cooldown_up_s) return false;
-	} else if (k_delta < 0) {
-		if (-k_delta < cfg->k_hyst_down) return false;
-		if (elapsed < cfg->cooldown_down_s) return false;
 	} else {
+		/* Down-moves are NOT allowed from content/EWMA drift. Only MCS
+		 * changes (via the settle-just-ended edge) or fallbacks can
+		 * move k down. This prevents steady-state oscillation — the
+		 * cost is a slightly over-engineered k on easy content, which
+		 * is cheaper than re-keying the session repeatedly. */
 		return false;
 	}
 
@@ -780,10 +823,36 @@ static void rssi_close(RssiSource *s)
 	s->kind = RSSI_SRC_NONE;
 }
 
-/* Parse one line. Returns 0 if it was an RX_ANT line we used, -1 otherwise. */
+/* Counter for forwarder-reported packet loss events (incremented by parse). */
+static uint64_t g_wfb_rx_loss_packets = 0;
+static uint64_t g_wfb_rx_loss_events  = 0;
+
+/* Parse one line. Returns 0 if it was a recognized/used line, -1 otherwise. */
 static int rssi_parse_line(RssiSource *s, const char *line, uint64_t now,
                            float alpha)
 {
+	/* Ground forwarder relays "LOST N" lines (wfb_rx packets-lost reports)
+	 * so we can see loss events timestamped alongside our own FEC/MCS
+	 * activity. Forward-compatible with the existing RX_ANT parser —
+	 * unknown prefixes fall through and return -1. */
+	if (line[0] == 'L' && line[1] == 'O' && line[2] == 'S' && line[3] == 'T') {
+		long n = strtol(line + 4, NULL, 10);
+		if (n > 0) {
+			g_wfb_rx_loss_packets += (uint64_t)n;
+			g_wfb_rx_loss_events++;
+			/* Emit at LOG level (not LOGV) so these are visible without
+			 * -v. Timestamped by the LOG macro, which is the point —
+			 * user wanted to see loss events lined up with SET_FEC
+			 * / SET_RADIO timestamps. */
+			fprintf(stderr,
+			        "[fec t=%8.3f] wfb_rx: %ld packets lost (total=%llu across %llu events)\n",
+			        log_rel_s(), n,
+			        (unsigned long long)g_wfb_rx_loss_packets,
+			        (unsigned long long)g_wfb_rx_loss_events);
+		}
+		return 0;
+	}
+
 	/* Skip leading whitespace / timestamp, find "RX_ANT". */
 	const char *tag = strstr(line, "RX_ANT");
 	if (!tag) return -1;
@@ -1189,7 +1258,10 @@ static void usage(const char *prog)
 		"  --bitrate-max N      bitrate ceiling in kbps (default 0 = unlimited)\n"
 		"  --bitrate-tol F      bitrate re-apply tolerance (default 0.15 = 15%%)\n"
 		"  --bitrate-grace F    suppress FEC emits for F s after a bitrate write\n"
-		"                       (default 2.0; breaks bitrate↔framesize↔k cascade)\n"
+		"                       (default 2.0; absorbs small venc transients)\n"
+		"  --mcs-settle-s F     suppress FEC emits for F s after an MCS change\n"
+		"                       (default 5.0; EWMA needs longer to track the big\n"
+		"                       frame-size jump caused by a phy rate change)\n"
 		"                       target = clamp(phy*k/n*safety, min, max)\n"
 		"\n"
 		"MCS scaler (opt-in):\n"
@@ -1264,6 +1336,7 @@ static void config_defaults(Config *c)
 	c->bitrate_max_kbps = 0;         /* 0 = unlimited */
 	c->bitrate_tolerance = 0.15f;
 	c->bitrate_grace_s = 2.0f;
+	c->mcs_settle_s    = 5.0f;
 
 	c->subscribe_s = 2.0f;
 	c->radio_poll_s = 1.0f;
@@ -1303,7 +1376,7 @@ int main(int argc, char **argv)
 		OPT_STARTUP_GRACE,
 		OPT_SAFETY, OPT_BITRATE_MIN, OPT_BITRATE_MAX,
 		OPT_BITRATE_DESIRED, /* deprecated alias for --bitrate-max */
-		OPT_BITRATE_TOL, OPT_BITRATE_GRACE, OPT_DRY_RUN,
+		OPT_BITRATE_TOL, OPT_BITRATE_GRACE, OPT_MCS_SETTLE, OPT_DRY_RUN,
 		OPT_MCS_ENABLE, OPT_MCS_MIN, OPT_MCS_MAX,
 		OPT_RSSI_STREAM, OPT_RSSI_UDP, OPT_RSSI_SILENCE,
 		OPT_RSSI_FALLBACK_S, OPT_FALLBACK_MCS,
@@ -1328,6 +1401,7 @@ int main(int argc, char **argv)
 		{"bitrate-desired", required_argument, 0, OPT_BITRATE_DESIRED},
 		{"bitrate-tol",   required_argument, 0, OPT_BITRATE_TOL},
 		{"bitrate-grace", required_argument, 0, OPT_BITRATE_GRACE},
+		{"mcs-settle-s",  required_argument, 0, OPT_MCS_SETTLE},
 		{"dry-run",       no_argument,       0, OPT_DRY_RUN},
 		{"mcs-enable",    no_argument,       0, OPT_MCS_ENABLE},
 		{"mcs-min",       required_argument, 0, OPT_MCS_MIN},
@@ -1387,6 +1461,7 @@ int main(int argc, char **argv)
 			break;
 		case OPT_BITRATE_TOL:   cfg.bitrate_tolerance = (float)atof(optarg); break;
 		case OPT_BITRATE_GRACE: cfg.bitrate_grace_s = (float)atof(optarg); break;
+		case OPT_MCS_SETTLE:    cfg.mcs_settle_s    = (float)atof(optarg); break;
 		case OPT_DRY_RUN:      cfg.dry_run        = true; break;
 		case OPT_MCS_ENABLE:   cfg.mcs_enable     = true; break;
 		case OPT_MCS_MIN:      cfg.mcs_min        = atoi(optarg); break;
@@ -1534,26 +1609,35 @@ int main(int argc, char **argv)
 				/* RSSI chunk: show whenever a source is configured, not just
 				 * when the scaler is enabled — so the user can see whether
 				 * feedback is arriving at all. */
-				char rssi_buf[96];
+				char rssi_buf[160];
 				if (rssi_src.fd >= 0) {
 					static uint64_t hb_prev_pkts = 0;
+					static uint64_t hb_prev_loss = 0;
 					uint64_t delta = rssi_src.pkts_total - hb_prev_pkts;
 					hb_prev_pkts = rssi_src.pkts_total;
+					uint64_t loss_delta = g_wfb_rx_loss_packets - hb_prev_loss;
+					hb_prev_loss = g_wfb_rx_loss_packets;
 					char mcs_part[16] = "";
 					if (cfg.mcs_enable)
 						snprintf(mcs_part, sizeof(mcs_part), " mcs=%d", scaler.mcs);
+					char loss_part[48] = "";
+					if (g_wfb_rx_loss_packets > 0)
+						snprintf(loss_part, sizeof(loss_part),
+						         " loss=%llu(+%llu/5s)",
+						         (unsigned long long)g_wfb_rx_loss_packets,
+						         (unsigned long long)loss_delta);
 					if (rssi_src.have_ewma) {
 						snprintf(rssi_buf, sizeof(rssi_buf),
-						         " rssi=%.1f%s rx=%llu(+%llu/5s)",
+						         " rssi=%.1f%s rx=%llu(+%llu/5s)%s",
 						         rssi_src.ewma_rssi, mcs_part,
 						         (unsigned long long)rssi_src.pkts_total,
-						         (unsigned long long)delta);
+						         (unsigned long long)delta, loss_part);
 					} else {
 						snprintf(rssi_buf, sizeof(rssi_buf),
-						         " rssi=(none)%s rx=%llu(+%llu/5s)",
+						         " rssi=(none)%s rx=%llu(+%llu/5s)%s",
 						         mcs_part,
 						         (unsigned long long)rssi_src.pkts_total,
-						         (unsigned long long)delta);
+						         (unsigned long long)delta, loss_part);
 					}
 				} else {
 					rssi_buf[0] = '\0';
@@ -1614,6 +1698,7 @@ int main(int argc, char **argv)
 						radio.phy_mbps = phy_mbps(radio.mcs, radio.bandwidth,
 						                          radio.short_gi, radio.vht_mode,
 						                          radio.vht_nss);
+						controller_arm_settle(&ctrl, now, cfg.mcs_settle_s);
 					}
 				}
 				LOGV(&cfg, "radio: mcs=%d bw=%d gi=%s vht=%d nss=%d phy=%.1f Mbps",
@@ -1666,6 +1751,7 @@ int main(int argc, char **argv)
 					scaler.in_fallback = true;
 					scaler.last_change_us = now;
 					scaler.have_pending = false;
+					controller_arm_settle(&ctrl, now, cfg.mcs_settle_s);
 					if (cfg.boost_s > 0.0f) {
 						ctrl.boost_until_us = now + (uint64_t)(cfg.boost_s * 1e6f);
 						LOG("fec: parity boost armed for %.1fs (mult=%.2f) [fallback]",
@@ -1692,6 +1778,7 @@ int main(int argc, char **argv)
 					scaler.in_fallback = false;
 					scaler.last_change_us = now;
 					scaler.have_pending = false;
+					controller_arm_settle(&ctrl, now, cfg.mcs_settle_s);
 				}
 
 				if (scaler.in_fallback) {
@@ -1724,6 +1811,7 @@ int main(int argc, char **argv)
 						radio.phy_mbps = phy_mbps(radio.mcs, radio.bandwidth,
 						                          radio.short_gi, radio.vht_mode,
 						                          radio.vht_nss);
+						controller_arm_settle(&ctrl, now, cfg.mcs_settle_s);
 						if (is_drop && cfg.boost_s > 0.0f) {
 							ctrl.boost_until_us = now + (uint64_t)(cfg.boost_s * 1e6f);
 							LOG("fec: parity boost armed for %.1fs (mult=%.2f)",
@@ -1779,11 +1867,19 @@ int main(int argc, char **argv)
 						if (venc_set_bitrate_kbps(&cfg, target) != 0)
 							LOG("bitrate: set failed");
 					}
-					/* Arm grace window so the next FEC emits wait for
-					 * venc to converge on the new target. */
-					if (cfg.bitrate_grace_s > 0.0f)
-						ctrl.bitrate_grace_until_us =
+					/* Arm settling grace, but only extend — never shorten
+					 * a longer in-flight window (e.g. an MCS settle
+					 * started earlier). We intentionally do NOT reset
+					 * the EWMA — it's closer to the new target value
+					 * than zero would be, and letting it drift over
+					 * the grace window converges faster than re-seeding
+					 * from a single transitional frame. */
+					if (cfg.bitrate_grace_s > 0.0f) {
+						uint64_t new_end =
 						    now + (uint64_t)(cfg.bitrate_grace_s * 1e6f);
+						if (new_end > ctrl.bitrate_grace_until_us)
+							ctrl.bitrate_grace_until_us = new_end;
+					}
 				}
 			}
 			next_bitrate_us = now + (uint64_t)(cfg.bitrate_poll_s * 1e6);
