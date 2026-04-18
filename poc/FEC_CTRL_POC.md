@@ -20,8 +20,10 @@ It:
    safe_kbps = phy_mbps * 1000 * (k / n) * safety_margin
    ```
 
-   If `video0.bitrate` (queried from the venc HTTP API) exceeds that
-   budget, the POC calls `/api/v1/set?video0.bitrate=N` to clamp it.
+   If `video0.bitrate` (queried from the venc HTTP API as
+   `GET /api/v1/get?video0.bitrate` — the field name is the query key,
+   not a `field=` value) exceeds that budget, the POC calls
+   `/api/v1/set?video0.bitrate=N` to clamp it.
 5. Emits `CMD_SET_FEC (k, n)` to wfb_tx on every committed update.
 
 Single thread, single `poll()` loop. No libs beyond libc.

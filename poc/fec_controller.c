@@ -591,12 +591,19 @@ static int json_find_int(const char *s, const char *key, long *out)
 	return 0;
 }
 
-/* Returns current video0.bitrate (kbps) or -1. */
+/* Returns current video0.bitrate (kbps) or -1.
+ *
+ * NOTE: venc /api/v1/get takes the field name as the KEY of the first
+ * query parameter, not "field=NAME". So the URL is literally
+ *   /api/v1/get?video0.bitrate
+ * not
+ *   /api/v1/get?field=video0.bitrate
+ */
 static long venc_get_bitrate_kbps(const Config *cfg)
 {
 	char body[2048];
 	int n = http_get(cfg->venc_host, cfg->venc_port,
-	                 "/api/v1/get?field=video0.bitrate",
+	                 "/api/v1/get?video0.bitrate",
 	                 body, sizeof(body), 500);
 	if (n <= 0) return -1;
 	long v;
@@ -827,7 +834,9 @@ int main(int argc, char **argv)
 			long safe_kbps = (long)(post_fec_kbps * cfg.safety_margin);
 
 			long cur = venc_get_bitrate_kbps(&cfg);
-			if (cur > 0) {
+			if (cur <= 0) {
+				LOGV(&cfg, "bitrate: venc HTTP query failed (is /api/v1/get reachable?)");
+			} else {
 				LOGV(&cfg, "bitrate: cur=%ld safe=%ld (phy=%.1f k/n=%d/%d)",
 				     cur, safe_kbps, radio.phy_mbps,
 				     ctrl.current.k, ctrl.current.n);
