@@ -4,23 +4,43 @@ End-to-end proof-of-concept stack for adaptive FEC on a wfb-ng video
 link. Everything in this directory is **on-device** code (SigmaStar
 Infinity6E / OpenIPC Linux, armv7l) plus a few host-native helpers.
 
-The hot loop:
+The hot loop (vehicle), with the optional MCS controller wired in:
 
 ```
- waybeam_venc                wfb_tx (patched)             radio
+ waybeam_venc                wfb_tx (patched)            radio
  ┌──────────┐               ┌──────────────┐           ┌──────┐
- │ encoder  │── /dev/shm ──►│ FEC encode + │── inject ►│ wlan │──► …
+ │ encoder  │── /dev/shm ──►│ FEC encode + │── inject ►│ wlan │──► (downlink)
  │ + sidecar│  (zero copy)  │ WiFi inject  │           └──────┘
- └────┬─────┘               └──┬───────────┘
-      │ frame metadata         │ -Y JSON tx_stats (1/interval)
-      ▼ (UDP loopback)         ▼ (UDP loopback)
- ┌────────────────────────────────────┐
- │ fec_controller                     │── HTTP API on :8765
- │   ── EWMA + headroom → k/n         │      /params /set /status
- │   ── 3-layer anti-bounce           │      /events (SSE) /health
- │   ── safe-bitrate assertion ───────┼─► venc HTTP /api/v1/set?...
- └────────────────────────────────────┘
+ └────┬─────┘               └──┬─────┬─────┘                ▲
+      │ frame metadata         │     │ -Y JSON tx_stats     │
+      ▼ (UDP loopback)         │     ▼ (UDP loopback)       │
+ ┌────────────────────────────────────┐                     │
+ │ fec_controller                     │── HTTP API on :8765 │
+ │   ── EWMA + headroom → k/n         │      /params /set   │
+ │   ── 3-layer anti-bounce           │      /status /events│
+ │   ── safe-bitrate assertion ───────┼─► venc HTTP         │
+ └─────────────────┬──────────────────┘                     │
+                   │ set_fec via wfb_tx CMD port (8000)     │
+                   ▼                                        │
+              wfb_tx control                                │
+                   ▲                                        │
+                   │ set_radio (mcs_index only)             │
+ ┌─────────────────┴──────────────────┐                     │
+ │ mcs_selector (optional)            │── HTTP API on :8766 │
+ │   ── EWMA RSSI + loss penalty      │      /params /set   │
+ │   ── 3-bucket FSM + deadband       │      /status /events│
+ │   ── failsafe + recovery streak    │                     │
+ └─────────────────▲──────────────────┘                     │
+                   │ rx_ant JSON via UDP (e.g. :6600)       │
+                   │                                        │
+                   └────── ground host wfb_rx -Y ───────────┘
 ```
+
+The two controllers are **independent and complementary**: fec_controller
+sizes FEC k/n for whatever MCS the radio happens to be at; mcs_selector
+reacts to ground-side RSSI/loss to pick that MCS. They share only the
+wfb_tx control port (8000) and use different commands (`set_fec` vs
+`set_radio`), so they don't collide.
 
 Wfb_tx and wfb_rx are **patched** (`shm-input.patch`) but otherwise
 upstream-compatible — invocations without `-H`/`-Y` behave identically
@@ -33,6 +53,7 @@ to stock wfb-ng.
 | Artifact | Where | Arch | What it does |
 |---|---|---|---|
 | `fec_controller` | `build/fec_controller` | ARM dyn (34 KB) | Adaptive FEC sizing + REST/SSE API. Single-binary on-device controller. |
+| `mcs_selector` | `build/mcs_selector` | ARM dyn (34 KB) | RSSI-driven adaptive MCS controller. Subscribes to `wfb_rx -Y`, writes `set_radio` to wfb_tx. Coexists with `fec_controller`. REST/SSE API on :8766. |
 | `wfb_tx` | `build/wfb_tx` | ARM static (543 KB) | wfb-ng tx with `-H` (SHM input), `-Y host:port` (UDP stats push), `-x` aux flag. |
 | `wfb_tx_cmd` | `build/wfb_tx_cmd` | ARM static (318 KB) | Runtime control: `set_fec`, `set_radio`, `set_mbit`, `get_radio`. |
 | `wfb_keygen` | `build/wfb_keygen` | ARM static (423 KB) | Key generator (drone/gs keys). |
@@ -78,6 +99,18 @@ make -f Makefile.fec_controller clean
 ```
 
 Set `DEPLOY_HOST=<ip>` to override the default vehicle IP.
+
+### mcs_selector (separate Makefile)
+
+Same pattern as fec_controller:
+
+```bash
+cd poc
+make -f Makefile.mcs_selector            # cross → build/mcs_selector (ARM)
+make -f Makefile.mcs_selector host       # native → build/mcs_selector.host
+make -f Makefile.mcs_selector deploy     # scp build/mcs_selector → 192.168.1.13:/tmp
+make -f Makefile.mcs_selector clean
+```
 
 ### Re-applying the patch after upstream wfb-ng changes
 
@@ -140,6 +173,26 @@ ssh root@192.168.1.13 '/etc/init.d/S96fec_controller start'
 
 # 6. Verify
 ssh root@192.168.1.13 'curl -s http://127.0.0.1:8765/status'
+```
+
+### Optional — also enable adaptive MCS (`mcs_selector`)
+
+```bash
+# 1. Cross-build and deploy
+make -f Makefile.mcs_selector
+scp -O build/mcs_selector root@192.168.1.13:/usr/bin/
+
+# 2. Run alongside fec_controller — the ground host needs to forward
+#    its wfb_rx -Y stream to the vehicle (here, port 6600):
+#    Ground:  sudo wfb_rx_native -K /etc/drone.key -i 207 -p 0 -l 200 -x \
+#                                 -Y 192.168.1.13:6600 wlxXXXXXX wlxYYYYYY
+ssh root@192.168.1.13 'mcs_selector --stats 127.0.0.1:6600 \
+                                    --wfb 127.0.0.1:8000 \
+                                    --api-port 8766 -v &'
+
+# 3. Verify both controllers
+ssh root@192.168.1.13 'curl -s http://127.0.0.1:8765/status   # fec_controller
+                       curl -s http://127.0.0.1:8766/status'  # mcs_selector
 ```
 
 ---
@@ -216,6 +269,146 @@ curl -s http://127.0.0.1:8765/health
 **Limits**: 8 concurrent HTTP clients, 4 of which can be SSE subscribers; 5th `/events` returns `503 sse: too many subscribers`.
 
 See `FEC_CTRL_POC.md` for the design rationale (asymmetric gating, dwell semantics, parity boost, etc.).
+
+---
+
+### `mcs_selector` — adaptive MCS controller
+
+**One-liner**: subscribes to `wfb_rx -Y` rx_ant JSON datagrams (forwarded
+from the ground), computes effective RSSI (smoothed antenna RSSI minus
+loss penalty), walks an asymmetric 3-bucket FSM (fast-down / slow-up
+with deadband, dwell hysteresis, per-direction cooldown, and oscillation
+backoff), and writes `CMD_SET_RADIO` to wfb_tx — varying `mcs_index` in
+isolation (every other radiotap field is preserved from a startup
+`CMD_GET_RADIO`). Runs alongside `fec_controller` without coordination.
+
+```bash
+# Default invocation (defaults: --stats 127.0.0.1:5801, --wfb 127.0.0.1:8000,
+#                               --api-port 8766)
+mcs_selector
+
+# Production invocation on this device — listen on the port the ground
+# wfb_rx is pushing -Y to, write to local wfb_tx control port:
+mcs_selector --stats 127.0.0.1:6600 --wfb 127.0.0.1:8000
+
+# Pick a starting range preset (sets the three mcs_bucket_* tunables)
+mcs_selector --range high      # buckets 0/1/2 → MCS 2/3/4 (bench, strong RSSI)
+mcs_selector --range med       # buckets 0/1/2 → MCS 1/2/3 (default)
+mcs_selector --range low       # buckets 0/1/2 → MCS 0/1/2 (long-range)
+
+# Compute decisions but never send CMD_SET_RADIO
+mcs_selector --dry-run -v
+
+# Force range[0] mcs at startup (off by default — observe-then-act)
+mcs_selector --start-low
+
+# Disable HTTP API
+mcs_selector --api-port 0
+```
+
+**Key flags** (see `mcs_selector --help` for the full list):
+
+| Flag | Default | Purpose |
+|---|---|---|
+| `--stats HOST:PORT` | `127.0.0.1:5801` | UDP listener for `wfb_rx -Y` JSON |
+| `--wfb HOST:PORT` | `127.0.0.1:8000` | wfb_tx control port (`-C`) |
+| `--api-port N` | `8766` | HTTP API bind (0 disables) |
+| `--range low\|med\|high` | `med` | preset bucket→mcs mapping |
+| `--rssi-low F` | `-70` | lower RSSI threshold (dBm); below = bucket 0 |
+| `--rssi-high F` | `-50` | upper RSSI threshold (dBm); above = bucket 2 |
+| `--deadband F` | `2.0` | symmetric crossing deadband (dB) |
+| `--up-consec N` | `3` | consecutive samples needed to commit UP |
+| `--down-consec N` | `1` | consecutive samples needed to commit DOWN |
+| `--up-cooldown F` | `3.0` | min seconds between UP commits |
+| `--down-cooldown F` | `0.2` | min seconds between DOWN commits |
+| `--failsafe F` | `0.5` | watchdog gap (s) before forcing bucket 0 |
+| `--loss-lost-pct F` | `0.5` | dB penalty per % of post-FEC `lost` |
+| `--loss-recov-pct F` | `0.0` | dB penalty per % of `fec_recovered` (0 = ignore; FEC working ≠ bad link) |
+| `--start-low` | off | force range[0] mcs at startup |
+| `--dry-run` | off | compute but don't send CMD_SET_RADIO |
+
+**HTTP API** (loopback only, mirrors fec_controller's API on a different port):
+
+```bash
+# Help
+curl -s http://127.0.0.1:8766/
+
+# Snapshot of current config (~28 hot-tunable fields)
+curl -s http://127.0.0.1:8766/params
+
+# Live state — selector + radio + last score
+curl -s http://127.0.0.1:8766/status
+
+# Live tuning — switch range preset by editing the three buckets together
+curl -s "http://127.0.0.1:8766/set?mcs_bucket_0=2&mcs_bucket_1=3&mcs_bucket_2=4"
+
+# Or change a single threshold
+curl -s "http://127.0.0.1:8766/set?rssi_thresh_high=-40"
+
+# Stream every log line as JSON SSE
+curl -sN http://127.0.0.1:8766/events | sed -n 's/^data: //p' | jq -r .msg
+
+# Health check
+curl -s http://127.0.0.1:8766/health
+```
+
+**Operator log lines you'll see**:
+
+```
+[mcs t=  0.089] decision: init bucket=2 mcs=3 eff=-27.0 smooth=-27.0 raw=-27.0 lost=0.00% recov=10.0% pen=0.0dB
+[mcs t=  5.009] hb: bucket=2 mcs=3 eff=-26.9 lost=0.00% recov=9.4% pen=0.0dB commits=1
+[mcs t= 13.289] realign: bucket=2 want_mcs=2 wfb_mcs=3
+[mcs t= 56.079] decision: down bucket=1 mcs=2 eff=-55.0 smooth=-55.0 raw=-90.0 lost=0.00% recov=9.5% pen=0.0dB
+[mcs t= 60.903] failsafe: no rx_ant for 0.55s (>0.50s) — forcing bucket 0
+[mcs t= 89.939] failsafe: recovered after 3 good samples
+[mcs t=  5.005] hb: waiting for rx_ant on udp:5801 (no datagram yet, 5.0s since boot)
+```
+
+`hb:` is heartbeat (every 5 s). `realign:` fires when the bucket→mcs
+mapping changes (operator edited a `mcs_bucket_X` tunable, or wfb_tx
+got an external SET) — not a bucket transition, just a refresh. The
+divergence indicator ` WFB_MCS=N!` is appended to heartbeat when
+`sel.current_mcs != radio.mcs` (e.g., during a SET-failure window).
+
+**Coexistence with `fec_controller`**:
+
+- mcs_selector listens on its own UDP port (default 5801; production
+  example uses 6600) — fec_controller listens on a different port
+  (default disabled, production uses 5500). They don't share the input
+  stream.
+- Both write to wfb_tx control port (8000) but use different command
+  IDs: `set_radio` (mcs_selector) vs `set_fec` (fec_controller). No
+  collision on the wire.
+- When mcs_selector commits a new MCS, fec_controller sees the change
+  on its next `tx_stats` datagram and arms its `mcs_settle_s` window
+  (default 5 s) to absorb the EWMA transient. Verified live: the two
+  cooperate without thrashing.
+
+**Topology** — typical wiring for the `--stats 127.0.0.1:6600` example:
+
+```
+GROUND:   wfb_rx -Y 192.168.1.13:6600 (pushes rx_ant JSON to vehicle)
+              │
+              ▼ (UDP over WiFi/ethernet)
+VEHICLE:  mcs_selector --stats 127.0.0.1:6600 (binds INADDR_ANY, host
+                                               argument is just a label)
+```
+
+The host part of `--stats` is informational; the listener actually binds
+`INADDR_ANY:port` so any source IP can deliver datagrams.
+
+**Failsafe semantics** (verified live):
+
+1. If no rx_ant datagram arrives for `failsafe_timeout_s` (default 0.5 s),
+   the FSM commits to bucket 0 (lowest MCS in the active range) and
+   freezes.
+2. The trip log fires exactly once; subsequent watchdog ticks early-exit
+   silently.
+3. If the failsafe `set_radio` itself fails (wfb_tx unreachable),
+   `in_failsafe` STAYS true and the realign block on the next
+   datagram retries the SET.
+4. Recovery requires `failsafe_recovery_consecutive` (default 3)
+   consecutive samples with `eff_rssi >= rssi_thresh_low + deadband`.
 
 ---
 
@@ -441,6 +634,7 @@ Currently installed:
 | `/usr/bin/wfb_tx` | `2fb2f18a…` | patched, ARM static, 543 KB |
 | `/usr/bin/wfb_tx_cmd` | `0a90845a…` | |
 | `/usr/bin/fec_controller` | `3dd500a5…` | post-PR #25 integration build, 34 KB |
+| `/usr/bin/mcs_selector` | `7f1f1b80…` | post-PR #27 integration build, 34 KB |
 | `/etc/init.d/S96fec_controller` | (script) | starts after S95venc on boot |
 | `/usr/bin/wfb_tx.bak.20260316` | `…` | pristine pre-patch backup |
 | `/usr/bin/fec_controller.bak.20260316-220122` | `f4d5e639…` | last pre-integration build |
@@ -484,19 +678,50 @@ The `bitrate_assert` tick is 1 Hz, and re-writes are gated by
 Edit `build/wfb-ng/src/{tx,rx}.cpp` to merge the conflict, then
 `cd build/wfb-ng && git diff > ../../shm-input.patch` to regenerate.
 
+**`mcs_selector` heartbeat says "waiting for rx_ant on udp:N (no datagram yet)".**
+Ground host's `wfb_rx -Y` isn't pointing at this vehicle's port. Confirm
+with `socat -u UDP-RECV:6600,reuseaddr -` on the vehicle to see if any
+bytes arrive. If not, check the ground-side `-Y target_ip:port` matches
+the vehicle's IP and `--stats` port.
+
+**`mcs_selector` heartbeat shows ` WFB_MCS=N!`.**
+Selector and wfb_tx are at different MCS values — usually because a
+SET_RADIO failed. The realign block on the next datagram retries; if
+divergence persists, check that `wfb_tx -C 8000` is reachable.
+
+**`mcs_selector` `recov` is consistently 15-20% on a strong link.**
+Normal. With wfb_tx `-k 6 -n 10` (40% parity), the receiver triggers
+FEC the moment it has `k` unique fragments, and that kth fragment is
+often a parity (sender interleaves data + parity). It does NOT mean
+diversity is broken or the link is bad. The default penalty weight on
+`fec_recovered` is 0 specifically for this reason — only `lost`
+contributes to penalty by default.
+
+**`mcs_selector` wfb_tx changes MCS unexpectedly on restart.**
+By default mcs_selector picks an MCS based on current RSSI at boot,
+which may differ from whatever wfb_tx was previously set to. If you
+want predictable boot behavior, run with `--start-low` (force range[0]
+mcs at startup) or pre-set wfb_tx to your desired MCS with a
+matching `--range` preset.
+
 ---
 
 ## Network port reference
 
 | Port | Owner | Direction | Purpose |
 |---|---|---|---|
-| 5500/udp | `wfb_tx -Y` → fec_controller | producer→consumer | tx_stats JSON |
+| 5500/udp | `wfb_tx -Y` → fec_controller | producer→consumer | tx_stats JSON (vehicle-local) |
 | 5602/udp | venc sidecar → fec_controller | producer→consumer | per-frame metadata |
 | 5800/udp | (free, reserved for `wfb_tx -Y` debug) | | |
-| 5801/udp | `wfb_rx -Y` → external (ground) | producer→consumer | rx_ant JSON |
+| 5801/udp | `wfb_rx -Y` → mcs_selector / dashboards | producer→consumer | rx_ant JSON (default mcs_selector listener) |
+| 6600/udp | ground `wfb_rx -Y` → vehicle mcs_selector | producer→consumer | rx_ant JSON (production example) |
 | 6666/udp | venc sidecar → fec_controller (default) | producer→consumer | per-frame metadata (default port) |
-| 8000/udp | `wfb_tx -C` ← wfb_tx_cmd / fec_controller | request/response | control: set_fec, set_radio, etc. |
+| 8000/udp | `wfb_tx -C` ← wfb_tx_cmd / fec_controller / mcs_selector | request/response | control: set_fec (fec_controller), set_radio (mcs_selector), etc. |
 | 8765/tcp | fec_controller HTTP API | server | REST + SSE |
+| 8766/tcp | mcs_selector HTTP API | server | REST + SSE |
 | 80/tcp | venc HTTP API | server | `/api/v1/set?video0.bitrate=N` |
 
-All ports are 127.0.0.1 (loopback) on the vehicle.
+`8000/udp`, `8765/tcp`, `8766/tcp`, `80/tcp` and the loopback `udp:5500/5602/5801/6600/6666` listeners are all 127.0.0.1 / INADDR_ANY on the
+vehicle. The `6600/udp` example above is the cross-host case: a ground
+station at any IP pushes rx_ant JSON over the WiFi/ethernet uplink to
+the vehicle's `INADDR_ANY:6600`.

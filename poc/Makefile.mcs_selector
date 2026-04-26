@@ -1,0 +1,58 @@
+# Cross-build the mcs_selector POC for SigmaStar Infinity6E (armv7l).
+#
+# Usage (from waybeam_wfb_ng/poc/):
+#   make -f Makefile.mcs_selector                # cross-build
+#   make -f Makefile.mcs_selector clean          # clean
+#   make -f Makefile.mcs_selector deploy         # scp to DEPLOY_HOST
+#   make -f Makefile.mcs_selector host           # native host build (debug)
+#
+# Env:
+#   DEPLOY_HOST=192.168.1.13   target star6e IP (default)
+#   DEPLOY_DIR=/tmp            destination dir
+
+TOOLCHAIN   ?= ../toolchain/toolchain.sigmastar-infinity6e
+CROSS_CC    ?= $(TOOLCHAIN)/bin/arm-openipc-linux-gnueabihf-gcc
+CROSS_STRIP ?= $(TOOLCHAIN)/bin/arm-openipc-linux-gnueabihf-strip
+
+BUILD_DIR   ?= build
+OUT          = $(BUILD_DIR)/mcs_selector
+OUT_HOST     = $(BUILD_DIR)/mcs_selector.host
+SRC          = mcs_selector.c
+
+CFLAGS_COMMON = -std=c99 -O2 -Wall -Wextra -Wno-missing-field-initializers
+LDFLAGS_COMMON = -lm
+
+DEPLOY_HOST ?= 192.168.1.13
+DEPLOY_DIR  ?= /tmp
+
+.PHONY: all clean deploy host help
+
+all: $(OUT)
+
+$(BUILD_DIR):
+	@mkdir -p $@
+
+$(OUT): $(SRC) | $(BUILD_DIR)
+	$(CROSS_CC) $(CFLAGS_COMMON) -o $@ $< $(LDFLAGS_COMMON)
+	$(CROSS_STRIP) $@
+	@echo "[mcs] built $@"
+	@ls -la $@
+
+host: $(OUT_HOST)
+
+$(OUT_HOST): $(SRC) | $(BUILD_DIR)
+	cc $(CFLAGS_COMMON) -g -o $@ $< $(LDFLAGS_COMMON)
+	@echo "[mcs] host build: $@"
+
+clean:
+	rm -f $(OUT) $(OUT_HOST)
+
+deploy: $(OUT)
+	scp -O $(OUT) root@$(DEPLOY_HOST):$(DEPLOY_DIR)/
+	@echo "[mcs] deployed to root@$(DEPLOY_HOST):$(DEPLOY_DIR)/mcs_selector"
+
+help:
+	@echo "make -f Makefile.mcs_selector         # cross-build"
+	@echo "make -f Makefile.mcs_selector host    # native host build"
+	@echo "make -f Makefile.mcs_selector deploy  # scp to root@\$$DEPLOY_HOST"
+	@echo "make -f Makefile.mcs_selector clean"
