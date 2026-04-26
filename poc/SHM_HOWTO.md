@@ -597,6 +597,74 @@ If modes disagree, RX log will include per-interval:
 N packets dropped (AEAD-mode mismatch, check -x flag on both sides)
 ```
 
+## UDP stats push (`-Y host:port`)
+
+Optional: emit one JSON datagram per `-l` interval to a fixed UDP target.
+Lets external consumers (e.g. `fec_controller`, status WebUI, metrics
+exporter) subscribe to live tx stats without attaching to wfb_tx's stdout
+— so wfb_tx can be supervised independently and multiple consumers can
+read the same stream.
+
+### Usage
+
+```bash
+# Push to fec_controller on the same host
+wfb_tx -K /etc/drone.key -H venc_wfb -k 8 -n 12 -p 0 -B 20 -M 3 \
+       -C 8000 -l 1000 -Y 127.0.0.1:5800 wlan0
+```
+
+Cadence is the existing `-l log_interval` (milliseconds) — the JSON
+emit happens at the same point as the human-readable `PKT` line, so
+both share one clock. The flag is additive: stdout output is unchanged.
+
+Init failures (bad host/port, socket() failure) log once on stderr and
+leave the feature disabled — wfb_tx continues normally. Send errors are
+silently ignored to avoid log spam if the consumer flaps.
+
+### Schema
+
+One datagram per emit, single-line UTF-8 JSON, terminated with `\n` for
+`nc -ul` debugging:
+
+```json
+{"ts_ms":1714115012345,"type":"tx_stats","ver":1,"interval_ms":1000,
+ "tx":{"pkts_in":12345,"bytes_in":456789,
+       "pkts_out":12340,"bytes_out":456000,
+       "pkts_drop":3,"pkts_trunc":2,"fec_timeouts":1,
+       "fec_k":12,"fec_n":20},
+ "radio":{"mcs":3,"bw":20,"short_gi":0,"stbc":0,"ldpc":0,
+          "vht_mode":0,"vht_nss":0}}
+```
+
+| Field | Meaning |
+|---|---|
+| `ts_ms` | Emit timestamp (`get_time_ms()`, monotonic-ish ms). |
+| `interval_ms` | The `-l` value at emit time. |
+| `tx.pkts_in` / `bytes_in` | Incoming UDP/SHM packets received this interval. |
+| `tx.pkts_out` / `bytes_out` | Successfully injected (includes FEC parity). |
+| `tx.pkts_drop` | Dropped due to rxq overflow or injection timeout. |
+| `tx.pkts_trunc` | Injected packets that were truncated. |
+| `tx.fec_timeouts` | Empty packets sent to close FEC blocks on `-T fec_timeout`. |
+| `tx.fec_k` / `fec_n` | Current FEC sizes (tracks `wfb_tx_cmd set_fec` writes). |
+| `radio.*` | Current radiotap state. `short_gi`/`ldpc`/`vht_mode` are 0/1. |
+
+`fec_k` / `fec_n` and the entire `radio` block let consumers track
+external `wfb_tx_cmd set_fec` / `set_radio` calls without polling
+`CMD_GET_RADIO` separately.
+
+### Debug
+
+```bash
+# Subscribe + pretty-print on the host
+nc -ul 5800 | jq -c .
+```
+
+### Versioning
+
+Increment `ver` on incompatible changes. Adding fields without removing
+or renaming existing ones is a non-breaking change (consumers ignore
+unknown keys). Renames or semantics changes bump the version.
+
 ## Quick reference — recommended FPV config
 
 For a typical 25 Mbps H.265 FPV video stream (vehicle → ground, one-way):
