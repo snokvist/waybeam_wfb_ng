@@ -405,10 +405,13 @@ typedef struct {
 	 * the window expires. */
 	uint64_t  bitrate_grace_until_us;
 	bool      was_in_grace;
-	/* k-down anti-bounce: a candidate proposing cand.k < current.k must
-	 * hold the same target for cfg.k_down_dwell_s before commit. Any
-	 * change in candidate target (lower or higher) restarts the timer;
-	 * any commit clears it. */
+	/* k-down anti-bounce: candidate must consistently want to drop below
+	 * current.k for cfg.k_down_dwell_s before commit. Small wobbles in the
+	 * exact lower target don't reset the timer (a noisy ppf flipping between
+	 * 18 and 19 still represents "wanting to go below 40"). The timer only
+	 * clears when cand.k climbs back to (or above) current.k or a commit
+	 * fires. k_down_pending_target tracks the most-recent candidate so the
+	 * eventual commit reflects current state. */
 	uint64_t  k_down_pending_since_us;
 	int       k_down_pending_target;
 } Controller;
@@ -437,6 +440,7 @@ static bool controller_commit(Controller *c, const FecParams *cand,
 	c->last_update_us = now;
 	c->update_count++;
 	c->k_down_pending_since_us = 0;
+	c->k_down_pending_target = 0;
 	*out = *cand;
 	return true;
 }
@@ -543,18 +547,20 @@ static bool controller_update(Controller *c, const Config *cfg,
 
 	int k_delta = cand.k - c->current.k;
 
-	/* k-down: candidate must hold the same lower target for k_down_dwell_s
-	 * before we commit. Any change in target (down further OR back up)
-	 * restarts the dwell, which biases toward stable k and prevents
-	 * thrashing on EWMA jitter. Mirror semantics of the (now-removed)
-	 * MCS scaler dwell. */
+	/* k-down: candidate must hold "wanting to go down" for k_down_dwell_s
+	 * before we commit. The dwell tracks "consistent desire to drop k,"
+	 * not "consistent exact lower target" — small wobbles in cand.k near
+	 * a quantization edge (e.g. ppf flipping between 18 and 19 while the
+	 * controller is stuck at k=40 after a transient I-frame spike) used
+	 * to reset the timer every tick, leaving k stuck at the inflated
+	 * value indefinitely. The timer only resets when the candidate
+	 * climbs back to (or above) current.k — that's handled by the
+	 * k_delta >= 0 branch below. We always track the latest cand.k so
+	 * the eventual commit reflects current state, not the first seen. */
 	if (k_delta < 0) {
-		if (c->k_down_pending_since_us == 0 ||
-		    c->k_down_pending_target != cand.k) {
+		if (c->k_down_pending_since_us == 0)
 			c->k_down_pending_since_us = now;
-			c->k_down_pending_target   = cand.k;
-			return false;
-		}
+		c->k_down_pending_target = cand.k;
 		float held_s = (float)(now - c->k_down_pending_since_us) / 1e6f;
 		if (held_s < cfg->k_down_dwell_s) return false;
 		return controller_commit(c, &cand, now, out);
@@ -562,6 +568,7 @@ static bool controller_update(Controller *c, const Config *cfg,
 
 	/* k unchanged or up: cancel any pending k-down. */
 	c->k_down_pending_since_us = 0;
+	c->k_down_pending_target = 0;
 
 	if (k_delta == 0) return false;
 	if (k_delta < cfg->k_hyst_up) return false;
