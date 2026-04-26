@@ -1784,12 +1784,32 @@ static int append_fec_json(char *buf, size_t cap, size_t pos,
 		? -1.0
 		: (double)(now_us() - s->last_stats_us) / 1e6;
 	float fps_now = fps_get(s->fps);
+
+	/* computed_safe_kbps: link budget the FEC controller WOULD assert
+	 * if it had a path to venc. This is exposed independently of
+	 * last_bitrate_kbps so the WebUI can show a meaningful number even
+	 * before / without an actual venc write. -1 = not computable
+	 * (radio invalid OR controller hasn't committed first k/n yet). */
+	long computed_safe = -1;
+	if (s->radio->valid && s->ctrl->have_current && s->ctrl->current.n > 0) {
+		float k = (float)s->ctrl->current.k;
+		float nn = (float)s->ctrl->current.n;
+		float post_fec_kbps = s->radio->phy_mbps * 1000.0f * (k / nn);
+		long safe = (long)(post_fec_kbps * s->cfg->fec.safety_margin);
+		if (s->cfg->fec.bitrate_max_kbps > 0 && safe > s->cfg->fec.bitrate_max_kbps)
+			safe = s->cfg->fec.bitrate_max_kbps;
+		if (safe < s->cfg->fec.bitrate_min_kbps)
+			safe = s->cfg->fec.bitrate_min_kbps;
+		computed_safe = safe;
+	}
+
 	int n = snprintf(buf + pos, cap - pos,
 		"\"fec\":{\"enabled\":%s,\"have_current\":%s,\"k\":%d,\"n\":%d,"
 		"\"avg_frame_size\":%.1f,\"update_count\":%u,\"fps\":%.2f,"
 		"\"in_grace\":%s,\"in_boost\":%s},"
 		"\"wfb\":{\"last_set_fec_k\":%d,\"last_set_fec_n\":%d,"
-		"\"last_bitrate_kbps\":%ld,\"stats_age_s\":%.3f}",
+		"\"last_bitrate_kbps\":%ld,\"computed_safe_kbps\":%ld,"
+		"\"stats_age_s\":%.3f}",
 		s->cfg->fec.enabled ? "true" : "false",
 		s->ctrl->have_current ? "true" : "false",
 		s->ctrl->current.k, s->ctrl->current.n,
@@ -1800,7 +1820,7 @@ static int append_fec_json(char *buf, size_t cap, size_t pos,
 		(s->ctrl->boost_until_us != 0 &&
 		    now_us() < s->ctrl->boost_until_us) ? "true" : "false",
 		s->last_written_fec_k, s->last_written_fec_n,
-		s->last_written_kbps, age_s);
+		s->last_written_kbps, computed_safe, age_s);
 	if (n < 0 || (size_t)n >= cap - pos) return -1;
 	return n;
 }

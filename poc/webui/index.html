@@ -110,7 +110,7 @@ main{padding:12px;overflow:auto;height:calc(100vh - 86px)}
       <div class="card"><h3>MCS bucket</h3><div class="v" id="c-mcs">—</div><div class="sub" id="c-mcs-sub">—</div></div>
       <div class="card"><h3>Effective RSSI</h3><div class="v" id="c-rssi">—</div><div class="sub" id="c-rssi-sub">—</div></div>
       <div class="card"><h3>Loss</h3><div class="v" id="c-loss">—</div><div class="sub" id="c-loss-sub">—</div></div>
-      <div class="card"><h3>Bitrate</h3><div class="v" id="c-bitrate">—</div><div class="sub" id="c-bitrate-sub">—</div></div>
+      <div class="card"><h3>Headroom</h3><div class="v" id="c-headroom">—</div><div class="sub" id="c-headroom-sub">—</div></div>
     </div>
     <div class="row">
       <div class="panel">
@@ -129,7 +129,7 @@ main{padding:12px;overflow:auto;height:calc(100vh - 86px)}
     <div class="panel">
       <h2>RSSI per antenna (last 60 samples · dBm)</h2>
       <div class="rssi-chart-wrap">
-        <svg id="rssi-svg" width="100%" height="160" viewBox="0 0 600 160" preserveAspectRatio="none">
+        <svg id="rssi-svg" width="100%" height="240" viewBox="0 0 600 240" preserveAspectRatio="none">
           <!-- Grid + axis labels are drawn dynamically once the first sample arrives. -->
           <g id="rssi-grid"></g>
           <g id="rssi-thresh"></g>
@@ -178,10 +178,13 @@ const ANT_COLORS = [
   "#f85149", "#36cae3", "#ff7eb6", "#b5b5b5",
 ];
 
-// Chart geometry — viewBox is 600x160; reserve 30px on the left for Y-axis labels.
+// Chart geometry — viewBox is 600x240; reserve 32px on the left for
+// Y-axis labels. Visible RSSI range tightened slightly so most real-
+// world bench/range traces fill the canvas instead of clustering near
+// the top.
 const CHART = {
-  W: 600, H: 160, PAD_L: 30, PAD_R: 4, PAD_T: 6, PAD_B: 14,
-  RSSI_LO: -100, RSSI_HI: -25,
+  W: 600, H: 240, PAD_L: 32, PAD_R: 4, PAD_T: 8, PAD_B: 16,
+  RSSI_LO: -95, RSSI_HI: -20,
 };
 
 const $ = sel => document.querySelector(sel);
@@ -287,12 +290,21 @@ function fmtKv(parent, obj, fmt) {
 function renderStatus(s) {
   $("#c-uptime").textContent = (s.uptime_s ?? 0).toFixed(1) + "s";
 
-  // FEC card
+  // FEC card — show k/n with explicit encoded bitrate + parity %.
+  // Bitrate is computed here (avg_frame_size × fps × 8) instead of in
+  // a separate card; the operator gets the number directly without
+  // mental math, and the "Headroom" card below shows the actionable
+  // budget-vs-encoded comparison.
   const fec = s.fec || {};
   if (fec.have_current) {
     $("#c-fec").textContent = fec.k + " / " + fec.n;
     $("#c-fec").className = "v ok";
-    $("#c-fec-sub").textContent = "avg " + (fec.avg_frame_size||0).toFixed(0) + " B  fps " + (fec.fps||0).toFixed(1);
+    const encoded_kbps = (fec.avg_frame_size||0) * (fec.fps||0) * 8 / 1000;
+    const parity_pct = fec.n > 0 ? ((fec.n - fec.k) / fec.n * 100) : 0;
+    const bps = encoded_kbps > 0
+      ? (encoded_kbps/1000).toFixed(2) + " Mbps · "
+      : "";
+    $("#c-fec-sub").textContent = bps + parity_pct.toFixed(0) + "% parity · " + (fec.fps||0).toFixed(0) + " fps";
   } else {
     $("#c-fec").textContent = "—";
     $("#c-fec").className = "v";
@@ -330,21 +342,38 @@ function renderStatus(s) {
     $("#c-loss-sub").textContent = "fec_recov " + ((score.recov_ratio||0)*100).toFixed(1) + "%";
   }
 
-  // Bitrate — last_bitrate_kbps is -1 sentinel (not "no value yet, just an
-  // out-of-band signal we haven't asserted anything yet"). Show n/a until
-  // a real assertion lands.
+  // Headroom — actionable derived value: how much link budget is left
+  // (or how far over budget the encoder is running). Computed from the
+  // sidecar's encoded bitrate vs the FEC controller's safe-budget
+  // (phy × k/n × safety, clamped to bitrate_min/max). Color by margin:
+  //   green  : usage  < 80% (plenty of room)
+  //   yellow : 80-95% (using most of the link)
+  //   red    : >= 95% or over budget (about to drop video)
   const wfb = s.wfb || {};
-  if (typeof wfb.last_bitrate_kbps === "number" && wfb.last_bitrate_kbps > 0) {
-    $("#c-bitrate").textContent = (wfb.last_bitrate_kbps/1000).toFixed(2) + " Mbps";
-    $("#c-bitrate").className = "v";
+  const have_budget  = typeof wfb.computed_safe_kbps === "number" && wfb.computed_safe_kbps > 0;
+  const have_encoded = fec.have_current && fec.fps > 0 && fec.avg_frame_size > 0;
+  if (have_budget && have_encoded) {
+    const encoded_kbps = (fec.avg_frame_size * fec.fps * 8) / 1000;
+    const free_kbps    = wfb.computed_safe_kbps - encoded_kbps;
+    const usage        = encoded_kbps / wfb.computed_safe_kbps;
+    const sign         = free_kbps >= 0 ? "+" : "";
+    $("#c-headroom").textContent = sign + (free_kbps/1000).toFixed(2) + " Mbps " +
+                                   (free_kbps >= 0 ? "free" : "over");
+    $("#c-headroom").className =
+      usage >= 0.95 ? "v bad"  :
+      usage >= 0.80 ? "v warn" : "v ok";
+    $("#c-headroom-sub").textContent =
+      (encoded_kbps/1000).toFixed(2) + " / " + (wfb.computed_safe_kbps/1000).toFixed(2) +
+      " Mbps  (" + (usage*100).toFixed(0) + "%)";
+  } else if (have_budget) {
+    $("#c-headroom").textContent = (wfb.computed_safe_kbps/1000).toFixed(2) + " Mbps";
+    $("#c-headroom").className = "v warn";
+    $("#c-headroom-sub").textContent = "budget only — no encoder data";
   } else {
-    $("#c-bitrate").textContent = "n/a";
-    $("#c-bitrate").className = "v muted";
+    $("#c-headroom").textContent = "—";
+    $("#c-headroom").className = "v muted";
+    $("#c-headroom-sub").textContent = "(no radio + controller state)";
   }
-  if (typeof wfb.last_set_fec_k === "number" && wfb.last_set_fec_k > 0)
-    $("#c-bitrate-sub").textContent = "last set_fec " + wfb.last_set_fec_k + "/" + wfb.last_set_fec_n;
-  else
-    $("#c-bitrate-sub").textContent = "(no venc write yet)";
 
   // Detail panels
   fmtKv($("#kv-sel"), {
@@ -411,18 +440,25 @@ function sampleToX(i, n) {
 function ensureRssiAxes() {
   const grid = $("#rssi-grid");
   if (grid.dataset.drawn === "1") return;
-  // Y-axis labels at -25, -50, -75, -100 with horizontal gridlines.
   let html = "";
-  for (const dbm of [-25, -50, -75, -100]) {
+  // Major gridlines + Y labels every 25 dBm (-20, -45, -70, -95).
+  for (const dbm of [-20, -45, -70, -95]) {
     const y = rssiToY(dbm).toFixed(1);
-    html += '<line x1="'+CHART.PAD_L+'" y1="'+y+'" x2="'+(CHART.W - CHART.PAD_R)+'" y2="'+y+'"/>';
+    html += '<line x1="'+CHART.PAD_L+'" y1="'+y+'" x2="'+(CHART.W - CHART.PAD_R)+'" y2="'+y+'" opacity="1"/>';
     html += '<text x="'+(CHART.PAD_L - 4)+'" y="'+(parseFloat(y)+3)+'" text-anchor="end">'+dbm+'</text>';
   }
-  // Bottom border.
+  // Minor gridlines every 5 dBm (no labels) — just light tick lines for
+  // readability without crowding.
+  for (let dbm = CHART.RSSI_LO; dbm <= CHART.RSSI_HI; dbm += 5) {
+    if (dbm === -20 || dbm === -45 || dbm === -70 || dbm === -95) continue;
+    const y = rssiToY(dbm).toFixed(1);
+    html += '<line x1="'+CHART.PAD_L+'" y1="'+y+'" x2="'+(CHART.W - CHART.PAD_R)+'" y2="'+y+'" opacity="0.3"/>';
+  }
+  // Bottom border + axis context labels.
   const yb = (CHART.H - CHART.PAD_B).toFixed(1);
   html += '<line x1="'+CHART.PAD_L+'" y1="'+yb+'" x2="'+(CHART.W - CHART.PAD_R)+'" y2="'+yb+'"/>';
-  html += '<text x="'+CHART.PAD_L+'" y="'+(CHART.H - 2)+'" fill="var(--mute)" font-size="9">oldest</text>';
-  html += '<text x="'+(CHART.W - CHART.PAD_R)+'" y="'+(CHART.H - 2)+'" text-anchor="end" fill="var(--mute)" font-size="9">now</text>';
+  html += '<text x="'+CHART.PAD_L+'" y="'+(CHART.H - 3)+'" fill="var(--mute)" font-size="9">oldest</text>';
+  html += '<text x="'+(CHART.W - CHART.PAD_R)+'" y="'+(CHART.H - 3)+'" text-anchor="end" fill="var(--mute)" font-size="9">now</text>';
   grid.innerHTML = html;
   grid.dataset.drawn = "1";
 }
