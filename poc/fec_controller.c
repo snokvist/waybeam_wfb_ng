@@ -178,12 +178,18 @@ typedef struct {
 	float    cooldown_up_s;
 	float    k_down_dwell_s;         /* candidate must hold below current
 	                                  * k for this many seconds before a
-	                                  * down-commit is allowed; pure anti-
-	                                  * bounce. Reset whenever the
-	                                  * candidate changes target or rises
-	                                  * back to current. Designed to be
+	                                  * down-commit is allowed. Reset only
+	                                  * when the candidate climbs back to
+	                                  * (or above) current.k. Designed to be
 	                                  * longer than mcs_settle_s so an MCS
 	                                  * edge-trigger always wins the race. */
+	float    k_up_dwell_s;           /* candidate must hold above current.k
+	                                  * for this many seconds before an up-
+	                                  * commit is allowed. Filters transient
+	                                  * EWMA spikes (e.g. one I-frame burst)
+	                                  * from triggering big k-up jumps that
+	                                  * would then take k_down_dwell_s to
+	                                  * unwind. 0 disables (legacy fast-up). */
 	float    startup_grace_s;        /* suppress emits for the first N sec */
 
 	/* Link budget */
@@ -414,6 +420,12 @@ typedef struct {
 	 * eventual commit reflects current state. */
 	uint64_t  k_down_pending_since_us;
 	int       k_down_pending_target;
+	/* k-up anti-spike: symmetric mirror of the k-down dwell. Tracks "wanted
+	 * to go above current.k" across ticks; latest cand.k is committed when
+	 * the dwell expires. Cleared when cand.k drops back to (or below)
+	 * current.k or a commit fires. */
+	uint64_t  k_up_pending_since_us;
+	int       k_up_pending_target;
 } Controller;
 
 /* Arm the "post-change" settling window, extending only (never shortening)
@@ -441,6 +453,8 @@ static bool controller_commit(Controller *c, const FecParams *cand,
 	c->update_count++;
 	c->k_down_pending_since_us = 0;
 	c->k_down_pending_target = 0;
+	c->k_up_pending_since_us = 0;
+	c->k_up_pending_target = 0;
 	*out = *cand;
 	return true;
 }
@@ -558,6 +572,9 @@ static bool controller_update(Controller *c, const Config *cfg,
 	 * k_delta >= 0 branch below. We always track the latest cand.k so
 	 * the eventual commit reflects current state, not the first seen. */
 	if (k_delta < 0) {
+		/* Going down: clear any in-flight k-up dwell (we changed our mind). */
+		c->k_up_pending_since_us = 0;
+		c->k_up_pending_target = 0;
 		if (c->k_down_pending_since_us == 0)
 			c->k_down_pending_since_us = now;
 		c->k_down_pending_target = cand.k;
@@ -570,7 +587,25 @@ static bool controller_update(Controller *c, const Config *cfg,
 	c->k_down_pending_since_us = 0;
 	c->k_down_pending_target = 0;
 
-	if (k_delta == 0) return false;
+	if (k_delta == 0) {
+		/* Steady — clear any pending k-up too. */
+		c->k_up_pending_since_us = 0;
+		c->k_up_pending_target = 0;
+		return false;
+	}
+
+	/* k-up: candidate wants to grow. Apply dwell first (sustained intent
+	 * filters single-frame spikes), then hyst (noise floor on magnitude),
+	 * then cooldown (rate limit). Symmetric with k-down dwell — both track
+	 * direction-of-desire, not exact target, so wobbles in cand.k while
+	 * still wanting to go up don't reset the timer. k_up_dwell_s = 0
+	 * preserves legacy fast-up behavior. */
+	if (c->k_up_pending_since_us == 0)
+		c->k_up_pending_since_us = now;
+	c->k_up_pending_target = cand.k;
+	float up_held_s = (float)(now - c->k_up_pending_since_us) / 1e6f;
+	if (up_held_s < cfg->k_up_dwell_s) return false;
+
 	if (k_delta < cfg->k_hyst_up) return false;
 	float elapsed = (float)(now - c->last_update_us) / 1e6f;
 	if (elapsed < cfg->cooldown_up_s) return false;
@@ -1110,6 +1145,10 @@ static void usage(const char *prog)
 		"                       before a k-down commit (default 8.0; pure\n"
 		"                       anti-bounce, longer than --mcs-settle-s so\n"
 		"                       an MCS edge-trigger always wins the race)\n"
+		"  --k-up-dwell F       candidate must hold above current k for F s\n"
+		"                       before a k-up commit (default 2.0; filters\n"
+		"                       single-frame I-frame spikes from triggering\n"
+		"                       big k-up jumps; 0 = legacy fast-up)\n"
 		"  --startup-grace F    suppress emits for first F seconds (default 2.0)\n"
 		"\n"
 		"Link budget:\n"
@@ -1173,6 +1212,10 @@ static void config_defaults(Config *c)
 	c->k_hyst_up = 2;                /* require Δk≥2 to emit an up-move */
 	c->cooldown_up_s = 1.0f;         /* at most one up-move per second */
 	c->k_down_dwell_s = 8.0f;        /* k-down candidate must hold for 8 s */
+	c->k_up_dwell_s = 2.0f;          /* k-up candidate must hold for 2 s —
+	                                  * filters single-frame I-frame spikes
+	                                  * (sub-second EWMA transients) without
+	                                  * delaying real scene-change response */
 	c->startup_grace_s = 2.0f;
 
 	c->safety_margin = 0.5f;         /* leave 50% airtime for uplink + headroom */
@@ -1203,7 +1246,8 @@ int main(int argc, char **argv)
 	enum {
 		OPT_SIDECAR = 256, OPT_WFB, OPT_VENC, OPT_MTU, OPT_MINK, OPT_MAXK,
 		OPT_PPF_DEADBAND,
-		OPT_K_HYST_UP, OPT_COOLDOWN_UP, OPT_K_DOWN_DWELL, OPT_STARTUP_GRACE,
+		OPT_K_HYST_UP, OPT_COOLDOWN_UP, OPT_K_DOWN_DWELL, OPT_K_UP_DWELL,
+		OPT_STARTUP_GRACE,
 		OPT_SAFETY, OPT_BITRATE_MIN, OPT_BITRATE_MAX,
 		OPT_BITRATE_DESIRED, /* deprecated alias for --bitrate-max */
 		OPT_BITRATE_TOL, OPT_BITRATE_GRACE, OPT_MCS_SETTLE, OPT_DRY_RUN,
@@ -1221,6 +1265,7 @@ int main(int argc, char **argv)
 		{"k-hyst-up",     required_argument, 0, OPT_K_HYST_UP},
 		{"cooldown-up",   required_argument, 0, OPT_COOLDOWN_UP},
 		{"k-down-dwell",  required_argument, 0, OPT_K_DOWN_DWELL},
+		{"k-up-dwell",    required_argument, 0, OPT_K_UP_DWELL},
 		{"startup-grace", required_argument, 0, OPT_STARTUP_GRACE},
 		{"safety",        required_argument, 0, OPT_SAFETY},
 		{"bitrate-min",   required_argument, 0, OPT_BITRATE_MIN},
@@ -1266,6 +1311,7 @@ int main(int argc, char **argv)
 		case OPT_K_HYST_UP:     cfg.k_hyst_up       = atoi(optarg); break;
 		case OPT_COOLDOWN_UP:   cfg.cooldown_up_s   = (float)atof(optarg); break;
 		case OPT_K_DOWN_DWELL:  cfg.k_down_dwell_s  = (float)atof(optarg); break;
+		case OPT_K_UP_DWELL:    cfg.k_up_dwell_s    = (float)atof(optarg); break;
 		case OPT_STARTUP_GRACE: cfg.startup_grace_s = (float)atof(optarg); break;
 		case OPT_SAFETY:        cfg.safety_margin   = (float)atof(optarg); break;
 		case OPT_BITRATE_MIN:   cfg.bitrate_min_kbps = atol(optarg); break;
