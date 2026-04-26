@@ -166,6 +166,12 @@ typedef struct {
 	float    headroom_max;
 	float    headroom_margin;
 	float    headroom_window_s;
+	float    ppf_deadband_frac;     /* slack as a fraction of MTU at the
+	                                 * (current_ppf±1)*MTU boundaries.
+	                                 * Suppresses ppf flips driven by EWMA
+	                                 * jitter near a bucket edge — only a
+	                                 * sustained shift past the deadband
+	                                 * actually moves k. */
 
 	/* Gating */
 	int      k_hyst_up;
@@ -335,12 +341,27 @@ typedef struct {
 	float headroom;
 } FecParams;
 
-static FecParams fec_compute(float avg_size, float headroom, const Config *cfg)
+/* current_ppf == 0 means "no current params yet" (skip deadband). */
+static FecParams fec_compute(float avg_size, float headroom, const Config *cfg,
+                             int current_ppf)
 {
 	FecParams p = {0};
 	float target = avg_size * headroom;
 	int ppf = (int)ceilf(target / (float)cfg->mtu);
 	if (ppf < 1) ppf = 1;
+
+	/* Boundary deadband: once we have a steady current_ppf, only step out
+	 * of the bucket when target crosses the next bucket's edge plus slack.
+	 * This kills the ppf ping-pong driven by ~5% EWMA + ~10% headroom
+	 * jitter that compound to ~15% target swings near a quantization edge.
+	 * Slack is symmetric so up- and down-noise are filtered identically. */
+	if (current_ppf > 0 && cfg->ppf_deadband_frac > 0.0f) {
+		float slack = (float)cfg->mtu * cfg->ppf_deadband_frac;
+		float up_edge   = (float)(current_ppf + 1) * (float)cfg->mtu + slack;
+		float down_edge = (float)(current_ppf - 1) * (float)cfg->mtu - slack;
+		if (ppf > current_ppf && target < up_edge)        ppf = current_ppf;
+		else if (ppf < current_ppf && target > down_edge) ppf = current_ppf;
+	}
 
 	int k = ppf;
 	if (k < cfg->min_k) k = cfg->min_k;
@@ -452,7 +473,8 @@ static bool controller_update(Controller *c, const Config *cfg,
 	float headroom = compute_headroom(
 		ring, cfg->headroom_margin, cfg->headroom_min, cfg->headroom_max);
 
-	FecParams cand = fec_compute(c->avg_frame_size, headroom, cfg);
+	int cur_ppf = c->have_current ? c->current.packets_per_frame : 0;
+	FecParams cand = fec_compute(c->avg_frame_size, headroom, cfg, cur_ppf);
 
 	/* Post-MCS-drop boost: inflate parity so the committed n is higher.
 	 * Force-emit is EDGE-triggered (entry / exit) — not per-tick — so that
@@ -1070,6 +1092,11 @@ static void usage(const char *prog)
 		"  --mtu N              packet size budget (default 1446)\n"
 		"  --min-k N            min k (default 1)\n"
 		"  --max-k N            max k (default 48)\n"
+		"  --ppf-deadband F     ±F*MTU slack at the (current_ppf±1)*MTU\n"
+		"                       quantization edges (default 0.15; 0 disables).\n"
+		"                       Suppresses k flips driven by EWMA jitter near\n"
+		"                       a bucket boundary; a sustained shift past the\n"
+		"                       deadband still moves k normally.\n"
 		"  --k-hyst-up N        min Δk to trigger an up-move (default 2)\n"
 		"  --cooldown-up F      min seconds between up-moves (default 1.0)\n"
 		"  --k-down-dwell F     candidate must hold below current k for F s\n"
@@ -1131,6 +1158,10 @@ static void config_defaults(Config *c)
 	c->headroom_max = 1.40f;
 	c->headroom_margin = 1.05f;
 	c->headroom_window_s = 2.5f;
+	c->ppf_deadband_frac = 0.15f;    /* ±15% of MTU slack at ppf bucket
+	                                  * edges; suppresses noise-driven k
+	                                  * flips while still tracking real
+	                                  * sustained shifts. 0 disables. */
 
 	c->k_hyst_up = 2;                /* require Δk≥2 to emit an up-move */
 	c->cooldown_up_s = 1.0f;         /* at most one up-move per second */
@@ -1164,6 +1195,7 @@ int main(int argc, char **argv)
 
 	enum {
 		OPT_SIDECAR = 256, OPT_WFB, OPT_VENC, OPT_MTU, OPT_MINK, OPT_MAXK,
+		OPT_PPF_DEADBAND,
 		OPT_K_HYST_UP, OPT_COOLDOWN_UP, OPT_K_DOWN_DWELL, OPT_STARTUP_GRACE,
 		OPT_SAFETY, OPT_BITRATE_MIN, OPT_BITRATE_MAX,
 		OPT_BITRATE_DESIRED, /* deprecated alias for --bitrate-max */
@@ -1178,6 +1210,7 @@ int main(int argc, char **argv)
 		{"mtu",           required_argument, 0, OPT_MTU},
 		{"min-k",         required_argument, 0, OPT_MINK},
 		{"max-k",         required_argument, 0, OPT_MAXK},
+		{"ppf-deadband",  required_argument, 0, OPT_PPF_DEADBAND},
 		{"k-hyst-up",     required_argument, 0, OPT_K_HYST_UP},
 		{"cooldown-up",   required_argument, 0, OPT_COOLDOWN_UP},
 		{"k-down-dwell",  required_argument, 0, OPT_K_DOWN_DWELL},
@@ -1222,6 +1255,7 @@ int main(int argc, char **argv)
 		case OPT_MTU:           cfg.mtu             = atoi(optarg); break;
 		case OPT_MINK:          cfg.min_k           = atoi(optarg); break;
 		case OPT_MAXK:          cfg.max_k           = atoi(optarg); break;
+		case OPT_PPF_DEADBAND:  cfg.ppf_deadband_frac = (float)atof(optarg); break;
 		case OPT_K_HYST_UP:     cfg.k_hyst_up       = atoi(optarg); break;
 		case OPT_COOLDOWN_UP:   cfg.cooldown_up_s   = (float)atof(optarg); break;
 		case OPT_K_DOWN_DWELL:  cfg.k_down_dwell_s  = (float)atof(optarg); break;
