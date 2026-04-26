@@ -345,10 +345,16 @@ function renderStatus(s) {
   // Headroom — actionable derived value: how much link budget is left
   // (or how far over budget the encoder is running). Computed from the
   // sidecar's encoded bitrate vs the FEC controller's safe-budget
-  // (phy × k/n × safety, clamped to bitrate_min/max). Color by margin:
-  //   green  : usage  < 80% (plenty of room)
-  //   yellow : 80-95% (using most of the link)
-  //   red    : >= 95% or over budget (about to drop video)
+  // (phy × k/n × safety, clamped to bitrate_min/max).
+  //
+  // Threshold calibration accounts for the fact that the budget is
+  // ALREADY safety_margin (0.5 by default) below post-FEC capacity, so
+  // small overshoots are within normal frame-size fluctuation:
+  //   green  : usage  < 100% (under conservative budget)
+  //   yellow : 100-140%      (eating safety margin, still fine)
+  //   red    : >= 140%       (approaching PHY-after-FEC ceiling)
+  // For reference: at 200% of budget the encoder is using 100% of the
+  // post-FEC capacity (= phy × k/n) and will drop frames.
   const wfb = s.wfb || {};
   const have_budget  = typeof wfb.computed_safe_kbps === "number" && wfb.computed_safe_kbps > 0;
   const have_encoded = fec.have_current && fec.fps > 0 && fec.avg_frame_size > 0;
@@ -360,8 +366,8 @@ function renderStatus(s) {
     $("#c-headroom").textContent = sign + (free_kbps/1000).toFixed(2) + " Mbps " +
                                    (free_kbps >= 0 ? "free" : "over");
     $("#c-headroom").className =
-      usage >= 0.95 ? "v bad"  :
-      usage >= 0.80 ? "v warn" : "v ok";
+      usage >= 1.40 ? "v bad"  :
+      usage >= 1.00 ? "v warn" : "v ok";
     $("#c-headroom-sub").textContent =
       (encoded_kbps/1000).toFixed(2) + " / " + (wfb.computed_safe_kbps/1000).toFixed(2) +
       " Mbps  (" + (usage*100).toFixed(0) + "%)";
