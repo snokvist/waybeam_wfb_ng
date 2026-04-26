@@ -934,6 +934,20 @@ static int wfb_stats_handle_datagram(const char *body,
 	                        last_written_fec_k, last_written_fec_n,
 	                        now);
 	bitrate_assert(radio, ctrl, cfg, last_written_kbps, now);
+
+	/* Surface congestion signals from wfb_tx. The counters are
+	 * per-interval (wfb_tx resets them after each emit), so any
+	 * non-zero value means the tx side hit rxq overflow / injection
+	 * timeout / a truncated packet within the last interval. We log
+	 * but don't act on these — the eventual congestion-aware throttle
+	 * will live on top of this signal. */
+	long drops = 0, trunc = 0;
+	(void)json_get_int(body, "pkts_drop", &drops);
+	(void)json_get_int(body, "pkts_trunc", &trunc);
+	if (drops > 0 || trunc > 0) {
+		LOG("wfb-stats: tx dropped %ld pkts (trunc=%ld) last interval",
+		    drops, trunc);
+	}
 	return 0;
 }
 
@@ -1272,6 +1286,15 @@ int main(int argc, char **argv)
 	int last_written_fec_k = -1;
 	int last_written_fec_n = -1;
 
+	/* Subscriber-side housekeeping: when the first datagram arrives we
+	 * log peer + key fields once (so the operator can see the wiring is
+	 * working without enabling -v). last_stats_us tracks freshness so
+	 * we can flag a stale stream when wfb_tx exits or its -Y is dropped. */
+	bool     stats_first_logged    = false;
+	uint64_t last_stats_us         = 0;
+	bool     stats_was_stale       = false;
+	const uint64_t STATS_STALE_US  = 3000000ULL;  /* 3 s */
+
 	while (!g_stop) {
 		uint64_t now = now_us();
 
@@ -1362,19 +1385,54 @@ int main(int argc, char **argv)
 		if (pr == 0) continue;
 
 		/* Drain wfb_tx stats first — radio info may inform a same-tick
-		 * sidecar read's bitrate calc. */
+		 * sidecar read's bitrate calc. recvfrom() (vs recv()) so we can
+		 * surface the peer in the first-datagram log. */
 		if (stats_idx >= 0 && (pfds[stats_idx].revents & POLLIN)) {
 			char dgram[2048];
+			struct sockaddr_in peer;
+			socklen_t plen;
 			for (;;) {
-				ssize_t n = recv(stats_fd, dgram, sizeof(dgram) - 1, 0);
+				plen = sizeof(peer);
+				ssize_t n = recvfrom(stats_fd, dgram, sizeof(dgram) - 1, 0,
+				                     (struct sockaddr *)&peer, &plen);
 				if (n <= 0) break;
 				dgram[n] = '\0';
-				(void)wfb_stats_handle_datagram(dgram,
-				                                &radio, &ctrl, &cfg,
-				                                &last_written_fec_k,
-				                                &last_written_fec_n,
-				                                &last_written_kbps,
-				                                now_us());
+				int rc = wfb_stats_handle_datagram(dgram,
+				                                   &radio, &ctrl, &cfg,
+				                                   &last_written_fec_k,
+				                                   &last_written_fec_n,
+				                                   &last_written_kbps,
+				                                   now_us());
+				if (rc != 0) continue;
+
+				last_stats_us = now_us();
+				if (stats_was_stale) {
+					LOG("wfb-stats: stream resumed (radio info refreshed)");
+					stats_was_stale = false;
+				}
+				if (!stats_first_logged) {
+					char ip[INET_ADDRSTRLEN];
+					inet_ntop(AF_INET, &peer.sin_addr, ip, sizeof(ip));
+					LOG("wfb-stats: first datagram from %s:%u (mcs=%d bw=%d fec=%d/%d phy=%.1fMbps)",
+					    ip, (unsigned)ntohs(peer.sin_port),
+					    radio.mcs, radio.bandwidth,
+					    last_written_fec_k, last_written_fec_n,
+					    radio.phy_mbps);
+					stats_first_logged = true;
+				}
+			}
+		}
+
+		/* Stale-stream check: if subscriber mode is on and we've seen
+		 * at least one datagram, log once when datagrams stop arriving
+		 * for STATS_STALE_US. Edge-triggered both ways (paired with
+		 * the "stream resumed" log inside the recv loop). */
+		if (cfg.wfb_stats_port != 0 && last_stats_us != 0) {
+			uint64_t age = now_us() - last_stats_us;
+			if (!stats_was_stale && age > STATS_STALE_US) {
+				LOG("wfb-stats: no datagrams for %.1fs, radio info may be stale",
+				    age / 1e6f);
+				stats_was_stale = true;
 			}
 		}
 

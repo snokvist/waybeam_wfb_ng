@@ -677,6 +677,36 @@ Increment `ver` on incompatible changes. Adding fields without removing
 or renaming existing ones is a non-breaking change (consumers ignore
 unknown keys). Renames or semantics changes bump the version.
 
+### Gotcha — `wfb_tx_cmd set_radio` is whole-struct, not partial
+
+`wfb_tx_cmd ... set_radio` always sends a complete CMD_SET_RADIO struct.
+Any flag you don't pass on the CLI is sent at the **wfb_tx_cmd
+hardcoded default**, NOT preserved from wfb_tx's current state. Defaults
+are: `mcs=1 bw=20 short_gi=0 stbc=0 ldpc=0 vht_mode=0 vht_nss=1`.
+
+So `wfb_tx_cmd 8000 set_radio -M 7` doesn't only "change MCS to 7" —
+it also resets `stbc/ldpc/vht_*` to their defaults, even if you started
+wfb_tx with `-S 1 -L 1`. To preserve, pass everything explicitly:
+
+```bash
+# Right: full restate
+wfb_tx_cmd 8000 set_radio -M 7 -B 20 -G long -S 1 -L 1
+```
+
+Two related footguns:
+
+- **Positional args are silently ignored.** `wfb_tx_cmd 8000 set_radio
+  mcs_index 7` parses as zero flags + two positional args (which
+  getopt drops), then sends a CMD_SET_RADIO with all defaults
+  (mcs=1, stbc=0, ldpc=0, ...). wfb_tx applies it; the operator sees
+  `Radiotap updated with ... mcs_index=1` (NOT 7) but might miss the
+  detail. Always use `-M N` (capital M) for mcs.
+- **The `-Y` stats stream + fec_controller correctly reflect the
+  applied values** (verified on hardware). If your subscriber sees
+  unexpected `radio.*` after a `wfb_tx_cmd set_radio`, double-check
+  the command — wfb_tx's "Radiotap updated with ..." stderr line is
+  the source of truth for what actually got applied.
+
 ## Quick reference — recommended FPV config
 
 For a typical 25 Mbps H.265 FPV video stream (vehicle → ground, one-way):
