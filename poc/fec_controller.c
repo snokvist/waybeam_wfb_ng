@@ -36,6 +36,7 @@
 #include <poll.h>
 #include <signal.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -228,6 +229,12 @@ typedef struct {
 	/* Post-MCS-drop FEC-parity boost (armed on detected external MCS-down) */
 	float    boost_s;
 	float    boost_mult;
+
+	/* Local HTTP API for live tuning. Binds 127.0.0.1:api_port at startup
+	 * (0 = disabled). Read-only routes /, /params, /status; mutating route
+	 * /set?key=value&key=value applies changes to the in-memory Config.
+	 * No persistence — restart resets to defaults / CLI overrides. */
+	int      api_port;
 
 	bool     dry_run;
 	int      verbose;
@@ -1114,6 +1121,447 @@ static int venc_set_bitrate_kbps(const Config *cfg, long kbps)
 	return (strstr(body, "\"ok\":true") || strstr(body, "\"ok\": true")) ? 0 : -1;
 }
 
+/* ── Local HTTP API (live tuning) ─────────────────────────────────────── */
+
+/* Single source of truth for the runtime-tunable Config fields. Used by
+ * /params (serialize), /set (parse + validate), and / (help). Adding a
+ * new tunable: add the field to Config, then a row here. */
+
+typedef enum { TF_INT, TF_LONG, TF_FLOAT, TF_BOOL } TunableType;
+
+typedef struct {
+	const char  *name;
+	TunableType  type;
+	size_t       offset;     /* offsetof(Config, field) */
+	double       lo, hi;     /* inclusive bounds; lo == hi disables checks */
+	const char  *help;
+} TunableDesc;
+
+static const TunableDesc TUNABLES[] = {
+	/* FEC sizing */
+	{"mtu",                 TF_INT,   offsetof(Config, mtu),                100, 65000, "RTP payload budget per packet"},
+	{"min_k",               TF_INT,   offsetof(Config, min_k),              1,   256,   "min k after sizing"},
+	{"max_k",               TF_INT,   offsetof(Config, max_k),              1,   256,   "max k after sizing"},
+	{"min_n",               TF_INT,   offsetof(Config, min_n),              1,   256,   "min n after sizing"},
+	{"max_n",               TF_INT,   offsetof(Config, max_n),              1,   256,   "max n after sizing"},
+	{"ewma_alpha",          TF_FLOAT, offsetof(Config, ewma_alpha),         0.001, 1.0, "EWMA weight on new frame size"},
+	{"headroom_min",        TF_FLOAT, offsetof(Config, headroom_min),       1.0, 4.0,   "headroom floor"},
+	{"headroom_max",        TF_FLOAT, offsetof(Config, headroom_max),       1.0, 4.0,   "headroom ceiling"},
+	{"headroom_margin",     TF_FLOAT, offsetof(Config, headroom_margin),    1.0, 4.0,   "extra factor on rolling max"},
+	{"headroom_window_s",   TF_FLOAT, offsetof(Config, headroom_window_s),  0.1, 60.0,  "rolling window for max-size"},
+	{"ppf_deadband_frac",   TF_FLOAT, offsetof(Config, ppf_deadband_frac),  0.0, 1.0,   "+/-MTU*F slack at ppf bucket edges"},
+	/* Gating */
+	{"k_hyst_up",           TF_INT,   offsetof(Config, k_hyst_up),          1,   64,    "min Δk to trigger an up-move"},
+	{"cooldown_up_s",       TF_FLOAT, offsetof(Config, cooldown_up_s),      0.0, 60.0,  "min seconds between up-moves"},
+	{"k_down_dwell_s",      TF_FLOAT, offsetof(Config, k_down_dwell_s),     0.0, 600.0, "k-down dwell"},
+	{"k_up_dwell_s",        TF_FLOAT, offsetof(Config, k_up_dwell_s),       0.0, 600.0, "k-up dwell (0 = legacy fast-up)"},
+	{"startup_grace_s",     TF_FLOAT, offsetof(Config, startup_grace_s),    0.0, 60.0,  "suppress emits for first N s"},
+	/* Link budget */
+	{"safety_margin",       TF_FLOAT, offsetof(Config, safety_margin),      0.05, 1.0,  "fraction of phy_mbps usable"},
+	{"bitrate_min_kbps",    TF_LONG,  offsetof(Config, bitrate_min_kbps),   1,   200000, "bitrate floor (kbps)"},
+	{"bitrate_max_kbps",    TF_LONG,  offsetof(Config, bitrate_max_kbps),   0,   200000, "bitrate ceiling (kbps; 0 = unlimited)"},
+	{"bitrate_tolerance",   TF_FLOAT, offsetof(Config, bitrate_tolerance),  0.0, 1.0,   "re-apply tolerance"},
+	{"bitrate_grace_s",     TF_FLOAT, offsetof(Config, bitrate_grace_s),    0.0, 60.0,  "post-bitrate-write FEC suppress"},
+	{"mcs_settle_s",        TF_FLOAT, offsetof(Config, mcs_settle_s),       0.0, 60.0,  "post-MCS-change FEC suppress"},
+	/* Boost */
+	{"boost_s",             TF_FLOAT, offsetof(Config, boost_s),            0.0, 30.0,  "parity boost duration"},
+	{"boost_mult",          TF_FLOAT, offsetof(Config, boost_mult),         1.0, 5.0,   "(n-k) parity multiplier during boost"},
+	/* Behavior */
+	{"dry_run",             TF_BOOL,  offsetof(Config, dry_run),            0, 0,       "compute but do not send set_fec/bitrate"},
+	{"verbose",             TF_INT,   offsetof(Config, verbose),            0, 4,       "log verbosity"},
+};
+#define TUNABLES_COUNT (sizeof(TUNABLES) / sizeof(TUNABLES[0]))
+
+/* Read field by descriptor into a double (lossy but uniform). */
+static double tunable_read(const TunableDesc *t, const Config *c)
+{
+	const char *base = (const char *)c + t->offset;
+	switch (t->type) {
+	case TF_INT:   return (double) *(const int *)base;
+	case TF_LONG:  return (double) *(const long *)base;
+	case TF_FLOAT: return (double) *(const float *)base;
+	case TF_BOOL:  return (double) (*(const bool *)base ? 1 : 0);
+	}
+	return 0.0;
+}
+
+/* Apply value to field after bounds-check. Returns 0 ok, -1 on bounds. */
+static int tunable_write(const TunableDesc *t, Config *c, const char *val)
+{
+	if (t->lo != t->hi) {
+		double v = atof(val);
+		if (v < t->lo || v > t->hi) return -1;
+	}
+	char *base = (char *)c + t->offset;
+	switch (t->type) {
+	case TF_INT:   *(int *)base   = atoi(val); return 0;
+	case TF_LONG:  *(long *)base  = atol(val); return 0;
+	case TF_FLOAT: *(float *)base = (float)atof(val); return 0;
+	case TF_BOOL:
+		*(bool *)base = (val[0] == '1' || val[0] == 't' || val[0] == 'T');
+		return 0;
+	}
+	return -1;
+}
+
+static const TunableDesc *tunable_find(const char *name)
+{
+	for (size_t i = 0; i < TUNABLES_COUNT; i++)
+		if (strcmp(TUNABLES[i].name, name) == 0) return &TUNABLES[i];
+	return NULL;
+}
+
+/* Append "key":value JSON pair. Numbers, no quoting needed. */
+static int json_append_field(char *buf, size_t cap, size_t pos,
+                             const TunableDesc *t, const Config *c, bool first)
+{
+	double v = tunable_read(t, c);
+	const char *sep = first ? "" : ",";
+	int n;
+	if (t->type == TF_INT || t->type == TF_LONG)
+		n = snprintf(buf + pos, cap - pos, "%s\"%s\":%lld",
+		             sep, t->name, (long long)v);
+	else if (t->type == TF_BOOL)
+		n = snprintf(buf + pos, cap - pos, "%s\"%s\":%s",
+		             sep, t->name, v != 0.0 ? "true" : "false");
+	else
+		n = snprintf(buf + pos, cap - pos, "%s\"%s\":%g",
+		             sep, t->name, v);
+	if (n < 0 || (size_t)n >= cap - pos) return -1;
+	return n;
+}
+
+/* Serialize all tunables as a flat JSON object. Returns length, -1 on overflow. */
+static int params_to_json(const Config *c, char *buf, size_t cap)
+{
+	size_t pos = 0;
+	int n = snprintf(buf + pos, cap - pos, "{");
+	if (n < 0) return -1;
+	pos += n;
+	for (size_t i = 0; i < TUNABLES_COUNT; i++) {
+		int w = json_append_field(buf, cap, pos, &TUNABLES[i], c, i == 0);
+		if (w < 0) return -1;
+		pos += w;
+	}
+	n = snprintf(buf + pos, cap - pos, "}");
+	if (n < 0 || (size_t)n >= cap - pos) return -1;
+	pos += n;
+	return (int)pos;
+}
+
+/* Snapshot of live controller state. */
+typedef struct {
+	const Config       *cfg;
+	const Controller   *ctrl;
+	const RadioState   *radio;
+	const FpsEst       *fps;
+	int                 last_written_fec_k;
+	int                 last_written_fec_n;
+	long                last_written_kbps;
+	uint64_t            last_stats_us;
+} ApiSnapshot;
+
+static int status_to_json(const ApiSnapshot *s, char *buf, size_t cap)
+{
+	float fps_now = fps_get(s->fps);
+	double age_s = s->last_stats_us == 0
+		? -1.0
+		: (double)(now_us() - s->last_stats_us) / 1e6;
+	int n = snprintf(buf, cap,
+		"{\"uptime_s\":%.3f,"
+		"\"controller\":{\"have_current\":%s,\"k\":%d,\"n\":%d,"
+		"\"avg_frame_size\":%.1f,\"update_count\":%u,\"fps\":%.2f},"
+		"\"radio\":{\"valid\":%s,\"mcs\":%d,\"bw\":%d,\"short_gi\":%d,"
+		"\"stbc\":%d,\"ldpc\":%d,\"vht_mode\":%d,\"vht_nss\":%d,"
+		"\"phy_mbps\":%.2f},"
+		"\"wfb\":{\"last_set_fec_k\":%d,\"last_set_fec_n\":%d,"
+		"\"last_bitrate_kbps\":%ld,\"stats_age_s\":%.3f}}",
+		log_rel_s(),
+		s->ctrl->have_current ? "true" : "false",
+		s->ctrl->current.k, s->ctrl->current.n,
+		(double)s->ctrl->avg_frame_size, s->ctrl->update_count,
+		(double)fps_now,
+		s->radio->valid ? "true" : "false",
+		s->radio->mcs, s->radio->bandwidth, s->radio->short_gi,
+		s->radio->stbc, s->radio->ldpc, s->radio->vht_mode, s->radio->vht_nss,
+		(double)s->radio->phy_mbps,
+		s->last_written_fec_k, s->last_written_fec_n,
+		s->last_written_kbps, age_s);
+	if (n < 0 || (size_t)n >= cap) return -1;
+	return n;
+}
+
+/* Parse "key=value&key=value" into Config. Mutates Config in place.
+ * On return, applied/errors are length-prefixed lists of key names (max 32).
+ * Tolerant: unknown keys / bad values go to errors, valid keys keep applying. */
+typedef struct {
+	const char *name;
+	const char *reason;   /* "unknown", "out_of_range", "no_value" */
+} ApiError;
+
+static void apply_query(Config *cfg, char *qstr,
+                        const char **applied, int *applied_n,
+                        ApiError *errors, int *errors_n,
+                        int max_keys)
+{
+	*applied_n = 0;
+	*errors_n  = 0;
+	while (qstr && *qstr) {
+		char *amp = strchr(qstr, '&');
+		if (amp) *amp = '\0';
+		char *eq = strchr(qstr, '=');
+		const char *key = qstr;
+		const char *val = NULL;
+		if (eq) { *eq = '\0'; val = eq + 1; }
+		const TunableDesc *t = tunable_find(key);
+		if (!t) {
+			if (*errors_n < max_keys) {
+				errors[*errors_n].name = key;
+				errors[*errors_n].reason = "unknown";
+				(*errors_n)++;
+			}
+		} else if (!val || !*val) {
+			if (*errors_n < max_keys) {
+				errors[*errors_n].name = key;
+				errors[*errors_n].reason = "no_value";
+				(*errors_n)++;
+			}
+		} else if (tunable_write(t, cfg, val) != 0) {
+			if (*errors_n < max_keys) {
+				errors[*errors_n].name = key;
+				errors[*errors_n].reason = "out_of_range";
+				(*errors_n)++;
+			}
+		} else {
+			if (*applied_n < max_keys) {
+				applied[*applied_n] = key;
+				(*applied_n)++;
+			}
+		}
+		if (!amp) break;
+		qstr = amp + 1;
+	}
+}
+
+/* Plain-text help: one line per route + one line per tunable. */
+static int help_to_text(char *buf, size_t cap)
+{
+	size_t pos = 0;
+	int n = snprintf(buf + pos, cap - pos,
+		"fec_controller HTTP API (127.0.0.1)\n"
+		"\n"
+		"Routes:\n"
+		"  GET /                  this help\n"
+		"  GET /params            JSON of all tunable Config fields\n"
+		"  GET /set?k=v&k=v...    apply changes; returns JSON\n"
+		"  GET /status            JSON snapshot of controller + radio + wfb\n"
+		"  GET /health            \"ok\\n\"\n"
+		"\n"
+		"Tunables (key  type  range  description):\n");
+	if (n < 0) return -1;
+	pos += n;
+	for (size_t i = 0; i < TUNABLES_COUNT; i++) {
+		const TunableDesc *t = &TUNABLES[i];
+		const char *type =
+			t->type == TF_INT   ? "int"   :
+			t->type == TF_LONG  ? "long"  :
+			t->type == TF_FLOAT ? "float" : "bool";
+		char range[64];
+		if (t->type == TF_BOOL)              snprintf(range, sizeof(range), "0|1");
+		else if (t->lo == t->hi)             snprintf(range, sizeof(range), "(any)");
+		else                                 snprintf(range, sizeof(range), "[%g..%g]", t->lo, t->hi);
+		n = snprintf(buf + pos, cap - pos, "  %-22s %-5s %-14s %s\n",
+		             t->name, type, range, t->help ? t->help : "");
+		if (n < 0 || (size_t)n >= cap - pos) return -1;
+		pos += n;
+	}
+	return (int)pos;
+}
+
+/* Build and send an HTTP response on fd; closes fd before returning. */
+static void api_send(int fd, int status, const char *content_type,
+                     const char *body, int body_len)
+{
+	const char *reason = (status == 200) ? "OK" :
+	                     (status == 400) ? "Bad Request" :
+	                     (status == 404) ? "Not Found"   : "Error";
+	char hdr[256];
+	int hlen = snprintf(hdr, sizeof(hdr),
+		"HTTP/1.0 %d %s\r\n"
+		"Content-Type: %s\r\n"
+		"Content-Length: %d\r\n"
+		"Cache-Control: no-store\r\n"
+		"Connection: close\r\n\r\n",
+		status, reason, content_type, body_len);
+	if (hlen > 0) (void)!write(fd, hdr, (size_t)hlen);
+	if (body_len > 0) (void)!write(fd, body, (size_t)body_len);
+	close(fd);
+}
+
+/* Per-connection state. We accept up to API_MAX_CLIENTS at once. */
+#define API_MAX_CLIENTS 4
+#define API_BUF_BYTES   2048
+
+typedef struct {
+	int      fd;        /* -1 = slot empty */
+	uint64_t accepted_us;
+	size_t   pos;
+	char     buf[API_BUF_BYTES];
+} ApiClient;
+
+static int api_listen_open(uint16_t port)
+{
+	int fd = socket(AF_INET, SOCK_STREAM, 0);
+	if (fd < 0) return -1;
+	int one = 1;
+	setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+	struct sockaddr_in a;
+	memset(&a, 0, sizeof(a));
+	a.sin_family = AF_INET;
+	a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	a.sin_port = htons(port);
+	if (bind(fd, (struct sockaddr *)&a, sizeof(a)) < 0) { close(fd); return -1; }
+	if (listen(fd, 4) < 0) { close(fd); return -1; }
+	int fl = fcntl(fd, F_GETFL, 0);
+	if (fl >= 0) fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+	return fd;
+}
+
+static int api_client_alloc(ApiClient *cs, int fd)
+{
+	for (int i = 0; i < API_MAX_CLIENTS; i++) {
+		if (cs[i].fd < 0) {
+			cs[i].fd = fd;
+			cs[i].accepted_us = now_us();
+			cs[i].pos = 0;
+			return i;
+		}
+	}
+	return -1;
+}
+
+static void api_client_drop(ApiClient *c)
+{
+	if (c->fd >= 0) close(c->fd);
+	c->fd = -1;
+	c->pos = 0;
+}
+
+/* Parse the request line in c->buf and dispatch. */
+static void api_handle_request(ApiClient *c, Config *cfg, ApiSnapshot *snap)
+{
+	c->buf[c->pos < API_BUF_BYTES ? c->pos : API_BUF_BYTES - 1] = '\0';
+
+	/* Expect "GET /path[?qs] HTTP/1.x\r\n..." */
+	if (strncmp(c->buf, "GET ", 4) != 0) {
+		api_send(c->fd, 400, "text/plain", "expected GET\n", 13);
+		c->fd = -1;
+		return;
+	}
+	char *path = c->buf + 4;
+	char *sp = strchr(path, ' ');
+	if (!sp) {
+		api_send(c->fd, 400, "text/plain", "malformed request line\n", 23);
+		c->fd = -1;
+		return;
+	}
+	*sp = '\0';
+	char *qs = strchr(path, '?');
+	if (qs) { *qs = '\0'; qs++; }
+
+	char body[8192];
+	int n = -1;
+
+	if (strcmp(path, "/") == 0) {
+		n = help_to_text(body, sizeof(body));
+		if (n > 0) api_send(c->fd, 200, "text/plain", body, n);
+		else       api_send(c->fd, 500, "text/plain", "help overflow\n", 14);
+	}
+	else if (strcmp(path, "/params") == 0) {
+		n = params_to_json(snap->cfg, body, sizeof(body));
+		if (n > 0) api_send(c->fd, 200, "application/json", body, n);
+		else       api_send(c->fd, 500, "text/plain", "json overflow\n", 14);
+	}
+	else if (strcmp(path, "/set") == 0) {
+		const char *applied[32];
+		ApiError    errors[32];
+		int an = 0, en = 0;
+		apply_query(cfg, qs, applied, &an, errors, &en, 32);
+		size_t pos = 0;
+		int w = snprintf(body + pos, sizeof(body) - pos,
+		                 "{\"applied\":[");
+		pos += (w > 0 ? (size_t)w : 0);
+		for (int i = 0; i < an; i++) {
+			w = snprintf(body + pos, sizeof(body) - pos, "%s\"%s\"",
+			             i ? "," : "", applied[i]);
+			pos += (w > 0 ? (size_t)w : 0);
+		}
+		w = snprintf(body + pos, sizeof(body) - pos, "],\"errors\":[");
+		pos += (w > 0 ? (size_t)w : 0);
+		for (int i = 0; i < en; i++) {
+			w = snprintf(body + pos, sizeof(body) - pos,
+			             "%s{\"key\":\"%s\",\"reason\":\"%s\"}",
+			             i ? "," : "", errors[i].name, errors[i].reason);
+			pos += (w > 0 ? (size_t)w : 0);
+		}
+		w = snprintf(body + pos, sizeof(body) - pos, "],\"params\":");
+		pos += (w > 0 ? (size_t)w : 0);
+		w = params_to_json(snap->cfg, body + pos, sizeof(body) - pos);
+		if (w > 0) pos += (size_t)w;
+		w = snprintf(body + pos, sizeof(body) - pos, "}");
+		pos += (w > 0 ? (size_t)w : 0);
+		api_send(c->fd, 200, "application/json", body, (int)pos);
+
+		if (an > 0) {
+			LOGV(cfg, "[fec t=%8.3f] api: applied %d key(s) via /set",
+			     log_rel_s(), an);
+		}
+	}
+	else if (strcmp(path, "/status") == 0) {
+		n = status_to_json(snap, body, sizeof(body));
+		if (n > 0) api_send(c->fd, 200, "application/json", body, n);
+		else       api_send(c->fd, 500, "text/plain", "json overflow\n", 14);
+	}
+	else if (strcmp(path, "/health") == 0) {
+		api_send(c->fd, 200, "text/plain", "ok\n", 3);
+	}
+	else {
+		api_send(c->fd, 404, "text/plain", "no such route\n", 14);
+	}
+	c->fd = -1;
+}
+
+/* Drain a client fd: fill buffer until "\r\n\r\n" found, then dispatch.
+ * If still incomplete after a read with EWOULDBLOCK, leave for next poll. */
+static void api_client_drain(ApiClient *c, Config *cfg, ApiSnapshot *snap)
+{
+	for (;;) {
+		if (c->pos >= API_BUF_BYTES - 1) {
+			api_send(c->fd, 400, "text/plain", "request too large\n", 18);
+			c->fd = -1;
+			return;
+		}
+		ssize_t r = recv(c->fd, c->buf + c->pos,
+		                 API_BUF_BYTES - 1 - c->pos, MSG_DONTWAIT);
+		if (r < 0) {
+			if (errno == EAGAIN || errno == EWOULDBLOCK) return;
+			api_client_drop(c);
+			return;
+		}
+		if (r == 0) {
+			/* peer closed without sending complete request */
+			api_client_drop(c);
+			return;
+		}
+		c->pos += (size_t)r;
+		c->buf[c->pos] = '\0';
+		if (strstr(c->buf, "\r\n\r\n") || strstr(c->buf, "\n\n")) {
+			api_handle_request(c, cfg, snap);
+			return;
+		}
+	}
+}
+
 /* ── CLI / usage ─────────────────────────────────────────────────────── */
 
 static void usage(const char *prog)
@@ -1129,6 +1577,10 @@ static void usage(const char *prog)
 		"                       JSON stats. When set, radio.* + fec_k/fec_n\n"
 		"                       come from incoming datagrams and CMD_GET_RADIO\n"
 		"                       polling is disabled (default 0 = polling mode).\n"
+		"  --api-port N         bind HTTP API on 127.0.0.1:N (default 8765;\n"
+		"                       0 disables). Routes: GET / /params /set?k=v\n"
+		"                       /status /health. Useful for live tuning —\n"
+		"                       see GET / for the per-tunable list.\n"
 		"\n"
 		"FEC sizing:\n"
 		"  --mtu N              packet size budget (default 1446)\n"
@@ -1232,6 +1684,8 @@ static void config_defaults(Config *c)
 	c->boost_s = 3.0f;
 	c->boost_mult = 1.3f;
 
+	c->api_port = 8765;              /* HTTP API on 127.0.0.1:8765 */
+
 	c->dry_run = false;
 	c->verbose = 0;
 }
@@ -1253,6 +1707,7 @@ int main(int argc, char **argv)
 		OPT_BITRATE_TOL, OPT_BITRATE_GRACE, OPT_MCS_SETTLE, OPT_DRY_RUN,
 		OPT_BOOST_S, OPT_BOOST_MULT,
 		OPT_WFB_STATS_PORT,
+		OPT_API_PORT,
 	};
 	static const struct option longopts[] = {
 		{"sidecar",       required_argument, 0, OPT_SIDECAR},
@@ -1278,6 +1733,7 @@ int main(int argc, char **argv)
 		{"boost-s",       required_argument, 0, OPT_BOOST_S},
 		{"boost-mult",    required_argument, 0, OPT_BOOST_MULT},
 		{"wfb-stats-port", required_argument, 0, OPT_WFB_STATS_PORT},
+		{"api-port",      required_argument, 0, OPT_API_PORT},
 		{"verbose",       no_argument,       0, 'v'},
 		{"help",          no_argument,       0, 'h'},
 		{0, 0, 0, 0},
@@ -1336,6 +1792,15 @@ int main(int argc, char **argv)
 			cfg.wfb_stats_port = (uint16_t)p;
 			break;
 		}
+		case OPT_API_PORT: {
+			int p = atoi(optarg);
+			if (p < 0 || p > 65535) {
+				fprintf(stderr, "invalid --api-port (0..65535)\n");
+				return 1;
+			}
+			cfg.api_port = p;
+			break;
+		}
 		case 'v':              cfg.verbose        = 1; break;
 		case 'h': default: usage(argv[0]); return (ch == 'h') ? 0 : 1;
 		}
@@ -1370,6 +1835,23 @@ int main(int argc, char **argv)
 		} else {
 			LOG("wfb-stats: listening on udp:%u (radio + fec_k/n driven by datagrams; CMD_GET_RADIO polling disabled)",
 			    cfg.wfb_stats_port);
+		}
+	}
+
+	/* Optional HTTP API listener. -1 = disabled. Bind failure logs and
+	 * disables; the controller still runs without it. */
+	int api_fd = -1;
+	ApiClient api_clients[API_MAX_CLIENTS];
+	for (int i = 0; i < API_MAX_CLIENTS; i++) api_clients[i].fd = -1;
+	if (cfg.api_port > 0) {
+		api_fd = api_listen_open((uint16_t)cfg.api_port);
+		if (api_fd < 0) {
+			LOG("api: bind on tcp:%d failed (%s); HTTP API disabled",
+			    cfg.api_port, strerror(errno));
+			cfg.api_port = 0;
+		} else {
+			LOG("api: listening on tcp:127.0.0.1:%d (GET / for help)",
+			    cfg.api_port);
 		}
 	}
 
@@ -1484,10 +1966,14 @@ int main(int argc, char **argv)
 			next_radio_us = now + (uint64_t)(cfg.radio_poll_s * 1e6);
 		}
 
-		/* --- Poll sidecar (and stats UDP if enabled) for up to 100 ms --- */
-		struct pollfd pfds[2];
+		/* --- Poll sidecar, optional stats UDP, and optional HTTP API --- */
+		/* Slots: sidecar(1) + stats(0..1) + api_listen(0..1) + api_clients(0..N) */
+		struct pollfd pfds[3 + API_MAX_CLIENTS];
 		int npfds = 0;
-		int sidecar_idx = -1, stats_idx = -1;
+		int sidecar_idx = -1, stats_idx = -1, api_listen_idx = -1;
+		int api_client_idx[API_MAX_CLIENTS];
+		for (int i = 0; i < API_MAX_CLIENTS; i++) api_client_idx[i] = -1;
+
 		pfds[npfds].fd = sfd;
 		pfds[npfds].events = POLLIN;
 		sidecar_idx = npfds++;
@@ -1496,9 +1982,66 @@ int main(int argc, char **argv)
 			pfds[npfds].events = POLLIN;
 			stats_idx = npfds++;
 		}
+		if (api_fd >= 0) {
+			pfds[npfds].fd = api_fd;
+			pfds[npfds].events = POLLIN;
+			api_listen_idx = npfds++;
+			for (int i = 0; i < API_MAX_CLIENTS; i++) {
+				if (api_clients[i].fd >= 0) {
+					pfds[npfds].fd = api_clients[i].fd;
+					pfds[npfds].events = POLLIN;
+					api_client_idx[i] = npfds++;
+				}
+			}
+		}
 		int pr = poll(pfds, npfds, 100);
 		if (pr < 0) { if (errno == EINTR) continue; perror("poll"); break; }
 		if (pr == 0) continue;
+
+		/* --- Service HTTP API first: small responses, finishes fast,
+		 * gives the operator near-real-time observability of /status
+		 * even when the controller is busy. */
+		if (api_listen_idx >= 0 && (pfds[api_listen_idx].revents & POLLIN)) {
+			for (;;) {
+				struct sockaddr_in peer;
+				socklen_t plen = sizeof(peer);
+				int cfd = accept(api_fd, (struct sockaddr *)&peer, &plen);
+				if (cfd < 0) {
+					if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+					break;
+				}
+				int fl = fcntl(cfd, F_GETFL, 0);
+				if (fl >= 0) fcntl(cfd, F_SETFL, fl | O_NONBLOCK);
+				if (api_client_alloc(api_clients, cfd) < 0) {
+					/* No free slot — politely 503 + close. */
+					api_send(cfd, 503, "text/plain",
+					         "no free api slot\n", 17);
+				}
+			}
+		}
+		if (api_listen_idx >= 0) {
+			ApiSnapshot snap = {
+				.cfg = &cfg, .ctrl = &ctrl, .radio = &radio, .fps = &fps,
+				.last_written_fec_k = last_written_fec_k,
+				.last_written_fec_n = last_written_fec_n,
+				.last_written_kbps  = last_written_kbps,
+				.last_stats_us      = last_stats_us,
+			};
+			for (int i = 0; i < API_MAX_CLIENTS; i++) {
+				if (api_client_idx[i] < 0) continue;
+				if (api_clients[i].fd < 0) continue;
+				if (pfds[api_client_idx[i]].revents & (POLLIN | POLLHUP | POLLERR))
+					api_client_drain(&api_clients[i], &cfg, &snap);
+			}
+			/* Reap clients that have been hanging idle > 2 s. */
+			uint64_t now2 = now_us();
+			for (int i = 0; i < API_MAX_CLIENTS; i++) {
+				if (api_clients[i].fd >= 0 &&
+				    now2 - api_clients[i].accepted_us > 2000000ULL) {
+					api_client_drop(&api_clients[i]);
+				}
+			}
+		}
 
 		/* Drain wfb_tx stats first — radio info may inform a same-tick
 		 * sidecar read's bitrate calc. recvfrom() (vs recv()) so we can
@@ -1604,6 +2147,9 @@ int main(int argc, char **argv)
 	}
 
 	if (stats_fd >= 0) close(stats_fd);
+	if (api_fd >= 0) close(api_fd);
+	for (int i = 0; i < API_MAX_CLIENTS; i++)
+		if (api_clients[i].fd >= 0) close(api_clients[i].fd);
 	close(sfd);
 	LOG("stopped after %u FEC updates", ctrl.update_count);
 	return 0;
