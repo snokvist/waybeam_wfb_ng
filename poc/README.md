@@ -52,8 +52,9 @@ to stock wfb-ng.
 
 | Artifact | Where | Arch | What it does |
 |---|---|---|---|
-| `fec_controller` | `build/fec_controller` | ARM dyn (34 KB) | Adaptive FEC sizing + REST/SSE API. Single-binary on-device controller. |
-| `mcs_selector` | `build/mcs_selector` | ARM dyn (34 KB) | RSSI-driven adaptive MCS controller. Subscribes to `wfb_rx -Y`, writes `set_radio` to wfb_tx. Coexists with `fec_controller`. REST/SSE API on :8766. |
+| `link_controller` | `build/link_controller` | ARM dyn (71 KB) | **Recommended.** Merged FEC + MCS controller with embedded WebUI. REST/SSE/HTML on :8765. Both subsystems in one binary, dual-loop poll(), shared wfb_tx control socket. See [Tool reference](#link_controller--merged-fec--mcs--webui). |
+| `fec_controller` | `build/fec_controller` | ARM dyn (34 KB) | Legacy single-purpose FEC controller. Superseded by `link_controller`; kept for rollback / A/B comparison. REST/SSE API on :8765. |
+| `mcs_selector` | `build/mcs_selector` | ARM dyn (34 KB) | Legacy single-purpose MCS controller. Superseded by `link_controller`; kept for rollback. REST/SSE API on :8766. |
 | `wfb_tx` | `build/wfb_tx` | ARM static (543 KB) | wfb-ng tx with `-H` (SHM input), `-Y host:port` (UDP stats push), `-x` aux flag. |
 | `wfb_tx_cmd` | `build/wfb_tx_cmd` | ARM static (318 KB) | Runtime control: `set_fec`, `set_radio`, `set_mbit`, `get_radio`. |
 | `wfb_keygen` | `build/wfb_keygen` | ARM static (423 KB) | Key generator (drone/gs keys). |
@@ -111,6 +112,24 @@ make -f Makefile.mcs_selector host       # native → build/mcs_selector.host
 make -f Makefile.mcs_selector deploy     # scp build/mcs_selector → 192.168.1.13:/tmp
 make -f Makefile.mcs_selector clean
 ```
+
+### link_controller (merged binary, recommended)
+
+Combines `fec_controller` + `mcs_selector` into one binary plus an
+embedded HTML WebUI. The Makefile auto-runs `xxd -i webui/index.html`
+into `webui_assets.h` on every build.
+
+```bash
+cd poc
+make -f Makefile.link_controller         # cross → build/link_controller (ARM)
+make -f Makefile.link_controller webui   # only regen embedded WebUI assets
+make -f Makefile.link_controller host    # native → build/link_controller.host
+make -f Makefile.link_controller deploy  # scp build/link_controller → 192.168.1.13:/tmp
+make -f Makefile.link_controller clean
+```
+
+`xxd` (from `vim-common`) is required on the host. The embedded WebUI
+adds ~12 KB to the stripped binary (~71 KB total ARM).
 
 ### Re-applying the patch after upstream wfb-ng changes
 
@@ -198,6 +217,141 @@ ssh root@192.168.1.13 'curl -s http://127.0.0.1:8765/status   # fec_controller
 ---
 
 ## Tool reference
+
+### `link_controller` — merged FEC + MCS + WebUI
+
+**One-liner**: combines `fec_controller` and `mcs_selector` into one
+binary plus an embedded HTML WebUI. Both control loops live in a single
+poll() loop, share the wfb_tx control socket, and feed a unified
+REST/SSE/HTML endpoint on port 8765. When the MCS subsystem commits a
+SET_RADIO it explicitly arms the FEC subsystem's `mcs_settle_s` window
+in-process — replacing the older `tx_stats`-detect-then-arm round-trip
+that the standalone pair used.
+
+```bash
+# Default — both subsystems on, polling-mode FEC, 8765 REST + WebUI
+link_controller --stats 127.0.0.1:6600
+
+# Production invocation on the vehicle
+link_controller --stats 127.0.0.1:6600 \
+                --wfb-stats-port 5601 \
+                --sidecar 127.0.0.1:5602 \
+                --api-port 8765 -v
+
+# MCS-only (skip FEC)
+link_controller --no-fec --stats 127.0.0.1:6600
+
+# FEC-only (skip MCS) — equivalent to legacy fec_controller
+link_controller --no-mcs --sidecar 127.0.0.1:5602
+
+# Compute but don't send any wfb_tx commands
+link_controller --dry-run -v
+```
+
+**Key flags**:
+
+| Flag | Default | Purpose |
+|---|---|---|
+| `--wfb HOST:PORT` | `127.0.0.1:8000` | shared wfb_tx control socket |
+| `--api-port N` | `8765` | REST + WebUI bind (0 disables) |
+| `--no-fec` / `--no-mcs` | both on | disable a subsystem |
+| `--sidecar HOST:PORT` | `127.0.0.1:6666` | venc sidecar (FEC) |
+| `--wfb-stats-port N` | `0` (poll mode) | UDP listener for `wfb_tx -Y` (FEC) |
+| `--stats HOST:PORT` | `127.0.0.1:5801` | UDP listener for `wfb_rx -Y` rx_ant (MCS) |
+| `--range low\|med\|high` | `med` (1,2,3) | bucket→mcs preset |
+| `--dry-run` | off | suppress all wfb_tx writes |
+
+See `link_controller --help` for the full list (53 hot tunables; the
+WebUI Tune tab generates a labeled input for every one of them).
+
+**HTTP API**:
+
+```bash
+# Browser → embedded WebUI (Live / Tune / Timeline tabs)
+open http://192.168.1.13:8765/
+
+# curl (no HTML accept) → plain-text help
+curl -s http://192.168.1.13:8765/
+
+# Same help, always plain text
+curl -s http://192.168.1.13:8765/help
+
+# All 53 tunables (dotted keys: fec.* / mcs.* / common.*)
+curl -s http://192.168.1.13:8765/params
+
+# Tunable schema (type/lo/hi/help) — for forms / validators
+curl -s http://192.168.1.13:8765/schema
+
+# Combined status snapshot
+curl -s http://192.168.1.13:8765/status
+
+# Per-subsystem subset
+curl -s http://192.168.1.13:8765/fec/status
+curl -s http://192.168.1.13:8765/mcs/status
+
+# Live tuning (multi-namespace atomic write)
+curl -s "http://192.168.1.13:8765/set?fec.mtu=1400&mcs.rssi_thresh_low=-65"
+
+# SSE — every log line as JSON, with subsys field
+curl -sN http://192.168.1.13:8765/events
+# data: {"t_s":42.123,"subsys":"mcs","msg":"decision: down bucket=1 ..."}
+
+# Health
+curl -s http://192.168.1.13:8765/health
+```
+
+**WebUI**:
+
+- **Live** — current FEC k/n, MCS bucket, effective RSSI, loss/recov %,
+  bitrate, plus inline SVG sparklines for last 60 antenna RSSI samples
+  per antenna.
+- **Tune** — auto-generated form from `/schema`, grouped by subsystem.
+  Per-row Apply button + flash animation on accept/reject. Init-once
+  pattern so the form doesn't reset on the 1 Hz status refresh.
+- **Timeline** — scrolling SSE log, color-coded by subsystem
+  (`fec`/`mcs`/`common`), filter chips per subsystem, XSS-safe
+  (`textContent` only).
+
+No external assets — all CSS+JS inline in `webui/index.html`, embedded
+into the binary at build time via `xxd -i`.
+
+**Coordination**:
+
+- MCS commit → in-process `controller_arm_settle()` on FEC. No race,
+  no tx_stats round-trip required.
+- Both subsystems share `RadioState`; MCS writes `from_self=true` so
+  the FEC "external change" log doesn't fire on self-induced changes.
+- Single `wfb_get_radio()` and shared `g_req_id` (single-threaded so
+  no atomicity needed).
+- The legacy `mcs_settle_s` config name is kept verbatim — it's a FEC
+  subsystem tunable that controls how long FEC ignores its own outputs
+  after an MCS-driven radio change.
+
+**Limits**: 8 concurrent HTTP clients, 4 of which can be SSE
+subscribers (`503 sse: too many subscribers` past that). 16 KB JSON
+response cap (overflow returns `500 json overflow`).
+
+**Migration from `fec_controller` + `mcs_selector`**:
+
+```bash
+# Before:
+fec_controller --sidecar 127.0.0.1:5602 --wfb-stats-port 5601
+mcs_selector --stats 127.0.0.1:6600 --api-port 8766
+
+# After (same behavior, single process):
+link_controller --sidecar 127.0.0.1:5602 \
+                --wfb-stats-port 5601 \
+                --stats 127.0.0.1:6600 \
+                --api-port 8765
+```
+
+Tunable names map mechanically: every `fec_controller` tunable becomes
+`fec.<name>` and every `mcs_selector` tunable becomes `mcs.<name>`.
+The two old binaries remain in tree for rollback / A/B comparison —
+they coexist on the vehicle (different REST ports) but only one of
+them should be writing to `wfb_tx` at a time per CMD ID.
+
+---
 
 ### `fec_controller` — adaptive FEC + bitrate controller
 

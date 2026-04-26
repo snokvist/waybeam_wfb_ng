@@ -1,0 +1,75 @@
+# Cross-build the link_controller POC for SigmaStar Infinity6E (armv7l).
+#
+# Usage (from waybeam_wfb_ng/poc/):
+#   make -f Makefile.link_controller                # cross-build (incl. WebUI)
+#   make -f Makefile.link_controller webui          # regen embedded WebUI only
+#   make -f Makefile.link_controller host           # native host build (debug)
+#   make -f Makefile.link_controller deploy         # scp to DEPLOY_HOST
+#   make -f Makefile.link_controller clean
+#
+# Env:
+#   DEPLOY_HOST=192.168.1.13   target star6e IP (default)
+#   DEPLOY_DIR=/tmp            destination dir
+
+TOOLCHAIN   ?= ../toolchain/toolchain.sigmastar-infinity6e
+CROSS_CC    ?= $(TOOLCHAIN)/bin/arm-openipc-linux-gnueabihf-gcc
+CROSS_STRIP ?= $(TOOLCHAIN)/bin/arm-openipc-linux-gnueabihf-strip
+
+BUILD_DIR   ?= build
+OUT          = $(BUILD_DIR)/link_controller
+OUT_HOST     = $(BUILD_DIR)/link_controller.host
+SRC          = link_controller.c
+WEBUI_SRC    = webui/index.html
+WEBUI_HDR    = webui_assets.h
+
+CFLAGS_COMMON = -std=gnu99 -O2 -Wall -Wextra -Wno-missing-field-initializers
+LDFLAGS_COMMON = -lm
+
+DEPLOY_HOST ?= 192.168.1.13
+DEPLOY_DIR  ?= /tmp
+
+.PHONY: all webui clean deploy host help
+
+all: $(OUT)
+
+webui: $(WEBUI_HDR)
+
+# xxd -i embeds the file as `unsigned char webui_index_html[]` with a
+# matching `_len`. We rename to `webui_html[]` / `webui_html_len` so the C
+# code doesn't depend on the input filename.
+$(WEBUI_HDR): $(WEBUI_SRC)
+	@echo "[link] embedding $(WEBUI_SRC) -> $@"
+	@xxd -i -n webui_html $< > $@
+	@# xxd uses "unsigned int <name>_len = N;" — promote to const so the
+	@# C side can declare it `const unsigned int`.
+	@sed -i 's/^unsigned char webui_html/const unsigned char webui_html/' $@
+	@sed -i 's/^unsigned int webui_html_len/const unsigned int webui_html_len/' $@
+
+$(BUILD_DIR):
+	@mkdir -p $@
+
+$(OUT): $(SRC) $(WEBUI_HDR) | $(BUILD_DIR)
+	$(CROSS_CC) $(CFLAGS_COMMON) -I. -o $@ $(SRC) $(LDFLAGS_COMMON)
+	$(CROSS_STRIP) $@
+	@echo "[link] built $@"
+	@ls -la $@
+
+host: $(OUT_HOST)
+
+$(OUT_HOST): $(SRC) $(WEBUI_HDR) | $(BUILD_DIR)
+	cc $(CFLAGS_COMMON) -I. -g -o $@ $(SRC) $(LDFLAGS_COMMON)
+	@echo "[link] host build: $@"
+
+clean:
+	rm -f $(OUT) $(OUT_HOST) $(WEBUI_HDR)
+
+deploy: $(OUT)
+	scp -O $(OUT) root@$(DEPLOY_HOST):$(DEPLOY_DIR)/
+	@echo "[link] deployed to root@$(DEPLOY_HOST):$(DEPLOY_DIR)/link_controller"
+
+help:
+	@echo "make -f Makefile.link_controller         # cross-build (incl. WebUI)"
+	@echo "make -f Makefile.link_controller webui   # regen embedded WebUI only"
+	@echo "make -f Makefile.link_controller host    # native host build"
+	@echo "make -f Makefile.link_controller deploy  # scp to root@\$$DEPLOY_HOST"
+	@echo "make -f Makefile.link_controller clean"

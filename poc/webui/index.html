@@ -1,0 +1,458 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>link_controller</title>
+<style>
+:root{
+  --bg:#0d1117;--panel:#161b22;--panel2:#1f2630;--text:#c9d1d9;--mute:#8b949e;
+  --accent:#58a6ff;--ok:#3fb950;--warn:#d29922;--bad:#f85149;
+  --fec:#58a6ff;--mcs:#bc8cff;--common:#8b949e;
+  --border:#30363d;
+}
+*{box-sizing:border-box}
+html,body{margin:0;padding:0;height:100%;font:13px/1.4 -apple-system,Segoe UI,Helvetica,Arial,sans-serif;background:var(--bg);color:var(--text)}
+header{display:flex;align-items:center;justify-content:space-between;padding:8px 14px;background:var(--panel);border-bottom:1px solid var(--border)}
+header h1{font-size:14px;margin:0;font-weight:600;letter-spacing:0.3px}
+header h1 .v{color:var(--mute);font-weight:400;margin-left:8px}
+header .conn{font-size:11px;padding:2px 8px;border-radius:10px;background:var(--panel2)}
+header .conn.ok{color:var(--ok)}
+header .conn.bad{color:var(--bad)}
+nav{display:flex;background:var(--panel);border-bottom:1px solid var(--border)}
+nav button{flex:0 0 auto;background:none;color:var(--mute);border:none;border-bottom:2px solid transparent;padding:8px 18px;font:inherit;cursor:pointer}
+nav button.active{color:var(--text);border-bottom-color:var(--accent)}
+nav button:hover{color:var(--text)}
+main{padding:12px;overflow:auto;height:calc(100vh - 86px)}
+.tab{display:none}
+.tab.active{display:block}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px;margin-bottom:12px}
+.card{background:var(--panel);border:1px solid var(--border);border-radius:6px;padding:10px}
+.card h3{margin:0 0 6px;font-size:11px;text-transform:uppercase;letter-spacing:0.6px;color:var(--mute);font-weight:600}
+.card .v{font-size:18px;font-weight:600}
+.card .v.ok{color:var(--ok)}.card .v.warn{color:var(--warn)}.card .v.bad{color:var(--bad)}
+.card .sub{font-size:11px;color:var(--mute);margin-top:2px}
+.row{display:flex;gap:10px;margin-bottom:12px}
+.row > *{flex:1}
+.panel{background:var(--panel);border:1px solid var(--border);border-radius:6px;padding:10px}
+.panel h2{margin:0 0 8px;font-size:12px;text-transform:uppercase;letter-spacing:0.5px;color:var(--mute);font-weight:600}
+.kv{display:grid;grid-template-columns:auto 1fr;gap:4px 12px;font-size:12px}
+.kv dt{color:var(--mute)}
+.kv dd{margin:0;font-variant-numeric:tabular-nums}
+.spark{display:block;background:var(--panel2);border-radius:3px;margin-top:4px}
+.spark-row{display:flex;align-items:center;gap:8px;font-size:11px;font-variant-numeric:tabular-nums;padding:3px 0;border-top:1px solid var(--border)}
+.spark-row:first-child{border-top:0}
+.spark-row .lbl{width:50px;color:var(--mute)}
+.spark-row .val{width:60px;text-align:right}
+.tune-section{margin-bottom:18px}
+.tune-section h2{margin:0 0 8px;font-size:12px;text-transform:uppercase;letter-spacing:0.5px;font-weight:600;border-left:3px solid var(--common);padding-left:8px}
+.tune-section.fec h2{border-left-color:var(--fec);color:var(--fec)}
+.tune-section.mcs h2{border-left-color:var(--mcs);color:var(--mcs)}
+.tune-section.common h2{border-left-color:var(--common);color:var(--mute)}
+.tune-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:6px}
+.tune-row{display:grid;grid-template-columns:170px 1fr 60px;gap:6px;align-items:center;padding:5px 8px;background:var(--panel);border:1px solid var(--border);border-radius:4px}
+.tune-row .name{font-family:ui-monospace,SFMono-Regular,monospace;font-size:11px;color:var(--text)}
+.tune-row .name .help{display:block;color:var(--mute);font-size:10px;font-family:inherit;margin-top:2px}
+.tune-row input{background:var(--panel2);color:var(--text);border:1px solid var(--border);border-radius:3px;padding:3px 5px;font:inherit;width:100%}
+.tune-row input:focus{outline:none;border-color:var(--accent)}
+.tune-row button{background:var(--panel2);color:var(--text);border:1px solid var(--border);border-radius:3px;padding:3px 8px;font:inherit;cursor:pointer}
+.tune-row button:hover{background:var(--accent);border-color:var(--accent);color:#000}
+.tune-row.applied{animation:flash-ok 1s ease-out}
+.tune-row.error{animation:flash-bad 1.5s ease-out}
+@keyframes flash-ok{0%{background:rgba(63,185,80,0.25)}100%{background:var(--panel)}}
+@keyframes flash-bad{0%{background:rgba(248,81,73,0.25)}100%{background:var(--panel)}}
+.timeline{font-family:ui-monospace,SFMono-Regular,monospace;font-size:11px}
+.timeline .filters{display:flex;gap:6px;margin-bottom:8px;align-items:center}
+.timeline .filters label{display:flex;align-items:center;gap:4px;cursor:pointer;padding:3px 8px;background:var(--panel);border:1px solid var(--border);border-radius:3px}
+.timeline .filters label input{margin:0}
+.timeline .filters .clear{margin-left:auto;background:var(--panel);color:var(--mute);border:1px solid var(--border);border-radius:3px;padding:3px 10px;cursor:pointer;font:inherit}
+.timeline .events{background:var(--panel);border:1px solid var(--border);border-radius:4px;padding:6px;height:calc(100vh - 200px);overflow-y:auto}
+.timeline .ev{padding:2px 4px;border-bottom:1px solid var(--border);display:flex;gap:8px;align-items:flex-start;white-space:pre-wrap;word-break:break-all}
+.timeline .ev:last-child{border:0}
+.timeline .ev .t{color:var(--mute);flex:0 0 auto}
+.timeline .ev .s{flex:0 0 auto;font-weight:600;width:36px}
+.timeline .ev.fec .s{color:var(--fec)}
+.timeline .ev.mcs .s{color:var(--mcs)}
+.timeline .ev.common .s{color:var(--common)}
+.timeline .ev .m{flex:1}
+.muted{color:var(--mute)}
+.empty{color:var(--mute);text-align:center;padding:20px}
+</style>
+</head>
+<body>
+<header>
+  <h1>link_controller<span class="v">FEC + MCS adaptive controller</span></h1>
+  <span id="conn" class="conn">connecting…</span>
+</header>
+<nav>
+  <button data-tab="live" class="active">Live</button>
+  <button data-tab="tune">Tune</button>
+  <button data-tab="timeline">Timeline</button>
+</nav>
+<main>
+  <section id="tab-live" class="tab active">
+    <div class="cards">
+      <div class="card"><h3>Uptime</h3><div class="v" id="c-uptime">—</div></div>
+      <div class="card"><h3>FEC k / n</h3><div class="v" id="c-fec">—</div><div class="sub" id="c-fec-sub">—</div></div>
+      <div class="card"><h3>MCS bucket</h3><div class="v" id="c-mcs">—</div><div class="sub" id="c-mcs-sub">—</div></div>
+      <div class="card"><h3>Effective RSSI</h3><div class="v" id="c-rssi">—</div><div class="sub" id="c-rssi-sub">—</div></div>
+      <div class="card"><h3>Loss</h3><div class="v" id="c-loss">—</div><div class="sub" id="c-loss-sub">—</div></div>
+      <div class="card"><h3>Bitrate</h3><div class="v" id="c-bitrate">—</div><div class="sub" id="c-bitrate-sub">—</div></div>
+    </div>
+    <div class="row">
+      <div class="panel">
+        <h2>Selector</h2>
+        <dl class="kv" id="kv-sel"></dl>
+      </div>
+      <div class="panel">
+        <h2>Controller</h2>
+        <dl class="kv" id="kv-ctrl"></dl>
+      </div>
+      <div class="panel">
+        <h2>Radio</h2>
+        <dl class="kv" id="kv-radio"></dl>
+      </div>
+    </div>
+    <div class="panel">
+      <h2>RSSI sparklines (last 60 samples per antenna)</h2>
+      <div id="sparks"></div>
+    </div>
+  </section>
+
+  <section id="tab-tune" class="tab"></section>
+
+  <section id="tab-timeline" class="tab">
+    <div class="timeline">
+      <div class="filters">
+        <label><input type="checkbox" data-subsys="fec" checked> fec</label>
+        <label><input type="checkbox" data-subsys="mcs" checked> mcs</label>
+        <label><input type="checkbox" data-subsys="common" checked> common</label>
+        <button class="clear" id="ev-clear">clear</button>
+      </div>
+      <div class="events" id="events"><div class="empty">waiting for events…</div></div>
+    </div>
+  </section>
+</main>
+
+<script>
+"use strict";
+
+// ── State ────────────────────────────────────────────────────────────
+const state = {
+  paramsSchema: null,    // [{name, type, lo, hi, help, value, subsys}, ...]
+  tuneRendered: false,
+  evBuf: [],             // [{t, subsys, msg}, ...] — capped
+  evCap: 200,
+  filters: {fec:true, mcs:true, common:true},
+  rssiHist: {},          // antIdx -> [last N values]
+  rssiCap: 60,
+};
+
+const $ = sel => document.querySelector(sel);
+const $$ = sel => document.querySelectorAll(sel);
+
+// ── Tabs ─────────────────────────────────────────────────────────────
+$$("nav button").forEach(b => b.addEventListener("click", () => {
+  $$("nav button").forEach(x => x.classList.remove("active"));
+  $$(".tab").forEach(x => x.classList.remove("active"));
+  b.classList.add("active");
+  $("#tab-" + b.dataset.tab).classList.add("active");
+  if (b.dataset.tab === "tune" && !state.tuneRendered) renderTune();
+}));
+
+// ── Subsystem detection from dotted key ──────────────────────────────
+function subsysOf(key) {
+  if (key.startsWith("fec.")) return "fec";
+  if (key.startsWith("mcs.")) return "mcs";
+  return "common";
+}
+
+// ── Connection status / SSE ──────────────────────────────────────────
+function setConn(ok, text) {
+  const el = $("#conn");
+  el.className = "conn " + (ok ? "ok" : "bad");
+  el.textContent = text;
+}
+
+function startSSE() {
+  let es;
+  try { es = new EventSource("/events"); } catch (e) { setConn(false, "sse failed"); return; }
+  es.onopen = () => setConn(true, "live");
+  es.onerror = () => setConn(false, "disconnected");
+  es.onmessage = e => {
+    let d;
+    try { d = JSON.parse(e.data); } catch (_) { return; }
+    pushEvent(d.t_s, d.subsys || "common", d.msg || "");
+  };
+}
+
+function pushEvent(t, subsys, msg) {
+  state.evBuf.push({t, subsys, msg});
+  if (state.evBuf.length > state.evCap) state.evBuf.shift();
+  appendEventToDom(t, subsys, msg);
+}
+
+function appendEventToDom(t, subsys, msg) {
+  if (!state.filters[subsys]) return;
+  const evDiv = $("#events");
+  if (evDiv.firstElementChild && evDiv.firstElementChild.classList.contains("empty"))
+    evDiv.innerHTML = "";
+  const row = document.createElement("div");
+  row.className = "ev " + subsys;
+  const t1 = document.createElement("span"); t1.className = "t"; t1.textContent = (typeof t === "number" ? t.toFixed(3) : "—") + "s";
+  const t2 = document.createElement("span"); t2.className = "s"; t2.textContent = subsys;
+  const t3 = document.createElement("span"); t3.className = "m"; t3.textContent = msg;
+  row.append(t1, t2, t3);
+  evDiv.appendChild(row);
+  // cap rendered children too
+  while (evDiv.children.length > state.evCap) evDiv.removeChild(evDiv.firstChild);
+  // auto-scroll if user is near bottom
+  if (evDiv.scrollTop + evDiv.clientHeight + 40 >= evDiv.scrollHeight)
+    evDiv.scrollTop = evDiv.scrollHeight;
+}
+
+function rerenderEvents() {
+  const evDiv = $("#events");
+  evDiv.innerHTML = "";
+  for (const e of state.evBuf) appendEventToDom(e.t, e.subsys, e.msg);
+  if (!evDiv.children.length) evDiv.innerHTML = '<div class="empty">no events match filters</div>';
+}
+
+$$(".timeline .filters input").forEach(cb => cb.addEventListener("change", () => {
+  state.filters[cb.dataset.subsys] = cb.checked;
+  rerenderEvents();
+}));
+$("#ev-clear").addEventListener("click", () => { state.evBuf = []; rerenderEvents(); });
+
+// ── Live tab — periodic /status fetch ────────────────────────────────
+async function pollStatus() {
+  try {
+    const r = await fetch("/status", {cache:"no-store"});
+    if (!r.ok) throw new Error(r.status);
+    const j = await r.json();
+    renderStatus(j);
+  } catch (_) { /* SSE conn indicator already shows it */ }
+}
+
+function fmtKv(parent, obj, fmt) {
+  parent.innerHTML = "";
+  for (const k of Object.keys(obj)) {
+    const dt = document.createElement("dt"); dt.textContent = k;
+    const dd = document.createElement("dd");
+    let v = obj[k];
+    if (fmt && fmt[k]) v = fmt[k](v);
+    else if (typeof v === "number") v = (Number.isInteger(v) ? v : v.toFixed(2));
+    else if (typeof v === "boolean") v = v ? "yes" : "no";
+    dd.textContent = (v === null || v === undefined) ? "—" : String(v);
+    parent.appendChild(dt); parent.appendChild(dd);
+  }
+}
+
+function renderStatus(s) {
+  $("#c-uptime").textContent = (s.uptime_s ?? 0).toFixed(1) + "s";
+
+  // FEC card
+  const fec = s.fec || {};
+  if (fec.have_current) {
+    $("#c-fec").textContent = fec.k + " / " + fec.n;
+    $("#c-fec").className = "v ok";
+    $("#c-fec-sub").textContent = "avg " + (fec.avg_frame_size||0).toFixed(0) + " B  fps " + (fec.fps||0).toFixed(1);
+  } else {
+    $("#c-fec").textContent = "—";
+    $("#c-fec").className = "v";
+    $("#c-fec-sub").textContent = "(waiting for first commit)";
+  }
+
+  // MCS card
+  const mcs = s.mcs || {};
+  if (mcs.current_bucket >= 0) {
+    $("#c-mcs").textContent = "B" + mcs.current_bucket + " · MCS " + mcs.current_mcs;
+    $("#c-mcs").className = mcs.in_failsafe ? "v bad" : "v ok";
+    $("#c-mcs-sub").textContent = mcs.in_failsafe
+      ? ("FAILSAFE  recov " + mcs.recovery_streak)
+      : ("commits " + mcs.commit_count + (mcs.changes_in_window > 1 ? "  osc " + mcs.changes_in_window : ""));
+  } else {
+    $("#c-mcs").textContent = "—";
+    $("#c-mcs").className = "v";
+    $("#c-mcs-sub").textContent = "(no rx_ant yet)";
+  }
+
+  // RSSI
+  const score = s.score || {};
+  if ("effective_rssi" in score) {
+    const eff = score.effective_rssi;
+    $("#c-rssi").textContent = eff.toFixed(1) + " dBm";
+    $("#c-rssi").className = "v " + (eff < -75 ? "bad" : eff < -60 ? "warn" : "ok");
+    $("#c-rssi-sub").textContent = "penalty " + (score.loss_penalty_db||0).toFixed(1) + " dB";
+  }
+
+  // Loss
+  if ("lost_ratio" in score) {
+    const lp = score.lost_ratio * 100;
+    $("#c-loss").textContent = lp.toFixed(2) + "%";
+    $("#c-loss").className = "v " + (lp > 5 ? "bad" : lp > 0.5 ? "warn" : "ok");
+    $("#c-loss-sub").textContent = "fec_recov " + ((score.recov_ratio||0)*100).toFixed(1) + "%";
+  }
+
+  // Bitrate
+  const wfb = s.wfb || {};
+  if (wfb.last_bitrate_kbps != null) {
+    $("#c-bitrate").textContent = (wfb.last_bitrate_kbps/1000).toFixed(2) + " Mbps";
+    $("#c-bitrate").className = "v";
+    $("#c-bitrate-sub").textContent = "last set_fec " + wfb.last_set_fec_k + "/" + wfb.last_set_fec_n;
+  }
+
+  // Detail panels
+  fmtKv($("#kv-sel"), {
+    bucket: mcs.current_bucket,
+    mcs: mcs.current_mcs,
+    pending_bucket: mcs.pending_bucket,
+    pending_streak: mcs.pending_streak,
+    in_failsafe: !!mcs.in_failsafe,
+    commit_count: mcs.commit_count,
+    changes_in_window: mcs.changes_in_window,
+  });
+  fmtKv($("#kv-ctrl"), {
+    have_current: !!fec.have_current,
+    k: fec.k, n: fec.n,
+    avg_frame_size: (fec.avg_frame_size||0).toFixed(1),
+    update_count: fec.update_count,
+    fps: (fec.fps||0).toFixed(2),
+  });
+  const radio = s.radio || {};
+  fmtKv($("#kv-radio"), {
+    valid: !!radio.valid,
+    mcs_index: radio.mcs,
+    bw: radio.bw,
+    short_gi: !!radio.short_gi,
+    stbc: radio.stbc,
+    ldpc: !!radio.ldpc,
+    vht: !!radio.vht_mode,
+    nss: radio.vht_nss,
+    phy_mbps: (radio.phy_mbps != null) ? radio.phy_mbps.toFixed(1) : "—",
+  });
+
+  // Antenna sparklines
+  if (s.ants && Array.isArray(s.ants)) renderSparks(s.ants);
+}
+
+function renderSparks(ants) {
+  const root = $("#sparks");
+  // build rows once if antenna count changed
+  if (root.dataset.n !== String(ants.length)) {
+    root.innerHTML = "";
+    for (let i = 0; i < ants.length; i++) {
+      const row = document.createElement("div"); row.className = "spark-row";
+      row.innerHTML = '<span class="lbl">ant '+i+'</span><span class="val" id="spark-v-'+i+'">—</span>'
+        + '<svg class="spark" id="spark-svg-'+i+'" width="100%" height="20" preserveAspectRatio="none" viewBox="0 0 60 20"></svg>';
+      root.appendChild(row);
+    }
+    root.dataset.n = ants.length;
+    state.rssiHist = {};
+  }
+  for (let i = 0; i < ants.length; i++) {
+    const v = ants[i];
+    if (typeof v !== "number") continue;
+    if (!state.rssiHist[i]) state.rssiHist[i] = [];
+    state.rssiHist[i].push(v);
+    if (state.rssiHist[i].length > state.rssiCap) state.rssiHist[i].shift();
+    $("#spark-v-"+i).textContent = v.toFixed(1) + " dBm";
+    drawSpark($("#spark-svg-"+i), state.rssiHist[i]);
+  }
+}
+
+function drawSpark(svg, data) {
+  if (!data.length) return;
+  const lo = -100, hi = -30;     // visible RSSI range
+  const w = 60, h = 20;
+  const pts = data.map((v,i) => {
+    const x = (i/(state.rssiCap-1))*w;
+    const y = h - ((Math.max(lo, Math.min(hi, v)) - lo)/(hi-lo))*h;
+    return x.toFixed(1)+","+y.toFixed(1);
+  }).join(" ");
+  const last = data[data.length-1];
+  const color = last < -75 ? "var(--bad)" : last < -60 ? "var(--warn)" : "var(--ok)";
+  svg.innerHTML = '<polyline fill="none" stroke="'+color+'" stroke-width="1.2" points="'+pts+'"/>';
+}
+
+// ── Tune tab — init-once form ────────────────────────────────────────
+async function renderTune() {
+  const root = $("#tab-tune");
+  root.innerHTML = '<div class="empty">loading…</div>';
+  let params, schema;
+  try {
+    [params, schema] = await Promise.all([
+      fetch("/params", {cache:"no-store"}).then(r => r.json()),
+      fetch("/schema", {cache:"no-store"}).then(r => r.json()),
+    ]);
+  } catch (e) {
+    root.innerHTML = '<div class="empty">failed to load params (' + e + ')</div>';
+    return;
+  }
+  // schema is [{name, type, lo, hi, help}, ...]
+  state.paramsSchema = schema.map(s => ({...s, value: params[s.name], subsys: subsysOf(s.name)}));
+
+  // Group by subsystem
+  const groups = {common:[], fec:[], mcs:[]};
+  for (const f of state.paramsSchema) groups[f.subsys].push(f);
+
+  root.innerHTML = "";
+  for (const g of ["common","fec","mcs"]) {
+    if (!groups[g].length) continue;
+    const sect = document.createElement("div"); sect.className = "tune-section " + g;
+    const h = document.createElement("h2"); h.textContent = g + " (" + groups[g].length + ")";
+    const grid = document.createElement("div"); grid.className = "tune-grid";
+    sect.append(h, grid);
+    for (const f of groups[g]) grid.appendChild(buildTuneRow(f));
+    root.appendChild(sect);
+  }
+  state.tuneRendered = true;
+}
+
+function buildTuneRow(f) {
+  const row = document.createElement("div"); row.className = "tune-row";
+  row.dataset.name = f.name;
+  const name = document.createElement("div"); name.className = "name";
+  const help = (f.lo === f.hi || f.type === "bool") ? "" : "  ["+f.lo+".."+f.hi+"]";
+  name.innerHTML = '<span>'+f.name+'</span><span class="help">'+(f.help||"")+help+'</span>';
+  const inp = document.createElement("input");
+  inp.type = (f.type === "bool") ? "text" : "number";
+  if (f.type !== "bool" && f.lo !== f.hi) {
+    inp.min = f.lo;
+    inp.max = f.hi;
+    if (f.type === "float") inp.step = "any";
+  }
+  inp.value = (typeof f.value === "boolean") ? (f.value ? "1" : "0") : String(f.value);
+  inp.addEventListener("keydown", e => { if (e.key === "Enter") apply(); });
+  const btn = document.createElement("button"); btn.textContent = "apply";
+  btn.addEventListener("click", apply);
+  row.append(name, inp, btn);
+  async function apply() {
+    const url = "/set?" + encodeURIComponent(f.name) + "=" + encodeURIComponent(inp.value);
+    try {
+      const r = await fetch(url, {cache:"no-store"});
+      const j = await r.json();
+      const ok = (j.applied || []).includes(f.name);
+      row.classList.remove("applied", "error");
+      void row.offsetWidth; // restart animation
+      row.classList.add(ok ? "applied" : "error");
+      // re-read from server response so coercion / clamping is visible
+      if (ok && j.params && (f.name in j.params)) {
+        const v = j.params[f.name];
+        f.value = v;
+        inp.value = (typeof v === "boolean") ? (v ? "1":"0") : String(v);
+      }
+    } catch (e) {
+      row.classList.add("error");
+    }
+  }
+  return row;
+}
+
+// ── Bootstrap ────────────────────────────────────────────────────────
+startSSE();
+pollStatus();
+setInterval(pollStatus, 1000);
+</script>
+</body>
+</html>
