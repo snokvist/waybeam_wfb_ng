@@ -2821,10 +2821,11 @@ int main(int argc, char **argv)
 	    cfg.fec.enabled ? "on" : "off",
 	    cfg.mcs.enabled ? "on" : "off");
 	if (cfg.fec.enabled) {
-		LOG_FEC("subsys: sidecar=%s:%u venc=%s:%u mtu=%d safety=%.2f stats_port=%u",
+		LOG_FEC("subsys: sidecar=%s:%u venc=%s:%u mtu=%d safety=%.2f stats_port=%u keepalive=%.1fs",
 		    cfg.fec.sidecar_host, cfg.fec.sidecar_port,
 		    cfg.fec.venc_host,    cfg.fec.venc_port,
-		    cfg.fec.mtu, cfg.fec.safety_margin, cfg.fec.wfb_stats_port);
+		    cfg.fec.mtu, cfg.fec.safety_margin, cfg.fec.wfb_stats_port,
+		    (double)cfg.fec.subscribe_s);
 	}
 	if (cfg.mcs.enabled) {
 		LOG_MCS("subsys: stats=%s:%u range=(%d,%d,%d) thresh=(%.1f/%.1f)±%.1f",
@@ -2998,7 +2999,14 @@ int main(int argc, char **argv)
 	while (!g_stop) {
 		uint64_t now = now_us();
 
-		/* --- FEC sidecar SUBSCRIBE keepalive --- */
+		/* --- FEC sidecar SUBSCRIBE keepalive ---
+		 * Pure datagram-level keepalive: venc treats us as subscribed
+		 * for ~5 s after each SUBSCRIBE arrives. The per-tick log used
+		 * to fire under -v but it's pure noise — there's no signal in
+		 * "yes, we sent another keepalive" every 2 s. The first one is
+		 * logged at startup (below) so the operator knows the keepalive
+		 * is running; after that, the FEC heartbeat (avg/fps fields) is
+		 * the authoritative "sidecar is wired up" indicator. */
 		if (cfg.fec.enabled && now >= next_subscribe_us) {
 			SidecarSubscribe s = {0};
 			s.magic = htonl(SC_MAGIC);
@@ -3006,7 +3014,6 @@ int main(int argc, char **argv)
 			s.msg_type = SC_MSG_SUBSCRIBE;
 			sendto(sidecar_fd, &s, sizeof(s), 0,
 			       (struct sockaddr*)&sidecar_dst, sizeof(sidecar_dst));
-			LOGV_FEC(&cfg, "sent SUBSCRIBE");
 			next_subscribe_us = now + (uint64_t)(cfg.fec.subscribe_s * 1e6);
 		}
 
