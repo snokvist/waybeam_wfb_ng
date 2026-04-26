@@ -708,6 +708,78 @@ Two related footguns:
   the command — wfb_tx's "Radiotap updated with ..." stderr line is
   the source of truth for what actually got applied.
 
+## UDP stats push for wfb_rx (`-Y host:port`)
+
+Same flag, mirror semantics. Emits one JSON datagram per `-l` interval
+with per-antenna RSSI/SNR plus the same aggregate counters that the
+human-readable `PKT` line carries. Lets ground-side consumers
+(fec_controller via uplink, status WebUI, RSSI overlays) subscribe
+without bridging through `ground_rssi_forwarder.py`.
+
+### Usage
+
+```bash
+# Ground (x86 host with WiFi adapter in monitor mode)
+sudo wfb_rx -K /etc/drone.key -i 207 -p 0 -l 1000 \
+            -Y 127.0.0.1:5801 wlx40a5ef2f229b
+```
+
+### Schema (`type: rx_ant`, ver 1)
+
+One datagram per emit, single line, newline-terminated. The `ant`
+array carries one entry per `(freq, mcs, bw, antenna_id)` key — so
+multi-antenna RX diversity surfaces naturally as multiple entries.
+
+```json
+{"ts_ms":26279557,"type":"rx_ant","ver":1,"seq":2,"interval_ms":1000,
+ "ant":[
+   {"freq":5745,"mcs":5,"bw":20,"id":"1","pkts":2286,
+    "rssi":{"min":-28,"avg":-27,"max":-26},
+    "snr":{"min":26,"avg":31,"max":35}},
+   {"freq":5745,"mcs":5,"bw":20,"id":"0","pkts":2286,
+    "rssi":{"min":-38,"avg":-37,"max":-36},
+    "snr":{"min":26,"avg":32,"max":38}}],
+ "pkt":{"all":2308,"bytes":2953783,"dec_err":21,"session":1,"data":2286,
+        "uniq":2286,"fec_recovered":49,"lost":0,"bad":0,
+        "outgoing":1252,"outgoing_bytes":1699183}}
+```
+
+| Field | Meaning |
+|---|---|
+| `ts_ms` | Emit timestamp (`get_time_ms()`). |
+| `seq` | Per-process monotonic counter (same semantics as wfb_tx). |
+| `interval_ms` | The `-l` value at emit time. |
+| `ant[].freq` / `mcs` / `bw` | Channel + modulation per the radiotap header. |
+| `ant[].id` | Hex string of `(sin_addr<<32) \| (wlan_idx<<8) \| ant_index`. Same packing the existing IPC `RX_ANT %PRIx64` uses. |
+| `ant[].pkts` | Packets seen on this antenna this interval. |
+| `ant[].rssi` / `snr` | min / avg / max in dBm and dB respectively. |
+| `pkt.all` / `bytes` | Total RF packets received this interval. |
+| `pkt.dec_err` | AEAD/decryption failures (off-channel chatter, mismatched -x, ...). |
+| `pkt.session` / `data` | Session-key vs data packet classification. |
+| `pkt.uniq` | Unique frames after FEC dedup. |
+| `pkt.fec_recovered` | Data packets recovered by FEC. |
+| `pkt.lost` | Data packets unrecoverable. |
+| `pkt.outgoing` / `outgoing_bytes` | Forwarded to `-c HOST:PORT`. |
+
+`ant` may be empty for the first datagram or two while the receiver
+warms up (no packets yet). `pkt.dec_err` may be high in the first
+second when the receiver picks up pre-existing off-channel traffic
+before its first session-key sync.
+
+### Backward compat
+
+Same rules as wfb_tx: omitting `-Y` keeps the stdout-only behavior;
+the `seq` field is additive on `ver:1`; consumers ignore unknown
+fields. `ground_rssi_forwarder.py` is **deprecated** — for new
+deployments, point a JSON-aware consumer at `wfb_rx -Y` directly.
+
+### Debug
+
+```bash
+# On the host running wfb_rx:
+nc -ul 5801 | jq -c '{seq, ant_count: (.ant | length), pkt_lost: .pkt.lost}'
+```
+
 ## Quick reference — recommended FPV config
 
 For a typical 25 Mbps H.265 FPV video stream (vehicle → ground, one-way):
