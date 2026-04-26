@@ -38,6 +38,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <getopt.h>
+#include <limits.h>
 #include <math.h>
 #include <netinet/in.h>
 #include <poll.h>
@@ -49,6 +50,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/time.h>
@@ -869,6 +871,10 @@ static void bitrate_assert(const RadioState *radio, Controller *ctrl,
 			else
 				*last_written_kbps = target;
 		} else {
+			/* Advance last_written_kbps in dry-run so we don't re-log
+			 * the "init" transition every tick. There is no external-
+			 * change detection on bitrate (unlike fec_k/n), so the
+			 * ghost-write here doesn't corrupt operator-visible state. */
 			*last_written_kbps = target;
 		}
 		if (cfg->fec.bitrate_grace_s > 0.0f) {
@@ -1321,7 +1327,14 @@ static void selector_init(Selector *s)
 static void selector_expire_changes(Selector *s, const Config *cfg, uint64_t now)
 {
 	uint64_t window_us = (uint64_t)(cfg->mcs.oscillation_window_s * 1e6f);
-	if (window_us == 0 || now < window_us) return;
+	if (window_us == 0) {
+		/* Window disabled — flush the ring so a stale entry from a
+		 * previous non-zero window can't peg the oscillation threshold
+		 * forever. */
+		s->changes_count = 0;
+		return;
+	}
+	if (now < window_us) return;
 	uint64_t cutoff = now - window_us;
 	while (s->changes_count > 0) {
 		int oldest = (s->changes_head - s->changes_count + OSC_RING) % OSC_RING;
@@ -1532,20 +1545,79 @@ static double tunable_read(const TunableDesc *t, const Config *c)
 	return 0.0;
 }
 
+/* Strict parser: reject garbage tokens (atoi/atof silently return 0 on
+ * "abc", which would corrupt the field with a value the operator did not
+ * intend). For numeric types we use strtoX with end-pointer check; only
+ * trailing whitespace is tolerated. For booleans we whitelist the common
+ * spellings. Returns 0 ok, -1 on parse / range failure. */
+static int parse_strict_double(const char *s, double *out)
+{
+	if (!s || !*s) return -1;
+	char *end;
+	double v = strtod(s, &end);
+	if (end == s) return -1;
+	while (*end == ' ' || *end == '\t' || *end == '\r' || *end == '\n') end++;
+	if (*end) return -1;
+	*out = v;
+	return 0;
+}
+static int parse_strict_long(const char *s, long *out)
+{
+	if (!s || !*s) return -1;
+	char *end;
+	long v = strtol(s, &end, 10);
+	if (end == s) return -1;
+	while (*end == ' ' || *end == '\t' || *end == '\r' || *end == '\n') end++;
+	if (*end) return -1;
+	*out = v;
+	return 0;
+}
+static int parse_strict_bool(const char *s, bool *out)
+{
+	if (!s || !*s) return -1;
+	if (!strcasecmp(s, "1") || !strcasecmp(s, "true") ||
+	    !strcasecmp(s, "yes") || !strcasecmp(s, "on")) {
+		*out = true;  return 0;
+	}
+	if (!strcasecmp(s, "0") || !strcasecmp(s, "false") ||
+	    !strcasecmp(s, "no") || !strcasecmp(s, "off")) {
+		*out = false; return 0;
+	}
+	return -1;
+}
+
 static int tunable_write(const TunableDesc *t, Config *c, const char *val)
 {
-	if (t->lo != t->hi) {
-		double v = atof(val);
-		if (v < t->lo || v > t->hi) return -1;
-	}
 	char *base = (char *)c + t->offset;
 	switch (t->type) {
-	case TF_INT:   *(int *)base   = atoi(val); return 0;
-	case TF_LONG:  *(long *)base  = atol(val); return 0;
-	case TF_FLOAT: *(float *)base = (float)atof(val); return 0;
-	case TF_BOOL:
-		*(bool *)base = (val[0] == '1' || val[0] == 't' || val[0] == 'T');
+	case TF_INT: {
+		long v;
+		if (parse_strict_long(val, &v) != 0) return -1;
+		if (t->lo != t->hi && (v < t->lo || v > t->hi)) return -1;
+		if (v < INT_MIN || v > INT_MAX) return -1;
+		*(int *)base = (int)v;
 		return 0;
+	}
+	case TF_LONG: {
+		long v;
+		if (parse_strict_long(val, &v) != 0) return -1;
+		if (t->lo != t->hi && ((double)v < t->lo || (double)v > t->hi)) return -1;
+		*(long *)base = v;
+		return 0;
+	}
+	case TF_FLOAT: {
+		double v;
+		if (parse_strict_double(val, &v) != 0) return -1;
+		if (t->lo != t->hi && (v < t->lo || v > t->hi)) return -1;
+		*(float *)base = (float)v;
+		return 0;
+	}
+	case TF_BOOL: {
+		bool b;
+		if (parse_strict_bool(val, &b) != 0) return -1;
+		*(bool *)base = b;
+		return 0;
+	}
 	}
 	return -1;
 }
@@ -2026,6 +2098,7 @@ static void api_client_drop(ApiClient *c)
 
 static int json_escape(char *out, size_t cap, size_t pos, const char *in)
 {
+	if (cap < 8) return -1;       /* `cap - 8` underflow guard */
 	size_t start = pos;
 	for (const unsigned char *p = (const unsigned char *)in; *p; p++) {
 		if (pos >= cap - 8) return -1;
@@ -2130,6 +2203,9 @@ static bool request_wants_html(const char *req)
 	       strstr(headers, "accept: text/html") != NULL;
 }
 
+/* Forward decl — defined alongside config_defaults further below. */
+static int cfg_validate_warnings(const Config *c);
+
 static void api_handle_request(ApiClient *c, Config *cfg, ApiSnapshot *snap)
 {
 	c->buf[c->pos < API_BUF_BYTES ? c->pos : API_BUF_BYTES - 1] = '\0';
@@ -2229,16 +2305,7 @@ static void api_handle_request(ApiClient *c, Config *cfg, ApiSnapshot *snap)
 
 		if (an > 0)
 			LOGV_COMMON(cfg, "api: applied %d key(s) via /set", an);
-		/* Cross-field consistency warnings (mcs sanity). */
-		if (cfg->mcs.rssi_thresh_low >= cfg->mcs.rssi_thresh_high) {
-			LOG_MCS("WARNING rssi_thresh_low (%.1f) >= rssi_thresh_high (%.1f) — bucket FSM will misbehave; fix with /set",
-			    (double)cfg->mcs.rssi_thresh_low,
-			    (double)cfg->mcs.rssi_thresh_high);
-		}
-		if (cfg->mcs.mcs_min > cfg->mcs.mcs_max) {
-			LOG_MCS("WARNING mcs_min (%d) > mcs_max (%d) — clamp will pin to mcs_max; fix with /set",
-			    cfg->mcs.mcs_min, cfg->mcs.mcs_max);
-		}
+		(void)cfg_validate_warnings(cfg);
 	}
 	else if (strcmp(path, "/status") == 0) {
 		n = status_to_json(snap, body, sizeof(body));
@@ -2405,6 +2472,51 @@ static int parse_range_preset(const char *s, Config *cfg)
 	if (strcmp(s, "med") == 0)  { cfg->mcs.mcs_bucket_0 = 1; cfg->mcs.mcs_bucket_1 = 2; cfg->mcs.mcs_bucket_2 = 3; return 0; }
 	if (strcmp(s, "high") == 0) { cfg->mcs.mcs_bucket_0 = 2; cfg->mcs.mcs_bucket_1 = 3; cfg->mcs.mcs_bucket_2 = 4; return 0; }
 	return -1;
+}
+
+/* Cross-field consistency warnings. Per-field bounds are enforced by
+ * tunable_write at /set time and by atoi/atof+range at CLI parse time;
+ * this catches invariants spanning two fields. Run at startup and after
+ * any /set so the operator gets a single, consistent set of warnings
+ * regardless of which entry path produced the misconfiguration. Returns
+ * the number of warnings emitted. */
+static int cfg_validate_warnings(const Config *c)
+{
+	int n = 0;
+	if (c->mcs.enabled &&
+	    c->mcs.rssi_thresh_low >= c->mcs.rssi_thresh_high) {
+		LOG_MCS("WARNING rssi_thresh_low (%.1f) >= rssi_thresh_high (%.1f) — bucket FSM will misbehave",
+		    (double)c->mcs.rssi_thresh_low,
+		    (double)c->mcs.rssi_thresh_high);
+		n++;
+	}
+	if (c->mcs.enabled && c->mcs.mcs_min > c->mcs.mcs_max) {
+		LOG_MCS("WARNING mcs_min (%d) > mcs_max (%d) — emit clamp will pin to mcs_max",
+		    c->mcs.mcs_min, c->mcs.mcs_max);
+		n++;
+	}
+	if (c->fec.enabled && c->fec.min_k > c->fec.max_k) {
+		LOG_FEC("WARNING fec.min_k (%d) > fec.max_k (%d) — sizing clamp inverted",
+		    c->fec.min_k, c->fec.max_k);
+		n++;
+	}
+	if (c->fec.enabled && c->fec.min_n > c->fec.max_n) {
+		LOG_FEC("WARNING fec.min_n (%d) > fec.max_n (%d) — sizing clamp inverted",
+		    c->fec.min_n, c->fec.max_n);
+		n++;
+	}
+	if (c->fec.enabled && c->fec.headroom_min > c->fec.headroom_max) {
+		LOG_FEC("WARNING fec.headroom_min (%.2f) > fec.headroom_max (%.2f) — bound inverted",
+		    (double)c->fec.headroom_min, (double)c->fec.headroom_max);
+		n++;
+	}
+	if (c->fec.enabled && c->fec.bitrate_max_kbps > 0 &&
+	    c->fec.bitrate_max_kbps < c->fec.bitrate_min_kbps) {
+		LOG_FEC("WARNING fec.bitrate_max_kbps (%ld) < fec.bitrate_min_kbps (%ld) — min wins, target will exceed max",
+		    c->fec.bitrate_max_kbps, c->fec.bitrate_min_kbps);
+		n++;
+	}
+	return n;
 }
 
 static void config_defaults(Config *c)
@@ -2687,6 +2799,7 @@ int main(int argc, char **argv)
 		    (double)cfg.mcs.rssi_thresh_low, (double)cfg.mcs.rssi_thresh_high,
 		    (double)cfg.mcs.rssi_deadband_db);
 	}
+	(void)cfg_validate_warnings(&cfg);
 
 	/* ── Bring up sockets ── */
 
@@ -3015,11 +3128,14 @@ int main(int argc, char **argv)
 			}
 		}
 
-		/* Poll deadline: soonest of subsystem timers. */
+		/* Poll deadline: soonest of subsystem timers. Each `< deadline`
+		 * test must guard against the timer being 0 (initial state) so
+		 * we don't drive the deadline to 0 and tight-loop on poll(). */
 		uint64_t deadline = next_heartbeat_us;
-		if (cfg.mcs.enabled && next_watchdog_us < deadline) deadline = next_watchdog_us;
+		if (cfg.mcs.enabled && next_watchdog_us > 0 && next_watchdog_us < deadline) deadline = next_watchdog_us;
 		if (cfg.fec.enabled && next_subscribe_us > 0 && next_subscribe_us < deadline) deadline = next_subscribe_us;
-		if (cfg.fec.enabled && cfg.fec.wfb_stats_port == 0 && next_radio_us < deadline) deadline = next_radio_us;
+		if (cfg.fec.enabled && cfg.fec.wfb_stats_port == 0 &&
+		    next_radio_us > 0 && next_radio_us < deadline) deadline = next_radio_us;
 		int timeout_ms = 100;
 		if (deadline > now) {
 			uint64_t ahead_ms = (deadline - now) / 1000ULL;
@@ -3095,7 +3211,11 @@ int main(int argc, char **argv)
 			char dgram[2048];
 			struct sockaddr_in peer;
 			socklen_t plen;
-			for (;;) {
+			/* Cap drains at 32 datagrams per poll wakeup so a flood on
+			 * one socket can't starve the other inputs (sidecar, rx_ant,
+			 * api). Anything left in the kernel queue is picked up on
+			 * the next poll() iteration; loopback latency is negligible. */
+			for (int drained = 0; drained < 32; drained++) {
 				plen = sizeof(peer);
 				ssize_t n = recvfrom(wfb_stats_fd, dgram, sizeof(dgram) - 1, 0,
 				                     (struct sockaddr *)&peer, &plen);
@@ -3141,7 +3261,8 @@ int main(int argc, char **argv)
 		/* --- Drain MCS rx_ant datagrams --- */
 		if (rx_ant_idx >= 0 && (pfds[rx_ant_idx].revents & POLLIN)) {
 			char dgram[2048];
-			for (;;) {
+			/* Same 32-datagram cap as wfb_stats above. */
+			for (int drained = 0; drained < 32; drained++) {
 				ssize_t n = recv(rx_ant_fd, dgram, sizeof(dgram) - 1, MSG_TRUNC);
 				if (n <= 0) break;
 				if ((size_t)n >= sizeof(dgram)) {
@@ -3348,10 +3469,12 @@ int main(int argc, char **argv)
 						last_written_fec_k = next_params.k;
 						last_written_fec_n = next_params.n;
 					}
-				} else {
-					last_written_fec_k = next_params.k;
-					last_written_fec_n = next_params.n;
 				}
+				/* Dry-run deliberately leaves last_written_fec_* untouched
+				 * so external-change detection (which compares observed
+				 * fec_k/n against this value) doesn't accuse wfb_tx of
+				 * "external change" against a value we never actually
+				 * sent. Same reasoning applies to bitrate_assert. */
 			}
 		}
 	}
