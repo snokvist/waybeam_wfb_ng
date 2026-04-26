@@ -327,9 +327,35 @@ into the binary at build time via `xxd -i`.
   subsystem tunable that controls how long FEC ignores its own outputs
   after an MCS-driven radio change.
 
+**Validation & input handling**:
+
+- `tunable_write` is **strict**: numeric tunables use `strtol`/`strtod`
+  with end-pointer check, so `/set?fec.mtu=abc` returns
+  `out_of_range` instead of silently coercing to 0. Boolean tunables
+  accept `1/0/true/false/yes/no/on/off` (case-insensitive) and reject
+  any other token.
+- `cfg_validate_warnings()` runs at startup and after every `/set` —
+  emits `LOG_*` warnings on cross-field misconfigs:
+  `mcs.rssi_thresh_low >= mcs.rssi_thresh_high`,
+  `mcs.mcs_min > mcs.mcs_max`, `fec.min_k > fec.max_k`,
+  `fec.min_n > fec.max_n`, `fec.headroom_min > fec.headroom_max`,
+  `fec.bitrate_max_kbps < fec.bitrate_min_kbps`. These don't refuse
+  the change (operator might be making a multi-step adjustment) — they
+  just announce the inconsistency.
+- UDP drains (`wfb_stats`, `rx_ant`) are **bounded at 32 datagrams per
+  poll wakeup** — a flood on one socket can't starve the others.
+- HTTP header / blob writes use a `write_all()` loop that handles
+  partial writes and EINTR.
+- Heartbeat lines flag a drift between controller-knowledge and
+  observed wfb_tx state: MCS shows `WFB_MCS=N!`, FEC shows
+  `WFB_FEC=k/n!`. Most often a sign that wfb_tx was restarted under
+  us.
+
 **Limits**: 8 concurrent HTTP clients, 4 of which can be SSE
 subscribers (`503 sse: too many subscribers` past that). 16 KB JSON
-response cap (overflow returns `500 json overflow`).
+response cap (`/set` returns `500 json overflow` on cap exhaustion;
+all other JSON routes do too). 32 datagrams per poll wakeup per UDP
+input (flood-resistant; remainder picked up next iteration).
 
 **Migration from `fec_controller` + `mcs_selector`**:
 

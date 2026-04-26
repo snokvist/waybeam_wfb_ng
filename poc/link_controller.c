@@ -128,6 +128,15 @@ typedef struct {
 #define CMD_SET_RADIO  2
 #define CMD_GET_RADIO  4
 
+/* Wire layout: req_id(4) + cmd_id(1) = 5-byte CmdReq header. SET_FEC adds
+ * 2 bytes (k,n); SET_RADIO adds RadioBody (7 bytes). GET_RADIO is just
+ * the header. Centralised so the sendto() length args don't drift from
+ * the struct definitions. */
+#define CMD_REQ_HEADER         5
+#define CMD_REQ_GET_RADIO_LEN  CMD_REQ_HEADER
+#define CMD_REQ_SET_FEC_LEN    (CMD_REQ_HEADER + 2)
+#define CMD_REQ_SET_RADIO_LEN  (CMD_REQ_HEADER + 7)   /* + sizeof(RadioBody) */
+
 #pragma pack(push, 1)
 typedef struct {
 	uint8_t stbc;
@@ -137,7 +146,7 @@ typedef struct {
 	uint8_t mcs_index;
 	uint8_t vht_mode;      /* bool, 0/1 */
 	uint8_t vht_nss;
-} RadioBody;            /* 7 bytes */
+} RadioBody;            /* 7 bytes — keep CMD_REQ_SET_RADIO_LEN in sync */
 
 typedef struct {
 	uint32_t req_id;       /* network byte order */
@@ -754,9 +763,6 @@ static void radio_apply_observation(RadioState *radio, Controller *ctrl,
                                     int new_mcs, int new_bw, int new_gi,
                                     int new_stbc, int new_ldpc,
                                     int new_vht_mode, int new_vht_nss,
-                                    int obs_fec_k, int obs_fec_n,
-                                    int *last_written_fec_k,
-                                    int *last_written_fec_n,
                                     uint64_t now,
                                     bool from_self)
 {
@@ -811,19 +817,32 @@ static void radio_apply_observation(RadioState *radio, Controller *ctrl,
 			}
 		}
 	}
+}
 
-	if (obs_fec_k > 0 && obs_fec_n > 0) {
-		if (*last_written_fec_k > 0 && *last_written_fec_n > 0 &&
-		    (obs_fec_k != *last_written_fec_k ||
-		     obs_fec_n != *last_written_fec_n))
-		{
-			LOG_FEC("external change observed k=%d n=%d (controller last wrote k=%d n=%d)",
-			    obs_fec_k, obs_fec_n,
-			    *last_written_fec_k, *last_written_fec_n);
-		}
-		*last_written_fec_k = obs_fec_k;
-		*last_written_fec_n = obs_fec_n;
+/* External-FEC tracker: separated from radio_apply_observation because
+ * only the wfb_stats datagram path carries fec_k/fec_n; the polling and
+ * MCS-self-mirror callers always passed -1, -1. Keep the bookkeeping
+ * orthogonal so radio mirroring can have a smaller signature.
+ *
+ * obs_k / obs_n: most recently observed sizes from the producer.
+ * last_written_*: in/out — controller's last-known authoritative pair.
+ * Logs once per drift, then updates last_written so the next divergence
+ * has to be a fresh change. */
+static void radio_track_external_fec(int obs_k, int obs_n,
+                                     int *last_written_fec_k,
+                                     int *last_written_fec_n)
+{
+	if (obs_k <= 0 || obs_n <= 0) return;
+	if (*last_written_fec_k > 0 && *last_written_fec_n > 0 &&
+	    (obs_k != *last_written_fec_k ||
+	     obs_n != *last_written_fec_n))
+	{
+		LOG_FEC("external change observed k=%d n=%d (controller last wrote k=%d n=%d)",
+		    obs_k, obs_n,
+		    *last_written_fec_k, *last_written_fec_n);
 	}
+	*last_written_fec_k = obs_k;
+	*last_written_fec_n = obs_n;
 }
 
 /* Forward decl. */
@@ -914,9 +933,9 @@ static int wfb_stats_handle_datagram(const char *body,
 	                        (int)mcs, (int)bw, (int)gi,
 	                        (int)stbc, (int)ldpc,
 	                        (int)vht_mode, (int)vht_nss,
-	                        (int)fec_k, (int)fec_n,
-	                        last_written_fec_k, last_written_fec_n,
 	                        now, false);
+	radio_track_external_fec((int)fec_k, (int)fec_n,
+	                         last_written_fec_k, last_written_fec_n);
 	bitrate_assert(radio, ctrl, cfg, last_written_kbps, now);
 
 	long drops = 0, trunc = 0;
@@ -1041,11 +1060,10 @@ static int wfb_send_set_fec(const Config *cfg, int k, int n)
 	req.u.set_fec.k = (uint8_t)k;
 	req.u.set_fec.n = (uint8_t)n;
 
-	/* wire: req_id(4) + cmd_id(1) + k(1) + n(1) = 7 bytes */
-	ssize_t s = sendto(fd, &req, 7, 0,
+	ssize_t s = sendto(fd, &req, CMD_REQ_SET_FEC_LEN, 0,
 	                   (const struct sockaddr*)&dst, sizeof(dst));
 	close(fd);
-	return (s == 7) ? 0 : -1;
+	return (s == CMD_REQ_SET_FEC_LEN) ? 0 : -1;
 }
 
 static int wfb_get_radio(const Config *cfg, RadioBody *out)
@@ -1060,8 +1078,8 @@ static int wfb_get_radio(const Config *cfg, RadioBody *out)
 	req.req_id = htonl(req_id);
 	req.cmd_id = CMD_GET_RADIO;
 
-	if (sendto(fd, &req, 5, 0,
-	           (const struct sockaddr*)&dst, sizeof(dst)) != 5) {
+	if (sendto(fd, &req, CMD_REQ_GET_RADIO_LEN, 0,
+	           (const struct sockaddr*)&dst, sizeof(dst)) != CMD_REQ_GET_RADIO_LEN) {
 		close(fd);
 		return -1;
 	}
@@ -1097,9 +1115,8 @@ static int wfb_set_radio(const Config *cfg, const RadioBody *params)
 	req.u.set_radio.short_gi = req.u.set_radio.short_gi ? 1 : 0;
 	req.u.set_radio.vht_mode = req.u.set_radio.vht_mode ? 1 : 0;
 
-	/* wire: req_id(4) + cmd_id(1) + body(7) = 12 bytes */
-	if (sendto(fd, &req, 12, 0,
-	           (const struct sockaddr*)&dst, sizeof(dst)) != 12) {
+	if (sendto(fd, &req, CMD_REQ_SET_RADIO_LEN, 0,
+	           (const struct sockaddr*)&dst, sizeof(dst)) != CMD_REQ_SET_RADIO_LEN) {
 		close(fd);
 		return -1;
 	}
@@ -1995,6 +2012,26 @@ static int help_to_text(char *buf, size_t cap)
 	return (int)pos;
 }
 
+/* Loop write_all() — handles partial writes and EINTR. Returns 0 on
+ * success, -1 if the connection died mid-write. Used for HTTP responses
+ * where a short header write would split the body across two TCP
+ * segments and let the client see truncated headers. */
+static int write_all(int fd, const void *buf, size_t len)
+{
+	const char *p = (const char *)buf;
+	while (len > 0) {
+		ssize_t w = write(fd, p, len);
+		if (w < 0) {
+			if (errno == EINTR) continue;
+			return -1;
+		}
+		if (w == 0) return -1;
+		p   += (size_t)w;
+		len -= (size_t)w;
+	}
+	return 0;
+}
+
 static void api_send(int fd, int status, const char *content_type,
                      const char *body, int body_len)
 {
@@ -2011,13 +2048,15 @@ static void api_send(int fd, int status, const char *content_type,
 		"Cache-Control: no-store\r\n"
 		"Connection: close\r\n\r\n",
 		status, reason, content_type, body_len);
-	if (hlen > 0) (void)!write(fd, hdr, (size_t)hlen);
-	if (body_len > 0) (void)!write(fd, body, (size_t)body_len);
+	if (hlen > 0 && write_all(fd, hdr, (size_t)hlen) == 0 &&
+	    body_len > 0)
+		(void)write_all(fd, body, (size_t)body_len);
 	close(fd);
 }
 
-/* For large embedded responses (WebUI HTML) — emits headers, then writes
- * the binary blob in chunks. Caller closes fd. */
+/* For large embedded responses (WebUI HTML) — emits headers then the
+ * binary blob; both go through write_all so a short header write can't
+ * leave the client looking at half a Content-Length line. Caller closes fd. */
 static void api_send_blob(int fd, const char *content_type,
                           const unsigned char *body, size_t body_len)
 {
@@ -2029,13 +2068,8 @@ static void api_send_blob(int fd, const char *content_type,
 		"Cache-Control: no-store\r\n"
 		"Connection: close\r\n\r\n",
 		content_type, body_len);
-	if (hlen > 0) (void)!write(fd, hdr, (size_t)hlen);
-	size_t off = 0;
-	while (off < body_len) {
-		ssize_t w = write(fd, body + off, body_len - off);
-		if (w <= 0) break;
-		off += (size_t)w;
-	}
+	if (hlen > 0 && write_all(fd, hdr, (size_t)hlen) == 0)
+		(void)write_all(fd, body, body_len);
 	close(fd);
 }
 
@@ -2127,7 +2161,7 @@ static void api_send_sse_headers(int fd)
 		"X-Accel-Buffering: no\r\n"
 		"Connection: keep-alive\r\n\r\n"
 		":link_controller events stream\n\n";
-	(void)!write(fd, hdr, strlen(hdr));
+	(void)write_all(fd, hdr, strlen(hdr));
 }
 
 /* Reentrancy invariant: log_emit() is the SOLE caller. Nothing in this
@@ -2947,7 +2981,6 @@ int main(int argc, char **argv)
 		    radio_body.mcs_index, radio_body.bandwidth, radio_body.short_gi,
 		    radio_body.stbc, radio_body.ldpc,
 		    radio_body.vht_mode, radio_body.vht_nss,
-		    -1, -1, &last_written_fec_k, &last_written_fec_n,
 		    now_us(), true);
 	}
 
@@ -2983,13 +3016,25 @@ int main(int argc, char **argv)
 				int k = fec_ctrl.current.k, n = fec_ctrl.current.n;
 				float fps_hz = fps_get(&fps);
 				bool boost = (fec_ctrl.boost_until_us != 0 && now < fec_ctrl.boost_until_us);
-				LOG_FEC("hb: k=%d n=%d avg=%.1fkB fps=%.1f mcs=%d phy=%.1fMbps br=%ldkbps upd=%u%s",
+				/* Mirrors MCS heartbeat's WFB_MCS=N! tag — flag a drift
+				 * between the value the controller thinks it last wrote
+				 * and what actually got latched at wfb_tx. Most often a
+				 * sign that wfb_tx was restarted under us. */
+				char divergence[40] = "";
+				if (last_written_fec_k > 0 && last_written_fec_n > 0 &&
+				    (last_written_fec_k != k || last_written_fec_n != n)) {
+					snprintf(divergence, sizeof(divergence),
+					         " WFB_FEC=%d/%d!",
+					         last_written_fec_k, last_written_fec_n);
+				}
+				LOG_FEC("hb: k=%d n=%d avg=%.1fkB fps=%.1f mcs=%d phy=%.1fMbps br=%ldkbps upd=%u%s%s",
 				    k, n,
 				    fec_ctrl.avg_frame_size / 1024.0f, fps_hz,
 				    radio.mcs, radio.phy_mbps,
 				    last_written_kbps,
 				    fec_ctrl.update_count,
-				    boost ? " BOOST" : "");
+				    boost ? " BOOST" : "",
+				    divergence);
 			}
 			if (cfg.mcs.enabled) {
 				if (sel.current_bucket >= 0) {
@@ -3032,7 +3077,6 @@ int main(int argc, char **argv)
 					radio_apply_observation(&radio, &fec_ctrl, &cfg,
 					    r.mcs_index, r.bandwidth, r.short_gi,
 					    r.stbc, r.ldpc, r.vht_mode, r.vht_nss,
-					    -1, -1, &last_written_fec_k, &last_written_fec_n,
 					    now, true);
 					if (mcs_sf_state) {
 						LOG_MCS("SET_RADIO recovered (mcs=%d, %d.%03ds since first failure)",
@@ -3069,8 +3113,6 @@ int main(int argc, char **argv)
 				    &radio, &fec_ctrl, &cfg,
 				    resp.mcs_index, resp.bandwidth, resp.short_gi,
 				    resp.stbc, resp.ldpc, resp.vht_mode, resp.vht_nss,
-				    -1, -1,
-				    &last_written_fec_k, &last_written_fec_n,
 				    now, false);
 				LOGV_FEC(&cfg, "radio: mcs=%d bw=%d gi=%s vht=%d nss=%d phy=%.1f Mbps",
 				     radio.mcs, radio.bandwidth,
@@ -3339,7 +3381,6 @@ int main(int argc, char **argv)
 								radio_apply_observation(&radio, &fec_ctrl, &cfg,
 								    r2.mcs_index, r2.bandwidth, r2.short_gi,
 								    r2.stbc, r2.ldpc, r2.vht_mode, r2.vht_nss,
-								    -1, -1, &last_written_fec_k, &last_written_fec_n,
 								    now_us(), true);
 								if (mcs_sf_state) {
 									LOG_MCS("realign: recovered (mcs=%d, %d.%03ds since first failure)",
@@ -3423,7 +3464,6 @@ int main(int argc, char **argv)
 				    radio_body.mcs_index, radio_body.bandwidth, radio_body.short_gi,
 				    radio_body.stbc, radio_body.ldpc,
 				    radio_body.vht_mode, radio_body.vht_nss,
-				    -1, -1, &last_written_fec_k, &last_written_fec_n,
 				    now_us(), true);
 			}
 		}
