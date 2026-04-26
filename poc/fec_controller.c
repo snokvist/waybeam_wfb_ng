@@ -198,7 +198,20 @@ typedef struct {
 
 	/* Tick intervals */
 	float    subscribe_s;
-	float    radio_poll_s;           /* radio + bitrate-assert cadence */
+	float    radio_poll_s;           /* radio + bitrate-assert cadence
+	                                  * (used only when wfb_stats_port == 0;
+	                                  * stats-subscribe mode is event-driven
+	                                  * by incoming datagrams). */
+
+	/* wfb_tx stats subscriber (-Y on the wfb_tx side). When set, bind a
+	 * UDP listener on 127.0.0.1:wfb_stats_port and drive radio.* + the
+	 * bitrate assertion from incoming JSON datagrams instead of polling
+	 * CMD_GET_RADIO. Lower latency on radio changes (per-datagram instead
+	 * of up-to-1s) and decoupled from wfb_tx process lifecycle: if wfb_tx
+	 * is restarted, datagrams just resume; no reconnection needed.
+	 *
+	 * 0 = disabled (fall back to CMD_GET_RADIO polling). */
+	uint16_t wfb_stats_port;
 
 	/* Post-MCS-drop FEC-parity boost (armed on detected external MCS-down) */
 	float    boost_s;
@@ -597,6 +610,50 @@ static int sidecar_open_and_bind(void)
 	return fd;
 }
 
+/* Bind a UDP listener on INADDR_ANY:port for wfb_tx -Y stats datagrams.
+ * Non-blocking so the main loop's poll() can drain it without stalling. */
+static int wfb_stats_open_listener(uint16_t port)
+{
+	int fd = socket(AF_INET, SOCK_DGRAM, 0);
+	if (fd < 0) return -1;
+	int one = 1;
+	setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+	struct sockaddr_in a = { .sin_family = AF_INET,
+	                         .sin_addr.s_addr = htonl(INADDR_ANY),
+	                         .sin_port = htons(port) };
+	if (bind(fd, (struct sockaddr*)&a, sizeof(a)) < 0) {
+		close(fd);
+		return -1;
+	}
+	int fl = fcntl(fd, F_GETFL, 0);
+	if (fl >= 0) fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+	return fd;
+}
+
+/* Minimal "find an integer field by name" JSON scraper. Targeted at the
+ * well-known wfb_tx tx_stats schema where every key we care about is a
+ * unique string in the document — we don't need a real parser, and a
+ * 30-line strstr+strtol is robust enough for known producers.
+ *
+ * Looks for "key" followed by optional whitespace, ':', whitespace, then
+ * an integer (possibly negative). Returns 0 on success, -1 if the key
+ * isn't found or the value isn't a parseable integer. */
+static int json_get_int(const char *s, const char *key, long *out)
+{
+	char pat[64];
+	int pl = snprintf(pat, sizeof(pat), "\"%s\"", key);
+	if (pl <= 0 || pl >= (int)sizeof(pat)) return -1;
+	const char *p = strstr(s, pat);
+	if (!p) return -1;
+	p += pl;
+	while (*p == ' ' || *p == '\t' || *p == ':') p++;
+	char *end;
+	long v = strtol(p, &end, 10);
+	if (end == p) return -1;
+	*out = v;
+	return 0;
+}
+
 /* ── wfb_tx control (request/response over a single UDP socket) ──────── */
 
 static uint32_t g_req_id = 1;
@@ -699,6 +756,187 @@ static float phy_mbps(int mcs, int bw_mhz, int short_gi,
 	return base * bw_scale * gi_scale * (float)nss;
 }
 
+/* Apply a fresh radio observation: update radio.*, detect external
+ * changes vs the previous snapshot, log them, arm the settle window
+ * (mcs_settle_s) on any change, arm parity boost on MCS-down.
+ *
+ * Shared by both the legacy CMD_GET_RADIO polling path and the
+ * --wfb-stats-port subscriber path. The stats subscriber additionally
+ * passes obs_fec_k/n; the polling path passes -1 (CMD_GET_RADIO doesn't
+ * carry FEC sizes). When obs_fec_k differs from last_written_fec_k it's
+ * an external set_fec — currently logged but not acted on (the next
+ * controller_update() will re-assert our value if needed). */
+static void radio_apply_observation(RadioState *radio, Controller *ctrl,
+                                    const Config *cfg,
+                                    int new_mcs, int new_bw, int new_gi,
+                                    int new_stbc, int new_ldpc,
+                                    int new_vht_mode, int new_vht_nss,
+                                    int obs_fec_k, int obs_fec_n,
+                                    int *last_written_fec_k,
+                                    int *last_written_fec_n,
+                                    uint64_t now)
+{
+	bool was_valid = radio->valid;
+	int  prev_mcs  = radio->mcs;
+	int  prev_bw   = radio->bandwidth;
+	int  prev_gi   = radio->short_gi;
+	int  prev_vht  = radio->vht_mode;
+	int  prev_nss  = radio->vht_nss;
+
+	radio->valid     = true;
+	radio->stbc      = new_stbc;
+	radio->ldpc      = new_ldpc;
+	radio->short_gi  = new_gi;
+	radio->bandwidth = new_bw;
+	radio->mcs       = new_mcs;
+	radio->vht_mode  = new_vht_mode;
+	radio->vht_nss   = new_vht_nss;
+	radio->phy_mbps  = phy_mbps(radio->mcs, radio->bandwidth,
+	                            radio->short_gi, radio->vht_mode,
+	                            radio->vht_nss);
+
+	if (was_valid) {
+		bool mcs_changed = (radio->mcs != prev_mcs);
+		bool any_changed = mcs_changed
+		    || radio->bandwidth != prev_bw
+		    || radio->short_gi  != prev_gi
+		    || radio->vht_mode  != prev_vht
+		    || radio->vht_nss   != prev_nss;
+		if (any_changed) {
+			LOG("radio: external change mcs %d->%d bw %d->%d gi %d->%d vht %d->%d nss %d->%d (phy=%.1fMbps)",
+			    prev_mcs, radio->mcs,
+			    prev_bw, radio->bandwidth,
+			    prev_gi, radio->short_gi,
+			    prev_vht, radio->vht_mode,
+			    prev_nss, radio->vht_nss,
+			    radio->phy_mbps);
+			controller_arm_settle(ctrl, now, cfg->mcs_settle_s);
+			if (mcs_changed && radio->mcs < prev_mcs) {
+				controller_arm_boost(ctrl, cfg, now);
+				if (cfg->boost_s > 0.0f)
+					LOG("fec: parity boost armed for %.1fs (mult=%.2f) [external MCS drop]",
+					    cfg->boost_s, cfg->boost_mult);
+			}
+		}
+	}
+
+	/* External set_fec detection (stats-subscribe path only). When
+	 * polling, obs_fec_k == -1 and we skip this. We only log a CHANGE,
+	 * which means there must be a previously-written reference to
+	 * compare against; the very first observation just seeds
+	 * last_written silently. */
+	if (obs_fec_k > 0 && obs_fec_n > 0) {
+		if (*last_written_fec_k > 0 && *last_written_fec_n > 0 &&
+		    (obs_fec_k != *last_written_fec_k ||
+		     obs_fec_n != *last_written_fec_n))
+		{
+			LOG("fec: external change observed k=%d n=%d (controller last wrote k=%d n=%d)",
+			    obs_fec_k, obs_fec_n,
+			    *last_written_fec_k, *last_written_fec_n);
+		}
+		*last_written_fec_k = obs_fec_k;
+		*last_written_fec_n = obs_fec_n;
+	}
+}
+
+/* Forward decl — defined later in the venc HTTP client section. */
+static int venc_set_bitrate_kbps(const Config *cfg, long kbps);
+
+/* Compute safe_kbps from current radio + ctrl, clamp to
+ * [bitrate_min_kbps, bitrate_max_kbps], and assert via venc HTTP if it
+ * differs from last_written_kbps by more than --bitrate-tol. Arms the
+ * post-write grace window on a successful (or dry-run) write. Shared by
+ * both paths. */
+static void bitrate_assert(const RadioState *radio, Controller *ctrl,
+                           const Config *cfg, long *last_written_kbps,
+                           uint64_t now)
+{
+	if (!radio->valid || !ctrl->have_current) return;
+
+	float k = (float)ctrl->current.k;
+	float n = (float)ctrl->current.n;
+	float post_fec_kbps = radio->phy_mbps * 1000.0f * (k / n);
+	long safe_kbps = (long)(post_fec_kbps * cfg->safety_margin);
+
+	long target = safe_kbps;
+	if (cfg->bitrate_max_kbps > 0 && target > cfg->bitrate_max_kbps)
+		target = cfg->bitrate_max_kbps;
+	if (target < cfg->bitrate_min_kbps)
+		target = cfg->bitrate_min_kbps;
+
+	long ref = (*last_written_kbps > 0) ? *last_written_kbps : 0;
+	long dev = ref - target;
+	long adev = dev < 0 ? -dev : dev;
+	long tol = (long)((double)target * (double)cfg->bitrate_tolerance);
+	if (tol < 1) tol = 1;
+
+	LOGV(cfg, "bitrate: target=%ld last_written=%ld safe=%ld min=%ld max=%ld (phy=%.1f k/n=%d/%d)",
+	     target, *last_written_kbps, safe_kbps,
+	     cfg->bitrate_min_kbps, cfg->bitrate_max_kbps,
+	     radio->phy_mbps, ctrl->current.k, ctrl->current.n);
+
+	if (*last_written_kbps < 0 || adev > tol) {
+		const char *dir = (*last_written_kbps < 0)
+		    ? "init"
+		    : ((ref > target) ? "down" : "up");
+		LOG("bitrate %s %ld -> %ld kbps (phy=%.1f Mbps, k/n=%d/%d, safe=%ld)",
+		    dir, *last_written_kbps, target, radio->phy_mbps,
+		    ctrl->current.k, ctrl->current.n, safe_kbps);
+		if (!cfg->dry_run) {
+			if (venc_set_bitrate_kbps(cfg, target) != 0)
+				LOG("bitrate: set failed");
+			else
+				*last_written_kbps = target;
+		} else {
+			*last_written_kbps = target;
+		}
+		if (cfg->bitrate_grace_s > 0.0f) {
+			uint64_t new_end =
+			    now + (uint64_t)(cfg->bitrate_grace_s * 1e6f);
+			if (new_end > ctrl->bitrate_grace_until_us)
+				ctrl->bitrate_grace_until_us = new_end;
+		}
+	}
+}
+
+/* Parse one wfb_tx tx_stats JSON datagram and forward into
+ * radio_apply_observation() + bitrate_assert(). Returns 0 if the
+ * datagram looked sane and was consumed, -1 otherwise. */
+static int wfb_stats_handle_datagram(const char *body,
+                                     RadioState *radio, Controller *ctrl,
+                                     const Config *cfg,
+                                     int *last_written_fec_k,
+                                     int *last_written_fec_n,
+                                     long *last_written_kbps,
+                                     uint64_t now)
+{
+	/* Sanity check: must look like a tx_stats v1 record. */
+	if (!strstr(body, "\"tx_stats\"")) return -1;
+
+	long mcs, bw, gi, stbc, ldpc, vht_mode, vht_nss;
+	if (json_get_int(body, "mcs",      &mcs)      != 0) return -1;
+	if (json_get_int(body, "bw",       &bw)       != 0) return -1;
+	if (json_get_int(body, "short_gi", &gi)       != 0) return -1;
+	if (json_get_int(body, "stbc",     &stbc)     != 0) return -1;
+	if (json_get_int(body, "ldpc",     &ldpc)     != 0) return -1;
+	if (json_get_int(body, "vht_mode", &vht_mode) != 0) return -1;
+	if (json_get_int(body, "vht_nss",  &vht_nss)  != 0) return -1;
+
+	long fec_k = -1, fec_n = -1;
+	(void)json_get_int(body, "fec_k", &fec_k);
+	(void)json_get_int(body, "fec_n", &fec_n);
+
+	radio_apply_observation(radio, ctrl, cfg,
+	                        (int)mcs, (int)bw, (int)gi,
+	                        (int)stbc, (int)ldpc,
+	                        (int)vht_mode, (int)vht_nss,
+	                        (int)fec_k, (int)fec_n,
+	                        last_written_fec_k, last_written_fec_n,
+	                        now);
+	bitrate_assert(radio, ctrl, cfg, last_written_kbps, now);
+	return 0;
+}
+
 
 /* ── venc HTTP client (tiny, blocking) ───────────────────────────────── */
 
@@ -784,6 +1022,10 @@ static void usage(const char *prog)
 		"  --sidecar HOST:PORT  venc sidecar (default 127.0.0.1:6666)\n"
 		"  --wfb HOST:PORT      wfb_tx control (default 127.0.0.1:8000)\n"
 		"  --venc HOST:PORT     venc HTTP API (default 127.0.0.1:80)\n"
+		"  --wfb-stats-port N   bind UDP listener on 127.0.0.1:N for wfb_tx -Y\n"
+		"                       JSON stats. When set, radio.* + fec_k/fec_n\n"
+		"                       come from incoming datagrams and CMD_GET_RADIO\n"
+		"                       polling is disabled (default 0 = polling mode).\n"
 		"\n"
 		"FEC sizing:\n"
 		"  --mtu N              packet size budget (default 1446)\n"
@@ -865,6 +1107,7 @@ static void config_defaults(Config *c)
 
 	c->subscribe_s = 2.0f;
 	c->radio_poll_s = 1.0f;          /* radio + bitrate-assert cadence */
+	c->wfb_stats_port = 0;           /* 0 = polling mode (legacy) */
 
 	c->boost_s = 3.0f;
 	c->boost_mult = 1.3f;
@@ -887,6 +1130,7 @@ int main(int argc, char **argv)
 		OPT_BITRATE_DESIRED, /* deprecated alias for --bitrate-max */
 		OPT_BITRATE_TOL, OPT_BITRATE_GRACE, OPT_MCS_SETTLE, OPT_DRY_RUN,
 		OPT_BOOST_S, OPT_BOOST_MULT,
+		OPT_WFB_STATS_PORT,
 	};
 	static const struct option longopts[] = {
 		{"sidecar",       required_argument, 0, OPT_SIDECAR},
@@ -909,6 +1153,7 @@ int main(int argc, char **argv)
 		{"dry-run",       no_argument,       0, OPT_DRY_RUN},
 		{"boost-s",       required_argument, 0, OPT_BOOST_S},
 		{"boost-mult",    required_argument, 0, OPT_BOOST_MULT},
+		{"wfb-stats-port", required_argument, 0, OPT_WFB_STATS_PORT},
 		{"verbose",       no_argument,       0, 'v'},
 		{"help",          no_argument,       0, 'h'},
 		{0, 0, 0, 0},
@@ -956,6 +1201,15 @@ int main(int argc, char **argv)
 		case OPT_DRY_RUN:      cfg.dry_run        = true; break;
 		case OPT_BOOST_S:      cfg.boost_s        = (float)atof(optarg); break;
 		case OPT_BOOST_MULT:   cfg.boost_mult     = (float)atof(optarg); break;
+		case OPT_WFB_STATS_PORT: {
+			int p = atoi(optarg);
+			if (p < 0 || p > 65535) {
+				fprintf(stderr, "invalid --wfb-stats-port (1..65535)\n");
+				return 1;
+			}
+			cfg.wfb_stats_port = (uint16_t)p;
+			break;
+		}
 		case 'v':              cfg.verbose        = 1; break;
 		case 'h': default: usage(argv[0]); return (ch == 'h') ? 0 : 1;
 		}
@@ -979,6 +1233,20 @@ int main(int argc, char **argv)
 		fprintf(stderr, "bad sidecar address\n"); return 1;
 	}
 
+	/* Optional wfb_tx -Y stats subscriber. -1 = disabled (polling mode). */
+	int stats_fd = -1;
+	if (cfg.wfb_stats_port != 0) {
+		stats_fd = wfb_stats_open_listener(cfg.wfb_stats_port);
+		if (stats_fd < 0) {
+			LOG("wfb-stats: bind on udp:%u failed (%s); falling back to CMD_GET_RADIO polling",
+			    cfg.wfb_stats_port, strerror(errno));
+			cfg.wfb_stats_port = 0;
+		} else {
+			LOG("wfb-stats: listening on udp:%u (radio + fec_k/n driven by datagrams; CMD_GET_RADIO polling disabled)",
+			    cfg.wfb_stats_port);
+		}
+	}
+
 	Controller ctrl = {0};
 	HeadroomRing ring = {0};
 	FpsEst fps = {0};
@@ -997,6 +1265,12 @@ int main(int argc, char **argv)
 	 * k-up cooldown absorb the resulting EWMA transient without
 	 * thrashing CMD_SET_FEC. -1 = nothing written yet. */
 	long last_written_kbps = -1;
+
+	/* Tracks the FEC sizes we last asserted via CMD_SET_FEC. Used by the
+	 * stats-subscribe path to detect external set_fec calls. -1 = nothing
+	 * written yet. */
+	int last_written_fec_k = -1;
+	int last_written_fec_n = -1;
 
 	while (!g_stop) {
 		uint64_t now = now_us();
@@ -1030,67 +1304,36 @@ int main(int argc, char **argv)
 			next_heartbeat_us = now + 5000000ULL;
 		}
 
-		/* --- Poll radio params + assert bitrate budget ---
+		/* --- Radio observation + bitrate assertion ---
 		 *
-		 * Single 1 Hz tick: refresh the radio snapshot, detect any
-		 * external changes (MCS / BW / GI / VHT mode / NSS), and assert
-		 * the safe-bitrate target.
+		 * Two paths, mutually exclusive (chosen at startup):
 		 *
-		 * On a detected MCS change we arm the long settle window
-		 * (--mcs-settle-s) so the EWMA can absorb the new frame-size
-		 * distribution before k re-converges. An MCS-DOWN additionally
-		 * arms the parity boost — same semantic as when the (now-
-		 * removed) internal scaler initiated the drop. We don't try to
-		 * distinguish "operator set this" from "controller set this":
-		 * we don't initiate MCS at all, so any change observed here is
-		 * external by definition. */
-		if (now >= next_radio_us) {
+		 *   stats-subscribe (--wfb-stats-port set):
+		 *     Drain stats_fd in the sidecar poll() block below.
+		 *     Each datagram drives radio_apply_observation() +
+		 *     bitrate_assert(). Lower latency on radio changes
+		 *     (per-datagram instead of up-to-1s) and decoupled from
+		 *     wfb_tx process lifecycle.
+		 *
+		 *   polling (default):
+		 *     1 Hz CMD_GET_RADIO request/response. No fec_k/n info
+		 *     comes back through this channel, so external set_fec
+		 *     detection is unavailable in this mode. */
+		if (cfg.wfb_stats_port == 0 && now >= next_radio_us) {
 			CmdResp resp;
 			if (wfb_get_radio(&cfg, &resp) == 0) {
-				bool was_valid = radio.valid;
-				int  prev_mcs  = radio.mcs;
-				int  prev_bw   = radio.bandwidth;
-				int  prev_gi   = radio.short_gi;
-				int  prev_vht  = radio.vht_mode;
-				int  prev_nss  = radio.vht_nss;
-
-				radio.valid     = true;
-				radio.stbc      = resp.u.get_radio.stbc;
-				radio.ldpc      = resp.u.get_radio.ldpc;
-				radio.short_gi  = resp.u.get_radio.short_gi;
-				radio.bandwidth = resp.u.get_radio.bandwidth;
-				radio.mcs       = resp.u.get_radio.mcs_index;
-				radio.vht_mode  = resp.u.get_radio.vht_mode;
-				radio.vht_nss   = resp.u.get_radio.vht_nss;
-				radio.phy_mbps  = phy_mbps(radio.mcs, radio.bandwidth,
-				                           radio.short_gi, radio.vht_mode,
-				                           radio.vht_nss);
-
-				if (was_valid) {
-					bool mcs_changed = (radio.mcs != prev_mcs);
-					bool any_changed = mcs_changed
-					    || radio.bandwidth != prev_bw
-					    || radio.short_gi  != prev_gi
-					    || radio.vht_mode  != prev_vht
-					    || radio.vht_nss   != prev_nss;
-					if (any_changed) {
-						LOG("radio: external change mcs %d->%d bw %d->%d gi %d->%d vht %d->%d nss %d->%d (phy=%.1fMbps)",
-						    prev_mcs, radio.mcs,
-						    prev_bw, radio.bandwidth,
-						    prev_gi, radio.short_gi,
-						    prev_vht, radio.vht_mode,
-						    prev_nss, radio.vht_nss,
-						    radio.phy_mbps);
-						controller_arm_settle(&ctrl, now, cfg.mcs_settle_s);
-						if (mcs_changed && radio.mcs < prev_mcs) {
-							controller_arm_boost(&ctrl, &cfg, now);
-							if (cfg.boost_s > 0.0f)
-								LOG("fec: parity boost armed for %.1fs (mult=%.2f) [external MCS drop]",
-								    cfg.boost_s, cfg.boost_mult);
-						}
-					}
-				}
-
+				radio_apply_observation(
+				    &radio, &ctrl, &cfg,
+				    resp.u.get_radio.mcs_index,
+				    resp.u.get_radio.bandwidth,
+				    resp.u.get_radio.short_gi,
+				    resp.u.get_radio.stbc,
+				    resp.u.get_radio.ldpc,
+				    resp.u.get_radio.vht_mode,
+				    resp.u.get_radio.vht_nss,
+				    -1, -1,  /* polling has no FEC info */
+				    &last_written_fec_k, &last_written_fec_n,
+				    now);
 				LOGV(&cfg, "radio: mcs=%d bw=%d gi=%s vht=%d nss=%d phy=%.1f Mbps",
 				     radio.mcs, radio.bandwidth,
 				     radio.short_gi ? "short" : "long",
@@ -1098,78 +1341,44 @@ int main(int argc, char **argv)
 			} else {
 				LOGV(&cfg, "radio: get_radio timed out");
 			}
-
-			/* --- Bitrate assertion ---
-			 *
-			 * The controller TRACKS the link budget, not a fixed user-
-			 * set target: target = clamp(safe, --bitrate-min,
-			 * --bitrate-max). With --bitrate-max=0 (default), the only
-			 * ceiling is safe_kbps itself, so when MCS climbs the
-			 * bitrate is pushed up to use the extra budget.
-			 *
-			 * No HTTP READ — we compare safe vs last_written_kbps. If
-			 * an external actor changes venc.bitrate, we don't see it
-			 * directly, but the next assertion overwrites it (and the
-			 * EWMA absorbs the resulting frame-size transient through
-			 * normal gating, no special-casing needed). */
-			if (radio.valid && ctrl.have_current) {
-				float k = (float)ctrl.current.k;
-				float n = (float)ctrl.current.n;
-				float post_fec_kbps = radio.phy_mbps * 1000.0f * (k / n);
-				long safe_kbps = (long)(post_fec_kbps * cfg.safety_margin);
-
-				long target = safe_kbps;
-				if (cfg.bitrate_max_kbps > 0 && target > cfg.bitrate_max_kbps)
-					target = cfg.bitrate_max_kbps;
-				if (target < cfg.bitrate_min_kbps)
-					target = cfg.bitrate_min_kbps;
-
-				long ref = (last_written_kbps > 0) ? last_written_kbps : 0;
-				long dev = ref - target;
-				long adev = dev < 0 ? -dev : dev;
-				long tol = (long)((double)target * (double)cfg.bitrate_tolerance);
-				if (tol < 1) tol = 1;
-
-				LOGV(&cfg, "bitrate: target=%ld last_written=%ld safe=%ld min=%ld max=%ld (phy=%.1f k/n=%d/%d)",
-				     target, last_written_kbps, safe_kbps,
-				     cfg.bitrate_min_kbps, cfg.bitrate_max_kbps,
-				     radio.phy_mbps, ctrl.current.k, ctrl.current.n);
-
-				if (last_written_kbps < 0 || adev > tol) {
-					const char *dir = (last_written_kbps < 0)
-					    ? "init"
-					    : ((ref > target) ? "down" : "up");
-					LOG("bitrate %s %ld -> %ld kbps (phy=%.1f Mbps, k/n=%d/%d, safe=%ld)",
-					    dir, last_written_kbps, target, radio.phy_mbps,
-					    ctrl.current.k, ctrl.current.n, safe_kbps);
-					if (!cfg.dry_run) {
-						if (venc_set_bitrate_kbps(&cfg, target) != 0)
-							LOG("bitrate: set failed");
-						else
-							last_written_kbps = target;
-					} else {
-						last_written_kbps = target;
-					}
-					/* Arm settling grace, but only extend — never shorten
-					 * a longer in-flight window (e.g. an MCS settle
-					 * started earlier). */
-					if (cfg.bitrate_grace_s > 0.0f) {
-						uint64_t new_end =
-						    now + (uint64_t)(cfg.bitrate_grace_s * 1e6f);
-						if (new_end > ctrl.bitrate_grace_until_us)
-							ctrl.bitrate_grace_until_us = new_end;
-					}
-				}
-			}
-
+			bitrate_assert(&radio, &ctrl, &cfg, &last_written_kbps, now);
 			next_radio_us = now + (uint64_t)(cfg.radio_poll_s * 1e6);
 		}
 
-		/* --- Poll sidecar for one FRAME (or wait up to 100 ms) --- */
-		struct pollfd pfd = { .fd = sfd, .events = POLLIN };
-		int pr = poll(&pfd, 1, 100);
+		/* --- Poll sidecar (and stats UDP if enabled) for up to 100 ms --- */
+		struct pollfd pfds[2];
+		int npfds = 0;
+		int sidecar_idx = -1, stats_idx = -1;
+		pfds[npfds].fd = sfd;
+		pfds[npfds].events = POLLIN;
+		sidecar_idx = npfds++;
+		if (stats_fd >= 0) {
+			pfds[npfds].fd = stats_fd;
+			pfds[npfds].events = POLLIN;
+			stats_idx = npfds++;
+		}
+		int pr = poll(pfds, npfds, 100);
 		if (pr < 0) { if (errno == EINTR) continue; perror("poll"); break; }
 		if (pr == 0) continue;
+
+		/* Drain wfb_tx stats first — radio info may inform a same-tick
+		 * sidecar read's bitrate calc. */
+		if (stats_idx >= 0 && (pfds[stats_idx].revents & POLLIN)) {
+			char dgram[2048];
+			for (;;) {
+				ssize_t n = recv(stats_fd, dgram, sizeof(dgram) - 1, 0);
+				if (n <= 0) break;
+				dgram[n] = '\0';
+				(void)wfb_stats_handle_datagram(dgram,
+				                                &radio, &ctrl, &cfg,
+				                                &last_written_fec_k,
+				                                &last_written_fec_n,
+				                                &last_written_kbps,
+				                                now_us());
+			}
+		}
+
+		if (!(pfds[sidecar_idx].revents & POLLIN)) continue;
 
 		uint8_t buf[128];
 		struct sockaddr_in src; socklen_t sl = sizeof(src);
@@ -1208,10 +1417,18 @@ int main(int argc, char **argv)
 			if (!cfg.dry_run) {
 				if (wfb_send_set_fec(&cfg, next_params.k, next_params.n) != 0)
 					LOG("set_fec send failed");
+				else {
+					last_written_fec_k = next_params.k;
+					last_written_fec_n = next_params.n;
+				}
+			} else {
+				last_written_fec_k = next_params.k;
+				last_written_fec_n = next_params.n;
 			}
 		}
 	}
 
+	if (stats_fd >= 0) close(stats_fd);
 	close(sfd);
 	LOG("stopped after %u FEC updates", ctrl.update_count);
 	return 0;

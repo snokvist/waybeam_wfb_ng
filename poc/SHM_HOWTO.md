@@ -624,7 +624,7 @@ silently ignored to avoid log spam if the consumer flaps.
 ### Schema
 
 One datagram per emit, single-line UTF-8 JSON, terminated with `\n` for
-`nc -ul` debugging:
+line-oriented tools:
 
 ```json
 {"ts_ms":1714115012345,"type":"tx_stats","ver":1,"interval_ms":1000,
@@ -654,8 +654,20 @@ external `wfb_tx_cmd set_fec` / `set_radio` calls without polling
 
 ### Debug
 
+**On-device** (busybox `nc` does NOT support `-u` UDP-listen mode — use
+`socat`, which is preinstalled on OpenIPC):
+
 ```bash
-# Subscribe + pretty-print on the host
+socat -u UDP-RECV:5800,reuseaddr -
+```
+
+**From a host on the same LAN** (point `-Y` at the host IP, then use
+real `nc`):
+
+```bash
+# On vehicle:
+wfb_tx ... -Y 192.168.1.5:5800 ...
+# On host (192.168.1.5):
 nc -ul 5800 | jq -c .
 ```
 
