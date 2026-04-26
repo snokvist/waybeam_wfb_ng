@@ -35,6 +35,7 @@
 #include <netinet/in.h>
 #include <poll.h>
 #include <signal.h>
+#include <stdarg.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -254,12 +255,31 @@ static double log_rel_s(void)
 	return (double)(now_us() - g_log_start_us) / 1e6;
 }
 
+/* Forward declaration — defined alongside the SSE client table near the
+ * bottom of the API section. Broadcasts a formatted log line (without the
+ * "[fec t=...]" prefix) to all SSE-subscribed clients as a JSON event. */
+static void sse_broadcast_log(double t_s, const char *line);
+
+static void log_emit(const char *fmt, ...)
+	__attribute__((format(printf, 1, 2)));
+
+static void log_emit(const char *fmt, ...)
+{
+	char body[1024];
+	va_list ap;
+	va_start(ap, fmt);
+	int n = vsnprintf(body, sizeof(body), fmt, ap);
+	va_end(ap);
+	if (n < 0) return;
+	if (n >= (int)sizeof(body)) n = sizeof(body) - 1;
+	double t = log_rel_s();
+	fprintf(stderr, "[fec t=%8.3f] %s\n", t, body);
+	sse_broadcast_log(t, body);
+}
+
 #define LOGV(cfg, fmt, ...) \
-	do { if ((cfg)->verbose) \
-		fprintf(stderr, "[fec t=%8.3f] " fmt "\n", log_rel_s(), ##__VA_ARGS__); \
-	} while (0)
-#define LOG(fmt, ...) \
-	fprintf(stderr, "[fec t=%8.3f] " fmt "\n", log_rel_s(), ##__VA_ARGS__)
+	do { if ((cfg)->verbose) log_emit(fmt, ##__VA_ARGS__); } while (0)
+#define LOG(fmt, ...) log_emit(fmt, ##__VA_ARGS__)
 
 /* ── Redundancy curve (k → redundancy fraction, linear interp) ───────── */
 
@@ -1355,6 +1375,8 @@ static int help_to_text(char *buf, size_t cap)
 		"  GET /params            JSON of all tunable Config fields\n"
 		"  GET /set?k=v&k=v...    apply changes; returns JSON\n"
 		"  GET /status            JSON snapshot of controller + radio + wfb\n"
+		"  GET /events            text/event-stream — every log line as JSON\n"
+		"                         (data: {\"t_s\":N,\"msg\":\"...\"}); curl-friendly\n"
 		"  GET /health            \"ok\\n\"\n"
 		"\n"
 		"Tunables (key  type  range  description):\n");
@@ -1398,16 +1420,27 @@ static void api_send(int fd, int status, const char *content_type,
 	close(fd);
 }
 
-/* Per-connection state. We accept up to API_MAX_CLIENTS at once. */
-#define API_MAX_CLIENTS 4
+/* Per-connection state. We accept up to API_MAX_CLIENTS at once. SSE
+ * subscribers occupy slots for their lifetime — a separate cap keeps
+ * them from starving short-lived REST traffic. */
+#define API_MAX_CLIENTS 8
+#define API_MAX_SSE     4
 #define API_BUF_BYTES   2048
 
 typedef struct {
-	int      fd;        /* -1 = slot empty */
+	int      fd;            /* -1 = slot empty */
 	uint64_t accepted_us;
 	size_t   pos;
+	bool     sse;           /* long-lived event-stream subscriber */
 	char     buf[API_BUF_BYTES];
 } ApiClient;
+
+/* Global SSE subscriber table — pointed at by main()'s api_clients[].
+ * Set by main() once the listener binds; nullified on shutdown. The
+ * log_emit() path needs this without threading a pointer through every
+ * caller, so we keep one globally-visible registration. Single-threaded;
+ * no locking required. */
+static ApiClient *g_api_clients = NULL;
 
 static int api_listen_open(uint16_t port)
 {
@@ -1445,6 +1478,113 @@ static void api_client_drop(ApiClient *c)
 	if (c->fd >= 0) close(c->fd);
 	c->fd = -1;
 	c->pos = 0;
+	c->sse = false;
+}
+
+/* Append a JSON-escaped copy of `in` into out[pos..cap], returning bytes
+ * written or -1 on overflow. Handles the must-escape characters defined in
+ * RFC 8259 §7. We don't pretty-print non-ASCII; embedded control bytes get
+ * "\u00XX" form so the output is valid JSON for any input. */
+static int json_escape(char *out, size_t cap, size_t pos, const char *in)
+{
+	size_t start = pos;
+	for (const unsigned char *p = (const unsigned char *)in; *p; p++) {
+		if (pos >= cap - 8) return -1;   /* keep slack for the longest escape */
+		unsigned c = *p;
+		if (c == '"' || c == '\\') { out[pos++] = '\\'; out[pos++] = (char)c; }
+		else if (c == '\n')        { out[pos++] = '\\'; out[pos++] = 'n'; }
+		else if (c == '\r')        { out[pos++] = '\\'; out[pos++] = 'r'; }
+		else if (c == '\t')        { out[pos++] = '\\'; out[pos++] = 't'; }
+		else if (c < 0x20) {
+			int n = snprintf(out + pos, cap - pos, "\\u%04x", c);
+			if (n < 0) return -1;
+			pos += (size_t)n;
+		} else {
+			out[pos++] = (char)c;
+		}
+	}
+	return (int)(pos - start);
+}
+
+/* Send the SSE response preamble. Connection stays open until the client
+ * disconnects (broadcast write fails) or an idle reaper drops it. */
+static void api_send_sse_headers(int fd)
+{
+	const char *hdr =
+		"HTTP/1.0 200 OK\r\n"
+		"Content-Type: text/event-stream\r\n"
+		"Cache-Control: no-store\r\n"
+		"X-Accel-Buffering: no\r\n"
+		"Connection: keep-alive\r\n\r\n"
+		/* Prelude comment so curl/EventSource both flush the headers
+		 * immediately; some clients buffer until the first byte of body. */
+		":fec_controller events stream\n\n";
+	(void)!write(fd, hdr, strlen(hdr));
+}
+
+/* Format and broadcast a log line as a JSON SSE event to every SSE
+ * subscriber. Called from log_emit() so every LOG()/LOGV() reaches both
+ * stderr and any subscribed HTTP client.
+ *
+ * Per-broadcast budget: 1280 bytes of body + envelope overhead. Anything
+ * larger is truncated by the snprintf bound — operator-readable logs are
+ * always well under this in practice.
+ *
+ * Errors during write (typically EPIPE if the client closed) drop the
+ * client. Single-threaded: no locking required. Reentrancy-safe because
+ * sse_broadcast_log() never calls log_emit() — even on error paths. */
+static void sse_broadcast_log(double t_s, const char *line)
+{
+	if (!g_api_clients) return;
+	char ev[1536];
+	int hpos = snprintf(ev, sizeof(ev), "data: {\"t_s\":%.3f,\"msg\":\"", t_s);
+	if (hpos < 0 || hpos >= (int)sizeof(ev)) return;
+	int wrote = json_escape(ev, sizeof(ev), (size_t)hpos, line);
+	if (wrote < 0) return;
+	int tpos = hpos + wrote;
+	int t = snprintf(ev + tpos, sizeof(ev) - (size_t)tpos, "\"}\n\n");
+	if (t < 0 || (size_t)t >= sizeof(ev) - (size_t)tpos) return;
+	int total = tpos + t;
+
+	for (int i = 0; i < API_MAX_CLIENTS; i++) {
+		if (!g_api_clients[i].sse) continue;
+		if (g_api_clients[i].fd < 0) continue;
+		ssize_t w = send(g_api_clients[i].fd, ev, (size_t)total,
+		                 MSG_NOSIGNAL | MSG_DONTWAIT);
+		if (w == (ssize_t)total) continue;
+		/* Partial write or error → drop. SSE keep-alive shouldn't tolerate
+		 * mid-event truncation; better to disconnect than leak partial JSON. */
+		close(g_api_clients[i].fd);
+		g_api_clients[i].fd = -1;
+		g_api_clients[i].sse = false;
+		g_api_clients[i].pos = 0;
+	}
+}
+
+/* Heartbeat comment so a client behind a NAT / proxy with idle timeouts
+ * keeps the connection. Called from the main loop on an interval. */
+static void sse_heartbeat_all(void)
+{
+	if (!g_api_clients) return;
+	const char *ping = ":ping\n\n";
+	for (int i = 0; i < API_MAX_CLIENTS; i++) {
+		if (!g_api_clients[i].sse) continue;
+		if (g_api_clients[i].fd < 0) continue;
+		ssize_t w = send(g_api_clients[i].fd, ping, strlen(ping),
+		                 MSG_NOSIGNAL | MSG_DONTWAIT);
+		if (w == (ssize_t)strlen(ping)) continue;
+		close(g_api_clients[i].fd);
+		g_api_clients[i].fd = -1;
+		g_api_clients[i].sse = false;
+		g_api_clients[i].pos = 0;
+	}
+}
+
+static int api_count_sse(const ApiClient *cs)
+{
+	int n = 0;
+	for (int i = 0; i < API_MAX_CLIENTS; i++) if (cs[i].sse) n++;
+	return n;
 }
 
 /* Parse the request line in c->buf and dispatch. */
@@ -1525,6 +1665,24 @@ static void api_handle_request(ApiClient *c, Config *cfg, ApiSnapshot *snap)
 	else if (strcmp(path, "/health") == 0) {
 		api_send(c->fd, 200, "text/plain", "ok\n", 3);
 	}
+	else if (strcmp(path, "/events") == 0) {
+		/* Promote this slot to a long-lived SSE subscriber. We cap SSE
+		 * at API_MAX_SSE so a flood of subscribers can't starve REST. */
+		if (api_count_sse(g_api_clients ? g_api_clients : (ApiClient *)c)
+		    >= API_MAX_SSE) {
+			api_send(c->fd, 503, "text/plain",
+			         "sse: too many subscribers\n", 26);
+			c->fd = -1;
+			return;
+		}
+		api_send_sse_headers(c->fd);
+		c->sse = true;
+		c->pos = 0;
+		LOGV(cfg, "api: sse subscriber attached (fd=%d)", c->fd);
+		/* Important: do NOT clear c->fd — caller (api_client_drain)
+		 * keeps the slot occupied for broadcasting. */
+		return;
+	}
 	else {
 		api_send(c->fd, 404, "text/plain", "no such route\n", 14);
 	}
@@ -1579,8 +1737,9 @@ static void usage(const char *prog)
 		"                       polling is disabled (default 0 = polling mode).\n"
 		"  --api-port N         bind HTTP API on 127.0.0.1:N (default 8765;\n"
 		"                       0 disables). Routes: GET / /params /set?k=v\n"
-		"                       /status /health. Useful for live tuning —\n"
-		"                       see GET / for the per-tunable list.\n"
+		"                       /status /events /health. Useful for live\n"
+		"                       tuning + log streaming — see GET / for the\n"
+		"                       per-tunable list.\n"
 		"\n"
 		"FEC sizing:\n"
 		"  --mtu N              packet size budget (default 1446)\n"
@@ -1842,7 +2001,12 @@ int main(int argc, char **argv)
 	 * disables; the controller still runs without it. */
 	int api_fd = -1;
 	ApiClient api_clients[API_MAX_CLIENTS];
-	for (int i = 0; i < API_MAX_CLIENTS; i++) api_clients[i].fd = -1;
+	for (int i = 0; i < API_MAX_CLIENTS; i++) {
+		api_clients[i].fd = -1;
+		api_clients[i].sse = false;
+		api_clients[i].pos = 0;
+	}
+	g_api_clients = api_clients;     /* expose to log_emit() / sse_broadcast */
 	if (cfg.api_port > 0) {
 		api_fd = api_listen_open((uint16_t)cfg.api_port);
 		if (api_fd < 0) {
@@ -1854,6 +2018,7 @@ int main(int argc, char **argv)
 			    cfg.api_port);
 		}
 	}
+	uint64_t next_sse_ping_us = now_us() + 15000000ULL;  /* 15 s heartbeat */
 
 	Controller ctrl = {0};
 	HeadroomRing ring = {0};
@@ -2030,16 +2195,31 @@ int main(int argc, char **argv)
 			for (int i = 0; i < API_MAX_CLIENTS; i++) {
 				if (api_client_idx[i] < 0) continue;
 				if (api_clients[i].fd < 0) continue;
+				if (api_clients[i].sse) {
+					/* SSE subscribers don't pipeline more requests; only
+					 * surface POLLHUP/POLLERR which means the peer closed. */
+					if (pfds[api_client_idx[i]].revents & (POLLHUP | POLLERR))
+						api_client_drop(&api_clients[i]);
+					continue;
+				}
 				if (pfds[api_client_idx[i]].revents & (POLLIN | POLLHUP | POLLERR))
 					api_client_drain(&api_clients[i], &cfg, &snap);
 			}
-			/* Reap clients that have been hanging idle > 2 s. */
+			/* Reap REST clients hanging idle > 2 s. SSE clients are
+			 * long-lived by design and exempt from idle reaping; broadcast
+			 * write failures (sse_broadcast_log) drop them instead. */
 			uint64_t now2 = now_us();
 			for (int i = 0; i < API_MAX_CLIENTS; i++) {
-				if (api_clients[i].fd >= 0 &&
+				if (api_clients[i].fd >= 0 && !api_clients[i].sse &&
 				    now2 - api_clients[i].accepted_us > 2000000ULL) {
 					api_client_drop(&api_clients[i]);
 				}
+			}
+			/* Periodic SSE heartbeat (15 s comment) so connections stay open
+			 * through NATs/proxies during quiet operating periods. */
+			if (now2 >= next_sse_ping_us) {
+				sse_heartbeat_all();
+				next_sse_ping_us = now2 + 15000000ULL;
 			}
 		}
 
@@ -2148,6 +2328,9 @@ int main(int argc, char **argv)
 
 	if (stats_fd >= 0) close(stats_fd);
 	if (api_fd >= 0) close(api_fd);
+	/* Disarm broadcast BEFORE closing fds so the final LOG below can't try
+	 * to send to a stale slot. */
+	g_api_clients = NULL;
 	for (int i = 0; i < API_MAX_CLIENTS; i++)
 		if (api_clients[i].fd >= 0) close(api_clients[i].fd);
 	close(sfd);
