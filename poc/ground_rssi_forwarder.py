@@ -1,5 +1,21 @@
 #!/usr/bin/env python3
 """
+DEPRECATED. Kept for reference only.
+
+This script existed to bridge wfb_rx's stdout RX_ANT lines into a UDP
+datagram stream. As of the wfb_rx -Y patch, wfb_rx emits a structured
+JSON datagram per interval directly — no wrapper needed. See the
+"UDP stats push for wfb_rx" section in SHM_HOWTO.md.
+
+Old usage:
+    wfb_rx ... | python3 ground_rssi_forwarder.py --target HOST:PORT
+
+Replacement:
+    wfb_rx -Y HOST:PORT ...
+
+Original docstring follows for historical context.
+---
+
 Ground-side RSSI forwarder for the fec_controller POC.
 
 Reads wfb_rx stdout (stdin by default, or a spawned wfb_rx subprocess, or a

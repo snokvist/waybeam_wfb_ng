@@ -1,8 +1,104 @@
 diff --git a/src/rx.cpp b/src/rx.cpp
-index 1603b6e..84a8f58 100644
+index 1603b6e..ab40814 100644
 --- a/src/rx.cpp
 +++ b/src/rx.cpp
-@@ -270,6 +270,7 @@ void Receiver::loop_iter(void)
+@@ -52,6 +52,95 @@ extern "C"
+ 
+ using namespace std;
+ 
++// --- UDP stats push (-Y host:port) ---
++//
++// Optional: emit one JSON datagram per -l log_interval to a fixed UDP
++// target. Mirror of the wfb_tx -Y mechanism (see SHM_HOWTO.md). Lets
++// external consumers (e.g. fec_controller, status WebUI, metrics
++// exporter) subscribe to per-antenna RSSI/SNR + aggregate counters
++// without attaching to wfb_rx's stdout. Replaces the
++// poc/ground_rssi_forwarder.py wrapper that used to bridge stdout
++// RX_ANT lines to UDP.
++//
++// Schema (single-line UTF-8 JSON, newline-terminated):
++//   {"ts_ms":..., "type":"rx_ant", "ver":1, "seq":..., "interval_ms":...,
++//    "ant":[{"freq":..., "mcs":..., "bw":..., "id":"<hex>",
++//            "pkts":..., "rssi":{"min":...,"avg":...,"max":...},
++//            "snr":{"min":...,"avg":...,"max":...}}, ...],
++//    "pkt":{"all":..., "bytes":..., "dec_err":..., "session":...,
++//           "data":..., "uniq":..., "fec_recovered":..., "lost":...,
++//           "bad":..., "outgoing":..., "outgoing_bytes":...}}
++//
++// Best-effort: sendto() errors are silently ignored. Init failures
++// log once and leave the feature disabled — wfb_rx continues normally.
++static int g_stats_udp_fd = -1;
++static struct sockaddr_in g_stats_udp_dst;
++static bool g_stats_udp_enabled = false;
++static uint64_t g_stats_seq = 0;
++// Captured from main() so Aggregator::dump_stats() (no params) can
++// include the configured interval in the JSON without plumbing it
++// through the BaseAggregator interface.
++static int g_log_interval_ms = 1000;
++
++static void stats_udp_init(const char *target)
++{
++    if (!target || !*target) return;
++    const char *colon = strrchr(target, ':');
++    if (!colon || colon == target) {
++        fprintf(stderr, "stats: invalid -Y target '%s' (expected host:port)\n", target);
++        return;
++    }
++    char host[64];
++    size_t hlen = (size_t)(colon - target);
++    if (hlen >= sizeof(host)) {
++        fprintf(stderr, "stats: -Y host too long\n");
++        return;
++    }
++    memcpy(host, target, hlen);
++    host[hlen] = '\0';
++    int port = atoi(colon + 1);
++    if (port <= 0 || port > 65535) {
++        fprintf(stderr, "stats: invalid -Y port %d\n", port);
++        return;
++    }
++    int fd = socket(AF_INET, SOCK_DGRAM, 0);
++    if (fd < 0) {
++        fprintf(stderr, "stats: socket() failed: %s\n", strerror(errno));
++        return;
++    }
++    memset(&g_stats_udp_dst, 0, sizeof(g_stats_udp_dst));
++    g_stats_udp_dst.sin_family = AF_INET;
++    g_stats_udp_dst.sin_port   = htons((uint16_t)port);
++    if (inet_pton(AF_INET, host, &g_stats_udp_dst.sin_addr) != 1) {
++        fprintf(stderr, "stats: invalid -Y host '%s' (numeric IPv4 only)\n", host);
++        close(fd);
++        return;
++    }
++    g_stats_udp_fd = fd;
++    g_stats_udp_enabled = true;
++    fprintf(stderr, "stats: pushing rx_ant JSON to %s:%d every -l ms\n",
++            host, port);
++}
++
++// Quick check from Aggregator::dump_stats() so we can skip iterating
++// the antenna_stat map for serialization when no consumer is attached.
++static inline bool stats_udp_is_enabled(void)
++{
++    return g_stats_udp_enabled;
++}
++
++// Send a pre-formatted single datagram. Caller is responsible for size
++// and content; this is a thin wrapper to keep the sendto() boilerplate
++// in one place. Best-effort.
++static void stats_udp_send(const char *buf, size_t len)
++{
++    if (!g_stats_udp_enabled || len == 0) return;
++    (void)sendto(g_stats_udp_fd, buf, len, 0,
++                 (const struct sockaddr*)&g_stats_udp_dst,
++                 sizeof(g_stats_udp_dst));
++}
++// --- end stats push ---
++
+ 
+ Receiver::Receiver(const char *wlan, int wlan_idx, uint32_t channel_id, BaseAggregator *agg, int rcv_buf_size) : wlan_idx(wlan_idx), agg(agg)
+ {
+@@ -270,6 +359,7 @@ void Receiver::loop_iter(void)
  Aggregator::Aggregator(const string &keypair, uint64_t epoch, uint32_t channel_id) : \
      count_p_all(0), count_b_all(0), count_p_dec_err(0), count_p_session(0), count_p_data(0), count_p_fec_recovered(0),
      count_p_lost(0), count_p_bad(0), count_p_override(0), count_p_outgoing(0), count_b_outgoing(0),
@@ -10,7 +106,7 @@ index 1603b6e..84a8f58 100644
      fec_p(NULL), fec_k(-1), fec_n(-1), seq(0), rx_ring{}, rx_ring_front(0), rx_ring_alloc(0),
      last_known_block((uint64_t)-1), epoch(epoch), channel_id(channel_id)
  {
-@@ -518,6 +519,15 @@ void Aggregator::dump_stats(void)
+@@ -518,6 +608,78 @@ void Aggregator::dump_stats(void)
          WFB_ERR("%u packets lost\n", count_p_lost);
      }
  
@@ -23,10 +119,73 @@ index 1603b6e..84a8f58 100644
 +                count_p_mode_mismatch);
 +    }
 +
++    // Mirror the per-antenna RX_ANT lines + aggregate PKT counters as a
++    // single JSON datagram for any -Y subscriber. Computed only when a
++    // consumer is configured (avoids the snprintf cost otherwise). Called
++    // before clear_stats() so all source data is intact.
++    if (stats_udp_is_enabled())
++    {
++        char dgram[4096];
++        int pos = 0;
++        bool ok = true;
++        bool first_ant = true;
++        uint64_t this_seq = g_stats_seq++;
++
++        int n = snprintf(dgram + pos, sizeof(dgram) - pos,
++                         "{\"ts_ms\":%" PRIu64 ",\"type\":\"rx_ant\",\"ver\":1,"
++                         "\"seq\":%" PRIu64 ",\"interval_ms\":%d,"
++                         "\"ant\":[",
++                         ts, this_seq, g_log_interval_ms);
++        if (n < 0 || n >= (int)sizeof(dgram) - pos) ok = false;
++        else pos += n;
++
++        for (auto it = antenna_stat.begin(); ok && it != antenna_stat.end(); it++)
++        {
++            int32_t cnt = it->second.count_all;
++            if (cnt <= 0) continue;
++            int rssi_avg = it->second.rssi_sum / cnt;
++            int snr_avg  = it->second.snr_sum  / cnt;
++            n = snprintf(dgram + pos, sizeof(dgram) - pos,
++                         "%s{\"freq\":%u,\"mcs\":%u,\"bw\":%u,\"id\":\"%" PRIx64 "\","
++                         "\"pkts\":%d,"
++                         "\"rssi\":{\"min\":%d,\"avg\":%d,\"max\":%d},"
++                         "\"snr\":{\"min\":%d,\"avg\":%d,\"max\":%d}}",
++                         first_ant ? "" : ",",
++                         (unsigned)it->first.freq,
++                         (unsigned)it->first.mcs_index,
++                         (unsigned)it->first.bandwidth,
++                         it->first.antenna_id,
++                         cnt,
++                         (int)it->second.rssi_min, rssi_avg, (int)it->second.rssi_max,
++                         (int)it->second.snr_min,  snr_avg,  (int)it->second.snr_max);
++            if (n < 0 || n >= (int)sizeof(dgram) - pos) { ok = false; break; }
++            pos += n;
++            first_ant = false;
++        }
++
++        if (ok)
++        {
++            n = snprintf(dgram + pos, sizeof(dgram) - pos,
++                         "],\"pkt\":{\"all\":%u,\"bytes\":%u,\"dec_err\":%u,"
++                         "\"session\":%u,\"data\":%u,\"uniq\":%u,"
++                         "\"fec_recovered\":%u,\"lost\":%u,\"bad\":%u,"
++                         "\"outgoing\":%u,\"outgoing_bytes\":%u}}\n",
++                         count_p_all, count_b_all, count_p_dec_err,
++                         count_p_session, count_p_data,
++                         (uint32_t)count_p_uniq.size(),
++                         count_p_fec_recovered, count_p_lost, count_p_bad,
++                         count_p_outgoing, count_b_outgoing);
++            if (n < 0 || n >= (int)sizeof(dgram) - pos) ok = false;
++            else pos += n;
++        }
++
++        if (ok) stats_udp_send(dgram, (size_t)pos);
++    }
++
      clear_stats();
  }
  
-@@ -592,6 +602,10 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
+@@ -592,6 +754,10 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
      switch(buf[0])
      {
      case WFB_PACKET_DATA:
@@ -37,7 +196,7 @@ index 1603b6e..84a8f58 100644
          if(size < sizeof(wblock_hdr_t) + crypto_aead_chacha20poly1305_ABYTES + sizeof(wpacket_hdr_t))
          {
              WFB_ERR("Short packet (fec header)\n");
-@@ -600,6 +614,18 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
+@@ -600,6 +766,18 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
          }
          break;
  
@@ -56,7 +215,7 @@ index 1603b6e..84a8f58 100644
      case WFB_PACKET_SESSION:
          new_session_data = (wsession_data_t*)session_tmp;
  
-@@ -714,16 +740,31 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
+@@ -714,16 +892,31 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
      unsigned long long decrypted_len;
      wblock_hdr_t *block_hdr = (wblock_hdr_t*)buf;
  
@@ -97,7 +256,7 @@ index 1603b6e..84a8f58 100644
      }
  
      count_p_data += 1;
-@@ -745,6 +786,18 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
+@@ -745,6 +938,18 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
          return;
      }
  
@@ -116,18 +275,19 @@ index 1603b6e..84a8f58 100644
      if (fragment_idx >= fec_n)
      {
          WFB_ERR("Invalid fragment_idx: %d\n", fragment_idx);
-@@ -1147,8 +1200,9 @@ int main(int argc, char* const *argv)
+@@ -1147,8 +1352,10 @@ int main(int argc, char* const *argv)
  
      string keypair = "rx.key";
      string unix_socket = "";
 +    int encrypt_data = 1;  // -x disables AEAD (must match TX's -x setting)
++    const char *stats_udp_target = NULL;  // -Y host:port; NULL = disabled
  
 -    while ((opt = getopt(argc, argv, "K:fa:c:u:U:p:l:i:e:R:s:")) != -1) {
-+    while ((opt = getopt(argc, argv, "K:fa:c:u:U:p:l:i:e:R:s:x")) != -1) {
++    while ((opt = getopt(argc, argv, "K:fa:c:u:U:p:l:i:e:R:s:xY:")) != -1) {
          switch (opt) {
          case 'K':
              keypair = optarg;
-@@ -1187,15 +1241,28 @@ int main(int argc, char* const *argv)
+@@ -1187,15 +1394,35 @@ int main(int argc, char* const *argv)
          case 'e':
              epoch = atoll(optarg);
              break;
@@ -137,19 +297,27 @@ index 1603b6e..84a8f58 100644
 +             * (DATA in plaintext mode, or DATA_PLAIN in AEAD mode). */
 +            encrypt_data = 0;
 +            break;
++        case 'Y':
++            /* -Y host:port — push rx_ant JSON datagrams to this UDP
++             * target on every -l interval. Decouples consumers from
++             * stdout attachment (replaces ground_rssi_forwarder.py).
++             * Numeric IPv4 only. */
++            stats_udp_target = optarg;
++            break;
          default: /* '?' */
          show_usage:
              WFB_INFO("Local RX: %s [-K rx_key] { [-c client_addr] [-u client_port] | [-U unix_socket] } [-p radio_port]\n"
 -                     "             [-R rcv_buf] [-s snd_buf] [-l log_interval] [-e epoch] [-i link_id] interface1 [interface2] ...\n", argv[0]);
-+                     "             [-R rcv_buf] [-s snd_buf] [-l log_interval] [-e epoch] [-i link_id] [-x]\n"
++                     "             [-R rcv_buf] [-s snd_buf] [-l log_interval] [-e epoch] [-i link_id] [-x] [-Y stats_host:port]\n"
 +                     "             interface1 [interface2] ...\n", argv[0]);
              WFB_INFO("RX forwarder: %s -f [-c client_addr] [-u client_port] [-p radio_port]  [-R rcv_buf] [-s snd_buf]\n"
 -                     "                    [-i link_id] interface1 [interface2] ...\n", argv[0]);
 +                     "                    [-i link_id] interface1 [interface2] ...\n"
-+                     "                    (note: -x has no effect in forwarder mode; downstream aggregator sets -x)\n", argv[0]);
++                     "                    (note: -x and -Y have no effect in forwarder mode; downstream aggregator sets -x / -Y)\n", argv[0]);
              WFB_INFO("RX aggregator: %s -a server_port [-K rx_key] { [-c client_addr] [-u client_port] | [-U unix_socket] } [-R rcv_buf]\n"
-                      "                                 [-s snd_buf] [-l log_interval] [-p radio_port] [-e epoch] [-i link_id]\n", argv[0]);
+-                     "                                 [-s snd_buf] [-l log_interval] [-p radio_port] [-e epoch] [-i link_id]\n", argv[0]);
 -            WFB_INFO("Default: K='%s', connect=%s:%d, link_id=0x%06x, radio_port=%u, epoch=%" PRIu64 ", log_interval=%d, rcv_buf=system_default, snd_buf=system_default\n", keypair.c_str(), client_addr.c_str(), client_port, link_id, radio_port, epoch, log_interval);
++                     "                                 [-s snd_buf] [-l log_interval] [-p radio_port] [-e epoch] [-i link_id] [-Y stats_host:port]\n", argv[0]);
 +            WFB_INFO("\nAEAD / cleartext-data option:\n"
 +                     "  -x   expect WFB_PACKET_DATA_PLAIN (cleartext data) from TX; session\n"
 +                     "       packets remain encrypted and authenticated.  Both sides must\n"
@@ -159,7 +327,17 @@ index 1603b6e..84a8f58 100644
              WFB_INFO("WFB-ng version %s, FEC: %s\n", WFB_VERSION, zfex_opt);
              WFB_INFO("WFB-ng home page: <http://wfb-ng.org>\n");
              exit(1);
-@@ -1239,21 +1306,41 @@ int main(int argc, char* const *argv)
+@@ -1223,6 +1450,9 @@ int main(int argc, char* const *argv)
+         return 1;
+     }
+ 
++    g_log_interval_ms = log_interval;
++    stats_udp_init(stats_udp_target);
++
+     try
+     {
+         uint32_t channel_id = (link_id << 8) + radio_port;
+@@ -1239,21 +1469,41 @@ int main(int argc, char* const *argv)
  
          unique_ptr<BaseAggregator> agg;
  
