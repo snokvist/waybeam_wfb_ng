@@ -13,9 +13,18 @@ It:
 3. Asymmetric gating: fast up (Δk ≥ 2 after 1.0 s cooldown), slow down
    (candidate must hold below `current.k` for `--k-down-dwell` seconds,
    default 8.0 s — pure anti-bounce on content jitter).
-4. Polls wfb_tx radio params (`CMD_GET_RADIO`) every 1 s to learn current
-   MCS / bandwidth / GI, computes a PHY-rate estimate, and asserts a safe
-   video bitrate via `/api/v1/set?video0.bitrate=N`:
+4. Learns wfb_tx radio params (MCS / bandwidth / GI) one of two ways
+   (mutually exclusive, chosen at startup):
+   - **Stats-subscribe** (recommended; `--wfb-stats-port N`): bind a UDP
+     listener and consume `wfb_tx -Y` JSON datagrams. Lower latency
+     (per-datagram, ≤ wfb_tx `-l` interval) and decoupled from wfb_tx
+     process lifecycle. Also surfaces `fec_k` / `fec_n`, so external
+     `wfb_tx_cmd set_fec` calls are detected without polling.
+   - **Polling** (legacy default): 1 Hz `CMD_GET_RADIO` request/response.
+     Has no `fec_k`/`fec_n` channel — only radio change detection.
+
+   Either way, computes a PHY-rate estimate and asserts a safe video
+   bitrate via `/api/v1/set?video0.bitrate=N`:
 
    ```
    safe_kbps = phy_mbps * 1000 * (k / n) * safety_margin
@@ -24,16 +33,16 @@ It:
 
    The controller tracks `last_written_kbps` internally — there is no
    HTTP READ. If something else changes `video0.bitrate` externally, the
-   next 1 Hz tick re-asserts `target` and the EWMA absorbs the resulting
+   next assertion re-applies `target` and the EWMA absorbs the resulting
    transient through normal gating.
 5. Emits `CMD_SET_FEC (k, n)` to wfb_tx on every committed update.
 
 The controller is **purely reactive**: it never touches MCS itself. If
 MCS, BW, GI, VHT mode, or NSS change externally (operator, other daemon,
-hardware re-init), the next radio poll detects it, arms the long settle
-window so the EWMA can re-converge to the new frame-size distribution,
-and resumes normal sizing. An MCS-DOWN additionally arms a brief
-parity boost while the EWMA catches up.
+hardware re-init), the next observation (datagram or poll) detects it,
+arms the long settle window so the EWMA can re-converge to the new
+frame-size distribution, and resumes normal sizing. An MCS-DOWN
+additionally arms a brief parity boost while the EWMA catches up.
 
 Single thread, single `poll()` loop. No libs beyond libc.
 
@@ -80,24 +89,34 @@ scp -O build/fec_controller root@192.168.1.13:/tmp/
 
 ## Run (on device)
 
+**Recommended (stats-subscribe mode)** — pair with `wfb_tx -Y 127.0.0.1:5800`:
+
 ```bash
-/tmp/fec_controller -v
+fec_controller --wfb-stats-port 5800 -v
+```
+
+**Legacy (CMD_GET_RADIO polling mode)** — works against an unmodified
+wfb_tx:
+
+```bash
+fec_controller -v
 ```
 
 Default CLI:
 
 ```
---sidecar 127.0.0.1:6666
---wfb     127.0.0.1:8000
---venc    127.0.0.1:80
---mtu     1446
---safety  0.50
+--sidecar         127.0.0.1:6666
+--wfb             127.0.0.1:8000
+--venc            127.0.0.1:80
+--wfb-stats-port  0       # 0 = polling mode (legacy)
+--mtu             1446
+--safety          0.50
 ```
 
 Dry run (compute-only, no `set_fec` / `set?video0.bitrate=` writes):
 
 ```bash
-/tmp/fec_controller -v --dry-run
+fec_controller --wfb-stats-port 5800 -v --dry-run
 ```
 
 ## Logs
@@ -174,12 +193,49 @@ by `safe`). The log tags moves as `bitrate up …`, `bitrate down …`, or
 > `--bitrate-desired` is kept as a deprecated alias for `--bitrate-max`
 > so older scripts still work; it prints a deprecation notice.
 
+## wfb_tx stats subscriber (`--wfb-stats-port`)
+
+Recommended way to learn radio params. Pair the wfb_tx side with `-Y`:
+
+```bash
+# Vehicle (single host setup, both bound to loopback):
+wfb_tx ... -C 8000 -l 1000 -Y 127.0.0.1:5800 wlan0
+fec_controller --wfb-stats-port 5800 -v
+```
+
+When set, the controller binds a UDP listener on `127.0.0.1:N`,
+**disables** the `CMD_GET_RADIO` polling, and drives `radio.*` +
+`fec_k`/`fec_n` from incoming JSON datagrams. Each datagram triggers
+both the change-detection logic and a bitrate assertion.
+
+Benefits over polling:
+
+| | Polling | Stats-subscribe |
+|---|---|---|
+| Detection latency on radio changes | ≤ `--radio-poll-s` (1 s) | ≤ wfb_tx `-l` (1 s typical, configurable lower) |
+| Detects external `wfb_tx_cmd set_fec` | ❌ | ✅ |
+| Detects external `wfb_tx_cmd set_radio` | ✅ | ✅ |
+| Survives wfb_tx restart | reconnects on next poll | datagrams just resume; no state |
+| Multiple consumers possible | ❌ (one CMD reply per request) | ✅ (multi-bind on the same port) |
+
+The schema is documented in `poc/SHM_HOWTO.md` under "UDP stats push".
+Required fields the controller reads: `mcs`, `bw`, `short_gi`, `stbc`,
+`ldpc`, `vht_mode`, `vht_nss`, plus optional `fec_k` / `fec_n`. Unknown
+keys are ignored — adding fields to the schema is a non-breaking change.
+
+If the bind fails (port already in use, wrong permissions), the
+controller logs once and falls back to polling mode automatically:
+
+```
+wfb-stats: bind on udp:5800 failed (Address already in use); falling back to CMD_GET_RADIO polling
+```
+
 ## External MCS-change reactivity
 
-The radio poll runs every 1 s. After each successful `CMD_GET_RADIO`,
-the controller compares the new snapshot against the previous one. Any
-change in `mcs / bandwidth / short_gi / vht_mode / vht_nss` is treated
-as external (the controller never initiates) and triggers:
+After every radio observation (poll or stats datagram), the controller
+compares the new snapshot against the previous one. Any change in
+`mcs / bandwidth / short_gi / vht_mode / vht_nss` is treated as external
+(the controller never initiates) and triggers:
 
 1. A log line: `radio: external change mcs A->B bw … (phy=X Mbps)`.
 2. `controller_arm_settle(--mcs-settle-s)` — suppresses non-edge FEC
@@ -195,6 +251,18 @@ as external (the controller never initiates) and triggers:
 This preserves the exact "extra parity while EWMA catches up after a
 phy-rate drop" semantic that the (now-removed) RSSI-driven scaler used
 to provide, just driven by observation rather than self-action.
+
+In stats-subscribe mode, the same datagrams also surface the live
+`fec_k`/`fec_n`, so external `wfb_tx_cmd set_fec` calls are logged:
+
+```
+[fec t=   4.001] fec: external change observed k=10 n=15 (controller last wrote k=43 n=58)
+```
+
+The next `controller_update()` will compute its own ideal k/n and emit a
+new `CMD_SET_FEC` (we don't try to "respect" the operator's value — the
+controller's job IS to size FEC; if you want to disable that, use
+`--dry-run`).
 
 ## Heartbeat
 
