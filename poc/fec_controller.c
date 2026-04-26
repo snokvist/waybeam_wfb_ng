@@ -1531,19 +1531,27 @@ static void api_send_sse_headers(int fd)
  * always well under this in practice.
  *
  * Errors during write (typically EPIPE if the client closed) drop the
- * client. Single-threaded: no locking required. Reentrancy-safe because
- * sse_broadcast_log() never calls log_emit() — even on error paths. */
+ * client. Single-threaded: no locking required.
+ *
+ * REENTRANCY INVARIANT — DO NOT VIOLATE: nothing in this function (or its
+ * call tree) may invoke LOG()/LOGV()/log_emit() or anything that does.
+ * log_emit() is the SOLE caller. Any error path here must close the slot
+ * silently; logging from here would recurse and stack-blow. The
+ * `in_broadcast` static guard below is a belt-and-suspenders backstop. */
 static void sse_broadcast_log(double t_s, const char *line)
 {
+	static bool in_broadcast = false;
+	if (in_broadcast) return;
 	if (!g_api_clients) return;
+	in_broadcast = true;
 	char ev[1536];
 	int hpos = snprintf(ev, sizeof(ev), "data: {\"t_s\":%.3f,\"msg\":\"", t_s);
-	if (hpos < 0 || hpos >= (int)sizeof(ev)) return;
+	if (hpos < 0 || hpos >= (int)sizeof(ev)) goto done;
 	int wrote = json_escape(ev, sizeof(ev), (size_t)hpos, line);
-	if (wrote < 0) return;
+	if (wrote < 0) goto done;
 	int tpos = hpos + wrote;
 	int t = snprintf(ev + tpos, sizeof(ev) - (size_t)tpos, "\"}\n\n");
-	if (t < 0 || (size_t)t >= sizeof(ev) - (size_t)tpos) return;
+	if (t < 0 || (size_t)t >= sizeof(ev) - (size_t)tpos) goto done;
 	int total = tpos + t;
 
 	for (int i = 0; i < API_MAX_CLIENTS; i++) {
@@ -1559,6 +1567,8 @@ static void sse_broadcast_log(double t_s, const char *line)
 		g_api_clients[i].sse = false;
 		g_api_clients[i].pos = 0;
 	}
+done:
+	in_broadcast = false;
 }
 
 /* Heartbeat comment so a client behind a NAT / proxy with idle timeouts
@@ -1639,9 +1649,19 @@ static void api_handle_request(ApiClient *c, Config *cfg, ApiSnapshot *snap)
 		w = snprintf(body + pos, sizeof(body) - pos, "],\"errors\":[");
 		pos += (w > 0 ? (size_t)w : 0);
 		for (int i = 0; i < en; i++) {
+			/* errors[i].name is the literal query-string key, which is
+			 * attacker-controlled (URL → strchr-split into c->buf). It
+			 * MUST be JSON-escaped or a key containing '"' breaks the
+			 * response. errors[i].reason is one of three string literals
+			 * — safe. applied[] keys come from tunable_find() and are
+			 * registry names (already safe ASCII). */
 			w = snprintf(body + pos, sizeof(body) - pos,
-			             "%s{\"key\":\"%s\",\"reason\":\"%s\"}",
-			             i ? "," : "", errors[i].name, errors[i].reason);
+			             "%s{\"key\":\"", i ? "," : "");
+			if (w > 0) pos += (size_t)w;
+			int esc = json_escape(body, sizeof(body), pos, errors[i].name);
+			if (esc > 0) pos += (size_t)esc;
+			w = snprintf(body + pos, sizeof(body) - pos,
+			             "\",\"reason\":\"%s\"}", errors[i].reason);
 			pos += (w > 0 ? (size_t)w : 0);
 		}
 		w = snprintf(body + pos, sizeof(body) - pos, "],\"params\":");
@@ -1667,9 +1687,18 @@ static void api_handle_request(ApiClient *c, Config *cfg, ApiSnapshot *snap)
 	}
 	else if (strcmp(path, "/events") == 0) {
 		/* Promote this slot to a long-lived SSE subscriber. We cap SSE
-		 * at API_MAX_SSE so a flood of subscribers can't starve REST. */
-		if (api_count_sse(g_api_clients ? g_api_clients : (ApiClient *)c)
-		    >= API_MAX_SSE) {
+		 * at API_MAX_SSE so a flood of subscribers can't starve REST.
+		 * The broadcast path requires the slot table to be registered;
+		 * if main() hasn't installed it yet (shouldn't happen — listener
+		 * binds after registration), refuse rather than fall back to a
+		 * single-element cast that would OOB-read. */
+		if (!g_api_clients) {
+			api_send(c->fd, 503, "text/plain",
+			         "sse: broadcast not initialized\n", 31);
+			c->fd = -1;
+			return;
+		}
+		if (api_count_sse(g_api_clients) >= API_MAX_SSE) {
 			api_send(c->fd, 503, "text/plain",
 			         "sse: too many subscribers\n", 26);
 			c->fd = -1;
