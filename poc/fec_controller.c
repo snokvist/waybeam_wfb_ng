@@ -901,13 +901,21 @@ static void bitrate_assert(const RadioState *radio, Controller *ctrl,
 
 /* Parse one wfb_tx tx_stats JSON datagram and forward into
  * radio_apply_observation() + bitrate_assert(). Returns 0 if the
- * datagram looked sane and was consumed, -1 otherwise. */
+ * datagram looked sane and was consumed, -1 otherwise.
+ *
+ * Tracks the producer's monotonic "seq" counter (additive in v1) via
+ * *last_seq (in/out, -1 = unset on first call). seq going up by more
+ * than 1 means the loopback dropped one or more datagrams; seq going
+ * down means wfb_tx restarted (its seq counter starts at 0 each
+ * process). Both are logged but not acted on — purely operator
+ * visibility. */
 static int wfb_stats_handle_datagram(const char *body,
                                      RadioState *radio, Controller *ctrl,
                                      const Config *cfg,
                                      int *last_written_fec_k,
                                      int *last_written_fec_n,
                                      long *last_written_kbps,
+                                     long *last_seq,
                                      uint64_t now)
 {
 	/* Sanity check: must look like a tx_stats v1 record. */
@@ -947,6 +955,23 @@ static int wfb_stats_handle_datagram(const char *body,
 	if (drops > 0 || trunc > 0) {
 		LOG("wfb-stats: tx dropped %ld pkts (trunc=%ld) last interval",
 		    drops, trunc);
+	}
+
+	/* Sequence-gap detection. The "seq" field is an additive v1
+	 * extension; older wfb_tx without it will simply not match the
+	 * lookup and we silently skip — backward compatible. */
+	long seq = -1;
+	if (json_get_int(body, "seq", &seq) == 0 && seq >= 0) {
+		if (*last_seq >= 0) {
+			if (seq < *last_seq) {
+				LOG("wfb-stats: seq went backwards (%ld -> %ld) — wfb_tx likely restarted",
+				    *last_seq, seq);
+			} else if (seq > *last_seq + 1) {
+				LOG("wfb-stats: seq gap %ld -> %ld (%ld datagram(s) lost on the wire)",
+				    *last_seq, seq, seq - *last_seq - 1);
+			}
+		}
+		*last_seq = seq;
 	}
 	return 0;
 }
@@ -1289,10 +1314,14 @@ int main(int argc, char **argv)
 	/* Subscriber-side housekeeping: when the first datagram arrives we
 	 * log peer + key fields once (so the operator can see the wiring is
 	 * working without enabling -v). last_stats_us tracks freshness so
-	 * we can flag a stale stream when wfb_tx exits or its -Y is dropped. */
+	 * we can flag a stale stream when wfb_tx exits or its -Y is dropped.
+	 * last_seq is the producer's monotonic counter from the JSON
+	 * (additive v1 extension) so we can flag dropped datagrams + wfb_tx
+	 * restart (-1 = unset, awaiting first observation). */
 	bool     stats_first_logged    = false;
 	uint64_t last_stats_us         = 0;
 	bool     stats_was_stale       = false;
+	long     last_stats_seq        = -1;
 	const uint64_t STATS_STALE_US  = 3000000ULL;  /* 3 s */
 
 	while (!g_stop) {
@@ -1402,6 +1431,7 @@ int main(int argc, char **argv)
 				                                   &last_written_fec_k,
 				                                   &last_written_fec_n,
 				                                   &last_written_kbps,
+				                                   &last_stats_seq,
 				                                   now_us());
 				if (rc != 0) continue;
 

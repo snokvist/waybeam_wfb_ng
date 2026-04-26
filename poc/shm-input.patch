@@ -252,7 +252,7 @@ index 856248e..d93fcee 100644
      PacketLossListener* packet_loss_listener_ = nullptr;
  };
 diff --git a/src/tx.cpp b/src/tx.cpp
-index 0dec131..bc9ccf7 100644
+index 0dec131..3fc60c4 100644
 --- a/src/tx.cpp
 +++ b/src/tx.cpp
 @@ -29,6 +29,7 @@
@@ -263,7 +263,7 @@ index 0dec131..bc9ccf7 100644
  #include <net/if.h>
  #include <linux/if_packet.h>
  #include <linux/if_ether.h>
-@@ -42,16 +43,126 @@
+@@ -42,16 +43,133 @@
  
  #include "zfex.h"
  
@@ -301,6 +301,12 @@ index 0dec131..bc9ccf7 100644
 +static int g_stats_udp_fd = -1;
 +static struct sockaddr_in g_stats_udp_dst;
 +static bool g_stats_udp_enabled = false;
++// Per-process monotonic counter, included as "seq" in every datagram so
++// consumers can detect drops (UDP loopback under load CAN drop). Reset
++// to 0 only on process restart — that combined with no-restart-state in
++// consumers means a seq going backwards is a strong signal that wfb_tx
++// just restarted.
++static uint64_t g_stats_seq = 0;
 +
 +static void stats_udp_init(const char *target)
 +{
@@ -352,14 +358,15 @@ index 0dec131..bc9ccf7 100644
 +{
 +    if (!g_stats_udp_enabled) return;
 +    char buf[512];
++    uint64_t this_seq = g_stats_seq++;
 +    int len = snprintf(buf, sizeof(buf),
-+        "{\"ts_ms\":%" PRIu64 ",\"type\":\"tx_stats\",\"ver\":1,\"interval_ms\":%d,"
++        "{\"ts_ms\":%" PRIu64 ",\"type\":\"tx_stats\",\"ver\":1,\"seq\":%" PRIu64 ",\"interval_ms\":%d,"
 +        "\"tx\":{\"pkts_in\":%u,\"bytes_in\":%u,\"pkts_out\":%u,\"bytes_out\":%u,"
 +        "\"pkts_drop\":%u,\"pkts_trunc\":%u,\"fec_timeouts\":%u,"
 +        "\"fec_k\":%d,\"fec_n\":%d},"
 +        "\"radio\":{\"mcs\":%u,\"bw\":%u,\"short_gi\":%u,\"stbc\":%u,\"ldpc\":%u,"
 +        "\"vht_mode\":%u,\"vht_nss\":%u}}\n",
-+        ts_ms, interval_ms,
++        ts_ms, this_seq, interval_ms,
 +        pkts_in, bytes_in, pkts_out, bytes_out,
 +        pkts_drop, pkts_trunc, fec_timeouts,
 +        fec_k, fec_n,
@@ -390,7 +397,7 @@ index 0dec131..bc9ccf7 100644
      epoch(epoch),
      channel_id(channel_id),
      fec_delay(fec_delay),
-@@ -110,6 +221,35 @@ void Transmitter::deinit_session(void)
+@@ -110,6 +228,35 @@ void Transmitter::deinit_session(void)
      fec_n = -1;
  }
  
@@ -426,7 +433,7 @@ index 0dec131..bc9ccf7 100644
  void Transmitter::init_session(int k, int n)
  {
      if (fec_p != NULL)
-@@ -126,6 +266,12 @@ void Transmitter::init_session(int k, int n)
+@@ -126,6 +273,12 @@ void Transmitter::init_session(int k, int n)
      fec_k = k;
      fec_n = n;
  
@@ -439,7 +446,7 @@ index 0dec131..bc9ccf7 100644
      zfex_status_code_t rc = fec_new(fec_k, fec_n, &fec_p);
      assert(rc == ZFEX_SC_OK);
  
-@@ -627,16 +773,29 @@ void Transmitter::send_block_fragment(size_t packet_size)
+@@ -627,16 +780,29 @@ void Transmitter::send_block_fragment(size_t packet_size)
  
      assert(packet_size <= MAX_FEC_PAYLOAD);
  
@@ -476,7 +483,7 @@ index 0dec131..bc9ccf7 100644
      }
  
      inject_packet(ciphertext, sizeof(wblock_hdr_t) + ciphertext_len);
-@@ -724,6 +883,120 @@ bool Transmitter::send_packet(const uint8_t *buf, size_t size, uint8_t flags)
+@@ -724,6 +890,120 @@ bool Transmitter::send_packet(const uint8_t *buf, size_t size, uint8_t flags)
      return true;
  }
  
@@ -597,7 +604,7 @@ index 0dec131..bc9ccf7 100644
  // Extract SO_RXQ_OVFL counter
  uint32_t extract_rxq_overflow(struct msghdr *msg)
  {
-@@ -739,10 +1012,29 @@ uint32_t extract_rxq_overflow(struct msghdr *msg)
+@@ -739,10 +1019,29 @@ uint32_t extract_rxq_overflow(struct msghdr *msg)
      return 0;
  }
  
@@ -629,7 +636,7 @@ index 0dec131..bc9ccf7 100644
  
      struct pollfd fds[nfds + 1];
      memset(fds, '\0', sizeof(fds));
-@@ -769,6 +1061,43 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
+@@ -769,6 +1068,43 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
      uint32_t count_p_truncated = 0; // injected large packets that were truncated
      int start_fd_idx = 0;
  
@@ -673,7 +680,7 @@ index 0dec131..bc9ccf7 100644
      for(;;)
      {
          uint64_t cur_ts = get_time_ms();
-@@ -779,7 +1108,55 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
+@@ -779,7 +1115,55 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
              poll_timeout = std::min(poll_timeout, (int)(fec_close_ts > cur_ts ? fec_close_ts - cur_ts : 0));
          }
  
@@ -730,7 +737,7 @@ index 0dec131..bc9ccf7 100644
  
          if (rc < 0)
          {
-@@ -797,6 +1174,25 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
+@@ -797,6 +1181,25 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
                      cur_ts, count_p_fec_timeouts, count_p_incoming, count_b_incoming, count_p_injected, count_b_injected, count_p_dropped, count_p_truncated);
              IPC_MSG_SEND();
  
@@ -756,7 +763,7 @@ index 0dec131..bc9ccf7 100644
              if(count_p_dropped)
              {
                  WFB_ERR("%u packets dropped\n", count_p_dropped);
-@@ -969,6 +1365,101 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
+@@ -969,6 +1372,101 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
                  }
                  break;
  
@@ -858,7 +865,7 @@ index 0dec131..bc9ccf7 100644
                  default:
                  {
                      resp.rc = htonl(ENOTSUP);
-@@ -980,7 +1471,7 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
+@@ -980,7 +1478,7 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
              }
          }
  
@@ -867,7 +874,7 @@ index 0dec131..bc9ccf7 100644
          {
              // close fec only if no data packets and fec timeout expired
              if (fec_timeout > 0 && cur_ts >= fec_close_ts)
-@@ -994,6 +1485,158 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
+@@ -994,6 +1492,158 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
              continue;
          }
  
@@ -1026,7 +1033,7 @@ index 0dec131..bc9ccf7 100644
          // rc > 0: events detected
          // start from last fd index and reset it to zero
          int _tmp = start_fd_idx;
-@@ -1071,6 +1714,15 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
+@@ -1071,6 +1721,15 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
  
                      t->send_packet(buf, rsize, 0);
  
@@ -1042,7 +1049,7 @@ index 0dec131..bc9ccf7 100644
                      if (cur_ts >= log_send_ts)  // log timeout expired
                      {
                          // Save current index and go to outer loop
-@@ -1428,7 +2080,8 @@ void local_loop_udp(int argc, char* const* argv, int optind, int rcv_buf, int lo
+@@ -1428,7 +2087,8 @@ void local_loop_udp(int argc, char* const* argv, int optind, int rcv_buf, int lo
                      int udp_port, int debug_port, int k, int n, const string &keypair, int fec_timeout,
                      uint64_t epoch, uint32_t channel_id, uint32_t fec_delay, bool use_qdisc, uint32_t fwmark,
                      radiotap_header_t &radiotap_header, uint8_t frame_type, int control_port, bool mirror,
@@ -1052,7 +1059,7 @@ index 0dec131..bc9ccf7 100644
  {
      vector<int> rx_fd;
      vector<string> wlans;
-@@ -1478,14 +2131,15 @@ void local_loop_udp(int argc, char* const* argv, int optind, int rcv_buf, int lo
+@@ -1478,14 +2138,15 @@ void local_loop_udp(int argc, char* const* argv, int optind, int rcv_buf, int lo
      }
  
      int control_fd = open_control_fd(control_port);
@@ -1070,7 +1077,7 @@ index 0dec131..bc9ccf7 100644
  {
      vector<int> rx_fd;
      vector<string> wlans;
-@@ -1522,15 +2176,61 @@ void local_loop_unix(int argc, char* const* argv, int optind, int rcv_buf, int l
+@@ -1522,15 +2183,61 @@ void local_loop_unix(int argc, char* const* argv, int optind, int rcv_buf, int l
      }
  
      int control_fd = open_control_fd(control_port);
@@ -1134,7 +1141,7 @@ index 0dec131..bc9ccf7 100644
  {
      vector<int> rx_fd;
      vector<pair<string, vector<uint16_t>>> remote_hosts;
-@@ -1598,7 +2298,7 @@ void distributor_loop(int argc, char* const* argv, int optind, int rcv_buf, int
+@@ -1598,7 +2305,7 @@ void distributor_loop(int argc, char* const* argv, int optind, int rcv_buf, int
                                                                                      fwmark, snd_buf_size));
  
      int control_fd = open_control_fd(control_port);
@@ -1143,7 +1150,7 @@ index 0dec131..bc9ccf7 100644
  }
  
  
-@@ -1606,7 +2306,7 @@ void distributor_loop_unix(int argc, char* const* argv, int optind, int rcv_buf,
+@@ -1606,7 +2313,7 @@ void distributor_loop_unix(int argc, char* const* argv, int optind, int rcv_buf,
                             const char* unix_socket, int k, int n, const string &keypair, int fec_timeout,
                             uint64_t epoch, uint32_t channel_id, uint32_t fec_delay, bool use_qdisc, uint32_t fwmark,
                             radiotap_header_t &radiotap_header, uint8_t frame_type, int control_port, bool mirror,
@@ -1152,7 +1159,7 @@ index 0dec131..bc9ccf7 100644
  {
      vector<int> rx_fd;
      vector<pair<string, vector<uint16_t>>> remote_hosts;
-@@ -1660,7 +2360,7 @@ void distributor_loop_unix(int argc, char* const* argv, int optind, int rcv_buf,
+@@ -1660,7 +2367,7 @@ void distributor_loop_unix(int argc, char* const* argv, int optind, int rcv_buf,
                                                                                      fwmark, snd_buf_size));
  
      int control_fd = open_control_fd(control_port);
@@ -1161,7 +1168,7 @@ index 0dec131..bc9ccf7 100644
  }
  
  
-@@ -1669,6 +2369,7 @@ int main(int argc, char * const *argv)
+@@ -1669,6 +2376,7 @@ int main(int argc, char * const *argv)
      int opt;
      uint8_t k=8, n=12, radio_port=0;
      uint32_t fec_delay = 0;
@@ -1169,7 +1176,7 @@ index 0dec131..bc9ccf7 100644
      uint32_t link_id = 0x0;
      uint64_t epoch = 0;
      int srv_port = 10000;
-@@ -1696,8 +2397,14 @@ int main(int argc, char * const *argv)
+@@ -1696,8 +2404,14 @@ int main(int argc, char * const *argv)
      char *unix_socket = NULL;
      uint32_t inject_retries = 0;
      uint32_t inject_retry_delay = 5000; // 5ms
@@ -1186,7 +1193,7 @@ index 0dec131..bc9ccf7 100644
          switch (opt) {
          case 'I':
              tx_mode = INJECTOR;
-@@ -1814,22 +2521,84 @@ int main(int argc, char * const *argv)
+@@ -1814,22 +2528,84 @@ int main(int argc, char * const *argv)
              inject_retry_delay = atoi(optarg);
              break;
  
@@ -1276,7 +1283,7 @@ index 0dec131..bc9ccf7 100644
              WFB_INFO("Radio MTU: %lu\n", (unsigned long)MAX_PAYLOAD_SIZE);
              WFB_INFO("WFB-ng version %s, FEC: %s\n", WFB_VERSION, zfex_opt);
              WFB_INFO("WFB-ng home page: <http://wfb-ng.org>\n");
-@@ -1862,11 +2631,30 @@ int main(int argc, char * const *argv)
+@@ -1862,11 +2638,30 @@ int main(int argc, char * const *argv)
          return 1;
      }
  
@@ -1307,7 +1314,7 @@ index 0dec131..bc9ccf7 100644
          switch(tx_mode)
          {
          case INJECTOR:
-@@ -1880,7 +2668,17 @@ int main(int argc, char * const *argv)
+@@ -1880,7 +2675,17 @@ int main(int argc, char * const *argv)
                                  unix_socket, debug_port, k, n, keypair, fec_timeout,
                                  epoch, channel_id, fec_delay, use_qdisc, fwmark,
                                  radiotap_header, frame_type, control_port, mirror,
@@ -1326,7 +1333,7 @@ index 0dec131..bc9ccf7 100644
              }
              else
              {
-@@ -1888,7 +2686,8 @@ int main(int argc, char * const *argv)
+@@ -1888,7 +2693,8 @@ int main(int argc, char * const *argv)
                                 udp_port, debug_port, k, n, keypair, fec_timeout,
                                 epoch, channel_id, fec_delay, use_qdisc, fwmark,
                                 radiotap_header, frame_type, control_port, mirror,
@@ -1336,7 +1343,7 @@ index 0dec131..bc9ccf7 100644
              }
              break;
  
-@@ -1899,7 +2698,7 @@ int main(int argc, char * const *argv)
+@@ -1899,7 +2705,7 @@ int main(int argc, char * const *argv)
                                        unix_socket, k, n, keypair, fec_timeout,
                                        epoch, channel_id, fec_delay, use_qdisc, fwmark,
                                        radiotap_header, frame_type, control_port, mirror,
@@ -1345,7 +1352,7 @@ index 0dec131..bc9ccf7 100644
              }
              else
              {
-@@ -1907,7 +2706,7 @@ int main(int argc, char * const *argv)
+@@ -1907,7 +2713,7 @@ int main(int argc, char * const *argv)
                                   udp_port, k, n, keypair, fec_timeout,
                                   epoch, channel_id, fec_delay, use_qdisc, fwmark,
                                   radiotap_header, frame_type, control_port, mirror,

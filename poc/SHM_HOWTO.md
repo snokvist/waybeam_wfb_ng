@@ -627,7 +627,7 @@ One datagram per emit, single-line UTF-8 JSON, terminated with `\n` for
 line-oriented tools:
 
 ```json
-{"ts_ms":1714115012345,"type":"tx_stats","ver":1,"interval_ms":1000,
+{"ts_ms":1714115012345,"type":"tx_stats","ver":1,"seq":42,"interval_ms":1000,
  "tx":{"pkts_in":12345,"bytes_in":456789,
        "pkts_out":12340,"bytes_out":456000,
        "pkts_drop":3,"pkts_trunc":2,"fec_timeouts":1,
@@ -639,6 +639,7 @@ line-oriented tools:
 | Field | Meaning |
 |---|---|
 | `ts_ms` | Emit timestamp (`get_time_ms()`, monotonic-ish ms). |
+| `seq` | Per-process monotonic counter, starts at 0. Lets consumers detect dropped UDP datagrams (gap > 1) and producer restarts (counter resets). Optional / additive: older wfb_tx emits no `seq` field. |
 | `interval_ms` | The `-l` value at emit time. |
 | `tx.pkts_in` / `bytes_in` | Incoming UDP/SHM packets received this interval. |
 | `tx.pkts_out` / `bytes_out` | Successfully injected (includes FEC parity). |
