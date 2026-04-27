@@ -39,24 +39,18 @@ main{padding:12px;overflow:auto;height:calc(100vh - 86px)}
 .kv{display:grid;grid-template-columns:auto 1fr;gap:4px 12px;font-size:12px}
 .kv dt{color:var(--mute)}
 .kv dd{margin:0;font-variant-numeric:tabular-nums}
-.rssi-chart-wrap{display:flex;flex-direction:column;gap:8px}
-#rssi-svg{display:block;background:var(--panel2);border-radius:3px}
-#rssi-grid line{stroke:var(--border);stroke-width:1;shape-rendering:crispEdges}
-#rssi-grid text{fill:var(--mute);font-size:9px;font-family:ui-monospace,SFMono-Regular,monospace}
-#rssi-thresh line{stroke-width:1;stroke-dasharray:4 4;opacity:0.7}
-#rssi-thresh line.low{stroke:var(--bad)}
-#rssi-thresh line.high{stroke:var(--ok)}
-#rssi-thresh text{font-size:9px;font-family:ui-monospace,SFMono-Regular,monospace;opacity:0.8}
-#rssi-thresh text.low{fill:var(--bad)}
-#rssi-thresh text.high{fill:var(--ok)}
-#rssi-lines polyline{fill:none;stroke-width:1.4}
-.rssi-legend{display:flex;flex-wrap:wrap;gap:8px;font-size:11px;font-variant-numeric:tabular-nums}
-.rssi-legend .li{display:flex;align-items:center;gap:5px;background:var(--panel2);padding:3px 8px;border-radius:3px;cursor:pointer;border:1px solid transparent}
-.rssi-legend .li.muted{opacity:0.35}
-.rssi-legend .li:hover{border-color:var(--border)}
-.rssi-legend .swatch{display:inline-block;width:10px;height:3px;border-radius:1px}
-.rssi-legend .name{color:var(--mute)}
-.rssi-legend .val{color:var(--text);font-weight:600}
+.ant-row{display:flex;flex-wrap:wrap;gap:8px}
+.ant-row .ant{display:flex;flex-direction:column;align-items:center;background:var(--panel2);padding:6px 12px;border-radius:4px;min-width:74px;border:1px solid var(--border)}
+.ant-row .ant .name{font-size:10px;color:var(--mute);text-transform:uppercase;letter-spacing:0.4px;margin-bottom:2px}
+.ant-row .ant .val{font-size:16px;font-weight:600;font-variant-numeric:tabular-nums}
+.ant-row .ant .val.ok{color:var(--ok)}
+.ant-row .ant .val.warn{color:var(--warn)}
+.ant-row .ant .val.bad{color:var(--bad)}
+.ant-row .ant.muted .val{color:var(--mute)}
+.payload-flags{display:inline-flex;gap:4px;margin-left:6px}
+.payload-flags .flag{font-size:9px;padding:1px 5px;border-radius:8px;text-transform:uppercase;letter-spacing:0.3px;font-weight:600}
+.payload-flags .flag.warn{background:rgba(210,153,34,0.18);color:var(--warn);border:1px solid var(--warn)}
+.payload-flags .flag.info{background:rgba(88,166,255,0.18);color:var(--accent);border:1px solid var(--accent)}
 .tune-section{margin-bottom:18px}
 .tune-section h2{margin:0 0 8px;font-size:12px;text-transform:uppercase;letter-spacing:0.5px;font-weight:600;border-left:3px solid var(--common);padding-left:8px}
 .tune-section.fec h2{border-left-color:var(--fec);color:var(--fec)}
@@ -111,6 +105,7 @@ main{padding:12px;overflow:auto;height:calc(100vh - 86px)}
       <div class="card"><h3>Effective RSSI</h3><div class="v" id="c-rssi">—</div><div class="sub" id="c-rssi-sub">—</div></div>
       <div class="card"><h3>Loss</h3><div class="v" id="c-loss">—</div><div class="sub" id="c-loss-sub">—</div></div>
       <div class="card"><h3>Headroom</h3><div class="v" id="c-headroom">—</div><div class="sub" id="c-headroom-sub">—</div></div>
+      <div class="card"><h3>Payload</h3><div class="v" id="c-payload">—</div><div class="sub" id="c-payload-sub">—</div></div>
     </div>
     <div class="row">
       <div class="panel">
@@ -127,16 +122,8 @@ main{padding:12px;overflow:auto;height:calc(100vh - 86px)}
       </div>
     </div>
     <div class="panel">
-      <h2>RSSI per antenna (last 60 samples · dBm)</h2>
-      <div class="rssi-chart-wrap">
-        <svg id="rssi-svg" width="100%" height="240" viewBox="0 0 600 240" preserveAspectRatio="none">
-          <!-- Grid + axis labels are drawn dynamically once the first sample arrives. -->
-          <g id="rssi-grid"></g>
-          <g id="rssi-thresh"></g>
-          <g id="rssi-lines"></g>
-        </svg>
-        <div class="rssi-legend" id="rssi-legend"></div>
-      </div>
+      <h2>RSSI per antenna · dBm (current)</h2>
+      <div class="ant-row" id="ant-row"><div class="empty">no rx_ant data yet</div></div>
     </div>
   </section>
 
@@ -165,26 +152,6 @@ const state = {
   evBuf: [],             // [{t, subsys, msg}, ...] — capped
   evCap: 200,
   filters: {fec:true, mcs:true, common:true},
-  rssiHist: {},          // antIdx -> [last N values]
-  rssiCap: 60,
-  rssiHidden: {},        // antIdx -> bool (legend toggle)
-  rssiThresh: {low: -70, high: -50},   // refreshed from /params on first load
-  rssiThreshFetched: false,
-};
-
-// 8-color palette for antennas (distinct hues; readable on dark bg).
-const ANT_COLORS = [
-  "#58a6ff", "#bc8cff", "#3fb950", "#d29922",
-  "#f85149", "#36cae3", "#ff7eb6", "#b5b5b5",
-];
-
-// Chart geometry — viewBox is 600x240; reserve 32px on the left for
-// Y-axis labels. Visible RSSI range tightened slightly so most real-
-// world bench/range traces fill the canvas instead of clustering near
-// the top.
-const CHART = {
-  W: 600, H: 240, PAD_L: 32, PAD_R: 4, PAD_T: 8, PAD_B: 16,
-  RSSI_LO: -95, RSSI_HI: -20,
 };
 
 const $ = sel => document.querySelector(sel);
@@ -411,131 +378,62 @@ function renderStatus(s) {
     phy_mbps: (radio.phy_mbps != null) ? radio.phy_mbps.toFixed(1) : "—",
   });
 
-  // RSSI multi-line chart (shared graph, one line per antenna)
-  if (s.ants && Array.isArray(s.ants)) renderRssiChart(s.ants);
-}
-
-// One-shot fetch of /params to seed the threshold lines on the chart.
-// Re-fetched on Tune-tab apply (the form already calls /set, then a
-// status poll picks up the new values via the `cfg` echo we add below).
-async function fetchRssiThresh() {
-  if (state.rssiThreshFetched) return;
-  try {
-    const r = await fetch("/params", {cache: "no-store"});
-    if (!r.ok) return;
-    const p = await r.json();
-    if (typeof p["mcs.rssi_thresh_low"] === "number") state.rssiThresh.low = p["mcs.rssi_thresh_low"];
-    if (typeof p["mcs.rssi_thresh_high"] === "number") state.rssiThresh.high = p["mcs.rssi_thresh_high"];
-    state.rssiThreshFetched = true;
-  } catch (_) {}
-}
-
-// Y-axis: dBm value -> SVG y coordinate (clamped to chart range).
-function rssiToY(v) {
-  const lo = CHART.RSSI_LO, hi = CHART.RSSI_HI;
-  const cv = Math.max(lo, Math.min(hi, v));
-  const innerH = CHART.H - CHART.PAD_T - CHART.PAD_B;
-  return CHART.PAD_T + innerH - ((cv - lo) / (hi - lo)) * innerH;
-}
-function sampleToX(i, n) {
-  const innerW = CHART.W - CHART.PAD_L - CHART.PAD_R;
-  const denom = Math.max(1, n - 1);
-  return CHART.PAD_L + (i / denom) * innerW;
-}
-
-function ensureRssiAxes() {
-  const grid = $("#rssi-grid");
-  if (grid.dataset.drawn === "1") return;
-  let html = "";
-  // Major gridlines + Y labels every 25 dBm (-20, -45, -70, -95).
-  for (const dbm of [-20, -45, -70, -95]) {
-    const y = rssiToY(dbm).toFixed(1);
-    html += '<line x1="'+CHART.PAD_L+'" y1="'+y+'" x2="'+(CHART.W - CHART.PAD_R)+'" y2="'+y+'" opacity="1"/>';
-    html += '<text x="'+(CHART.PAD_L - 4)+'" y="'+(parseFloat(y)+3)+'" text-anchor="end">'+dbm+'</text>';
-  }
-  // Minor gridlines every 5 dBm (no labels) — just light tick lines for
-  // readability without crowding.
-  for (let dbm = CHART.RSSI_LO; dbm <= CHART.RSSI_HI; dbm += 5) {
-    if (dbm === -20 || dbm === -45 || dbm === -70 || dbm === -95) continue;
-    const y = rssiToY(dbm).toFixed(1);
-    html += '<line x1="'+CHART.PAD_L+'" y1="'+y+'" x2="'+(CHART.W - CHART.PAD_R)+'" y2="'+y+'" opacity="0.3"/>';
-  }
-  // Bottom border + axis context labels.
-  const yb = (CHART.H - CHART.PAD_B).toFixed(1);
-  html += '<line x1="'+CHART.PAD_L+'" y1="'+yb+'" x2="'+(CHART.W - CHART.PAD_R)+'" y2="'+yb+'"/>';
-  html += '<text x="'+CHART.PAD_L+'" y="'+(CHART.H - 3)+'" fill="var(--mute)" font-size="9">oldest</text>';
-  html += '<text x="'+(CHART.W - CHART.PAD_R)+'" y="'+(CHART.H - 3)+'" text-anchor="end" fill="var(--mute)" font-size="9">now</text>';
-  grid.innerHTML = html;
-  grid.dataset.drawn = "1";
-}
-
-function renderRssiThreshLines() {
-  const lo = state.rssiThresh.low, hi = state.rssiThresh.high;
-  const yL = rssiToY(lo).toFixed(1);
-  const yH = rssiToY(hi).toFixed(1);
-  const x0 = CHART.PAD_L, x1 = CHART.W - CHART.PAD_R;
-  $("#rssi-thresh").innerHTML =
-    '<line class="low"  x1="'+x0+'" y1="'+yL+'" x2="'+x1+'" y2="'+yL+'"/>' +
-    '<text class="low"  x="'+(x1 - 2)+'" y="'+(parseFloat(yL) - 2)+'" text-anchor="end">low '+lo+'</text>' +
-    '<line class="high" x1="'+x0+'" y1="'+yH+'" x2="'+x1+'" y2="'+yH+'"/>' +
-    '<text class="high" x="'+(x1 - 2)+'" y="'+(parseFloat(yH) - 2)+'" text-anchor="end">high '+hi+'</text>';
-}
-
-function renderRssiChart(ants) {
-  fetchRssiThresh();   // no-op after first successful fetch
-
-  // Push current sample into per-antenna ring.
-  for (let i = 0; i < ants.length; i++) {
-    if (typeof ants[i] !== "number") continue;
-    if (!state.rssiHist[i]) state.rssiHist[i] = [];
-    state.rssiHist[i].push(ants[i]);
-    if (state.rssiHist[i].length > state.rssiCap) state.rssiHist[i].shift();
-  }
-
-  ensureRssiAxes();
-  renderRssiThreshLines();
-
-  // One polyline per antenna in #rssi-lines.
-  let svg = "";
-  for (let i = 0; i < ants.length; i++) {
-    if (state.rssiHidden[i]) continue;
-    const data = state.rssiHist[i] || [];
-    if (data.length < 2) continue;
-    const color = ANT_COLORS[i % ANT_COLORS.length];
-    const pts = data.map((v, j) => {
-      const x = sampleToX(j, state.rssiCap).toFixed(1);
-      const y = rssiToY(v).toFixed(1);
-      return x + "," + y;
-    }).join(" ");
-    svg += '<polyline stroke="'+color+'" points="'+pts+'"/>';
-  }
-  $("#rssi-lines").innerHTML = svg;
-
-  // Legend with last value; click to hide/show.
-  const leg = $("#rssi-legend");
-  if (leg.dataset.n !== String(ants.length)) {
-    let lh = "";
-    for (let i = 0; i < ants.length; i++) {
-      const color = ANT_COLORS[i % ANT_COLORS.length];
-      lh += '<span class="li" data-ant="'+i+'">' +
-            '<span class="swatch" style="background:'+color+'"></span>' +
-            '<span class="name">ant '+i+'</span>' +
-            '<span class="val" id="rssi-leg-v-'+i+'">—</span>' +
-            '</span>';
+  // Payload card — adaptive outgoing.maxPayloadSize. When --max-payload
+  // is unset the card shows "off" muted; when enabled it shows the
+  // last value written to venc with two pill flags:
+  //   CAPPED  — the bitrate→payload tier table wanted more headroom
+  //             than --max-payload allowed (operator declined jumbo at
+  //             this rate; expect higher pps);
+  //   JUMBO   — informational, --max-payload > 1472 so the operator
+  //             has declared a jumbo-capable end-to-end path.
+  const pld = s.payload || {};
+  const cP = $("#c-payload"), cPS = $("#c-payload-sub");
+  if (!pld.enabled) {
+    cP.textContent = "off";
+    cP.className = "v muted";
+    cPS.textContent = "(--max-payload not set)";
+  } else {
+    let flags = "";
+    if (pld.table_clipped) flags += '<span class="flag warn">CAPPED</span>';
+    if (pld.would_fragment_on_1500_mtu) flags += '<span class="flag info">JUMBO</span>';
+    const flagHtml = flags ? '<span class="payload-flags">' + flags + '</span>' : "";
+    if (pld.last_written > 0) {
+      cP.innerHTML = pld.last_written + " B" + flagHtml;
+      cP.className = "v " + (pld.table_clipped ? "warn" : "ok");
+      cPS.textContent = "max " + pld.max + " · sel " + (pld.selected || "—");
+    } else if (pld.selected > 0) {
+      cP.innerHTML = pld.selected + " B" + flagHtml;
+      cP.className = "v warn";
+      cPS.textContent = "max " + pld.max + " · pending first commit";
+    } else {
+      cP.innerHTML = "—" + flagHtml;
+      cP.className = "v muted";
+      cPS.textContent = "max " + pld.max + " · waiting for radio";
     }
-    leg.innerHTML = lh;
-    leg.dataset.n = String(ants.length);
-    leg.querySelectorAll(".li").forEach(li => li.addEventListener("click", () => {
-      const i = parseInt(li.dataset.ant, 10);
-      state.rssiHidden[i] = !state.rssiHidden[i];
-      li.classList.toggle("muted", state.rssiHidden[i]);
-    }));
   }
+
+  // Per-antenna instant values (replaces the time-series chart).
+  if (s.ants && Array.isArray(s.ants)) renderAntRow(s.ants);
+}
+
+function renderAntRow(ants) {
+  const row = $("#ant-row");
+  if (!ants.length) {
+    row.innerHTML = '<div class="empty">no rx_ant data yet</div>';
+    return;
+  }
+  let html = "";
   for (let i = 0; i < ants.length; i++) {
     const v = ants[i];
-    const el = document.getElementById("rssi-leg-v-"+i);
-    if (el) el.textContent = (typeof v === "number") ? v.toFixed(1) + " dBm" : "—";
+    const has = typeof v === "number";
+    let cls = "";
+    if (has) cls = v < -75 ? "bad" : v < -60 ? "warn" : "ok";
+    html += '<div class="ant' + (has ? "" : " muted") + '">' +
+            '<span class="name">ant ' + i + '</span>' +
+            '<span class="val ' + cls + '">' + (has ? v.toFixed(1) : "—") + '</span>' +
+            '</div>';
   }
+  row.innerHTML = html;
 }
 
 // ── Tune tab — init-once form ────────────────────────────────────────
@@ -604,13 +502,6 @@ function buildTuneRow(f) {
         const v = j.params[f.name];
         f.value = v;
         inp.value = (typeof v === "boolean") ? (v ? "1":"0") : String(v);
-        // Live tab caches the rssi thresholds for the chart's reference
-        // lines — pick them up immediately on apply rather than waiting
-        // for the once-per-session /params fetch.
-        if (j.params["mcs.rssi_thresh_low"]  !== undefined)
-          state.rssiThresh.low  = j.params["mcs.rssi_thresh_low"];
-        if (j.params["mcs.rssi_thresh_high"] !== undefined)
-          state.rssiThresh.high = j.params["mcs.rssi_thresh_high"];
       }
     } catch (e) {
       row.classList.add("error");
