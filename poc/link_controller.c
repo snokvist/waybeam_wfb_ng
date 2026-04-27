@@ -245,19 +245,16 @@ typedef struct {
 		 * controller never writes outgoing.maxPayloadSize and venc keeps
 		 * whatever it was started with. Enabled via --max-payload N at
 		 * startup, where N is the operator's path-MTU commitment in
-		 * bytes (576..4000). The selector picks P = payload_max whenever
-		 * the airtime model says the link can sustain the target
-		 * bitrate at that payload; otherwise it still picks payload_max
-		 * (lowest pps for the bitrate) and flags the link as
-		 * insufficient. payload_max is *startup-only* and intentionally
-		 * absent from the live tunable registry; the airtime constants
-		 * and payload_min are live-mutable so an operator can override
-		 * the theoretical model from measured data. */
+		 * bytes (576..4000). The selector consults a static
+		 * bitrate→payload tier table (see PAYLOAD_TABLE) and clamps to
+		 * [payload_min, payload_max]. payload_max is *startup-only* and
+		 * intentionally absent from the live tunable registry;
+		 * payload_min is live-mutable. The table is operator-empirical
+		 * — values measured to keep pps under ~1100 across the
+		 * realistic bitrate range; override locally if your hardware
+		 * differs. */
 		int      payload_max;        /* 0 = feature off */
 		int      payload_min;        /* clamped against the venc API floor (576) */
-		float    airtime_util;       /* fraction of airtime usable [0..1] */
-		float    pkt_overhead_us;    /* fixed per-packet airtime cost (µs) */
-		int      pkt_overhead_bytes; /* per-packet wire overhead (bytes) */
 	} fec;
 
 	/* ── MCS subsystem ── */
@@ -773,24 +770,46 @@ static float phy_mbps(int mcs, int bw_mhz, int short_gi,
 	return base * bw_scale * gi_scale * (float)nss;
 }
 
-/* Theoretical airtime / packet-rate ceiling for a single PHY operating
- * point. Bootstrap model only — operator-measured ceilings should
- * override via the live tunables (fec.airtime_util, fec.pkt_overhead_us,
- * fec.pkt_overhead_bytes). Returns 0 if any input is degenerate.
+/* Bitrate→payload tier table. Operator-empirical, sized to keep
+ * required pps under ~1100 across the realistic bitrate range when the
+ * existing safety_margin × phy_mbps × k/n bitrate-cap is in effect.
  *
- *   airtime_us = pkt_overhead_us + (payload + pkt_overhead_bytes)*8 / phy_mbps
- *   safe_pps   = airtime_util * 1e6 / airtime_us
- */
-static float safe_pps(int payload_bytes, float phy_mbps_,
-                      float pkt_overhead_us, int pkt_overhead_bytes,
-                      float airtime_util)
+ * pps-at-tier-top reference (= bitrate / 8 / payload):
+ *   <  2000 kbps → 800 B  (≤  313 pps)
+ *   <  4000 kbps → 1000 B (≤  500 pps)
+ *   <  8000 kbps → 1200 B (≤  833 pps)
+ *   < 12000 kbps → 1400 B (≤ 1071 pps)
+ *   < 18000 kbps → 2000 B (≤ 1125 pps)
+ *   < 25000 kbps → 2800 B (≤ 1116 pps)
+ *   ≥ 25000 kbps → 3200 B (≥  977 pps; tier ceiling)
+ *
+ * MCS 0/1/2 are pps-limited but the bitrate they'll sustain (≤ ~7 Mbps
+ * post-FEC at 50 % safety) lands them in the 800/1000/1200 tiers, well
+ * under their pps cliffs. MCS 3+ sustains ≥ 1100 pps so the high tiers
+ * are also safe. */
+typedef struct {
+	long bitrate_lt_kbps;  /* tier matches when bitrate < this (last entry: LONG_MAX) */
+	int  payload_bytes;
+} PayloadTier;
+
+static const PayloadTier PAYLOAD_TABLE[] = {
+	{  2000,  800},
+	{  4000, 1000},
+	{  8000, 1200},
+	{ 12000, 1400},
+	{ 18000, 2000},
+	{ 25000, 2800},
+	{LONG_MAX, 3200},
+};
+#define PAYLOAD_TABLE_LEN (sizeof(PAYLOAD_TABLE) / sizeof(PAYLOAD_TABLE[0]))
+
+static int payload_table_lookup(long bitrate_kbps)
 {
-	if (phy_mbps_ <= 0.0f || payload_bytes <= 0 || airtime_util <= 0.0f)
-		return 0.0f;
-	float airtime_us = pkt_overhead_us +
-	    (float)(payload_bytes + pkt_overhead_bytes) * 8.0f / phy_mbps_;
-	if (airtime_us <= 0.0f) return 0.0f;
-	return airtime_util * 1.0e6f / airtime_us;
+	for (size_t i = 0; i < PAYLOAD_TABLE_LEN; i++) {
+		if (bitrate_kbps < PAYLOAD_TABLE[i].bitrate_lt_kbps)
+			return PAYLOAD_TABLE[i].payload_bytes;
+	}
+	return PAYLOAD_TABLE[PAYLOAD_TABLE_LEN - 1].payload_bytes;
 }
 
 /* Apply a fresh radio observation: update RadioState, detect external
@@ -887,52 +906,41 @@ static void radio_track_external_fec(int obs_k, int obs_n,
 static int venc_apply(const Config *cfg, long bitrate_kbps, int payload_bytes);
 
 /* Compute the payload size to ask venc for, given the current target
- * bitrate and PHY rate. Uses the largest-OK rule: payload_max minimises
- * pps for any fixed bitrate, so prefer it whenever the airtime model
- * says the link can sustain the target bitrate at that payload. If even
- * the ceiling is too tight, return the ceiling anyway (still the lowest
- * pps) and surface insufficient=true so the operator sees the warning.
- *
- * Returns the chosen payload (always between payload_min and payload_max
- * when feature is enabled) or 0 when disabled / inputs are degenerate.
- * Out params populate the diagnostics — pass NULL to ignore. */
-static int payload_select(const Config *cfg, const RadioState *radio,
-                          long target_bitrate_kbps,
-                          float *out_safe_pps, float *out_required_pps,
-                          bool *out_insufficient)
+ * bitrate. Static tier-table lookup (see PAYLOAD_TABLE) clamped to
+ * [payload_min, payload_max]. Returns 0 when feature is off or inputs
+ * are degenerate. The diagnostic out_table_clipped is set true iff the
+ * tier table wanted a larger payload than --max-payload allowed — that
+ * is the only "operator declined the headroom we'd have used" signal
+ * the table can produce, and it maps to elevated pps at the chosen
+ * payload (operator's choice; visible in /status and heartbeat). */
+static int payload_select(const Config *cfg, long target_bitrate_kbps,
+                          bool *out_table_clipped)
 {
-	if (out_safe_pps)      *out_safe_pps = 0.0f;
-	if (out_required_pps)  *out_required_pps = 0.0f;
-	if (out_insufficient)  *out_insufficient = false;
+	if (out_table_clipped) *out_table_clipped = false;
 
 	if (cfg->fec.payload_max <= 0) return 0;
-	if (!radio->valid || radio->phy_mbps <= 0.0f) return 0;
 	if (target_bitrate_kbps <= 0) return 0;
 
-	int ceiling = cfg->fec.payload_max;
-	int floor_  = cfg->fec.payload_min;
-	if (floor_ < 576)  floor_ = 576;
-	if (floor_ > 4000) floor_ = 4000;
-	if (ceiling > 4000) ceiling = 4000;
-	if (ceiling < floor_) ceiling = floor_;
+	int max_p = cfg->fec.payload_max;
+	if (max_p > 4000) max_p = 4000;
+	int min_p = cfg->fec.payload_min;
+	if (min_p < 576)  min_p = 576;
+	if (min_p > 4000) min_p = 4000;
+	/* Misconfiguration (payload_min > payload_max set live via /set):
+	 * clamp the floor to the ceiling so we never violate the operator's
+	 * --max-payload contract. payload_select still returns a legal
+	 * value; the WebUI / /status surfaces table_clipped so the operator
+	 * can see they've boxed themselves in. */
+	if (min_p > max_p) min_p = max_p;
 
-	float pps_at_ceiling = safe_pps(ceiling, radio->phy_mbps,
-	                                cfg->fec.pkt_overhead_us,
-	                                cfg->fec.pkt_overhead_bytes,
-	                                cfg->fec.airtime_util);
-	float bps = (float)target_bitrate_kbps * 1000.0f;
-	float required_at_ceiling = bps / 8.0f / (float)ceiling;
-
-	if (out_safe_pps)     *out_safe_pps = pps_at_ceiling;
-	if (out_required_pps) *out_required_pps = required_at_ceiling;
-	if (out_insufficient) *out_insufficient = (required_at_ceiling > pps_at_ceiling);
-
-	/* Closed form: required_pps and safe_pps both decrease monotonically
-	 * with P, but their ratio is bounded as P grows; the *largest*
-	 * payload that fits airtime is therefore always P_max when the link
-	 * permits it, and P_max is also the lowest-pps fallback when it
-	 * doesn't. So one branch suffices. */
-	return ceiling;
+	int table_pick = payload_table_lookup(target_bitrate_kbps);
+	int result = table_pick;
+	if (result > max_p) {
+		result = max_p;
+		if (out_table_clipped) *out_table_clipped = true;
+	}
+	if (result < min_p) result = min_p;
+	return result;
 }
 
 static void bitrate_assert(const RadioState *radio, Controller *ctrl,
@@ -959,23 +967,30 @@ static void bitrate_assert(const RadioState *radio, Controller *ctrl,
 	long tol = (long)((double)target * (double)cfg->fec.bitrate_tolerance);
 	if (tol < 1) tol = 1;
 
-	float sel_safe_pps = 0.0f, sel_req_pps = 0.0f;
-	bool  sel_insufficient = false;
-	int   target_payload = payload_select(cfg, radio, target,
-	                                      &sel_safe_pps, &sel_req_pps,
-	                                      &sel_insufficient);
-
 	bool bitrate_changed = (*last_written_kbps < 0 || adev > tol);
+
+	/* Payload selection is tied to bitrate writes: re-evaluate the tier
+	 * table only when bitrate would actually move (or first commit).
+	 * Two consequences: (1) sub-tolerance bitrate jitter that crosses a
+	 * tier boundary cannot flap the payload — it has to move enough to
+	 * trigger a bitrate write first; (2) live operator changes to
+	 * fec.payload_min take effect on the next bitrate move, not
+	 * instantly. Acceptable trade for the simplicity. */
+	int  target_payload = 0;
+	bool table_clipped  = false;
+	if (bitrate_changed) {
+		target_payload = payload_select(cfg, target, &table_clipped);
+	}
 	bool payload_changed = (target_payload > 0 &&
 	                        target_payload != *last_written_payload);
 
-	LOGV_FEC(cfg, "bitrate: target=%ld last_written=%ld safe=%ld min=%ld max=%ld (phy=%.1f k/n=%d/%d) payload=%d req_pps=%.0f safe_pps=%.0f",
+	LOGV_FEC(cfg, "bitrate: target=%ld last_written=%ld safe=%ld min=%ld max=%ld (phy=%.1f k/n=%d/%d) payload=%d clipped=%d",
 	     target, *last_written_kbps, safe_kbps,
 	     cfg->fec.bitrate_min_kbps, cfg->fec.bitrate_max_kbps,
 	     radio->phy_mbps, ctrl->current.k, ctrl->current.n,
-	     target_payload, (double)sel_req_pps, (double)sel_safe_pps);
+	     target_payload, table_clipped ? 1 : 0);
 
-	if (bitrate_changed || payload_changed) {
+	if (bitrate_changed) {
 		const char *dir = (*last_written_kbps < 0)
 		    ? "init"
 		    : ((ref > target) ? "down" : "up");
@@ -983,18 +998,17 @@ static void bitrate_assert(const RadioState *radio, Controller *ctrl,
 		    dir, *last_written_kbps, target, radio->phy_mbps,
 		    ctrl->current.k, ctrl->current.n, safe_kbps,
 		    target_payload, *last_written_payload,
-		    sel_insufficient ? " LINK_INSUFFICIENT_FOR_TARGET_BITRATE" : "");
+		    table_clipped ? " PAYLOAD_CAPPED_BY_MAX" : "");
 		if (!cfg->dry_run) {
 			/* Atomic write: when payload sizing is enabled the bitrate
 			 * and payload travel in one HTTP GET to venc so the next
 			 * encoded frame uses a consistent pair. */
-			long bitrate_arg = bitrate_changed ? target : -1;
-			int  payload_arg = payload_changed ? target_payload : -1;
-			if (venc_apply(cfg, bitrate_arg, payload_arg) != 0) {
+			int payload_arg = payload_changed ? target_payload : -1;
+			if (venc_apply(cfg, target, payload_arg) != 0) {
 				LOG_FEC("venc apply failed (bitrate=%ld payload=%d)",
-				    bitrate_arg, payload_arg);
+				    target, payload_arg);
 			} else {
-				if (bitrate_changed) *last_written_kbps = target;
+				*last_written_kbps = target;
 				if (payload_changed) *last_written_payload = target_payload;
 			}
 		} else {
@@ -1002,7 +1016,7 @@ static void bitrate_assert(const RadioState *radio, Controller *ctrl,
 			 * transition every tick. There is no external-change
 			 * detection on either field (unlike fec_k/n), so the
 			 * ghost-write here doesn't corrupt operator-visible state. */
-			if (bitrate_changed) *last_written_kbps = target;
+			*last_written_kbps = target;
 			if (payload_changed) *last_written_payload = target_payload;
 		}
 		if (cfg->fec.bitrate_grace_s > 0.0f) {
@@ -1651,13 +1665,10 @@ static const TunableDesc TUNABLES[] = {
 	{"fec.boost_s",                 SUB_FEC, TF_FLOAT, OFF_FEC(boost_s),                 0.0, 30.0, "parity boost duration"},
 	{"fec.boost_mult",              SUB_FEC, TF_FLOAT, OFF_FEC(boost_mult),              1.0, 5.0,  "(n-k) parity multiplier during boost"},
 	/* Payload sizing — payload_max is intentionally NOT live (startup
-	 * only via --max-payload); the airtime constants and floor are
-	 * live-mutable so an operator can override the theoretical model
-	 * with measured values from the field. */
+	 * only via --max-payload). payload_min is the only live-mutable
+	 * field; the bitrate→payload table itself is hard-coded
+	 * (operator-empirical). */
 	{"fec.payload_min",             SUB_FEC, TF_INT,   OFF_FEC(payload_min),             576, 4000, "live payload floor (bytes); venc API floor is 576"},
-	{"fec.airtime_util",            SUB_FEC, TF_FLOAT, OFF_FEC(airtime_util),            0.05, 1.0,  "fraction of airtime usable (theoretical model)"},
-	{"fec.pkt_overhead_us",         SUB_FEC, TF_FLOAT, OFF_FEC(pkt_overhead_us),         0.0, 1000.0,"per-packet fixed airtime overhead (µs)"},
-	{"fec.pkt_overhead_bytes",      SUB_FEC, TF_INT,   OFF_FEC(pkt_overhead_bytes),      0, 4000,    "per-packet fixed wire overhead (bytes)"},
 
 	/* ── mcs ── */
 	{"mcs.enabled",                       SUB_MCS, TF_BOOL,  OFF_MCS(enabled),                       0, 0,       "enable MCS subsystem"},
@@ -1942,18 +1953,16 @@ static int append_fec_json(char *buf, size_t cap, size_t pos,
 		computed_safe = safe;
 	}
 
-	/* Payload-sizing diagnostics. selected_payload mirrors what the
-	 * selector would pick right now (re-runs the same closed form as
-	 * bitrate_assert with the current bitrate), independent of whether
-	 * a write has actually occurred yet. */
+	/* Payload-sizing diagnostics. `selected` mirrors what the table
+	 * lookup would pick right now using the most recent committed
+	 * bitrate (or the controller's computed_safe if we haven't written
+	 * one yet); independent of whether a write has actually occurred. */
 	int   sel_payload = 0;
-	float sel_safe = 0.0f, sel_req = 0.0f;
-	bool  sel_insufficient = false;
+	bool  sel_clipped = false;
 	long  br_for_sel = (s->last_written_kbps > 0) ? s->last_written_kbps :
 	                   (computed_safe > 0 ? computed_safe : 0);
 	if (br_for_sel > 0) {
-		sel_payload = payload_select(s->cfg, s->radio, br_for_sel,
-		                             &sel_safe, &sel_req, &sel_insufficient);
+		sel_payload = payload_select(s->cfg, br_for_sel, &sel_clipped);
 	}
 	bool would_fragment = (s->cfg->fec.payload_max > 0 &&
 	                       s->cfg->fec.payload_max > 1472);
@@ -1967,10 +1976,7 @@ static int append_fec_json(char *buf, size_t cap, size_t pos,
 		"\"stats_age_s\":%.3f},"
 		"\"payload\":{\"enabled\":%s,\"max\":%d,\"min\":%d,"
 		"\"last_written\":%d,\"selected\":%d,"
-		"\"safe_pps\":%.0f,\"required_pps\":%.0f,"
-		"\"link_sufficient\":%s,\"would_fragment_on_1500_mtu\":%s,"
-		"\"airtime_util\":%.2f,"
-		"\"pkt_overhead_us\":%.1f,\"pkt_overhead_bytes\":%d}",
+		"\"table_clipped\":%s,\"would_fragment_on_1500_mtu\":%s}",
 		s->cfg->fec.enabled ? "true" : "false",
 		s->ctrl->have_current ? "true" : "false",
 		s->ctrl->current.k, s->ctrl->current.n,
@@ -1985,12 +1991,8 @@ static int append_fec_json(char *buf, size_t cap, size_t pos,
 		s->cfg->fec.payload_max > 0 ? "true" : "false",
 		s->cfg->fec.payload_max, s->cfg->fec.payload_min,
 		s->last_written_payload, sel_payload,
-		(double)sel_safe, (double)sel_req,
-		sel_insufficient ? "false" : "true",
-		would_fragment ? "true" : "false",
-		(double)s->cfg->fec.airtime_util,
-		(double)s->cfg->fec.pkt_overhead_us,
-		s->cfg->fec.pkt_overhead_bytes);
+		sel_clipped ? "true" : "false",
+		would_fragment ? "true" : "false");
 	if (n < 0 || (size_t)n >= cap - pos) return -1;
 	return n;
 }
@@ -2638,10 +2640,12 @@ static void usage(const char *prog)
 		"  --mcs-settle-s F         post-MCS-change FEC suppress (default 5.0)\n"
 		"  --boost-s F              parity boost duration (default 3.0)\n"
 		"  --boost-mult F           parity multiplier during boost (default 1.3)\n"
-		"  --max-payload N          enable adaptive outgoing.maxPayloadSize\n"
+		"  --max-payload N          enable adaptive outgoing.maxPayloadSize via\n"
+		"                           bitrate→payload tier table\n"
 		"                           (576..4000; unset = feature off; startup-only).\n"
-		"                           Live tunables: fec.payload_min, fec.airtime_util,\n"
-		"                           fec.pkt_overhead_us, fec.pkt_overhead_bytes.\n"
+		"                           ≤1472 keeps the path on a 1500 MTU; >1472\n"
+		"                           declares jumbo-capable end-to-end. Live\n"
+		"                           tunable: fec.payload_min (default 576).\n"
 		"\n"
 		"MCS subsystem (--mcs-* / disable with --no-mcs):\n"
 		"  --no-mcs                 disable MCS subsystem\n"
@@ -2788,9 +2792,6 @@ static void config_defaults(Config *c)
 	 * in by setting --max-payload to their declared path-MTU ceiling. */
 	c->fec.payload_max          = 0;
 	c->fec.payload_min          = 576;
-	c->fec.airtime_util         = 0.70f;
-	c->fec.pkt_overhead_us      = 36.0f;
-	c->fec.pkt_overhead_bytes   = 80;
 
 	/* MCS defaults (lifted from mcs_selector.c). */
 	c->mcs.enabled = true;
@@ -3059,11 +3060,8 @@ int main(int argc, char **argv)
 		    cfg.fec.mtu, cfg.fec.safety_margin, cfg.fec.wfb_stats_port,
 		    (double)cfg.fec.subscribe_s);
 		if (cfg.fec.payload_max > 0) {
-			LOG_FEC("payload sizing: ON max=%d min=%d util=%.2f overhead=%.0fµs+%dB%s",
+			LOG_FEC("payload sizing: ON (table lookup) max=%d min=%d%s",
 			    cfg.fec.payload_max, cfg.fec.payload_min,
-			    (double)cfg.fec.airtime_util,
-			    (double)cfg.fec.pkt_overhead_us,
-			    cfg.fec.pkt_overhead_bytes,
 			    cfg.fec.payload_max > 1472 ? " (assumes jumbo path)" : "");
 		} else {
 			LOG_FEC("payload sizing: off (pass --max-payload N to enable)");
