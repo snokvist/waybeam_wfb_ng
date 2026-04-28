@@ -83,8 +83,9 @@ static inline uint64_t be64_read(const void *p)
 #define SC_VERSION      1
 #define SC_MSG_SUBSCRIBE 1
 #define SC_MSG_FRAME     2
-#define SC_FLAG_KEYFRAME 0x01
-#define SC_FLAG_ENC_INFO 0x02
+#define SC_FLAG_KEYFRAME       0x01
+#define SC_FLAG_ENC_INFO       0x02
+#define SC_FLAG_TRANSPORT_INFO 0x04
 
 #pragma pack(push, 1)
 typedef struct {
@@ -120,7 +121,22 @@ typedef struct {
 	uint8_t  idr_inserted;
 	uint16_t frames_since_idr;
 } SidecarEncInfo;     /* 12 bytes */
+
+/* Optional transport-stats trailer; appended after SidecarEncInfo when both
+ * flags are set, or directly after SidecarFrame when only TRANSPORT_INFO is
+ * set. transport_drops / packets_sent are authoritative for shm:// in v0.9.2;
+ * unix:// / udp:// emit zero pending socket-side counter instrumentation. */
+typedef struct {
+	uint8_t  fill_pct;        /* output queue fill: 0..100              */
+	uint8_t  in_pressure;     /* 1 = backpressure hysteresis active     */
+	uint8_t  pad[2];          /* reserved, zero                         */
+	uint32_t transport_drops; /* drops at transport layer (low 32 bits) */
+	uint32_t pressure_drops;  /* frames producer chose to skip          */
+	uint32_t packets_sent;    /* lifetime delivery count (low 32 bits)  */
+} SidecarTransportInfo; /* 16 bytes */
 #pragma pack(pop)
+_Static_assert(sizeof(SidecarTransportInfo) == 16,
+               "SidecarTransportInfo must be 16 bytes (rtp_sidecar.h)");
 
 /* ── wfb_tx control protocol (matches poc/build/wfb-ng/src/tx_cmd.h) ───── */
 
@@ -269,6 +285,18 @@ typedef struct {
 		bool     safe_startup_enabled;
 		long     safe_startup_bitrate_kbps;
 		int      safe_startup_payload;
+
+		/* Backpressure-aware FEC adaptation.  When the sidecar trailer
+		 * (venc 0.9.2+, RTP_SIDECAR_FLAG_TRANSPORT_INFO) reports the
+		 * producer's output queue is heavily filled OR the producer
+		 * dropped frames since the last sample, suppress this tick's
+		 * FEC k/n update — the frame size is no longer a clean signal
+		 * about the encoder's natural rate.  One-tick suppression only:
+		 * the next clean frame resumes adaptation. The threshold matches
+		 * the producer's hysteresis ceiling so the controller and venc
+		 * agree on what "heavily filled" means. */
+		bool     skip_on_backpressure;
+		int      backpressure_fill_pct;  /* skip-FEC threshold, 0..100 */
 	} fec;
 
 	/* ── MCS subsystem ── */
@@ -1737,6 +1765,8 @@ static const TunableDesc TUNABLES[] = {
 	 * field; the bitrate→payload table itself is hard-coded
 	 * (operator-empirical). */
 	{"fec.payload_min",             SUB_FEC, TF_INT,   OFF_FEC(payload_min),             576, 4000, "live payload floor (bytes); venc API floor is 576"},
+	{"fec.skip_on_backpressure",    SUB_FEC, TF_BOOL,  OFF_FEC(skip_on_backpressure),    0, 0,      "suppress FEC update for one tick when sidecar reports producer backpressure"},
+	{"fec.backpressure_fill_pct",   SUB_FEC, TF_INT,   OFF_FEC(backpressure_fill_pct),   0, 100,    "skip-FEC threshold (output queue fill %)"},
 
 	/* ── mcs ── */
 	{"mcs.enabled",                       SUB_MCS, TF_BOOL,  OFF_MCS(enabled),                       0, 0,       "enable MCS subsystem"},
@@ -1949,6 +1979,19 @@ typedef struct {
 	int                 last_emit_mcs;
 	int                 ant_count;
 	float               ant_avg[ANT_MAX];
+	/* Producer-side transport telemetry (sidecar TRANSPORT_INFO trailer).
+	 * tr_present == false → no v0.9.2-capable producer attached. The
+	 * surfaced object always renders, with present=false in that case so
+	 * a WebUI can grey-out the section without recomputing. */
+	bool     tr_present;
+	uint8_t  tr_fill_pct;
+	uint8_t  tr_in_pressure;
+	uint32_t tr_drops;
+	uint32_t tr_pressure_drops;
+	uint32_t tr_pressure_drops_delta;
+	uint32_t tr_packets_sent;
+	uint64_t tr_last_us;
+	uint32_t tr_fec_skipped;
 } ApiSnapshot;
 
 static int append_score_json(char *buf, size_t cap, size_t pos,
@@ -2077,6 +2120,30 @@ static int append_fec_json(char *buf, size_t cap, size_t pos,
 	return n;
 }
 
+static int append_transport_json(char *buf, size_t cap, size_t pos,
+                                 const ApiSnapshot *s)
+{
+	double age_s = s->tr_last_us == 0
+		? -1.0
+		: (double)(now_us() - s->tr_last_us) / 1e6;
+	int n = snprintf(buf + pos, cap - pos,
+		"\"transport\":{\"present\":%s,\"fill_pct\":%u,\"in_pressure\":%s,"
+		"\"transport_drops\":%u,\"pressure_drops\":%u,"
+		"\"pressure_drops_delta\":%u,\"packets_sent\":%u,"
+		"\"age_s\":%.3f,\"fec_skipped\":%u,"
+		"\"skip_on_backpressure\":%s,\"backpressure_fill_pct\":%d}",
+		s->tr_present ? "true" : "false",
+		(unsigned)s->tr_fill_pct,
+		s->tr_in_pressure ? "true" : "false",
+		s->tr_drops, s->tr_pressure_drops,
+		s->tr_pressure_drops_delta, s->tr_packets_sent,
+		age_s, s->tr_fec_skipped,
+		s->cfg->fec.skip_on_backpressure ? "true" : "false",
+		s->cfg->fec.backpressure_fill_pct);
+	if (n < 0 || (size_t)n >= cap - pos) return -1;
+	return n;
+}
+
 static int append_mcs_json(char *buf, size_t cap, size_t pos,
                            const ApiSnapshot *s)
 {
@@ -2110,6 +2177,14 @@ static int status_to_json(const ApiSnapshot *s, char *buf, size_t cap)
 	pos += n;
 
 	int w = append_fec_json(buf, cap, pos, s);
+	if (w < 0) return -1;
+	pos += w;
+
+	w = snprintf(buf + pos, cap - pos, ",");
+	if (w < 0 || (size_t)w >= cap - pos) return -1;
+	pos += w;
+
+	w = append_transport_json(buf, cap, pos, s);
 	if (w < 0) return -1;
 	pos += w;
 
@@ -2151,6 +2226,12 @@ static int fec_status_to_json(const ApiSnapshot *s, char *buf, size_t cap)
 	if (n < 0 || (size_t)n >= cap) return -1;
 	pos += n;
 	int w = append_fec_json(buf, cap, pos, s);
+	if (w < 0) return -1;
+	pos += w;
+	n = snprintf(buf + pos, cap - pos, ",");
+	if (n < 0 || (size_t)n >= cap - pos) return -1;
+	pos += n;
+	w = append_transport_json(buf, cap, pos, s);
 	if (w < 0) return -1;
 	pos += w;
 	n = snprintf(buf + pos, cap - pos, ",");
@@ -2888,6 +2969,13 @@ static void config_defaults(Config *c)
 	c->fec.safe_startup_bitrate_kbps  = 1500;
 	c->fec.safe_startup_payload       = 1400;
 
+	/* Skip-on-backpressure: default on. Threshold 80% matches venc's
+	 * hysteresis-on ceiling — at that fill level the producer is itself
+	 * about to start dropping frames, so the next encoded frame's size
+	 * is no longer a clean rate signal. */
+	c->fec.skip_on_backpressure       = true;
+	c->fec.backpressure_fill_pct      = 80;
+
 	/* MCS defaults (lifted from mcs_selector.c). */
 	c->mcs.enabled = true;
 	strcpy(c->mcs.stats_host, "127.0.0.1"); c->mcs.stats_port = 5801;
@@ -3314,6 +3402,22 @@ int main(int argc, char **argv)
 	long last_stats_seq = -1;
 	const uint64_t STATS_STALE_US = 3000000ULL;
 
+	/* Producer-side transport telemetry from sidecar TRANSPORT_INFO trailer
+	 * (venc v0.9.2+).  fill_pct / in_pressure / pressure_drops are
+	 * authoritative for shm:// / unix:// / udp://; transport_drops and
+	 * packets_sent are only authoritative for shm:// in v0.9.2.  Lifetime
+	 * counters are low-32-bit; the delta is computed with saturating
+	 * subtraction so wrap doesn't generate a giant spurious delta. */
+	bool     last_transport_present = false;
+	uint8_t  last_transport_fill_pct = 0;
+	uint8_t  last_transport_in_pressure = 0;
+	uint32_t last_transport_drops = 0;
+	uint32_t last_transport_pressure_drops = 0;
+	uint32_t last_transport_pressure_drops_delta = 0;
+	uint32_t last_transport_packets_sent = 0;
+	uint64_t last_transport_us = 0;
+	uint32_t fec_skipped_on_pressure = 0;
+
 	Selector sel;
 	selector_init(&sel);
 	Scorer scorer;
@@ -3618,6 +3722,15 @@ int main(int argc, char **argv)
 				.last_loss_penalty_db = last_loss_pen_db,
 				.last_emit_mcs       = last_emit_mcs,
 				.ant_count           = last_ant_count,
+				.tr_present              = last_transport_present,
+				.tr_fill_pct             = last_transport_fill_pct,
+				.tr_in_pressure          = last_transport_in_pressure,
+				.tr_drops                = last_transport_drops,
+				.tr_pressure_drops       = last_transport_pressure_drops,
+				.tr_pressure_drops_delta = last_transport_pressure_drops_delta,
+				.tr_packets_sent         = last_transport_packets_sent,
+				.tr_last_us              = last_transport_us,
+				.tr_fec_skipped          = fec_skipped_on_pressure,
 			};
 			memcpy(snap.ant_avg, last_ant_avg, sizeof(snap.ant_avg));
 			for (int i = 0; i < API_MAX_CLIENTS; i++) {
@@ -3882,12 +3995,65 @@ int main(int argc, char **argv)
 			uint64_t ready = be64_read(&f->frame_ready_us);
 			fps_feed(&fps, ready);
 
+			/* Optional transport-stats trailer (v0.9.2+).  Parse before any
+			 * later `continue` because case 3 (transport-only, no enc) is a
+			 * legal wire layout the producer emits when encoder telemetry
+			 * isn't enabled. Trailer offset is base + (enc ? 12 : 0). */
+			bool tr_skip_fec = false;
+			if (f->flags & SC_FLAG_TRANSPORT_INFO) {
+				size_t t_off = sizeof(SidecarFrame) +
+				    ((f->flags & SC_FLAG_ENC_INFO) ? sizeof(SidecarEncInfo) : 0);
+				if (nrd >= (ssize_t)(t_off + sizeof(SidecarTransportInfo))) {
+					const SidecarTransportInfo *t =
+					    (const SidecarTransportInfo*)(buf + t_off);
+					uint32_t pd_now = ntohl(t->pressure_drops);
+					uint32_t pd_delta;
+					if (last_transport_present && pd_now >= last_transport_pressure_drops) {
+						pd_delta = pd_now - last_transport_pressure_drops;
+					} else {
+						/* First sample, or counter wrapped (low-32 of a uint64
+						 * lifetime ctr) — clamp to zero rather than emit a
+						 * spurious billion-frame jump. */
+						pd_delta = 0;
+					}
+					last_transport_present = true;
+					last_transport_fill_pct = t->fill_pct;
+					last_transport_in_pressure = t->in_pressure ? 1 : 0;
+					last_transport_drops = ntohl(t->transport_drops);
+					last_transport_pressure_drops = pd_now;
+					last_transport_pressure_drops_delta = pd_delta;
+					last_transport_packets_sent = ntohl(t->packets_sent);
+					last_transport_us = now_us();
+
+					/* Skip-on-backpressure: if the producer's output queue is
+					 * heavily filled or it's actively dropping frames, don't
+					 * let this tick's frame size pull the FEC EWMA — the
+					 * frame may be undersized (skipped) or oversized (queued
+					 * burst). One-tick suppression only; the next clean
+					 * frame resumes adaptation. */
+					if (cfg.fec.skip_on_backpressure &&
+					    (last_transport_fill_pct >= cfg.fec.backpressure_fill_pct ||
+					     pd_delta > 0)) {
+						tr_skip_fec = true;
+					}
+				}
+			}
+
 			if (!(f->flags & SC_FLAG_ENC_INFO)) continue;
 			if (nrd < (ssize_t)(sizeof(SidecarFrame) + sizeof(SidecarEncInfo))) continue;
 
 			SidecarEncInfo *e = (SidecarEncInfo*)(buf + sizeof(SidecarFrame));
 			uint32_t frame_size = ntohl(e->frame_size_bytes);
 			if (frame_size == 0) continue;
+
+			if (tr_skip_fec) {
+				fec_skipped_on_pressure++;
+				LOG_FEC("FEC skip (backpressure: fill=%u%% pd_delta=%u in_pressure=%u)",
+				    last_transport_fill_pct,
+				    last_transport_pressure_drops_delta,
+				    last_transport_in_pressure);
+				continue;
+			}
 
 			FecParams next_params;
 			bool emit = controller_update(&fec_ctrl, &cfg, frame_size, &fec_ring,
