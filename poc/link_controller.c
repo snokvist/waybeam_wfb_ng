@@ -255,6 +255,20 @@ typedef struct {
 		 * differs. */
 		int      payload_max;        /* 0 = feature off */
 		int      payload_min;        /* clamped against the venc API floor (576) */
+
+		/* Safe-startup: write a known-safe (bitrate, payload) pair to
+		 * venc once at controller start, before the main loop runs.
+		 * Bridges the gap between previous-controller's last-written
+		 * state and this controller's first wfb_stats-driven bitrate
+		 * write (~2-3 s of inherited venc state). Without this, a
+		 * stranded high bitrate at low MCS — e.g. previous run died at
+		 * MCS 7 + 21 Mbps and wfb_tx is now at MCS 2 — saturates
+		 * wfb_tx during the startup window. The first natural
+		 * bitrate_assert overrides these values within seconds. Skipped
+		 * in --dry-run. */
+		bool     safe_startup_enabled;
+		long     safe_startup_bitrate_kbps;
+		int      safe_startup_payload;
 	} fec;
 
 	/* ── MCS subsystem ── */
@@ -2712,6 +2726,13 @@ static void usage(const char *prog)
 		"                           ≤1472 keeps the path on a 1500 MTU; >1472\n"
 		"                           declares jumbo-capable end-to-end. Live\n"
 		"                           tunable: fec.payload_min (default 576).\n"
+		"  --no-safe-startup        disable one-time safe (bitrate, payload)\n"
+		"                           write to venc at controller start. Default\n"
+		"                           ON; bridges the gap between an inherited\n"
+		"                           dangerous venc state and the first natural\n"
+		"                           bitrate write.\n"
+		"  --safe-startup-bitrate N override safe-startup bitrate kbps (default 1500)\n"
+		"  --safe-startup-payload N override safe-startup payload bytes (default 1400)\n"
 		"\n"
 		"MCS subsystem (--mcs-* / disable with --no-mcs):\n"
 		"  --no-mcs                 disable MCS subsystem\n"
@@ -2859,6 +2880,14 @@ static void config_defaults(Config *c)
 	c->fec.payload_max          = 0;
 	c->fec.payload_min          = 576;
 
+	/* Safe-startup defaults: 1500 kbps + 1400 B = ~134 pps. Bulletproof
+	 * at MCS 0 (post-FEC ~1.6 Mbps fits 1500); 1400 B sits in the
+	 * <12000 kbps→1400 B tier so it never trips the pps cap on
+	 * startup. Override if your floor is different. */
+	c->fec.safe_startup_enabled       = true;
+	c->fec.safe_startup_bitrate_kbps  = 1500;
+	c->fec.safe_startup_payload       = 1400;
+
 	/* MCS defaults (lifted from mcs_selector.c). */
 	c->mcs.enabled = true;
 	strcpy(c->mcs.stats_host, "127.0.0.1"); c->mcs.stats_port = 5801;
@@ -2907,6 +2936,7 @@ int main(int argc, char **argv)
 		OPT_BITRATE_MIN, OPT_BITRATE_MAX, OPT_BITRATE_TOL, OPT_BITRATE_GRACE,
 		OPT_MCS_SETTLE, OPT_BOOST_S, OPT_BOOST_MULT,
 		OPT_MAX_PAYLOAD,
+		OPT_NO_SAFE_STARTUP, OPT_SAFE_STARTUP_BITRATE, OPT_SAFE_STARTUP_PAYLOAD,
 		/* mcs */
 		OPT_NO_MCS, OPT_STATS, OPT_RANGE,
 		OPT_RSSI_LOW, OPT_RSSI_HIGH, OPT_DEADBAND,
@@ -2943,6 +2973,9 @@ int main(int argc, char **argv)
 		{"boost-s",        required_argument, 0, OPT_BOOST_S},
 		{"boost-mult",     required_argument, 0, OPT_BOOST_MULT},
 		{"max-payload",    required_argument, 0, OPT_MAX_PAYLOAD},
+		{"no-safe-startup",      no_argument,       0, OPT_NO_SAFE_STARTUP},
+		{"safe-startup-bitrate", required_argument, 0, OPT_SAFE_STARTUP_BITRATE},
+		{"safe-startup-payload", required_argument, 0, OPT_SAFE_STARTUP_PAYLOAD},
 		{"no-mcs",         no_argument,       0, OPT_NO_MCS},
 		{"stats",          required_argument, 0, OPT_STATS},
 		{"range",          required_argument, 0, OPT_RANGE},
@@ -3037,6 +3070,29 @@ int main(int argc, char **argv)
 				return 1;
 			}
 			cfg.fec.payload_max = p;
+			break;
+		}
+		case OPT_NO_SAFE_STARTUP:
+			cfg.fec.safe_startup_enabled = false;
+			break;
+		case OPT_SAFE_STARTUP_BITRATE: {
+			long v = atol(optarg);
+			if (v < 100 || v > 100000) {
+				fprintf(stderr,
+				    "invalid --safe-startup-bitrate %ld: must be in [100, 100000] kbps\n", v);
+				return 1;
+			}
+			cfg.fec.safe_startup_bitrate_kbps = v;
+			break;
+		}
+		case OPT_SAFE_STARTUP_PAYLOAD: {
+			int p = atoi(optarg);
+			if (p < 576 || p > 4000) {
+				fprintf(stderr,
+				    "invalid --safe-startup-payload %d: must be in [576, 4000]\n", p);
+				return 1;
+			}
+			cfg.fec.safe_startup_payload = p;
 			break;
 		}
 		case OPT_STATS:
@@ -3290,6 +3346,25 @@ int main(int argc, char **argv)
 		    radio_body.stbc, radio_body.ldpc,
 		    radio_body.vht_mode, radio_body.vht_nss,
 		    now_us(), true);
+	}
+
+	/* ── Safe-startup ──
+	 * One-time atomic venc write of (safe_bitrate, safe_payload) so the
+	 * controller never inherits a dangerous prior config during the 2-3 s
+	 * gap before the first natural bitrate_assert. Skipped in --dry-run
+	 * and when the FEC subsystem is disabled (no venc HTTP API in play). */
+	if (cfg.fec.enabled && cfg.fec.safe_startup_enabled && !cfg.dry_run) {
+		long  br = cfg.fec.safe_startup_bitrate_kbps;
+		int   pl = cfg.fec.safe_startup_payload;
+		if (venc_apply(&cfg, br, pl) == 0) {
+			LOG_FEC("safe-startup: wrote video0.bitrate=%ld outgoing.maxPayloadSize=%d (one-time guard)",
+			    br, pl);
+		} else {
+			LOG_FEC("safe-startup: venc write failed (br=%ld pl=%d) — venc unreachable; controller will retry on first bitrate_assert",
+			    br, pl);
+		}
+	} else if (cfg.fec.enabled && !cfg.fec.safe_startup_enabled) {
+		LOG_FEC("safe-startup: disabled (--no-safe-startup) — venc state inherited as-is");
 	}
 
 	/* ── Timers ── */
