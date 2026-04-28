@@ -35,6 +35,7 @@ MSG_SYNC_RESP = 4
 
 FLAG_KEYFRAME = 0x01
 FLAG_ENC_INFO = 0x02
+FLAG_TRANSPORT_INFO = 0x04
 
 FRAME_TYPE_P = 0
 FRAME_TYPE_I = 1
@@ -73,12 +74,22 @@ ENC_TRAILER_SIZE = 12
 # RtpSidecarFrameExt = base(52) + trailer(12) = 64 bytes
 FRAME_EXT_SIZE = FRAME_BASE_SIZE + ENC_TRAILER_SIZE
 
+# RtpSidecarTransportInfoWire (16 bytes, packed):
+#   fill_pct(1) in_pressure(1) _pad(2) transport_drops(4)
+#   pressure_drops(4) packets_sent(4)
+TRANSPORT_TRAILER_FMT = "!BB2sIII"
+TRANSPORT_TRAILER_SIZE = 16
+
 # Verify sizes match the C packed structs
 assert struct.calcsize(FRAME_BASE_FMT) == FRAME_BASE_SIZE, (
     f"FRAME_BASE_FMT size {struct.calcsize(FRAME_BASE_FMT)} != {FRAME_BASE_SIZE}"
 )
 assert struct.calcsize(ENC_TRAILER_FMT) == ENC_TRAILER_SIZE, (
     f"ENC_TRAILER_FMT size {struct.calcsize(ENC_TRAILER_FMT)} != {ENC_TRAILER_SIZE}"
+)
+assert struct.calcsize(TRANSPORT_TRAILER_FMT) == TRANSPORT_TRAILER_SIZE, (
+    f"TRANSPORT_TRAILER_FMT size {struct.calcsize(TRANSPORT_TRAILER_FMT)}"
+    f" != {TRANSPORT_TRAILER_SIZE}"
 )
 
 
@@ -109,6 +120,17 @@ class SidecarFrame:
     gop_state: int = 0
     idr_inserted: int = 0
     frames_since_idr: int = 0
+    # Transport-stats trailer (only valid when has_transport_info is True).
+    # Field semantics by transport — see rtp_sidecar.h. fill_pct, in_pressure
+    # and pressure_drops are authoritative across shm:// / unix:// / udp://.
+    # transport_drops and packets_sent are authoritative for shm:// in v0.9.2;
+    # unix:// / udp:// emit zero pending socket-side instrumentation.
+    has_transport_info: bool = False
+    fill_pct: int = 0
+    in_pressure: int = 0
+    transport_drops: int = 0
+    pressure_drops: int = 0
+    packets_sent: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -176,6 +198,27 @@ def parse_frame(data: bytes) -> SidecarFrame | None:
         frame.idr_inserted = idr_inserted
         frame.frames_since_idr = frames_since_idr
 
+    # The transport-stats trailer slides up to land directly after the base
+    # frame when ENC_INFO is absent — the producer never emits an empty
+    # ENC_INFO trailer just to keep the offset stable. Compute the offset
+    # explicitly so all four flag combinations parse correctly.
+    if flags & FLAG_TRANSPORT_INFO:
+        transport_offset = FRAME_BASE_SIZE + (
+            ENC_TRAILER_SIZE if (flags & FLAG_ENC_INFO) else 0
+        )
+        if len(data) >= transport_offset + TRANSPORT_TRAILER_SIZE:
+            trailer = data[
+                transport_offset : transport_offset + TRANSPORT_TRAILER_SIZE
+            ]
+            (fill_pct, in_pressure, _pad, transport_drops, pressure_drops,
+             packets_sent) = struct.unpack(TRANSPORT_TRAILER_FMT, trailer)
+            frame.has_transport_info = True
+            frame.fill_pct = fill_pct
+            frame.in_pressure = in_pressure
+            frame.transport_drops = transport_drops
+            frame.pressure_drops = pressure_drops
+            frame.packets_sent = packets_sent
+
     return frame
 
 
@@ -233,3 +276,72 @@ def pack_frame_base(
         ssrc, rtp_timestamp, frame_id, frame_ready_us,
         seq_first, seq_count, capture_us, last_pkt_send_us,
     )
+
+
+def pack_frame_full(
+    ssrc: int = 0,
+    rtp_timestamp: int = 0,
+    frame_id: int = 0,
+    frame_ready_us: int = 0,
+    seq_first: int = 0,
+    seq_count: int = 0,
+    capture_us: int = 0,
+    last_pkt_send_us: int = 0,
+    stream_id: int = 0,
+    keyframe: bool = False,
+    enc: dict | None = None,
+    transport: dict | None = None,
+) -> bytes:
+    """Build a FRAME message with optional ENC_INFO and TRANSPORT_INFO trailers.
+
+    Mirrors rtp_sidecar_send_frame_transport on the venc side: when ENC_INFO
+    is absent the transport trailer slides up to offset 52, producing a
+    52 + 16 = 68-byte packet. Used by tests to round-trip all four flag
+    combinations.
+
+    enc: dict with keys frame_size_bytes, frame_type, qp, complexity,
+         scene_change, gop_state, idr_inserted, frames_since_idr
+         (all default 0 / FRAME_TYPE_P).
+    transport: dict with keys fill_pct, in_pressure, transport_drops,
+         pressure_drops, packets_sent (all default 0).
+    """
+    flags = 0
+    if keyframe:
+        flags |= FLAG_KEYFRAME
+    if enc is not None:
+        flags |= FLAG_ENC_INFO
+    if transport is not None:
+        flags |= FLAG_TRANSPORT_INFO
+
+    out = struct.pack(
+        FRAME_BASE_FMT,
+        SIDECAR_MAGIC, SIDECAR_VERSION, MSG_FRAME, stream_id, flags,
+        ssrc, rtp_timestamp, frame_id, frame_ready_us,
+        seq_first, seq_count, capture_us, last_pkt_send_us,
+    )
+
+    if enc is not None:
+        out += struct.pack(
+            ENC_TRAILER_FMT,
+            enc.get("frame_size_bytes", 0),
+            enc.get("frame_type", FRAME_TYPE_P),
+            enc.get("qp", 0),
+            enc.get("complexity", 0),
+            enc.get("scene_change", 0),
+            enc.get("gop_state", 0),
+            enc.get("idr_inserted", 0),
+            enc.get("frames_since_idr", 0),
+        )
+
+    if transport is not None:
+        out += struct.pack(
+            TRANSPORT_TRAILER_FMT,
+            transport.get("fill_pct", 0),
+            transport.get("in_pressure", 0),
+            b"\x00\x00",
+            transport.get("transport_drops", 0),
+            transport.get("pressure_drops", 0),
+            transport.get("packets_sent", 0),
+        )
+
+    return out

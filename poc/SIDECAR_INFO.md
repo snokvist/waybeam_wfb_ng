@@ -52,7 +52,7 @@ The sidecar uses a simple binary UDP protocol:
 | Message | Direction | Size | Purpose |
 |---------|-----------|------|---------|
 | SUBSCRIBE | probe -> venc | 8 B | Start/refresh metadata subscription |
-| FRAME | venc -> probe | 52 B base, 64 B with trailer | Per-frame timing + RTP sequence info, plus optional encoder telemetry |
+| FRAME | venc -> probe | 52, 64, 68, or 80 B | Per-frame timing + RTP seq, optional ENC_INFO trailer (12 B), optional TRANSPORT_INFO trailer (16 B) |
 | SYNC_REQ | probe -> venc | 16 B | NTP-style clock offset request |
 | SYNC_RESP | venc -> probe | 32 B | Clock offset response (t1, t2, t3) |
 
@@ -62,16 +62,40 @@ All messages share a common 6-byte header: 4-byte magic (`0x52545053` =
 Subscription expires after 5 seconds without any probe message. Both
 SUBSCRIBE and SYNC_REQ refresh the expiry timer.
 
-When Star6E adaptive encoder control is enabled, `FRAME` appends a 12-byte
-trailer carrying `frame_size_bytes`, `frame_type`, `qp`, `complexity`,
-`scene_change`, `idr_inserted`, and `frames_since_idr`.
-Maruko and timing-only Star6E runs keep sending the original 52-byte frame.
+FRAME has up to two optional trailers, gated by independent flag bits in the
+base frame's `flags` byte. They appear in fixed order (ENC_INFO first, then
+TRANSPORT_INFO), so the offset of the second trailer depends on whether the
+first is present:
+
+- `FLAG_ENC_INFO` (`0x02`) — 12-byte encoder telemetry trailer:
+  `frame_size_bytes`, `frame_type`, `qp`, `complexity`, `scene_change`,
+  `gop_state`, `idr_inserted`, `frames_since_idr`. Star6E with
+  `video0.scene_threshold>0`. Maruko and timing-only Star6E runs omit it.
+- `FLAG_TRANSPORT_INFO` (`0x04`) — 16-byte producer-output telemetry trailer:
+  `fill_pct`, `in_pressure`, `transport_drops`, `pressure_drops`,
+  `packets_sent`. Emitted when the active output transport reports a queue
+  fill model (shm:// always; unix:// and udp:// in venc 0.9.2+). When
+  ENC_INFO is absent, this trailer slides up to land directly at offset 52
+  (total packet size 68); when both are present it lives at offset 64
+  (total 80). `fill_pct` / `in_pressure` / `pressure_drops` are
+  authoritative across all transports; `transport_drops` / `packets_sent`
+  are authoritative for shm:// in v0.9.2 (unix:// / udp:// emit 0 pending
+  socket-side counter instrumentation).
+
+Forward-compat: probes that don't recognise a flag simply read the base
+frame (and any trailer they do recognise) and ignore the trailing bytes.
+No protocol version bump.
 
 Link-control / FEC usage:
 - RTP video keeps using `outgoing.server` as usual.
 - Set `outgoing.sidecarPort` to expose sidecar metadata on a separate UDP port.
 - Base timing fields are available whenever the sidecar is enabled.
 - The extra encoder trailer requires Star6E with `video0.scene_threshold>0`.
+- The transport trailer requires venc 0.9.2+ with backpressure-aware output
+  (`outgoing.backpressure=true`); link_controller surfaces the values via
+  `/status` (`transport.*`) and gates a one-tick FEC suppression on
+  `fill_pct ≥ 80` or any new `pressure_drops` (`fec.skip_on_backpressure`,
+  default on).
 - The sender tracks one active sidecar subscriber at a time; the most recent
   probe or consumer to subscribe receives the frame metadata.
 
