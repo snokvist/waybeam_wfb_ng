@@ -262,6 +262,7 @@ wfb_tx -u 5600 -K /etc/drone.key -k 8 -n 12 -p 0 wlan0
 | High lag but not full | Momentary burst; should recover | Normal during keyframes; monitor over time |
 | `shm_ring_stats` shows `write_idx=0` | venc not encoding | Check venc logs; verify sensor/ISP init |
 | `SHM producer stalled` | venc crashed without cleanup (watchdog kicked in at 3 s frozen write_idx) | wfb_tx auto-detaches; restart venc, wfb_tx will reattach |
+| `SHM header drift: ... Producer restarted; detaching` | venc was rebuilt onto the same `/dev/shm` inode (older venc that uses `O_TRUNC`, or manual `rm /dev/shm/<name>` + restart) — wfb_tx caught the new epoch before any corrupt read | Auto-recovers via re-attach to the new ring. With current venc (uses `shm_unlink` + `O_EXCL` since v0.9.2), restarts produce a fresh inode and the watchdog branch evicts instead — this branch stays silent |
 | Audio not working | `audioPort=0` disables audio in SHM mode | Set `audioPort: 5601` and run separate `wfb_tx -u 5601` for audio |
 | Video comes up but is black on ground | AEAD-mode mismatch (only one side has `-x`) | Check RX logs for `packets dropped (AEAD-mode mismatch, check -x flag on both sides)` — set or clear `-x` to match |
 | `Invalid fragment_idx: N` at startup | Pre-session data packets (RX hasn't received session packet yet) — fixed in current build | None needed; the guard is automatic. Log should stop within 1 s |
