@@ -812,6 +812,34 @@ static int payload_table_lookup(long bitrate_kbps)
 	return PAYLOAD_TABLE[PAYLOAD_TABLE_LEN - 1].payload_bytes;
 }
 
+/* Reverse lookup: given a payload bytes value, return the highest
+ * bitrate_lt_kbps from PAYLOAD_TABLE whose tier payload <= P. That is
+ * the largest bitrate the table considers safe at this payload size
+ * (i.e. pps stays under the ~1100 implicit ceiling baked into the
+ * tier annotations). Used to clamp target bitrate when the operator's
+ * --max-payload forces a payload smaller than the natural tier pick —
+ * without this clamp the chosen payload + target bitrate combination
+ * can require pps far above what the wifi driver can sustain (verified:
+ * MCS 7 + payload=800 + ~21 Mbps target → ~3300 pkts/s ingress, 5200
+ * pkts/s egress → softirq backlog → kernel watchdog reboot).
+ *
+ * Returns LONG_MAX when payload exceeds every tier (no cap needed).
+ * Returns the lowest tier ceiling when payload < tier[0].payload_bytes
+ * (operator picked a payload below the smallest table tier — extreme
+ * pps; cap to 2 Mbps as a defensive floor). */
+static long payload_safe_bitrate_kbps(int payload_bytes)
+{
+	long best = -1;
+	for (size_t i = 0; i < PAYLOAD_TABLE_LEN; i++) {
+		if (PAYLOAD_TABLE[i].payload_bytes <= payload_bytes) {
+			if (PAYLOAD_TABLE[i].bitrate_lt_kbps > best)
+				best = PAYLOAD_TABLE[i].bitrate_lt_kbps;
+		}
+	}
+	if (best < 0) return PAYLOAD_TABLE[0].bitrate_lt_kbps;
+	return best;
+}
+
 /* Apply a fresh radio observation: update RadioState, detect external
  * changes vs the previous snapshot, log them, arm fec settle window
  * (mcs_settle_s) on any change, arm parity boost on MCS-down. */
@@ -961,6 +989,44 @@ static void bitrate_assert(const RadioState *radio, Controller *ctrl,
 	if (target < cfg->fec.bitrate_min_kbps)
 		target = cfg->fec.bitrate_min_kbps;
 
+	/* Pre-evaluate payload using the natural target. Done unconditionally
+	 * when payload sizing is enabled (cheap O(7) lookup) so we can apply
+	 * the pps-budget cap below before the bitrate-changed decision — that
+	 * cap may force target down enough to *trigger* a write that the
+	 * tolerance band would otherwise have suppressed. */
+	int  target_payload = 0;
+	bool table_clipped  = false;
+	long pps_cap_kbps   = -1;  /* -1 = no cap applied; >0 = applied value */
+	if (cfg->fec.payload_max > 0) {
+		target_payload = payload_select(cfg, target, &table_clipped);
+		if (table_clipped && target_payload > 0) {
+			/* Operator-pinned --max-payload is below what the tier table
+			 * would have picked. The chosen (smaller) payload cannot
+			 * sustain `target` kbps without exceeding the wifi driver's
+			 * empirical pps ceiling. Cap target to the largest tier
+			 * bitrate_lt where tier.payload <= target_payload. Without
+			 * this clamp, e.g. MCS 7 + --max-payload 800 → 21 Mbps target
+			 * → ~3300 pkts/s ingress / 5200 pkts/s egress crashed the
+			 * box (kernel watchdog reboot). With the clamp, the same
+			 * combination settles at ≤ 2 Mbps and stays under the pps
+			 * cliff. The operator override is preserved (payload still
+			 * pinned), only the bitrate is constrained. */
+			long safe_for_payload = payload_safe_bitrate_kbps(target_payload);
+			if (safe_for_payload > 0 && target > safe_for_payload) {
+				pps_cap_kbps = safe_for_payload;
+				target = safe_for_payload;
+				if (target < cfg->fec.bitrate_min_kbps) {
+					/* Operator's bitrate floor is above what the chosen
+					 * payload can sustain. We honour bitrate_min (the
+					 * controller has no path to "refuse to write") but
+					 * the operator is now fully outside the safe envelope
+					 * of the table — surfaced via pps_capped_kbps. */
+					target = cfg->fec.bitrate_min_kbps;
+				}
+			}
+		}
+	}
+
 	long ref = (*last_written_kbps > 0) ? *last_written_kbps : 0;
 	long dev = ref - target;
 	long adev = dev < 0 ? -dev : dev;
@@ -968,37 +1034,25 @@ static void bitrate_assert(const RadioState *radio, Controller *ctrl,
 	if (tol < 1) tol = 1;
 
 	bool bitrate_changed = (*last_written_kbps < 0 || adev > tol);
-
-	/* Payload selection is tied to bitrate writes: re-evaluate the tier
-	 * table only when bitrate would actually move (or first commit).
-	 * Two consequences: (1) sub-tolerance bitrate jitter that crosses a
-	 * tier boundary cannot flap the payload — it has to move enough to
-	 * trigger a bitrate write first; (2) live operator changes to
-	 * fec.payload_min take effect on the next bitrate move, not
-	 * instantly. Acceptable trade for the simplicity. */
-	int  target_payload = 0;
-	bool table_clipped  = false;
-	if (bitrate_changed) {
-		target_payload = payload_select(cfg, target, &table_clipped);
-	}
 	bool payload_changed = (target_payload > 0 &&
 	                        target_payload != *last_written_payload);
 
-	LOGV_FEC(cfg, "bitrate: target=%ld last_written=%ld safe=%ld min=%ld max=%ld (phy=%.1f k/n=%d/%d) payload=%d clipped=%d",
+	LOGV_FEC(cfg, "bitrate: target=%ld last_written=%ld safe=%ld min=%ld max=%ld (phy=%.1f k/n=%d/%d) payload=%d clipped=%d pps_cap=%ld",
 	     target, *last_written_kbps, safe_kbps,
 	     cfg->fec.bitrate_min_kbps, cfg->fec.bitrate_max_kbps,
 	     radio->phy_mbps, ctrl->current.k, ctrl->current.n,
-	     target_payload, table_clipped ? 1 : 0);
+	     target_payload, table_clipped ? 1 : 0, pps_cap_kbps);
 
 	if (bitrate_changed) {
 		const char *dir = (*last_written_kbps < 0)
 		    ? "init"
 		    : ((ref > target) ? "down" : "up");
-		LOG_FEC("bitrate %s %ld -> %ld kbps (phy=%.1f Mbps, k/n=%d/%d, safe=%ld) payload=%d/%d%s",
+		LOG_FEC("bitrate %s %ld -> %ld kbps (phy=%.1f Mbps, k/n=%d/%d, safe=%ld) payload=%d/%d%s%s",
 		    dir, *last_written_kbps, target, radio->phy_mbps,
 		    ctrl->current.k, ctrl->current.n, safe_kbps,
 		    target_payload, *last_written_payload,
-		    table_clipped ? " PAYLOAD_CAPPED_BY_MAX" : "");
+		    table_clipped ? " PAYLOAD_CAPPED_BY_MAX" : "",
+		    pps_cap_kbps > 0 ? " PPS_LIMITED" : "");
 		if (!cfg->dry_run) {
 			/* Atomic write: when payload sizing is enabled the bitrate
 			 * and payload travel in one HTTP GET to venc so the next
@@ -1966,6 +2020,17 @@ static int append_fec_json(char *buf, size_t cap, size_t pos,
 	}
 	bool would_fragment = (s->cfg->fec.payload_max > 0 &&
 	                       s->cfg->fec.payload_max > 1472);
+	/* pps_capped_kbps: when the operator's --max-payload forces a
+	 * smaller payload than the tier table would have picked for the
+	 * controller's would-be target, the controller caps target bitrate
+	 * at the highest tier_lt where tier.payload <= chosen payload.
+	 * Surfaced here so the WebUI can show "operator override is leaving
+	 * link capacity on the table" without recomputing. -1 = not capped. */
+	long pps_cap = -1;
+	if (sel_clipped && sel_payload > 0) {
+		long sb = payload_safe_bitrate_kbps(sel_payload);
+		if (sb > 0) pps_cap = sb;
+	}
 
 	int n = snprintf(buf + pos, cap - pos,
 		"\"fec\":{\"enabled\":%s,\"have_current\":%s,\"k\":%d,\"n\":%d,"
@@ -1976,7 +2041,8 @@ static int append_fec_json(char *buf, size_t cap, size_t pos,
 		"\"stats_age_s\":%.3f},"
 		"\"payload\":{\"enabled\":%s,\"max\":%d,\"min\":%d,"
 		"\"last_written\":%d,\"selected\":%d,"
-		"\"table_clipped\":%s,\"would_fragment_on_1500_mtu\":%s}",
+		"\"table_clipped\":%s,\"pps_capped_kbps\":%ld,"
+		"\"would_fragment_on_1500_mtu\":%s}",
 		s->cfg->fec.enabled ? "true" : "false",
 		s->ctrl->have_current ? "true" : "false",
 		s->ctrl->current.k, s->ctrl->current.n,
@@ -1991,7 +2057,7 @@ static int append_fec_json(char *buf, size_t cap, size_t pos,
 		s->cfg->fec.payload_max > 0 ? "true" : "false",
 		s->cfg->fec.payload_max, s->cfg->fec.payload_min,
 		s->last_written_payload, sel_payload,
-		sel_clipped ? "true" : "false",
+		sel_clipped ? "true" : "false", pps_cap,
 		would_fragment ? "true" : "false");
 	if (n < 0 || (size_t)n >= cap - pos) return -1;
 	return n;
@@ -2621,7 +2687,7 @@ static void usage(const char *prog)
 		"\n"
 		"FEC subsystem (--fec-* / disable with --no-fec):\n"
 		"  --no-fec                 disable FEC subsystem\n"
-		"  --sidecar HOST:PORT      venc sidecar (default 127.0.0.1:6666)\n"
+		"  --sidecar HOST:PORT      venc sidecar (default 127.0.0.1:5602)\n"
 		"  --venc HOST:PORT         venc HTTP API (default 127.0.0.1:80)\n"
 		"  --wfb-stats-port N       UDP listener for wfb_tx -Y JSON (default 0 = poll mode)\n"
 		"  --mtu N                  packet size budget (default 1446)\n"
@@ -2761,7 +2827,7 @@ static void config_defaults(Config *c)
 
 	/* FEC defaults (lifted from fec_controller.c). */
 	c->fec.enabled = true;
-	strcpy(c->fec.sidecar_host, "127.0.0.1"); c->fec.sidecar_port = 6666;
+	strcpy(c->fec.sidecar_host, "127.0.0.1"); c->fec.sidecar_port = 5602;
 	strcpy(c->fec.venc_host,    "127.0.0.1"); c->fec.venc_port    = 80;
 	c->fec.mtu = 1446;
 	c->fec.min_k = 1;    c->fec.max_k = 48;
