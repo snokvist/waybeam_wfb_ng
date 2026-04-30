@@ -3891,7 +3891,6 @@ int main(int argc, char **argv)
 				long pkt_adapters = -1;
 				(void)json_get_int_in(pkt_block, "adapters", &pkt_adapters);
 				int adapters_seen = (pkt_adapters >= 0) ? (int)pkt_adapters : -1;
-				(void)pkt_data; /* no longer needed in scorer; kept parsed for log/debug */
 
 				Score score;
 				if (!scorer_update(&scorer, &cfg, dgram,

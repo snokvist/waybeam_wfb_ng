@@ -152,7 +152,11 @@ echo "=== Building wfb_tx ==="
 
 WFB_CFLAGS="-Wall -O2 -fno-strict-aliasing -I$SODIUM_PREFIX/include -I$VENC_ROOT/include -I$WFB_DIR/src/stub"
 WFB_CFLAGS="$WFB_CFLAGS -DZFEX_UNROLL_ADDMUL_SIMD=8 -DZFEX_INLINE_ADDMUL -DZFEX_INLINE_ADDMUL_SIMD"
-WFB_CFLAGS="$WFB_CFLAGS -DWFB_VERSION='\"shm-patched\"'"
+# WFB_VERSION must reach the compiler as `"shm-patched"` (a string).  Single
+# quotes around the value would be interpreted by the C preprocessor as a
+# multi-character literal and gcc warns about it; escape the inner double
+# quotes only and let bash word-splitting deliver the token verbatim.
+WFB_CFLAGS="$WFB_CFLAGS -DWFB_VERSION=\"shm-patched\""
 WFB_LDFLAGS="-L$SODIUM_PREFIX/lib -lrt -lsodium -static"
 
 cd "$WFB_DIR"
@@ -199,7 +203,7 @@ NATIVE_BUILD="$BUILD_DIR/native"
 mkdir -p "$NATIVE_BUILD"
 NATIVE_CFLAGS="-Wall -O2 -fno-strict-aliasing -I$VENC_ROOT/include"
 NATIVE_CFLAGS="$NATIVE_CFLAGS -DZFEX_UNROLL_ADDMUL_SIMD=8 -DZFEX_INLINE_ADDMUL -DZFEX_INLINE_ADDMUL_SIMD"
-NATIVE_CFLAGS="$NATIVE_CFLAGS -DWFB_VERSION='\"shm-patched-native\"'"
+NATIVE_CFLAGS="$NATIVE_CFLAGS -DWFB_VERSION=\"shm-patched-native\""
 g++ $NATIVE_CFLAGS -std=gnu++11 -c -o "$NATIVE_BUILD/rx_native.o" src/rx.cpp
 gcc $NATIVE_CFLAGS -std=gnu99 -c -o "$NATIVE_BUILD/zfex_native.o" src/zfex.c
 g++ $NATIVE_CFLAGS -std=gnu++11 -c -o "$NATIVE_BUILD/wfb_native.o" src/wifibroadcast.cpp
