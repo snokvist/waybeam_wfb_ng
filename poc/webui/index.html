@@ -104,6 +104,7 @@ main{padding:12px;overflow:auto;height:calc(100vh - 86px)}
       <div class="card"><h3>MCS bucket</h3><div class="v" id="c-mcs">—</div><div class="sub" id="c-mcs-sub">—</div></div>
       <div class="card"><h3>Effective RSSI</h3><div class="v" id="c-rssi">—</div><div class="sub" id="c-rssi-sub">—</div></div>
       <div class="card"><h3>Loss</h3><div class="v" id="c-loss">—</div><div class="sub" id="c-loss-sub">—</div></div>
+      <div class="card"><h3>Diversity</h3><div class="v" id="c-div">—</div><div class="sub" id="c-div-sub">—</div></div>
       <div class="card"><h3>Headroom</h3><div class="v" id="c-headroom">—</div><div class="sub" id="c-headroom-sub">—</div></div>
       <div class="card"><h3>Payload</h3><div class="v" id="c-payload">—</div><div class="sub" id="c-payload-sub">—</div></div>
     </div>
@@ -307,6 +308,21 @@ function renderStatus(s) {
     $("#c-loss").textContent = lp.toFixed(2) + "%";
     $("#c-loss").className = "v " + (lp > 5 ? "bad" : lp > 0.5 ? "warn" : "ok");
     $("#c-loss-sub").textContent = "fec_recov " + ((score.recov_ratio||0)*100).toFixed(1) + "%";
+  }
+
+  // Diversity — fraction of fragments received on >1 adapter (count_p_diversity
+  // / count_p_data).  Distinct from fec_recov: high diversity means the second
+  // antenna routinely saved us without needing parity.  Older link_controller
+  // builds (no rx-side patch) omit the field — render "—" in that case.
+  if ("diversity_ratio" in score) {
+    const dv = (score.diversity_ratio || 0) * 100;
+    $("#c-div").textContent = dv.toFixed(2) + "%";
+    /* Healthy: >0% means redundant coverage exists. Single-adapter setups
+     * sit at 0% by design, so the colour is purely informational. */
+    $("#c-div").className = "v " + (dv >= 5 ? "ok" : dv > 0 ? "warn" : "");
+    $("#c-div-sub").textContent = dv > 0
+      ? "second-antenna saves"
+      : "single adapter / no overlap";
   }
 
   // Headroom — actionable derived value: how much link budget is left
