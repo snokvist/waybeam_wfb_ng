@@ -1,5 +1,5 @@
 diff --git a/src/rx.cpp b/src/rx.cpp
-index 1603b6e..d18fb46 100644
+index 1603b6e..136d16d 100644
 --- a/src/rx.cpp
 +++ b/src/rx.cpp
 @@ -52,6 +52,101 @@ extern "C"
@@ -362,7 +362,31 @@ index 1603b6e..d18fb46 100644
      if (fragment_idx >= fec_n)
      {
          WFB_ERR("Invalid fragment_idx: %d\n", fragment_idx);
-@@ -836,6 +1092,15 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
+@@ -825,17 +1081,37 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
+                 //Recover missed fragments using FEC
+                 apply_fec(ring_idx);
+ 
+-                // Count total number of recovered fragments
++                /* Count recovered slots — but skip synthetic FEC_ONLY slots
++                 * that close_block_early wrote on the TX side.  Those slots
++                 * carry zero payload + flags=WFB_PACKET_FEC_ONLY; they exist
++                 * only so the RX has fec_k inputs for the FEC decode and are
++                 * suppressed at send_packet anyway.  Counting them here
++                 * inflates fec_recovered by (fec_k - actual_k) on every
++                 * frame-boundary block, which makes the counter useless as
++                 * a "real-loss compensated by parity" metric — particularly
++                 * for the multi-adapter case where the user expects
++                 * diversity to drive it toward zero. */
+                 for(; f_idx < fec_k; f_idx++)
+                 {
+                     if(! p->fragment_map[f_idx])
+                     {
+-                        fec_count += 1;
++                        wpacket_hdr_t *hdr = (wpacket_hdr_t*)p->fragments[f_idx];
++                        if (!(hdr->flags & WFB_PACKET_FEC_ONLY))
++                            fec_count += 1;
+                     }
+                 }
  
                  if(fec_count)
                  {
@@ -378,7 +402,7 @@ index 1603b6e..d18fb46 100644
                      count_p_fec_recovered += fec_count;
                      WFB_DBG("FEC recovered %u packets\n", fec_count);
                  }
-@@ -1147,8 +1412,10 @@ int main(int argc, char* const *argv)
+@@ -1147,8 +1423,10 @@ int main(int argc, char* const *argv)
  
      string keypair = "rx.key";
      string unix_socket = "";
@@ -390,7 +414,7 @@ index 1603b6e..d18fb46 100644
          switch (opt) {
          case 'K':
              keypair = optarg;
-@@ -1187,15 +1454,35 @@ int main(int argc, char* const *argv)
+@@ -1187,15 +1465,35 @@ int main(int argc, char* const *argv)
          case 'e':
              epoch = atoll(optarg);
              break;
@@ -430,7 +454,7 @@ index 1603b6e..d18fb46 100644
              WFB_INFO("WFB-ng version %s, FEC: %s\n", WFB_VERSION, zfex_opt);
              WFB_INFO("WFB-ng home page: <http://wfb-ng.org>\n");
              exit(1);
-@@ -1223,6 +1510,9 @@ int main(int argc, char* const *argv)
+@@ -1223,6 +1521,9 @@ int main(int argc, char* const *argv)
          return 1;
      }
  
@@ -440,7 +464,7 @@ index 1603b6e..d18fb46 100644
      try
      {
          uint32_t channel_id = (link_id << 8) + radio_port;
-@@ -1239,21 +1529,41 @@ int main(int argc, char* const *argv)
+@@ -1239,21 +1540,41 @@ int main(int argc, char* const *argv)
  
          unique_ptr<BaseAggregator> agg;
  
