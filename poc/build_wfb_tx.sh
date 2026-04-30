@@ -19,6 +19,8 @@
 #   shm_consumer_test  - ring throughput tester (cross, dynamic)
 #   wfb_rx_native      - x86_64 native build for the ground-station laptop;
 #                        the cross pcap stub only covers wfb_tx's inject path
+#   wfb_tx_native      - x86_64 native build of wfb_tx for benchtop / lab use
+#                        (same source set as the cross build, dynamic libsodium)
 #
 # Requirements:
 #   - star6e toolchain at ../toolchain/toolchain.sigmastar-infinity6e/
@@ -210,6 +212,25 @@ g++ -o "$BUILD_DIR/wfb_rx_native" \
     -lrt -lsodium -lpcap
 strip "$BUILD_DIR/wfb_rx_native"
 
+# ── Native wfb_tx (x86_64) for benchtop / lab use ───────────────────
+# Mirrors the cross build but links dynamically against system
+# libsodium and uses the same stub pcap.h (wfb_tx never calls libpcap;
+# the include is only there because wifibroadcast.hpp pulls it in).
+# Useful for testing TX behaviour against a host wfb_rx_native loop or
+# for driving an x86 ground station as a transmitter without flashing
+# a SigmaStar device.
+echo "  Building wfb_tx (native x86_64)..."
+NATIVE_TX_CFLAGS="$NATIVE_CFLAGS -I$WFB_DIR/src/stub"
+g++ $NATIVE_TX_CFLAGS -std=gnu++11 -c -o "$NATIVE_BUILD/tx_native.o" src/tx.cpp
+gcc $NATIVE_TX_CFLAGS -std=gnu99 -c -o "$NATIVE_BUILD/venc_ring_native.o" src/venc_ring.c
+g++ -o "$BUILD_DIR/wfb_tx_native" \
+    "$NATIVE_BUILD/tx_native.o" \
+    "$NATIVE_BUILD/zfex_native.o" \
+    "$NATIVE_BUILD/wfb_native.o" \
+    "$NATIVE_BUILD/venc_ring_native.o" \
+    -lrt -lsodium
+strip "$BUILD_DIR/wfb_tx_native"
+
 # ── Step 6: Build SHM diagnostic tools ───────────────────────────────
 
 echo "=== Building SHM tools ==="
@@ -237,7 +258,7 @@ echo ""
 echo "=== Build complete ==="
 echo ""
 ls -lh "$BUILD_DIR/wfb_tx" "$BUILD_DIR/wfb_keygen" "$BUILD_DIR/wfb_tx_cmd" \
-       "$BUILD_DIR/wfb_rx_native" \
+       "$BUILD_DIR/wfb_rx_native" "$BUILD_DIR/wfb_tx_native" \
        "$BUILD_DIR/shm_ring_stats" "$BUILD_DIR/shm_consumer_test"
 echo ""
 
@@ -274,4 +295,7 @@ else
     echo ""
     echo "Manual deploy (ground-station x86_64 native wfb_rx):"
     echo "  cp $BUILD_DIR/wfb_rx_native /wherever/you/run/wfb_rx"
+    echo ""
+    echo "Manual deploy (x86_64 native wfb_tx for benchtop / lab use):"
+    echo "  cp $BUILD_DIR/wfb_tx_native /wherever/you/run/wfb_tx"
 fi
