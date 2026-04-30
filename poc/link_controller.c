@@ -241,6 +241,15 @@ typedef struct {
 		float    bitrate_grace_s;
 		float    mcs_settle_s;
 
+		/* Lead time inserted between an MCS-down bitrate pre-drop (venc
+		 * HTTP write) and the deferred CMD_SET_RADIO that actually moves
+		 * wfb_tx to the lower MCS. Gives the encoder a few frames to
+		 * settle at the lower rate before the radio link can no longer
+		 * carry the old bitrate, preventing SHM/queue overflow during
+		 * the transition. MCS-up is unaffected (radio commits first,
+		 * bitrate rises on next stats tick). */
+		float    bitrate_lead_s;
+
 		/* Tick intervals */
 		float    subscribe_s;
 		float    radio_poll_s;
@@ -611,6 +620,13 @@ typedef struct {
 	int       k_down_pending_target;
 	uint64_t  k_up_pending_since_us;
 	int       k_up_pending_target;
+
+	/* MCS-down protection: while > now, bitrate_assert refuses *upward*
+	 * writes. Set when arming a pending SET_RADIO drop or when
+	 * commit_mcs_pre_drop_bitrate writes the safe lower bitrate. Prevents
+	 * an already-in-flight wfb_stats datagram (queued at the old high
+	 * MCS) from racing the pre-drop and pumping the bitrate back up. */
+	uint64_t  bitrate_up_lock_until_us;
 } Controller;
 
 /* Arm the post-change settling window (extending only). */
@@ -1079,6 +1095,20 @@ static void bitrate_assert(const RadioState *radio, Controller *ctrl,
 	bool payload_changed = (target_payload > 0 &&
 	                        target_payload != *last_written_payload);
 
+	/* During the post-MCS-down window the up-lock prevents stale
+	 * wfb_stats datagrams (queued at the old high MCS) from racing the
+	 * pre-drop and pumping bitrate back up. Downward writes are still
+	 * allowed (more conservative is fine). */
+	bool would_increase = (*last_written_kbps > 0 && target > *last_written_kbps);
+	bool up_locked = (ctrl->bitrate_up_lock_until_us != 0 &&
+	                  now < ctrl->bitrate_up_lock_until_us);
+	if (bitrate_changed && would_increase && up_locked) {
+		LOGV_FEC(cfg, "bitrate up-lock: suppress %ld -> %ld kbps for %.2fs more",
+		    *last_written_kbps, target,
+		    (double)(ctrl->bitrate_up_lock_until_us - now) / 1e6);
+		bitrate_changed = false;
+	}
+
 	LOGV_FEC(cfg, "bitrate: target=%ld last_written=%ld safe=%ld min=%ld max=%ld (phy=%.1f k/n=%d/%d) payload=%d clipped=%d pps_cap=%ld",
 	     target, *last_written_kbps, safe_kbps,
 	     cfg->fec.bitrate_min_kbps, cfg->fec.bitrate_max_kbps,
@@ -1371,6 +1401,118 @@ static int wfb_set_radio(const Config *cfg, const RadioBody *params)
 	if (n < (ssize_t)(sizeof(uint32_t) * 2)) return -1;
 	if (ntohl(resp.req_id) != req_id) return -1;
 	if (ntohl(resp.rc) != 0) return -1;
+	return 0;
+}
+
+/* ── MCS-down ordered-commit machinery ─────────────────────────────────
+ *
+ * MCS drops must be preceded by a venc bitrate drop, otherwise the
+ * encoder pumps frames that the new lower-rate radio link can no longer
+ * carry → SHM ring fills → frame drops. The flow:
+ *
+ *   1. commit_mcs_change() detects new_mcs < current_mcs.
+ *   2. commit_mcs_pre_drop_bitrate() synthesizes a future RadioState
+ *      with the new (lower) phy_mbps and runs bitrate_assert against it.
+ *      bitrate_assert writes the safe lower bitrate to venc immediately.
+ *   3. PendingMcsDown is armed with deadline = now + bitrate_lead_s.
+ *   4. The main-loop pending tick fires CMD_SET_RADIO at the deadline
+ *      and runs radio_apply_observation as if the change had been
+ *      synchronous.
+ *
+ * MCS-up keeps the existing semantics: SET_RADIO synchronously, bitrate
+ * lifts on the next wfb_stats tick. The asymmetry is intentional. */
+
+typedef struct {
+	bool      active;
+	uint64_t  deadline_us;
+	int       target_mcs;       /* for logging / cancel-replace decisions */
+	RadioBody pending_radio;    /* what to write at deadline */
+} PendingMcsDown;
+
+static void pending_mcs_clear(PendingMcsDown *p)
+{
+	p->active = false;
+	p->deadline_us = 0;
+	p->target_mcs = -1;
+}
+
+static void commit_mcs_pre_drop_bitrate(
+    const Config *cfg,
+    const RadioState *radio,
+    Controller *ctrl,
+    long *last_written_kbps,
+    int  *last_written_payload,
+    int new_mcs, uint64_t now)
+{
+	if (!cfg->fec.enabled) return;
+	if (!radio->valid) return;
+	if (!ctrl->have_current) return;
+
+	RadioState future = *radio;
+	future.mcs = new_mcs;
+	future.phy_mbps = phy_mbps(new_mcs, future.bandwidth, future.short_gi,
+	                           future.vht_mode, future.vht_nss);
+
+	/* Arm the up-lock BEFORE bitrate_assert so a re-entrant call can't
+	 * pump the bitrate back up. mcs_settle_s covers the full transition
+	 * window (lead + ~1 wfb_stats interval for stale datagrams to flush). */
+	uint64_t lock_end = now +
+	    (uint64_t)((cfg->fec.bitrate_lead_s + cfg->fec.mcs_settle_s) * 1e6f);
+	if (lock_end > ctrl->bitrate_up_lock_until_us)
+		ctrl->bitrate_up_lock_until_us = lock_end;
+
+	bitrate_assert(&future, ctrl, cfg, last_written_kbps,
+	               last_written_payload, now);
+}
+
+/* Returns:
+ *   0 = SET_RADIO sent synchronously and acked (caller updates radio_body).
+ *   1 = MCS-down deferred (pending armed, bitrate pre-dropped).
+ *  -1 = synchronous SET_RADIO send/ack failed (caller decides recovery).
+ *
+ * On return code 1 the caller must NOT update radio_body or last_emit_mcs;
+ * the main-loop pending tick handles that when the deadline fires. */
+static int commit_mcs_change(
+    const Config *cfg,
+    PendingMcsDown *pending,
+    const RadioBody *current_radio,
+    int new_mcs,
+    const RadioState *radio,
+    Controller *ctrl,
+    long *last_written_kbps,
+    int  *last_written_payload,
+    uint64_t now)
+{
+	int prev_mcs = (int)current_radio->mcs_index;
+	bool is_down = (new_mcs < prev_mcs);
+
+	RadioBody r = *current_radio;
+	r.mcs_index = (uint8_t)new_mcs;
+
+	if (is_down && cfg->fec.bitrate_lead_s > 0.0f && !cfg->dry_run) {
+		commit_mcs_pre_drop_bitrate(cfg, radio, ctrl,
+		    last_written_kbps, last_written_payload,
+		    new_mcs, now);
+		pending->active = true;
+		pending->deadline_us = now +
+		    (uint64_t)(cfg->fec.bitrate_lead_s * 1e6f);
+		pending->target_mcs = new_mcs;
+		pending->pending_radio = r;
+		LOG_MCS("ordered drop: bitrate pre-dropped, SET_RADIO mcs=%d->%d deferred %.0fms",
+		    prev_mcs, new_mcs, (double)(cfg->fec.bitrate_lead_s * 1000.0f));
+		return 1;
+	}
+
+	/* Sync path: MCS up, equal, dry-run, or zero lead time. Cancel any
+	 * stale pending — an up commit (or operator override) supersedes any
+	 * unfired drop. */
+	if (pending->active) {
+		LOGV_MCS(cfg, "ordered drop: cancel pending (target=%d) due to sync commit (new=%d)",
+		    pending->target_mcs, new_mcs);
+		pending_mcs_clear(pending);
+	}
+	if (cfg->dry_run) return 0;
+	if (wfb_set_radio(cfg, &r) != 0) return -1;
 	return 0;
 }
 
@@ -1781,6 +1923,7 @@ static const TunableDesc TUNABLES[] = {
 	{"fec.bitrate_tolerance",       SUB_FEC, TF_FLOAT, OFF_FEC(bitrate_tolerance),       0.0, 1.0,  "re-apply tolerance"},
 	{"fec.bitrate_grace_s",         SUB_FEC, TF_FLOAT, OFF_FEC(bitrate_grace_s),         0.0, 60.0, "post-bitrate-write FEC suppress"},
 	{"fec.mcs_settle_s",            SUB_FEC, TF_FLOAT, OFF_FEC(mcs_settle_s),            0.0, 60.0, "post-MCS-change FEC suppress"},
+	{"fec.bitrate_lead_s",          SUB_FEC, TF_FLOAT, OFF_FEC(bitrate_lead_s),          0.0, 5.0,  "MCS-down: lead time between bitrate pre-drop and SET_RADIO"},
 	{"fec.boost_s",                 SUB_FEC, TF_FLOAT, OFF_FEC(boost_s),                 0.0, 30.0, "parity boost duration"},
 	{"fec.boost_mult",              SUB_FEC, TF_FLOAT, OFF_FEC(boost_mult),              1.0, 5.0,  "(n-k) parity multiplier during boost"},
 	/* Payload sizing — payload_max is intentionally NOT live (startup
@@ -2017,6 +2160,12 @@ typedef struct {
 	uint32_t tr_packets_sent;
 	uint64_t tr_last_us;
 	uint32_t tr_fec_skipped;
+	/* Ordered MCS-down state: pending_drop_active means the bitrate has
+	 * already been pre-dropped and a deferred CMD_SET_RADIO is waiting
+	 * for `pending_drop_ms_remaining` ms before firing. */
+	bool     pending_drop_active;
+	int      pending_drop_target_mcs;
+	int      pending_drop_ms_remaining;
 } ApiSnapshot;
 
 static int append_score_json(char *buf, size_t cap, size_t pos,
@@ -2183,13 +2332,19 @@ static int append_mcs_json(char *buf, size_t cap, size_t pos,
 		"\"in_failsafe\":%s,\"recovery_streak\":%d,"
 		"\"pending_bucket\":%d,\"pending_streak\":%d,"
 		"\"commit_count\":%u,\"changes_in_window\":%d,"
-		"\"last_emit_mcs\":%d,\"rx_ant_age_s\":%.3f}",
+		"\"last_emit_mcs\":%d,\"rx_ant_age_s\":%.3f,"
+		"\"bitrate_lead_s\":%.3f,"
+		"\"pending_drop\":{\"active\":%s,\"target_mcs\":%d,\"ms_remaining\":%d}}",
 		s->cfg->mcs.enabled ? "true" : "false",
 		s->sel->current_bucket, s->sel->current_mcs,
 		s->sel->in_failsafe ? "true" : "false", s->sel->recovery_streak,
 		s->sel->pending_bucket, s->sel->pending_streak,
 		s->sel->commit_count, s->sel->changes_count,
-		s->last_emit_mcs, rx_age_s);
+		s->last_emit_mcs, rx_age_s,
+		(double)s->cfg->fec.bitrate_lead_s,
+		s->pending_drop_active ? "true" : "false",
+		s->pending_drop_target_mcs,
+		s->pending_drop_ms_remaining);
 	if (n < 0 || (size_t)n >= cap - pos) return -1;
 	return n;
 }
@@ -2826,6 +2981,7 @@ static void usage(const char *prog)
 		"  --bitrate-max N          bitrate ceiling in kbps (default 0 = unlimited)\n"
 		"  --bitrate-tol F          bitrate re-apply tolerance (default 0.15)\n"
 		"  --bitrate-grace F        post-bitrate-write FEC suppress (default 2.0)\n"
+		"  --bitrate-lead-s F       MCS-down: lead between bitrate pre-drop and SET_RADIO (default 0.05)\n"
 		"  --mcs-settle-s F         post-MCS-change FEC suppress (default 5.0)\n"
 		"  --boost-s F              parity boost duration (default 3.0)\n"
 		"  --boost-mult F           parity multiplier during boost (default 1.3)\n"
@@ -2979,6 +3135,7 @@ static void config_defaults(Config *c)
 	c->fec.bitrate_tolerance = 0.15f;
 	c->fec.bitrate_grace_s = 2.0f;
 	c->fec.mcs_settle_s    = 5.0f;
+	c->fec.bitrate_lead_s  = 0.05f;
 	c->fec.subscribe_s = 2.0f;
 	c->fec.radio_poll_s = 1.0f;
 	c->fec.wfb_stats_port = 0;
@@ -3050,7 +3207,7 @@ int main(int argc, char **argv)
 		OPT_K_HYST_UP, OPT_COOLDOWN_UP, OPT_K_DOWN_DWELL, OPT_K_UP_DWELL,
 		OPT_STARTUP_GRACE, OPT_SAFETY,
 		OPT_BITRATE_MIN, OPT_BITRATE_MAX, OPT_BITRATE_TOL, OPT_BITRATE_GRACE,
-		OPT_MCS_SETTLE, OPT_BOOST_S, OPT_BOOST_MULT,
+		OPT_BITRATE_LEAD, OPT_MCS_SETTLE, OPT_BOOST_S, OPT_BOOST_MULT,
 		OPT_MAX_PAYLOAD,
 		OPT_NO_SAFE_STARTUP, OPT_SAFE_STARTUP_BITRATE, OPT_SAFE_STARTUP_PAYLOAD,
 		/* mcs */
@@ -3085,6 +3242,7 @@ int main(int argc, char **argv)
 		{"bitrate-max",    required_argument, 0, OPT_BITRATE_MAX},
 		{"bitrate-tol",    required_argument, 0, OPT_BITRATE_TOL},
 		{"bitrate-grace",  required_argument, 0, OPT_BITRATE_GRACE},
+		{"bitrate-lead-s", required_argument, 0, OPT_BITRATE_LEAD},
 		{"mcs-settle-s",   required_argument, 0, OPT_MCS_SETTLE},
 		{"boost-s",        required_argument, 0, OPT_BOOST_S},
 		{"boost-mult",     required_argument, 0, OPT_BOOST_MULT},
@@ -3175,6 +3333,7 @@ int main(int argc, char **argv)
 		case OPT_BITRATE_MAX:   cfg.fec.bitrate_max_kbps = atol(optarg); break;
 		case OPT_BITRATE_TOL:   cfg.fec.bitrate_tolerance = (float)atof(optarg); break;
 		case OPT_BITRATE_GRACE: cfg.fec.bitrate_grace_s   = (float)atof(optarg); break;
+		case OPT_BITRATE_LEAD:  cfg.fec.bitrate_lead_s   = (float)atof(optarg); break;
 		case OPT_MCS_SETTLE:    cfg.fec.mcs_settle_s     = (float)atof(optarg); break;
 		case OPT_BOOST_S:       cfg.fec.boost_s          = (float)atof(optarg); break;
 		case OPT_BOOST_MULT:    cfg.fec.boost_mult       = (float)atof(optarg); break;
@@ -3375,22 +3534,9 @@ int main(int argc, char **argv)
 		}
 	}
 
-	/* Optional safety boot SET. */
-	if (cfg.mcs.enabled && cfg.mcs.start_low &&
-	    radio_body_valid && !cfg.dry_run) {
-		int target_mcs = mcs_for_bucket(0, &cfg);
-		if (radio_body.mcs_index != target_mcs) {
-			RadioBody r = radio_body;
-			r.mcs_index = (uint8_t)target_mcs;
-			if (wfb_set_radio(&cfg, &r) == 0) {
-				radio_body = r;
-				LOG_MCS("startup: forced mcs=%d (range[0]) per --start-low",
-				    target_mcs);
-			} else {
-				LOG_MCS("startup: --start-low SET failed");
-			}
-		}
-	}
+	/* --start-low is moved BELOW safe-startup so the bitrate is already
+	 * safe before the boot-time MCS drop. Otherwise the inherited high
+	 * bitrate would briefly outrun the new lower MCS. */
 
 	/* ── HTTP API ── */
 
@@ -3445,6 +3591,12 @@ int main(int argc, char **argv)
 	uint32_t last_transport_packets_sent = 0;
 	uint64_t last_transport_us = 0;
 	uint32_t fec_skipped_on_pressure = 0;
+
+	/* Ordered MCS-down state (see commit_mcs_change above). The deadline
+	 * fires `bitrate_lead_s` after the bitrate pre-drop and writes the
+	 * deferred CMD_SET_RADIO. */
+	PendingMcsDown pending_drop;
+	pending_mcs_clear(&pending_drop);
 
 	Selector sel;
 	selector_init(&sel);
@@ -3501,6 +3653,27 @@ int main(int argc, char **argv)
 		LOG_FEC("safe-startup: disabled (--no-safe-startup) — venc state inherited as-is");
 	}
 
+	/* Optional --start-low boot SET, deferred until after safe-startup so
+	 * the bitrate is already at the floor before the radio drops. The FEC
+	 * controller has no `have_current` yet, so the helper's pre-drop
+	 * bitrate write is a no-op — safe-startup covers that responsibility
+	 * here. We use the helper anyway for ordering consistency. */
+	if (cfg.mcs.enabled && cfg.mcs.start_low &&
+	    radio_body_valid && !cfg.dry_run) {
+		int target_mcs = mcs_for_bucket(0, &cfg);
+		if (radio_body.mcs_index != target_mcs) {
+			RadioBody r = radio_body;
+			r.mcs_index = (uint8_t)target_mcs;
+			if (wfb_set_radio(&cfg, &r) == 0) {
+				radio_body = r;
+				LOG_MCS("startup: forced mcs=%d (range[0]) per --start-low",
+				    target_mcs);
+			} else {
+				LOG_MCS("startup: --start-low SET failed");
+			}
+		}
+	}
+
 	/* ── Timers ── */
 
 	uint64_t next_subscribe_us = 0;
@@ -3514,6 +3687,46 @@ int main(int argc, char **argv)
 
 	while (!g_stop) {
 		uint64_t now = now_us();
+
+		/* --- Deferred MCS-down SET_RADIO ---
+		 * Fires `bitrate_lead_s` after a commit_mcs_change() armed an
+		 * ordered drop. By now the venc bitrate write has been applied
+		 * and the encoder has had time to spool down to the safe rate.
+		 * Failure here keeps `pending_drop.active` so the next tick
+		 * retries — same retry semantics as the pre-existing failsafe /
+		 * realign paths, which means this also opportunistically
+		 * recovers if wfb_tx blipped. */
+		if (pending_drop.active && now >= pending_drop.deadline_us) {
+			RadioBody r = pending_drop.pending_radio;
+			if (wfb_set_radio(&cfg, &r) == 0) {
+				radio_body = r;
+				last_emit_mcs = pending_drop.target_mcs;
+				radio_apply_observation(&radio, &fec_ctrl, &cfg,
+				    r.mcs_index, r.bandwidth, r.short_gi,
+				    r.stbc, r.ldpc, r.vht_mode, r.vht_nss,
+				    now, true);
+				if (mcs_sf_state) {
+					LOG_MCS("ordered drop: SET_RADIO recovered (mcs=%d)",
+					    pending_drop.target_mcs);
+					mcs_sf_state = 0;
+				}
+				LOG_MCS("ordered drop: SET_RADIO mcs=%d committed",
+				    pending_drop.target_mcs);
+				pending_mcs_clear(&pending_drop);
+			} else {
+				if (!mcs_sf_state ||
+				    mcs_sf_target_mcs != pending_drop.target_mcs) {
+					LOG_MCS("ordered drop: SET_RADIO mcs=%d send failed — retrying every tick until ack",
+					    pending_drop.target_mcs);
+					mcs_sf_state = 1;
+					mcs_sf_first_us = now;
+					mcs_sf_target_mcs = pending_drop.target_mcs;
+				}
+				/* Push deadline forward so we retry next iteration but
+				 * don't tight-loop SET_RADIO. */
+				pending_drop.deadline_us = now + 100000ULL;
+			}
+		}
 
 		/* --- FEC sidecar SUBSCRIBE keepalive ---
 		 * Pure datagram-level keepalive: venc treats us as subscribed
@@ -3594,14 +3807,14 @@ int main(int argc, char **argv)
 			int new_mcs = -1;
 			SelectDecision sd = selector_tick_no_data(&sel, &cfg, now, &new_mcs);
 			if (sd == SD_FAILSAFE && radio_body_valid && !cfg.dry_run) {
-				RadioBody r = radio_body;
-				r.mcs_index = (uint8_t)new_mcs;
-				if (wfb_set_radio(&cfg, &r) == 0) {
+				int rc = commit_mcs_change(&cfg, &pending_drop,
+				    &radio_body, new_mcs, &radio, &fec_ctrl,
+				    &last_written_kbps, &last_written_payload, now);
+				if (rc == 0) {
+					RadioBody r = radio_body;
+					r.mcs_index = (uint8_t)new_mcs;
 					radio_body = r;
 					last_emit_mcs = new_mcs;
-					/* Mirror into shared RadioState; flag from_self so the
-					 * fec subsystem arms its settle window without logging
-					 * an "external" change. */
 					radio_apply_observation(&radio, &fec_ctrl, &cfg,
 					    r.mcs_index, r.bandwidth, r.short_gi,
 					    r.stbc, r.ldpc, r.vht_mode, r.vht_nss,
@@ -3613,6 +3826,8 @@ int main(int argc, char **argv)
 						    (int)(((now - mcs_sf_first_us) / 1000ULL) % 1000));
 						mcs_sf_state = 0;
 					}
+				} else if (rc == 1) {
+					/* Deferred drop armed; pending tick will fire SET_RADIO. */
 				} else {
 					/* DELIBERATELY do NOT undo here. Stay in failsafe and
 					 * let the realign retry on the next datagram. */
@@ -3707,6 +3922,8 @@ int main(int argc, char **argv)
 		if (cfg.fec.enabled && next_subscribe_us > 0 && next_subscribe_us < deadline) deadline = next_subscribe_us;
 		if (cfg.fec.enabled && cfg.fec.wfb_stats_port == 0 &&
 		    next_radio_us > 0 && next_radio_us < deadline) deadline = next_radio_us;
+		if (pending_drop.active && pending_drop.deadline_us < deadline)
+			deadline = pending_drop.deadline_us;
 		int timeout_ms = 100;
 		if (deadline > now) {
 			uint64_t ahead_ms = (deadline - now) / 1000ULL;
@@ -3763,6 +3980,13 @@ int main(int argc, char **argv)
 				.tr_packets_sent         = last_transport_packets_sent,
 				.tr_last_us              = last_transport_us,
 				.tr_fec_skipped          = fec_skipped_on_pressure,
+				.pending_drop_active     = pending_drop.active,
+				.pending_drop_target_mcs = pending_drop.target_mcs,
+				.pending_drop_ms_remaining = pending_drop.active
+				    ? (int)((pending_drop.deadline_us > now_us())
+				            ? (pending_drop.deadline_us - now_us()) / 1000ULL
+				            : 0)
+				    : 0,
 			};
 			memcpy(snap.ant_avg, last_ant_avg, sizeof(snap.ant_avg));
 			for (int i = 0; i < API_MAX_CLIENTS; i++) {
@@ -3920,14 +4144,25 @@ int main(int argc, char **argv)
 					if (sel.current_bucket >= 0 && radio_body_valid &&
 					    !cfg.dry_run) {
 						int want = mcs_for_bucket(sel.current_bucket, &cfg);
-						if (want != (int)radio_body.mcs_index) {
+						/* If a deferred drop already targets this mcs, let
+						 * the pending tick handle it — avoid issuing a
+						 * duplicate SET_RADIO. */
+						bool covered_by_pending =
+						    pending_drop.active &&
+						    pending_drop.target_mcs == want;
+						if (want != (int)radio_body.mcs_index &&
+						    !covered_by_pending) {
 							if (!mcs_sf_state || mcs_sf_target_mcs != want) {
 								LOG_MCS("realign: bucket=%d want_mcs=%d wfb_mcs=%d",
 								    sel.current_bucket, want, radio_body.mcs_index);
 							}
-							RadioBody r2 = radio_body;
-							r2.mcs_index = (uint8_t)want;
-							if (wfb_set_radio(&cfg, &r2) == 0) {
+							int rc = commit_mcs_change(&cfg, &pending_drop,
+							    &radio_body, want, &radio, &fec_ctrl,
+							    &last_written_kbps, &last_written_payload,
+							    now_us());
+							if (rc == 0) {
+								RadioBody r2 = radio_body;
+								r2.mcs_index = (uint8_t)want;
 								radio_body = r2;
 								sel.current_mcs = want;
 								last_emit_mcs = want;
@@ -3942,6 +4177,14 @@ int main(int argc, char **argv)
 									    (int)(((now_us() - mcs_sf_first_us) / 1000ULL) % 1000));
 									mcs_sf_state = 0;
 								}
+							} else if (rc == 1) {
+								/* Deferred drop. The selector's bucket
+								 * mapping needs to reflect the target so
+								 * subsequent decisions stay coherent;
+								 * sel.current_mcs is updated here even
+								 * though radio_body waits for the
+								 * pending tick. */
+								sel.current_mcs = want;
 							} else {
 								if (!mcs_sf_state || mcs_sf_target_mcs != want) {
 									LOG_MCS("realign: SET_RADIO failed (mcs=%d) — retrying silently until recovery",
@@ -3983,9 +4226,10 @@ int main(int argc, char **argv)
 						continue;
 					}
 				}
-				RadioBody r = radio_body;
-				r.mcs_index = (uint8_t)new_mcs;
-				if (wfb_set_radio(&cfg, &r) != 0) {
+				int rc = commit_mcs_change(&cfg, &pending_drop,
+				    &radio_body, new_mcs, &radio, &fec_ctrl,
+				    &last_written_kbps, &last_written_payload, now_us());
+				if (rc < 0) {
 					sel = sel_snap;
 					if (!mcs_sf_state || mcs_sf_target_mcs != new_mcs) {
 						LOG_MCS("SET_RADIO failed (selector wanted mcs=%d, wfb_tx still %d) — undoing commit, retrying silently until recovery",
@@ -3996,6 +4240,13 @@ int main(int argc, char **argv)
 					}
 					continue;
 				}
+				if (rc == 1) {
+					/* Deferred MCS-down. The selector commit stands; the
+					 * pending tick will write SET_RADIO and run
+					 * radio_apply_observation when bitrate_lead_s elapses. */
+					continue;
+				}
+				/* rc == 0: synchronous commit (MCS up or equal). */
 				if (mcs_sf_state) {
 					LOG_MCS("SET_RADIO recovered (mcs=%d, %d.%03ds since first failure)",
 					    new_mcs,
@@ -4006,6 +4257,8 @@ int main(int argc, char **argv)
 				/* Read back so subsequent SETs reflect what wfb_tx
 				 * actually latched. On read-back failure keep optimistic
 				 * cache (the SET acked rc=0). */
+				RadioBody r = radio_body;
+				r.mcs_index = (uint8_t)new_mcs;
 				RadioBody fresh;
 				if (wfb_get_radio(&cfg, &fresh) == 0) radio_body = fresh;
 				else                                   radio_body = r;
