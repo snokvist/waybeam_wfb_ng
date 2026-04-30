@@ -104,6 +104,7 @@ main{padding:12px;overflow:auto;height:calc(100vh - 86px)}
       <div class="card"><h3>MCS bucket</h3><div class="v" id="c-mcs">—</div><div class="sub" id="c-mcs-sub">—</div></div>
       <div class="card"><h3>Effective RSSI</h3><div class="v" id="c-rssi">—</div><div class="sub" id="c-rssi-sub">—</div></div>
       <div class="card"><h3>Loss</h3><div class="v" id="c-loss">—</div><div class="sub" id="c-loss-sub">—</div></div>
+      <div class="card"><h3>Diversity</h3><div class="v" id="c-div">—</div><div class="sub" id="c-div-sub">—</div></div>
       <div class="card"><h3>Headroom</h3><div class="v" id="c-headroom">—</div><div class="sub" id="c-headroom-sub">—</div></div>
       <div class="card"><h3>Payload</h3><div class="v" id="c-payload">—</div><div class="sub" id="c-payload-sub">—</div></div>
     </div>
@@ -307,6 +308,29 @@ function renderStatus(s) {
     $("#c-loss").textContent = lp.toFixed(2) + "%";
     $("#c-loss").className = "v " + (lp > 5 ? "bad" : lp > 0.5 ? "warn" : "ok");
     $("#c-loss-sub").textContent = "fec_recov " + ((score.recov_ratio||0)*100).toFixed(1) + "%";
+  }
+
+  // Diversity — redundant-copies-per-unique-fragment (count_p_diversity /
+  // count_p_uniq).  Two adapters fully overlapping = 100%; N adapters fully
+  // overlapping = (N-1) × 100%.  Distinct from fec_recov: high diversity
+  // means a second/third adapter routinely saved us without needing parity.
+  // adapter_count = -1 → older RX without the patch.
+  if ("diversity_ratio" in score) {
+    const dv = (score.diversity_ratio || 0) * 100;
+    const ac = ("adapter_count" in score) ? score.adapter_count : -1;
+    $("#c-div").textContent = dv.toFixed(1) + "%";
+    /* Colour: ok when ≥1 redundant copy on average; warn for partial
+     * overlap; neutral for single-adapter setups. */
+    $("#c-div").className = "v " + (dv >= 95 ? "ok" : dv > 0 ? "warn" : "");
+    let sub;
+    if (ac > 0) {
+      sub = ac + (ac === 1 ? " adapter" : " adapters") + " active";
+    } else if (dv > 0) {
+      sub = "redundant coverage";
+    } else {
+      sub = "single adapter / no overlap";
+    }
+    $("#c-div-sub").textContent = sub;
   }
 
   // Headroom — actionable derived value: how much link budget is left

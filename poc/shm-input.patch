@@ -1,8 +1,8 @@
 diff --git a/src/rx.cpp b/src/rx.cpp
-index 1603b6e..ab40814 100644
+index 1603b6e..136d16d 100644
 --- a/src/rx.cpp
 +++ b/src/rx.cpp
-@@ -52,6 +52,95 @@ extern "C"
+@@ -52,6 +52,101 @@ extern "C"
  
  using namespace std;
  
@@ -23,7 +23,13 @@ index 1603b6e..ab40814 100644
 +//            "snr":{"min":...,"avg":...,"max":...}}, ...],
 +//    "pkt":{"all":..., "bytes":..., "dec_err":..., "session":...,
 +//           "data":..., "uniq":..., "fec_recovered":..., "lost":...,
-+//           "bad":..., "outgoing":..., "outgoing_bytes":...}}
++//           "bad":..., "outgoing":..., "outgoing_bytes":...,
++//           "diversity":...}}
++//
++// "diversity" is a multi-adapter overlap counter: increments when the same
++// data_nonce arrives on a second wlan_idx while count_p_uniq still holds it.
++// "fec_recovered" is parity-rebuild count from apply_fec(); the two are
++// independent (see Aggregator::process_packet for the increment sites).
 +//
 +// Best-effort: sendto() errors are silently ignored. Init failures
 +// log once and leave the feature disabled — wfb_rx continues normally.
@@ -98,15 +104,58 @@ index 1603b6e..ab40814 100644
  
  Receiver::Receiver(const char *wlan, int wlan_idx, uint32_t channel_id, BaseAggregator *agg, int rcv_buf_size) : wlan_idx(wlan_idx), agg(agg)
  {
-@@ -270,6 +359,7 @@ void Receiver::loop_iter(void)
+@@ -259,6 +354,16 @@ void Receiver::loop_iter(void)
+         {
+             agg->process_packet(pkt + sizeof(ieee80211_header), pktlen - sizeof(ieee80211_header),
+                                 wlan_idx, antenna, rssi, noise, freq, mcs_index, bandwidth, NULL);
++            /* Round-robin pcap dispatch: yield to the next adapter after a
++             * single accepted packet so multi-adapter flows interleave at
++             * the Aggregator.  Without this, a bursty pcap drain on one
++             * adapter can push has_fragments past fec_k (with parity from
++             * adapter A) before the missing data slot arrives in adapter
++             * B's still-unread queue, triggering apply_fec unnecessarily
++             * and inflating count_p_fec_recovered.  Bad-FCS / short-pkt
++             * paths still `continue` to drain corrupt frames without
++             * yielding — they don't affect FEC bookkeeping. */
++            break;
+         } else {
+             WFB_ERR("Short packet (ieee header)\n");
+             continue;
+@@ -270,6 +375,7 @@ void Receiver::loop_iter(void)
  Aggregator::Aggregator(const string &keypair, uint64_t epoch, uint32_t channel_id) : \
      count_p_all(0), count_b_all(0), count_p_dec_err(0), count_p_session(0), count_p_data(0), count_p_fec_recovered(0),
      count_p_lost(0), count_p_bad(0), count_p_override(0), count_p_outgoing(0), count_b_outgoing(0),
-+    count_p_mode_mismatch(0),
++    count_p_mode_mismatch(0), count_p_diversity(0), wlan_idx_mask(0),
      fec_p(NULL), fec_k(-1), fec_n(-1), seq(0), rx_ring{}, rx_ring_front(0), rx_ring_alloc(0),
      last_known_block((uint64_t)-1), epoch(epoch), channel_id(channel_id)
  {
-@@ -518,6 +608,78 @@ void Aggregator::dump_stats(void)
+@@ -498,14 +604,23 @@ void Aggregator::dump_stats(void)
+                 it->second.snr_min, it->second.snr_sum / it->second.count_all, it->second.snr_max);
+     }
+ 
+-    IPC_MSG("%" PRIu64 "\tPKT\t%u:%u:%u:%u:%u:%u:%u:%u:%u:%u:%u\n", ts,
++    /* PKT line schema (colon-separated):
++     *   0:count_p_all  1:count_b_all  2:count_p_dec_err  3:count_p_session
++     *   4:count_p_data 5:count_p_uniq 6:count_p_fec_recovered  7:count_p_lost
++     *   8:count_p_bad  9:count_p_outgoing 10:count_b_outgoing 11:count_p_diversity
++     * Fields 11 (diversity) and 12 (adapters) were appended at the end so
++     * existing parsers that read the first 11 fields by index continue to
++     * work unchanged.  adapters = popcount(wlan_idx_mask). */
++    IPC_MSG("%" PRIu64 "\tPKT\t%u:%u:%u:%u:%u:%u:%u:%u:%u:%u:%u:%u:%u\n", ts,
+             count_p_all, count_b_all,                    // incoming
+             count_p_dec_err,                             // decryption
+             count_p_session, count_p_data,               // classification
+             (uint32_t)count_p_uniq.size(),               // unique check
+             count_p_fec_recovered, count_p_lost,         // fec recovering
+             count_p_bad,                                 // internal errors
+-            count_p_outgoing, count_b_outgoing);         // outgoing
++            count_p_outgoing, count_b_outgoing,          // outgoing
++            count_p_diversity,                           // diversity overlap
++            (uint32_t)__builtin_popcount(wlan_idx_mask));// adapters seen
+     IPC_MSG_SEND();
+ 
+     if(count_p_override)
+@@ -518,6 +633,89 @@ void Aggregator::dump_stats(void)
          WFB_ERR("%u packets lost\n", count_p_lost);
      }
  
@@ -165,16 +214,27 @@ index 1603b6e..ab40814 100644
 +
 +        if (ok)
 +        {
++            // mode_mismatch surfaces a -x flag disagreement between TX and
++            // RX without requiring stdout/IPC attachment.  Programmatic
++            // consumers (link_controller, fec_controller) can flip a UI
++            // warning when this counter is non-zero.  "adapters" is the
++            // popcount of wlan_idx_mask — distinct adapters that delivered
++            // ≥1 data fragment this interval.
++            uint32_t adapters_now = (uint32_t)__builtin_popcount(wlan_idx_mask);
 +            n = snprintf(dgram + pos, sizeof(dgram) - pos,
 +                         "],\"pkt\":{\"all\":%u,\"bytes\":%u,\"dec_err\":%u,"
 +                         "\"session\":%u,\"data\":%u,\"uniq\":%u,"
 +                         "\"fec_recovered\":%u,\"lost\":%u,\"bad\":%u,"
-+                         "\"outgoing\":%u,\"outgoing_bytes\":%u}}\n",
++                         "\"outgoing\":%u,\"outgoing_bytes\":%u,"
++                         "\"diversity\":%u,\"mode_mismatch\":%u,"
++                         "\"adapters\":%u}}\n",
 +                         count_p_all, count_b_all, count_p_dec_err,
 +                         count_p_session, count_p_data,
 +                         (uint32_t)count_p_uniq.size(),
 +                         count_p_fec_recovered, count_p_lost, count_p_bad,
-+                         count_p_outgoing, count_b_outgoing);
++                         count_p_outgoing, count_b_outgoing,
++                         count_p_diversity, count_p_mode_mismatch,
++                         adapters_now);
 +            if (n < 0 || n >= (int)sizeof(dgram) - pos) ok = false;
 +            else pos += n;
 +        }
@@ -185,7 +245,7 @@ index 1603b6e..ab40814 100644
      clear_stats();
  }
  
-@@ -592,6 +754,10 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
+@@ -592,6 +790,10 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
      switch(buf[0])
      {
      case WFB_PACKET_DATA:
@@ -196,7 +256,7 @@ index 1603b6e..ab40814 100644
          if(size < sizeof(wblock_hdr_t) + crypto_aead_chacha20poly1305_ABYTES + sizeof(wpacket_hdr_t))
          {
              WFB_ERR("Short packet (fec header)\n");
-@@ -600,6 +766,18 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
+@@ -600,6 +802,18 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
          }
          break;
  
@@ -215,7 +275,7 @@ index 1603b6e..ab40814 100644
      case WFB_PACKET_SESSION:
          new_session_data = (wsession_data_t*)session_tmp;
  
-@@ -714,16 +892,31 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
+@@ -714,19 +928,40 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
      unsigned long long decrypted_len;
      wblock_hdr_t *block_hdr = (wblock_hdr_t*)buf;
  
@@ -256,7 +316,33 @@ index 1603b6e..ab40814 100644
      }
  
      count_p_data += 1;
-@@ -745,6 +938,18 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
++    /* Track which adapters delivered ≥1 accepted data fragment this interval.
++     * popcount(wlan_idx_mask) at dump_stats time = "adapters currently
++     * receiving".  Guarded for wlan_idx >= 32 to keep the mask 32-bit; in
++     * practice wfb-ng has well under 32 adapters per host. */
++    if (wlan_idx < 32)
++        wlan_idx_mask |= (1u << wlan_idx);
+     log_rssi(sockaddr, wlan_idx, antenna, rssi, noise, freq, mcs_index, bandwidth);
+ 
+     assert(decrypted_len >= sizeof(wpacket_hdr_t));
+@@ -735,7 +970,15 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
+     uint64_t block_idx = be64toh(block_hdr->data_nonce) >> 8;
+     uint8_t fragment_idx = (uint8_t)(be64toh(block_hdr->data_nonce) & 0xff);
+ 
+-    count_p_uniq.insert(be64toh(block_hdr->data_nonce));
++    /* set::insert returns (iterator, inserted_bool).  When inserted_bool is
++     * false the same data_nonce was already in the dedup set — i.e. this
++     * fragment arrived on a second adapter.  That's a diversity save: no
++     * FEC parity was needed because two adapters independently received
++     * the original fragment.  Tracked separately from count_p_fec_recovered. */
++    if (!count_p_uniq.insert(be64toh(block_hdr->data_nonce)).second)
++    {
++        count_p_diversity += 1;
++    }
+ 
+     // Should never happend due to generating new session key on tx side
+     if (block_idx > MAX_BLOCK_IDX)
+@@ -745,6 +988,19 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
          return;
      }
  
@@ -266,16 +352,57 @@ index 1603b6e..ab40814 100644
 +    // encrypt mode the decrypt above already rejected these; in plaintext
 +    // mode we need this guard explicitly or every pre-session fragment
 +    // hits the fragment_idx >= fec_n check below with a misleading error.
++    // Don't bump count_p_bad — that counter is reserved for actual protocol
++    // errors (oversize, fragment_idx out of range, etc).
 +    if (fec_n <= 0)
 +    {
-+        count_p_bad += 1;
 +        return;
 +    }
 +
      if (fragment_idx >= fec_n)
      {
          WFB_ERR("Invalid fragment_idx: %d\n", fragment_idx);
-@@ -1147,8 +1352,10 @@ int main(int argc, char* const *argv)
+@@ -825,17 +1081,37 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
+                 //Recover missed fragments using FEC
+                 apply_fec(ring_idx);
+ 
+-                // Count total number of recovered fragments
++                /* Count recovered slots — but skip synthetic FEC_ONLY slots
++                 * that close_block_early wrote on the TX side.  Those slots
++                 * carry zero payload + flags=WFB_PACKET_FEC_ONLY; they exist
++                 * only so the RX has fec_k inputs for the FEC decode and are
++                 * suppressed at send_packet anyway.  Counting them here
++                 * inflates fec_recovered by (fec_k - actual_k) on every
++                 * frame-boundary block, which makes the counter useless as
++                 * a "real-loss compensated by parity" metric — particularly
++                 * for the multi-adapter case where the user expects
++                 * diversity to drive it toward zero. */
+                 for(; f_idx < fec_k; f_idx++)
+                 {
+                     if(! p->fragment_map[f_idx])
+                     {
+-                        fec_count += 1;
++                        wpacket_hdr_t *hdr = (wpacket_hdr_t*)p->fragments[f_idx];
++                        if (!(hdr->flags & WFB_PACKET_FEC_ONLY))
++                            fec_count += 1;
+                     }
+                 }
+ 
+                 if(fec_count)
+                 {
++                    /* count_p_fec_recovered tracks fragments rebuilt from
++                     * Reed-Solomon parity within a single FEC block. It is
++                     * NOT the same as diversity reception: when the same
++                     * fragment arrives on two adapters wfb_rx dedupes via
++                     * count_p_uniq and never enters this branch, so a
++                     * link with diversity-only recovery shows
++                     * fec_recovered = 0.  The webui's "fec_recov %" tile
++                     * follows this counter and therefore reflects parity
++                     * usage, not multi-adapter overlap. */
+                     count_p_fec_recovered += fec_count;
+                     WFB_DBG("FEC recovered %u packets\n", fec_count);
+                 }
+@@ -1147,8 +1423,10 @@ int main(int argc, char* const *argv)
  
      string keypair = "rx.key";
      string unix_socket = "";
@@ -287,7 +414,7 @@ index 1603b6e..ab40814 100644
          switch (opt) {
          case 'K':
              keypair = optarg;
-@@ -1187,15 +1394,35 @@ int main(int argc, char* const *argv)
+@@ -1187,15 +1465,35 @@ int main(int argc, char* const *argv)
          case 'e':
              epoch = atoll(optarg);
              break;
@@ -327,7 +454,7 @@ index 1603b6e..ab40814 100644
              WFB_INFO("WFB-ng version %s, FEC: %s\n", WFB_VERSION, zfex_opt);
              WFB_INFO("WFB-ng home page: <http://wfb-ng.org>\n");
              exit(1);
-@@ -1223,6 +1450,9 @@ int main(int argc, char* const *argv)
+@@ -1223,6 +1521,9 @@ int main(int argc, char* const *argv)
          return 1;
      }
  
@@ -337,7 +464,7 @@ index 1603b6e..ab40814 100644
      try
      {
          uint32_t channel_id = (link_id << 8) + radio_port;
-@@ -1239,21 +1469,41 @@ int main(int argc, char* const *argv)
+@@ -1239,21 +1540,41 @@ int main(int argc, char* const *argv)
  
          unique_ptr<BaseAggregator> agg;
  
@@ -382,7 +509,7 @@ index 1603b6e..ab40814 100644
              break;
  
 diff --git a/src/rx.hpp b/src/rx.hpp
-index 856248e..d93fcee 100644
+index 856248e..18858b9 100644
 --- a/src/rx.hpp
 +++ b/src/rx.hpp
 @@ -179,6 +179,14 @@ public:
@@ -400,15 +527,17 @@ index 856248e..d93fcee 100644
      // Make stats public for android userspace receiver
      void clear_stats(void)
      {
-@@ -195,6 +203,7 @@ public:
+@@ -195,6 +203,9 @@ public:
          count_p_override = 0;
          count_p_outgoing = 0;
          count_b_outgoing = 0;
 +        count_p_mode_mismatch = 0;
++        count_p_diversity = 0;
++        wlan_idx_mask = 0;
      }
  
      rx_antenna_stat_t antenna_stat;
-@@ -210,6 +219,10 @@ public:
+@@ -210,6 +221,22 @@ public:
      uint32_t count_p_override;
      uint32_t count_p_outgoing;
      uint32_t count_b_outgoing;
@@ -416,10 +545,22 @@ index 856248e..d93fcee 100644
 +    // disagrees with the -x startup setting.  Surfaces mode-mismatch deploys
 +    // without triggering per-packet error logs.
 +    uint32_t count_p_mode_mismatch;
++    // Diversity overlap: bumped when the same data_nonce arrives on a second
++    // (or later) adapter, i.e. count_p_uniq.insert() reported the value was
++    // already present.  Independent from count_p_fec_recovered, which tracks
++    // Reed-Solomon parity rebuilds inside a single block.  Ratio is
++    // diversity / uniq, normalised so that two adapters fully overlapping
++    // reads as 100% (= one redundant copy per unique fragment).  N adapters
++    // with full overlap reads as (N-1) * 100%.
++    uint32_t count_p_diversity;
++    // Bitmap of wlan_idx values that produced ≥1 accepted data fragment in
++    // the current log interval.  popcount = "adapters currently receiving".
++    // 32 bits is plenty — wfb-ng caps wlans well below this in practice.
++    uint32_t wlan_idx_mask;
  
  protected:
      virtual void send_to_socket(const uint8_t *payload, uint16_t packet_size) = 0;
-@@ -247,6 +260,9 @@ private:
+@@ -247,6 +274,9 @@ private:
      uint8_t tx_publickey[crypto_box_PUBLICKEYBYTES];
      uint8_t session_key[crypto_aead_chacha20poly1305_KEYBYTES];
  
@@ -430,7 +571,7 @@ index 856248e..d93fcee 100644
      PacketLossListener* packet_loss_listener_ = nullptr;
  };
 diff --git a/src/tx.cpp b/src/tx.cpp
-index 0dec131..0998c69 100644
+index 0dec131..dad5e39 100644
 --- a/src/tx.cpp
 +++ b/src/tx.cpp
 @@ -29,6 +29,7 @@
@@ -641,7 +782,8 @@ index 0dec131..0998c69 100644
 -                                             (uint8_t*)block_hdr, sizeof(wblock_hdr_t),
 -                                             NULL, (uint8_t*)(&(block_hdr->data_nonce)), session_key) < 0)
 +    if (encrypt_data)
-+    {
+     {
+-        throw runtime_error("Unable to encrypt packet!");
 +        // AEAD: ChaCha20-Poly1305 encrypts plaintext + appends 16 B tag.
 +        if (crypto_aead_chacha20poly1305_encrypt(ciphertext + sizeof(wblock_hdr_t), &ciphertext_len,
 +                                                 block[fragment_idx], packet_size,
@@ -652,8 +794,7 @@ index 0dec131..0998c69 100644
 +        }
 +    }
 +    else
-     {
--        throw runtime_error("Unable to encrypt packet!");
++    {
 +        // Plaintext: copy the block slot directly.  No tag, no MAC.  RX
 +        // reads it as-is.  Saves ABYTES (16) on wire + ChaCha20 CPU.
 +        memcpy(ciphertext + sizeof(wblock_hdr_t), block[fragment_idx], packet_size);
@@ -1282,9 +1423,9 @@ index 0dec131..0998c69 100644
      int control_fd = open_control_fd(control_port);
 -    data_source(t, rx_fd, control_fd, fec_timeout, mirror, log_interval);
 +    data_source(t, rx_fd, control_fd, fec_timeout, mirror, log_interval, NULL, mbit_close_enable, parity_ratio_q8, encrypt_data);
- }
- 
- 
++}
++
++
 +// --- SHM ring input mode ---
 +void local_loop_shm(int argc, char* const* argv, int optind, int log_interval,
 +                    const char *shm_name, int debug_port, int k, int n, const string &keypair,
@@ -1327,10 +1468,10 @@ index 0dec131..0998c69 100644
 +        venc_ring_destroy(g_shm_ring);
 +        g_shm_ring = NULL;
 +    }
-+}
+ }
 +// --- end SHM ring input mode ---
-+
-+
+ 
+ 
  void distributor_loop(int argc, char* const* argv, int optind, int rcv_buf, int log_interval,
                        int udp_port, int k, int n, const string &keypair, int fec_timeout,
                        uint64_t epoch, uint32_t channel_id, uint32_t fec_delay, bool use_qdisc, uint32_t fwmark,
@@ -1392,7 +1533,42 @@ index 0dec131..0998c69 100644
          switch (opt) {
          case 'I':
              tx_mode = INJECTOR;
-@@ -1814,22 +2549,84 @@ int main(int argc, char * const *argv)
+@@ -1710,11 +2445,32 @@ int main(int argc, char * const *argv)
+             keypair = optarg;
+             break;
+         case 'k':
+-            k = atoi(optarg);
++        {
++            /* Strict parse — atoi("abc")==0 silently produces fec_k=0,
++             * which then trips an assert (or, with NDEBUG, walks off the
++             * end of fec_p == NULL inside zfex).  Reject up front. */
++            char *endp;
++            long v = strtol(optarg, &endp, 10);
++            if (*endp != '\0' || endp == optarg || v < 1 || v > 255)
++            {
++                WFB_ERR("-k must be an integer in 1..255\n");
++                exit(1);
++            }
++            k = (uint8_t)v;
+             break;
++        }
+         case 'n':
+-            n = atoi(optarg);
++        {
++            char *endp;
++            long v = strtol(optarg, &endp, 10);
++            if (*endp != '\0' || endp == optarg || v < 1 || v > 255)
++            {
++                WFB_ERR("-n must be an integer in 1..255\n");
++                exit(1);
++            }
++            n = (uint8_t)v;
+             break;
++        }
+         case 'u':
+             udp_port = atoi(optarg);
+             break;
+@@ -1814,33 +2570,121 @@ int main(int argc, char * const *argv)
              inject_retry_delay = atoi(optarg);
              break;
  
@@ -1452,6 +1628,16 @@ index 0dec131..0998c69 100644
          default: /* '?' */
          show_usage:
 -            WFB_INFO("Local TX: %s [-K tx_key] [-k RS_K] [-n RS_N] { [-u udp_port] | [-U unix_socket] } [-R rcv_buf] [-p radio_port]\n"
++        {
++            char parity_ratio_q8_buf[32];
++            const char *parity_ratio_q8_label;
++            if (parity_ratio_q8 < 0) {
++                parity_ratio_q8_label = "auto";
++            } else {
++                snprintf(parity_ratio_q8_buf, sizeof(parity_ratio_q8_buf),
++                         "%.2f", parity_ratio_q8 / 256.0);
++                parity_ratio_q8_label = parity_ratio_q8_buf;
++            }
 +            WFB_INFO("Local TX: %s [-K tx_key] [-k RS_K] [-n RS_N] { [-u udp_port] | [-U unix_socket] | [-H shm_name] } [-R rcv_buf] [-p radio_port]\n"
                       "             [-F fec_delay] [-B bandwidth] [-G guard_interval] [-S stbc] [-L ldpc] [-M mcs_index] [-N VHT_NSS]\n"
                       "             [-T fec_timeout] [-l log_interval] [-e epoch] [-i link_id] [-f { data | rts }] [-m] [-V] [-Q]\n"
@@ -1472,17 +1658,44 @@ index 0dec131..0998c69 100644
 -                     keypair.c_str(), k, n, fec_delay, udp_port, link_id, radio_port, epoch, bandwidth, short_gi ? "short" : "long", stbc, ldpc, mcs_index, vht_nss, vht_mode, fec_timeout, log_interval, fwmark, control_port, inject_retries, inject_retry_delay);
 +            WFB_INFO("\nM-bit FEC close / AEAD options:\n"
 +                     "  -b 0|1       enable RTP M-bit FEC-block close (1=on, default)\n"
-+                     "  -r RATIO     partial-block parity:data (float, default %.2f; set to (n-k)/k for proportional)\n"
++                     "  -r RATIO     partial-block parity:data (float, default %s; set to (n-k)/k for proportional)\n"
 +                     "  -x           disable per-fragment AEAD (emit WFB_PACKET_DATA_PLAIN; session still signed)\n"
 +                     "  Examples: -k 8 -n 12 -r 0.5  (default, typical)\n"
 +                     "            -k 6 -n 18 -r 2.0  (heavy FEC)\n",
-+                     parity_ratio_q8 / 256.0);
-+            WFB_INFO("Default: K='%s', k=%d, n=%d, fec_delay=%u [us], udp_port=%d, link_id=0x%06x, radio_port=%u, epoch=%" PRIu64 ", bandwidth=%d guard_interval=%s stbc=%d ldpc=%d mcs_index=%d vht_nss=%d, vht_mode=%d, fec_timeout=%d, log_interval=%d, rcv_buf=system_default, snd_buf=system_default, frame_type=data, mirror=false, use_qdisc=false, fwmark=%u, control_port=%d, inject_retries=%u, inject_retry_delay=%u, mbit_close=%d, parity_ratio=%.2f, aead=%s\n",
-+                     keypair.c_str(), k, n, fec_delay, udp_port, link_id, radio_port, epoch, bandwidth, short_gi ? "short" : "long", stbc, ldpc, mcs_index, vht_nss, vht_mode, fec_timeout, log_interval, fwmark, control_port, inject_retries, inject_retry_delay, mbit_close_enable, parity_ratio_q8 / 256.0, encrypt_data ? "on" : "off");
++                     /* Sentinel -1 means "auto-scale (n-k)/k from -k/-n";
++                      * a non-negative value is explicit Q8.8.  Format the
++                      * label out of band to avoid the misleading
++                      * "default -0.00" the raw division produced. */
++                     parity_ratio_q8_label);
++            WFB_INFO("Default: K='%s', k=%d, n=%d, fec_delay=%u [us], udp_port=%d, link_id=0x%06x, radio_port=%u, epoch=%" PRIu64 ", bandwidth=%d guard_interval=%s stbc=%d ldpc=%d mcs_index=%d vht_nss=%d, vht_mode=%d, fec_timeout=%d, log_interval=%d, rcv_buf=system_default, snd_buf=system_default, frame_type=data, mirror=false, use_qdisc=false, fwmark=%u, control_port=%d, inject_retries=%u, inject_retry_delay=%u, mbit_close=%d, parity_ratio=%s, aead=%s\n",
++                     keypair.c_str(), k, n, fec_delay, udp_port, link_id, radio_port, epoch, bandwidth, short_gi ? "short" : "long", stbc, ldpc, mcs_index, vht_nss, vht_mode, fec_timeout, log_interval, fwmark, control_port, inject_retries, inject_retry_delay, mbit_close_enable, parity_ratio_q8_label, encrypt_data ? "on" : "off");
              WFB_INFO("Radio MTU: %lu\n", (unsigned long)MAX_PAYLOAD_SIZE);
              WFB_INFO("WFB-ng version %s, FEC: %s\n", WFB_VERSION, zfex_opt);
              WFB_INFO("WFB-ng home page: <http://wfb-ng.org>\n");
-@@ -1862,11 +2659,30 @@ int main(int argc, char * const *argv)
+             exit(1);
+         }
++        }
+     }
+ 
+     if (optind >= argc) {
+         goto show_usage;
+     }
+ 
++    /* Final sanity on -k / -n.  zfex requires k <= n, n < 256 (each parity
++     * index fits in a byte).  Caught here so the operator gets a clear
++     * message rather than an abort() from the asserts inside init_session
++     * (or, with NDEBUG, a NULL-fec_p crash on the first packet). */
++    if (k > n || n < 1 || k < 1)
++    {
++        WFB_ERR("Invalid FEC params: -k=%u -n=%u (require 1 <= k <= n <= 255)\n",
++                (unsigned)k, (unsigned)n);
++        exit(1);
++    }
++
+     {
+         int fd;
+         int c;
+@@ -1862,11 +2706,30 @@ int main(int argc, char * const *argv)
          return 1;
      }
  
@@ -1513,7 +1726,7 @@ index 0dec131..0998c69 100644
          switch(tx_mode)
          {
          case INJECTOR:
-@@ -1880,7 +2696,17 @@ int main(int argc, char * const *argv)
+@@ -1880,7 +2743,17 @@ int main(int argc, char * const *argv)
                                  unix_socket, debug_port, k, n, keypair, fec_timeout,
                                  epoch, channel_id, fec_delay, use_qdisc, fwmark,
                                  radiotap_header, frame_type, control_port, mirror,
@@ -1532,7 +1745,7 @@ index 0dec131..0998c69 100644
              }
              else
              {
-@@ -1888,7 +2714,8 @@ int main(int argc, char * const *argv)
+@@ -1888,7 +2761,8 @@ int main(int argc, char * const *argv)
                                 udp_port, debug_port, k, n, keypair, fec_timeout,
                                 epoch, channel_id, fec_delay, use_qdisc, fwmark,
                                 radiotap_header, frame_type, control_port, mirror,
@@ -1542,7 +1755,7 @@ index 0dec131..0998c69 100644
              }
              break;
  
-@@ -1899,7 +2726,7 @@ int main(int argc, char * const *argv)
+@@ -1899,7 +2773,7 @@ int main(int argc, char * const *argv)
                                        unix_socket, k, n, keypair, fec_timeout,
                                        epoch, channel_id, fec_delay, use_qdisc, fwmark,
                                        radiotap_header, frame_type, control_port, mirror,
@@ -1551,7 +1764,7 @@ index 0dec131..0998c69 100644
              }
              else
              {
-@@ -1907,7 +2734,7 @@ int main(int argc, char * const *argv)
+@@ -1907,7 +2781,7 @@ int main(int argc, char * const *argv)
                                   udp_port, k, n, keypair, fec_timeout,
                                   epoch, channel_id, fec_delay, use_qdisc, fwmark,
                                   radiotap_header, frame_type, control_port, mirror,

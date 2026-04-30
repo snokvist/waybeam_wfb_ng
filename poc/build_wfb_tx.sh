@@ -19,6 +19,8 @@
 #   shm_consumer_test  - ring throughput tester (cross, dynamic)
 #   wfb_rx_native      - x86_64 native build for the ground-station laptop;
 #                        the cross pcap stub only covers wfb_tx's inject path
+#   wfb_tx_native      - x86_64 native build of wfb_tx for benchtop / lab use
+#                        (same source set as the cross build, dynamic libsodium)
 #
 # Requirements:
 #   - star6e toolchain at ../toolchain/toolchain.sigmastar-infinity6e/
@@ -150,7 +152,11 @@ echo "=== Building wfb_tx ==="
 
 WFB_CFLAGS="-Wall -O2 -fno-strict-aliasing -I$SODIUM_PREFIX/include -I$VENC_ROOT/include -I$WFB_DIR/src/stub"
 WFB_CFLAGS="$WFB_CFLAGS -DZFEX_UNROLL_ADDMUL_SIMD=8 -DZFEX_INLINE_ADDMUL -DZFEX_INLINE_ADDMUL_SIMD"
-WFB_CFLAGS="$WFB_CFLAGS -DWFB_VERSION='\"shm-patched\"'"
+# WFB_VERSION must reach the compiler as `"shm-patched"` (a string).  Single
+# quotes around the value would be interpreted by the C preprocessor as a
+# multi-character literal and gcc warns about it; escape the inner double
+# quotes only and let bash word-splitting deliver the token verbatim.
+WFB_CFLAGS="$WFB_CFLAGS -DWFB_VERSION=\"shm-patched\""
 WFB_LDFLAGS="-L$SODIUM_PREFIX/lib -lrt -lsodium -static"
 
 cd "$WFB_DIR"
@@ -197,7 +203,7 @@ NATIVE_BUILD="$BUILD_DIR/native"
 mkdir -p "$NATIVE_BUILD"
 NATIVE_CFLAGS="-Wall -O2 -fno-strict-aliasing -I$VENC_ROOT/include"
 NATIVE_CFLAGS="$NATIVE_CFLAGS -DZFEX_UNROLL_ADDMUL_SIMD=8 -DZFEX_INLINE_ADDMUL -DZFEX_INLINE_ADDMUL_SIMD"
-NATIVE_CFLAGS="$NATIVE_CFLAGS -DWFB_VERSION='\"shm-patched-native\"'"
+NATIVE_CFLAGS="$NATIVE_CFLAGS -DWFB_VERSION=\"shm-patched-native\""
 g++ $NATIVE_CFLAGS -std=gnu++11 -c -o "$NATIVE_BUILD/rx_native.o" src/rx.cpp
 gcc $NATIVE_CFLAGS -std=gnu99 -c -o "$NATIVE_BUILD/zfex_native.o" src/zfex.c
 g++ $NATIVE_CFLAGS -std=gnu++11 -c -o "$NATIVE_BUILD/wfb_native.o" src/wifibroadcast.cpp
@@ -209,6 +215,25 @@ g++ -o "$BUILD_DIR/wfb_rx_native" \
     "$NATIVE_BUILD/radiotap_native.o" \
     -lrt -lsodium -lpcap
 strip "$BUILD_DIR/wfb_rx_native"
+
+# ── Native wfb_tx (x86_64) for benchtop / lab use ───────────────────
+# Mirrors the cross build but links dynamically against system
+# libsodium and uses the same stub pcap.h (wfb_tx never calls libpcap;
+# the include is only there because wifibroadcast.hpp pulls it in).
+# Useful for testing TX behaviour against a host wfb_rx_native loop or
+# for driving an x86 ground station as a transmitter without flashing
+# a SigmaStar device.
+echo "  Building wfb_tx (native x86_64)..."
+NATIVE_TX_CFLAGS="$NATIVE_CFLAGS -I$WFB_DIR/src/stub"
+g++ $NATIVE_TX_CFLAGS -std=gnu++11 -c -o "$NATIVE_BUILD/tx_native.o" src/tx.cpp
+gcc $NATIVE_TX_CFLAGS -std=gnu99 -c -o "$NATIVE_BUILD/venc_ring_native.o" src/venc_ring.c
+g++ -o "$BUILD_DIR/wfb_tx_native" \
+    "$NATIVE_BUILD/tx_native.o" \
+    "$NATIVE_BUILD/zfex_native.o" \
+    "$NATIVE_BUILD/wfb_native.o" \
+    "$NATIVE_BUILD/venc_ring_native.o" \
+    -lrt -lsodium
+strip "$BUILD_DIR/wfb_tx_native"
 
 # ── Step 6: Build SHM diagnostic tools ───────────────────────────────
 
@@ -237,7 +262,7 @@ echo ""
 echo "=== Build complete ==="
 echo ""
 ls -lh "$BUILD_DIR/wfb_tx" "$BUILD_DIR/wfb_keygen" "$BUILD_DIR/wfb_tx_cmd" \
-       "$BUILD_DIR/wfb_rx_native" \
+       "$BUILD_DIR/wfb_rx_native" "$BUILD_DIR/wfb_tx_native" \
        "$BUILD_DIR/shm_ring_stats" "$BUILD_DIR/shm_consumer_test"
 echo ""
 
@@ -274,4 +299,7 @@ else
     echo ""
     echo "Manual deploy (ground-station x86_64 native wfb_rx):"
     echo "  cp $BUILD_DIR/wfb_rx_native /wherever/you/run/wfb_rx"
+    echo ""
+    echo "Manual deploy (x86_64 native wfb_tx for benchtop / lab use):"
+    echo "  cp $BUILD_DIR/wfb_tx_native /wherever/you/run/wfb_tx"
 fi
