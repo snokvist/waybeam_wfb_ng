@@ -1,5 +1,5 @@
 diff --git a/src/rx.cpp b/src/rx.cpp
-index 1603b6e..fd99b83 100644
+index 1603b6e..b48152c 100644
 --- a/src/rx.cpp
 +++ b/src/rx.cpp
 @@ -52,6 +52,101 @@ extern "C"
@@ -108,11 +108,11 @@ index 1603b6e..fd99b83 100644
  Aggregator::Aggregator(const string &keypair, uint64_t epoch, uint32_t channel_id) : \
      count_p_all(0), count_b_all(0), count_p_dec_err(0), count_p_session(0), count_p_data(0), count_p_fec_recovered(0),
      count_p_lost(0), count_p_bad(0), count_p_override(0), count_p_outgoing(0), count_b_outgoing(0),
-+    count_p_mode_mismatch(0), count_p_diversity(0),
++    count_p_mode_mismatch(0), count_p_diversity(0), wlan_idx_mask(0),
      fec_p(NULL), fec_k(-1), fec_n(-1), seq(0), rx_ring{}, rx_ring_front(0), rx_ring_alloc(0),
      last_known_block((uint64_t)-1), epoch(epoch), channel_id(channel_id)
  {
-@@ -498,14 +594,21 @@ void Aggregator::dump_stats(void)
+@@ -498,14 +594,23 @@ void Aggregator::dump_stats(void)
                  it->second.snr_min, it->second.snr_sum / it->second.count_all, it->second.snr_max);
      }
  
@@ -121,9 +121,10 @@ index 1603b6e..fd99b83 100644
 +     *   0:count_p_all  1:count_b_all  2:count_p_dec_err  3:count_p_session
 +     *   4:count_p_data 5:count_p_uniq 6:count_p_fec_recovered  7:count_p_lost
 +     *   8:count_p_bad  9:count_p_outgoing 10:count_b_outgoing 11:count_p_diversity
-+     * Field 11 (diversity) was appended at the end so existing parsers that
-+     * read the first 11 fields by index continue to work unchanged. */
-+    IPC_MSG("%" PRIu64 "\tPKT\t%u:%u:%u:%u:%u:%u:%u:%u:%u:%u:%u:%u\n", ts,
++     * Fields 11 (diversity) and 12 (adapters) were appended at the end so
++     * existing parsers that read the first 11 fields by index continue to
++     * work unchanged.  adapters = popcount(wlan_idx_mask). */
++    IPC_MSG("%" PRIu64 "\tPKT\t%u:%u:%u:%u:%u:%u:%u:%u:%u:%u:%u:%u:%u\n", ts,
              count_p_all, count_b_all,                    // incoming
              count_p_dec_err,                             // decryption
              count_p_session, count_p_data,               // classification
@@ -132,11 +133,12 @@ index 1603b6e..fd99b83 100644
              count_p_bad,                                 // internal errors
 -            count_p_outgoing, count_b_outgoing);         // outgoing
 +            count_p_outgoing, count_b_outgoing,          // outgoing
-+            count_p_diversity);                          // diversity overlap
++            count_p_diversity,                           // diversity overlap
++            (uint32_t)__builtin_popcount(wlan_idx_mask));// adapters seen
      IPC_MSG_SEND();
  
      if(count_p_override)
-@@ -518,6 +621,84 @@ void Aggregator::dump_stats(void)
+@@ -518,6 +623,89 @@ void Aggregator::dump_stats(void)
          WFB_ERR("%u packets lost\n", count_p_lost);
      }
  
@@ -198,19 +200,24 @@ index 1603b6e..fd99b83 100644
 +            // mode_mismatch surfaces a -x flag disagreement between TX and
 +            // RX without requiring stdout/IPC attachment.  Programmatic
 +            // consumers (link_controller, fec_controller) can flip a UI
-+            // warning when this counter is non-zero.
++            // warning when this counter is non-zero.  "adapters" is the
++            // popcount of wlan_idx_mask — distinct adapters that delivered
++            // ≥1 data fragment this interval.
++            uint32_t adapters_now = (uint32_t)__builtin_popcount(wlan_idx_mask);
 +            n = snprintf(dgram + pos, sizeof(dgram) - pos,
 +                         "],\"pkt\":{\"all\":%u,\"bytes\":%u,\"dec_err\":%u,"
 +                         "\"session\":%u,\"data\":%u,\"uniq\":%u,"
 +                         "\"fec_recovered\":%u,\"lost\":%u,\"bad\":%u,"
 +                         "\"outgoing\":%u,\"outgoing_bytes\":%u,"
-+                         "\"diversity\":%u,\"mode_mismatch\":%u}}\n",
++                         "\"diversity\":%u,\"mode_mismatch\":%u,"
++                         "\"adapters\":%u}}\n",
 +                         count_p_all, count_b_all, count_p_dec_err,
 +                         count_p_session, count_p_data,
 +                         (uint32_t)count_p_uniq.size(),
 +                         count_p_fec_recovered, count_p_lost, count_p_bad,
 +                         count_p_outgoing, count_b_outgoing,
-+                         count_p_diversity, count_p_mode_mismatch);
++                         count_p_diversity, count_p_mode_mismatch,
++                         adapters_now);
 +            if (n < 0 || n >= (int)sizeof(dgram) - pos) ok = false;
 +            else pos += n;
 +        }
@@ -221,7 +228,7 @@ index 1603b6e..fd99b83 100644
      clear_stats();
  }
  
-@@ -592,6 +773,10 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
+@@ -592,6 +780,10 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
      switch(buf[0])
      {
      case WFB_PACKET_DATA:
@@ -232,7 +239,7 @@ index 1603b6e..fd99b83 100644
          if(size < sizeof(wblock_hdr_t) + crypto_aead_chacha20poly1305_ABYTES + sizeof(wpacket_hdr_t))
          {
              WFB_ERR("Short packet (fec header)\n");
-@@ -600,6 +785,18 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
+@@ -600,6 +792,18 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
          }
          break;
  
@@ -251,7 +258,7 @@ index 1603b6e..fd99b83 100644
      case WFB_PACKET_SESSION:
          new_session_data = (wsession_data_t*)session_tmp;
  
-@@ -714,16 +911,31 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
+@@ -714,19 +918,40 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
      unsigned long long decrypted_len;
      wblock_hdr_t *block_hdr = (wblock_hdr_t*)buf;
  
@@ -292,7 +299,16 @@ index 1603b6e..fd99b83 100644
      }
  
      count_p_data += 1;
-@@ -735,7 +947,15 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
++    /* Track which adapters delivered ≥1 accepted data fragment this interval.
++     * popcount(wlan_idx_mask) at dump_stats time = "adapters currently
++     * receiving".  Guarded for wlan_idx >= 32 to keep the mask 32-bit; in
++     * practice wfb-ng has well under 32 adapters per host. */
++    if (wlan_idx < 32)
++        wlan_idx_mask |= (1u << wlan_idx);
+     log_rssi(sockaddr, wlan_idx, antenna, rssi, noise, freq, mcs_index, bandwidth);
+ 
+     assert(decrypted_len >= sizeof(wpacket_hdr_t));
+@@ -735,7 +960,15 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
      uint64_t block_idx = be64toh(block_hdr->data_nonce) >> 8;
      uint8_t fragment_idx = (uint8_t)(be64toh(block_hdr->data_nonce) & 0xff);
  
@@ -309,7 +325,7 @@ index 1603b6e..fd99b83 100644
  
      // Should never happend due to generating new session key on tx side
      if (block_idx > MAX_BLOCK_IDX)
-@@ -745,6 +965,19 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
+@@ -745,6 +978,19 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
          return;
      }
  
@@ -329,7 +345,7 @@ index 1603b6e..fd99b83 100644
      if (fragment_idx >= fec_n)
      {
          WFB_ERR("Invalid fragment_idx: %d\n", fragment_idx);
-@@ -836,6 +1069,15 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
+@@ -836,6 +1082,15 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
  
                  if(fec_count)
                  {
@@ -345,7 +361,7 @@ index 1603b6e..fd99b83 100644
                      count_p_fec_recovered += fec_count;
                      WFB_DBG("FEC recovered %u packets\n", fec_count);
                  }
-@@ -1147,8 +1389,10 @@ int main(int argc, char* const *argv)
+@@ -1147,8 +1402,10 @@ int main(int argc, char* const *argv)
  
      string keypair = "rx.key";
      string unix_socket = "";
@@ -357,7 +373,7 @@ index 1603b6e..fd99b83 100644
          switch (opt) {
          case 'K':
              keypair = optarg;
-@@ -1187,15 +1431,35 @@ int main(int argc, char* const *argv)
+@@ -1187,15 +1444,35 @@ int main(int argc, char* const *argv)
          case 'e':
              epoch = atoll(optarg);
              break;
@@ -397,7 +413,7 @@ index 1603b6e..fd99b83 100644
              WFB_INFO("WFB-ng version %s, FEC: %s\n", WFB_VERSION, zfex_opt);
              WFB_INFO("WFB-ng home page: <http://wfb-ng.org>\n");
              exit(1);
-@@ -1223,6 +1487,9 @@ int main(int argc, char* const *argv)
+@@ -1223,6 +1500,9 @@ int main(int argc, char* const *argv)
          return 1;
      }
  
@@ -407,7 +423,7 @@ index 1603b6e..fd99b83 100644
      try
      {
          uint32_t channel_id = (link_id << 8) + radio_port;
-@@ -1239,21 +1506,41 @@ int main(int argc, char* const *argv)
+@@ -1239,21 +1519,41 @@ int main(int argc, char* const *argv)
  
          unique_ptr<BaseAggregator> agg;
  
@@ -452,7 +468,7 @@ index 1603b6e..fd99b83 100644
              break;
  
 diff --git a/src/rx.hpp b/src/rx.hpp
-index 856248e..6525340 100644
+index 856248e..18858b9 100644
 --- a/src/rx.hpp
 +++ b/src/rx.hpp
 @@ -179,6 +179,14 @@ public:
@@ -470,16 +486,17 @@ index 856248e..6525340 100644
      // Make stats public for android userspace receiver
      void clear_stats(void)
      {
-@@ -195,6 +203,8 @@ public:
+@@ -195,6 +203,9 @@ public:
          count_p_override = 0;
          count_p_outgoing = 0;
          count_b_outgoing = 0;
 +        count_p_mode_mismatch = 0;
 +        count_p_diversity = 0;
++        wlan_idx_mask = 0;
      }
  
      rx_antenna_stat_t antenna_stat;
-@@ -210,6 +220,17 @@ public:
+@@ -210,6 +221,22 @@ public:
      uint32_t count_p_override;
      uint32_t count_p_outgoing;
      uint32_t count_b_outgoing;
@@ -490,14 +507,19 @@ index 856248e..6525340 100644
 +    // Diversity overlap: bumped when the same data_nonce arrives on a second
 +    // (or later) adapter, i.e. count_p_uniq.insert() reported the value was
 +    // already present.  Independent from count_p_fec_recovered, which tracks
-+    // Reed-Solomon parity rebuilds inside a single block.  ratio = diversity
-+    // / count_p_data is "how often the second antenna saved us from a single
-+    // -adapter loss without needing FEC".
++    // Reed-Solomon parity rebuilds inside a single block.  Ratio is
++    // diversity / uniq, normalised so that two adapters fully overlapping
++    // reads as 100% (= one redundant copy per unique fragment).  N adapters
++    // with full overlap reads as (N-1) * 100%.
 +    uint32_t count_p_diversity;
++    // Bitmap of wlan_idx values that produced ≥1 accepted data fragment in
++    // the current log interval.  popcount = "adapters currently receiving".
++    // 32 bits is plenty — wfb-ng caps wlans well below this in practice.
++    uint32_t wlan_idx_mask;
  
  protected:
      virtual void send_to_socket(const uint8_t *payload, uint16_t packet_size) = 0;
-@@ -247,6 +268,9 @@ private:
+@@ -247,6 +274,9 @@ private:
      uint8_t tx_publickey[crypto_box_PUBLICKEYBYTES];
      uint8_t session_key[crypto_aead_chacha20poly1305_KEYBYTES];
  

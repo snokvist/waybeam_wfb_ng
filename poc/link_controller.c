@@ -1394,11 +1394,15 @@ typedef struct {
 	float smoothed_lost_ratio;
 	float recov_ratio;
 	float smoothed_recov_ratio;
-	/* Diversity overlap ratio: pkt_diversity / pkt_data — i.e. fraction of
-	 * data fragments that arrived on >1 adapter.  Independent from
-	 * recov_ratio (parity rebuilds) and lost_ratio (unrecoverable). */
+	/* Diversity overlap ratio: pkt_diversity / pkt_uniq — number of
+	 * redundant copies per unique fragment.  Two adapters fully overlapping
+	 * = 1.0 (= 100%); N adapters fully overlapping = (N-1).  Independent
+	 * from recov_ratio (parity rebuilds) and lost_ratio (unrecoverable). */
 	float diversity_ratio;
 	float smoothed_diversity_ratio;
+	/* Distinct adapters that delivered ≥1 data fragment in the last
+	 * interval.  -1 = unknown (older RX without the patch). */
+	int   adapter_count;
 	float loss_penalty_db;
 	float effective_rssi;
 	/* Per-antenna avg dBm — for /status sparklines. -200 = unset. */
@@ -1418,7 +1422,7 @@ static void scorer_reset(Scorer *s)
 
 static bool scorer_update(Scorer *s, const Config *cfg, const char *body,
                           long pkt_uniq, long pkt_lost, long pkt_fec_recovered,
-                          long pkt_data, long pkt_diversity,
+                          long pkt_diversity, int adapters_seen,
                           Score *out)
 {
 	float best = -200.0f;
@@ -1473,15 +1477,14 @@ static bool scorer_update(Scorer *s, const Config *cfg, const char *body,
 	long denom = pkt_uniq > 0 ? pkt_uniq : 1;
 	float lost_r  = (pkt_lost          > 0) ? (float)pkt_lost          / (float)denom : 0.0f;
 	float recov_r = (pkt_fec_recovered > 0) ? (float)pkt_fec_recovered / (float)denom : 0.0f;
-	/* Diversity is normalised against pkt_data (= total fragments seen across
-	 * all adapters before dedup).  pkt_data >= pkt_uniq, and pkt_diversity =
-	 * pkt_data - pkt_uniq when no other drop paths fire, so the ratio caps at
-	 * (n_adapters - 1) / n_adapters in steady state. */
-	long ddenom = pkt_data > 0 ? pkt_data : 1;
-	float div_r   = (pkt_diversity     > 0) ? (float)pkt_diversity     / (float)ddenom : 0.0f;
+	/* Diversity is normalised against pkt_uniq so two adapters fully
+	 * overlapping = 1.0 (= 100%, "one redundant copy per unique fragment").
+	 * N adapters fully overlapping = (N-1).  Not capped at 1.0 — the ratio
+	 * legitimately exceeds 1 with 3+ adapters and the WebUI shows it as e.g.
+	 * 200%. */
+	float div_r   = (pkt_diversity     > 0) ? (float)pkt_diversity     / (float)denom : 0.0f;
 	if (lost_r  > 1.0f) lost_r  = 1.0f;
 	if (recov_r > 1.0f) recov_r = 1.0f;
-	if (div_r   > 1.0f) div_r   = 1.0f;
 
 	if (!s->have_loss) {
 		s->smoothed_lost  = lost_r;
@@ -1509,6 +1512,7 @@ static bool scorer_update(Scorer *s, const Config *cfg, const char *body,
 	out->smoothed_recov_ratio = s->smoothed_recov;
 	out->diversity_ratio = div_r;
 	out->smoothed_diversity_ratio = s->smoothed_diversity;
+	out->adapter_count = adapters_seen;
 	out->loss_penalty_db = penalty;
 	out->effective_rssi = s->smoothed_rssi - penalty;
 	return true;
@@ -1995,6 +1999,7 @@ typedef struct {
 	float               last_lost_ratio;
 	float               last_recov_ratio;
 	float               last_diversity_ratio;
+	int                 last_adapter_count;
 	float               last_loss_penalty_db;
 	int                 last_emit_mcs;
 	int                 ant_count;
@@ -2021,11 +2026,11 @@ static int append_score_json(char *buf, size_t cap, size_t pos,
 	int n = snprintf(buf + pos, cap - pos,
 		"\"score\":{\"effective_rssi\":%.2f,\"smoothed_rssi\":%.2f,"
 		"\"lost_ratio\":%.4f,\"recov_ratio\":%.4f,"
-		"\"diversity_ratio\":%.4f,"
+		"\"diversity_ratio\":%.4f,\"adapter_count\":%d,"
 		"\"loss_penalty_db\":%.2f}",
 		(double)s->last_eff_rssi, (double)s->last_smoothed_rssi,
 		(double)s->last_lost_ratio, (double)s->last_recov_ratio,
-		(double)s->last_diversity_ratio,
+		(double)s->last_diversity_ratio, s->last_adapter_count,
 		(double)s->last_loss_penalty_db);
 	if (n < 0 || (size_t)n >= cap - pos) return -1;
 	pos += n;
@@ -3450,6 +3455,7 @@ int main(int argc, char **argv)
 	float    last_lost_ratio  = 0.0f;
 	float    last_recov_ratio = 0.0f;
 	float    last_diversity_ratio = 0.0f;
+	int      last_adapter_count = -1;
 	float    last_loss_pen_db = 0.0f;
 	int      last_emit_mcs    = -1;
 	int      last_ant_count   = 0;
@@ -3744,6 +3750,7 @@ int main(int argc, char **argv)
 				.last_lost_ratio     = last_lost_ratio,
 				.last_recov_ratio    = last_recov_ratio,
 				.last_diversity_ratio = last_diversity_ratio,
+				.last_adapter_count  = last_adapter_count,
 				.last_loss_penalty_db = last_loss_pen_db,
 				.last_emit_mcs       = last_emit_mcs,
 				.ant_count           = last_ant_count,
@@ -3877,20 +3884,19 @@ int main(int argc, char **argv)
 				}
 				(void)json_get_int_in(pkt_block, "lost", &pkt_lost);
 				(void)json_get_int_in(pkt_block, "fec_recovered", &pkt_fec_recovered);
-				/* "diversity" is added by the patched wfb_rx (>= 2026-04
-				 * shm-input).  Older receivers omit the key; default 0. */
+				/* "diversity" and "adapters" are added by the patched
+				 * wfb_rx (>= 2026-04 shm-input).  Older receivers omit
+				 * both keys; defaults are 0 and -1 (unknown). */
 				(void)json_get_int_in(pkt_block, "diversity", &pkt_diversity);
+				long pkt_adapters = -1;
+				(void)json_get_int_in(pkt_block, "adapters", &pkt_adapters);
+				int adapters_seen = (pkt_adapters >= 0) ? (int)pkt_adapters : -1;
+				(void)pkt_data; /* no longer needed in scorer; kept parsed for log/debug */
 
-				/* pkt_data missing → older RX without the diversity patch.
-				 * Older RX also omits "diversity" so pkt_diversity is 0;
-				 * the ratio computes to 0 / pkt_uniq = 0 and the fallback
-				 * denominator is harmless.  Newer RX always provides
-				 * pkt_data >= pkt_uniq. */
 				Score score;
 				if (!scorer_update(&scorer, &cfg, dgram,
 				                   pkt_uniq, pkt_lost, pkt_fec_recovered,
-				                   pkt_data > 0 ? pkt_data : pkt_uniq,
-				                   pkt_diversity,
+				                   pkt_diversity, adapters_seen,
 				                   &score))
 					continue;
 
@@ -3900,6 +3906,7 @@ int main(int argc, char **argv)
 				last_lost_ratio  = score.smoothed_lost_ratio;
 				last_recov_ratio = score.smoothed_recov_ratio;
 				last_diversity_ratio = score.smoothed_diversity_ratio;
+				last_adapter_count = score.adapter_count;
 				last_loss_pen_db = score.loss_penalty_db;
 				last_ant_count   = score.ant_count;
 				memcpy(last_ant_avg, score.ant_avg, sizeof(last_ant_avg));
