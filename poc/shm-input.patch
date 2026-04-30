@@ -1,5 +1,5 @@
 diff --git a/src/rx.cpp b/src/rx.cpp
-index 1603b6e..ab40814 100644
+index 1603b6e..6b314f7 100644
 --- a/src/rx.cpp
 +++ b/src/rx.cpp
 @@ -52,6 +52,95 @@ extern "C"
@@ -275,7 +275,23 @@ index 1603b6e..ab40814 100644
      if (fragment_idx >= fec_n)
      {
          WFB_ERR("Invalid fragment_idx: %d\n", fragment_idx);
-@@ -1147,8 +1352,10 @@ int main(int argc, char* const *argv)
+@@ -836,6 +1041,15 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
+ 
+                 if(fec_count)
+                 {
++                    /* count_p_fec_recovered tracks fragments rebuilt from
++                     * Reed-Solomon parity within a single FEC block. It is
++                     * NOT the same as diversity reception: when the same
++                     * fragment arrives on two adapters wfb_rx dedupes via
++                     * count_p_uniq and never enters this branch, so a
++                     * link with diversity-only recovery shows
++                     * fec_recovered = 0.  The webui's "fec_recov %" tile
++                     * follows this counter and therefore reflects parity
++                     * usage, not multi-adapter overlap. */
+                     count_p_fec_recovered += fec_count;
+                     WFB_DBG("FEC recovered %u packets\n", fec_count);
+                 }
+@@ -1147,8 +1361,10 @@ int main(int argc, char* const *argv)
  
      string keypair = "rx.key";
      string unix_socket = "";
@@ -287,7 +303,7 @@ index 1603b6e..ab40814 100644
          switch (opt) {
          case 'K':
              keypair = optarg;
-@@ -1187,15 +1394,35 @@ int main(int argc, char* const *argv)
+@@ -1187,15 +1403,35 @@ int main(int argc, char* const *argv)
          case 'e':
              epoch = atoll(optarg);
              break;
@@ -327,7 +343,7 @@ index 1603b6e..ab40814 100644
              WFB_INFO("WFB-ng version %s, FEC: %s\n", WFB_VERSION, zfex_opt);
              WFB_INFO("WFB-ng home page: <http://wfb-ng.org>\n");
              exit(1);
-@@ -1223,6 +1450,9 @@ int main(int argc, char* const *argv)
+@@ -1223,6 +1459,9 @@ int main(int argc, char* const *argv)
          return 1;
      }
  
@@ -337,7 +353,7 @@ index 1603b6e..ab40814 100644
      try
      {
          uint32_t channel_id = (link_id << 8) + radio_port;
-@@ -1239,21 +1469,41 @@ int main(int argc, char* const *argv)
+@@ -1239,21 +1478,41 @@ int main(int argc, char* const *argv)
  
          unique_ptr<BaseAggregator> agg;
  
@@ -430,7 +446,7 @@ index 856248e..d93fcee 100644
      PacketLossListener* packet_loss_listener_ = nullptr;
  };
 diff --git a/src/tx.cpp b/src/tx.cpp
-index 0dec131..0998c69 100644
+index 0dec131..dad5e39 100644
 --- a/src/tx.cpp
 +++ b/src/tx.cpp
 @@ -29,6 +29,7 @@
@@ -641,7 +657,8 @@ index 0dec131..0998c69 100644
 -                                             (uint8_t*)block_hdr, sizeof(wblock_hdr_t),
 -                                             NULL, (uint8_t*)(&(block_hdr->data_nonce)), session_key) < 0)
 +    if (encrypt_data)
-+    {
+     {
+-        throw runtime_error("Unable to encrypt packet!");
 +        // AEAD: ChaCha20-Poly1305 encrypts plaintext + appends 16 B tag.
 +        if (crypto_aead_chacha20poly1305_encrypt(ciphertext + sizeof(wblock_hdr_t), &ciphertext_len,
 +                                                 block[fragment_idx], packet_size,
@@ -652,8 +669,7 @@ index 0dec131..0998c69 100644
 +        }
 +    }
 +    else
-     {
--        throw runtime_error("Unable to encrypt packet!");
++    {
 +        // Plaintext: copy the block slot directly.  No tag, no MAC.  RX
 +        // reads it as-is.  Saves ABYTES (16) on wire + ChaCha20 CPU.
 +        memcpy(ciphertext + sizeof(wblock_hdr_t), block[fragment_idx], packet_size);
@@ -1282,9 +1298,9 @@ index 0dec131..0998c69 100644
      int control_fd = open_control_fd(control_port);
 -    data_source(t, rx_fd, control_fd, fec_timeout, mirror, log_interval);
 +    data_source(t, rx_fd, control_fd, fec_timeout, mirror, log_interval, NULL, mbit_close_enable, parity_ratio_q8, encrypt_data);
- }
- 
- 
++}
++
++
 +// --- SHM ring input mode ---
 +void local_loop_shm(int argc, char* const* argv, int optind, int log_interval,
 +                    const char *shm_name, int debug_port, int k, int n, const string &keypair,
@@ -1327,10 +1343,10 @@ index 0dec131..0998c69 100644
 +        venc_ring_destroy(g_shm_ring);
 +        g_shm_ring = NULL;
 +    }
-+}
+ }
 +// --- end SHM ring input mode ---
-+
-+
+ 
+ 
  void distributor_loop(int argc, char* const* argv, int optind, int rcv_buf, int log_interval,
                        int udp_port, int k, int n, const string &keypair, int fec_timeout,
                        uint64_t epoch, uint32_t channel_id, uint32_t fec_delay, bool use_qdisc, uint32_t fwmark,
@@ -1392,7 +1408,42 @@ index 0dec131..0998c69 100644
          switch (opt) {
          case 'I':
              tx_mode = INJECTOR;
-@@ -1814,22 +2549,84 @@ int main(int argc, char * const *argv)
+@@ -1710,11 +2445,32 @@ int main(int argc, char * const *argv)
+             keypair = optarg;
+             break;
+         case 'k':
+-            k = atoi(optarg);
++        {
++            /* Strict parse — atoi("abc")==0 silently produces fec_k=0,
++             * which then trips an assert (or, with NDEBUG, walks off the
++             * end of fec_p == NULL inside zfex).  Reject up front. */
++            char *endp;
++            long v = strtol(optarg, &endp, 10);
++            if (*endp != '\0' || endp == optarg || v < 1 || v > 255)
++            {
++                WFB_ERR("-k must be an integer in 1..255\n");
++                exit(1);
++            }
++            k = (uint8_t)v;
+             break;
++        }
+         case 'n':
+-            n = atoi(optarg);
++        {
++            char *endp;
++            long v = strtol(optarg, &endp, 10);
++            if (*endp != '\0' || endp == optarg || v < 1 || v > 255)
++            {
++                WFB_ERR("-n must be an integer in 1..255\n");
++                exit(1);
++            }
++            n = (uint8_t)v;
+             break;
++        }
+         case 'u':
+             udp_port = atoi(optarg);
+             break;
+@@ -1814,33 +2570,121 @@ int main(int argc, char * const *argv)
              inject_retry_delay = atoi(optarg);
              break;
  
@@ -1452,6 +1503,16 @@ index 0dec131..0998c69 100644
          default: /* '?' */
          show_usage:
 -            WFB_INFO("Local TX: %s [-K tx_key] [-k RS_K] [-n RS_N] { [-u udp_port] | [-U unix_socket] } [-R rcv_buf] [-p radio_port]\n"
++        {
++            char parity_ratio_q8_buf[32];
++            const char *parity_ratio_q8_label;
++            if (parity_ratio_q8 < 0) {
++                parity_ratio_q8_label = "auto";
++            } else {
++                snprintf(parity_ratio_q8_buf, sizeof(parity_ratio_q8_buf),
++                         "%.2f", parity_ratio_q8 / 256.0);
++                parity_ratio_q8_label = parity_ratio_q8_buf;
++            }
 +            WFB_INFO("Local TX: %s [-K tx_key] [-k RS_K] [-n RS_N] { [-u udp_port] | [-U unix_socket] | [-H shm_name] } [-R rcv_buf] [-p radio_port]\n"
                       "             [-F fec_delay] [-B bandwidth] [-G guard_interval] [-S stbc] [-L ldpc] [-M mcs_index] [-N VHT_NSS]\n"
                       "             [-T fec_timeout] [-l log_interval] [-e epoch] [-i link_id] [-f { data | rts }] [-m] [-V] [-Q]\n"
@@ -1472,17 +1533,44 @@ index 0dec131..0998c69 100644
 -                     keypair.c_str(), k, n, fec_delay, udp_port, link_id, radio_port, epoch, bandwidth, short_gi ? "short" : "long", stbc, ldpc, mcs_index, vht_nss, vht_mode, fec_timeout, log_interval, fwmark, control_port, inject_retries, inject_retry_delay);
 +            WFB_INFO("\nM-bit FEC close / AEAD options:\n"
 +                     "  -b 0|1       enable RTP M-bit FEC-block close (1=on, default)\n"
-+                     "  -r RATIO     partial-block parity:data (float, default %.2f; set to (n-k)/k for proportional)\n"
++                     "  -r RATIO     partial-block parity:data (float, default %s; set to (n-k)/k for proportional)\n"
 +                     "  -x           disable per-fragment AEAD (emit WFB_PACKET_DATA_PLAIN; session still signed)\n"
 +                     "  Examples: -k 8 -n 12 -r 0.5  (default, typical)\n"
 +                     "            -k 6 -n 18 -r 2.0  (heavy FEC)\n",
-+                     parity_ratio_q8 / 256.0);
-+            WFB_INFO("Default: K='%s', k=%d, n=%d, fec_delay=%u [us], udp_port=%d, link_id=0x%06x, radio_port=%u, epoch=%" PRIu64 ", bandwidth=%d guard_interval=%s stbc=%d ldpc=%d mcs_index=%d vht_nss=%d, vht_mode=%d, fec_timeout=%d, log_interval=%d, rcv_buf=system_default, snd_buf=system_default, frame_type=data, mirror=false, use_qdisc=false, fwmark=%u, control_port=%d, inject_retries=%u, inject_retry_delay=%u, mbit_close=%d, parity_ratio=%.2f, aead=%s\n",
-+                     keypair.c_str(), k, n, fec_delay, udp_port, link_id, radio_port, epoch, bandwidth, short_gi ? "short" : "long", stbc, ldpc, mcs_index, vht_nss, vht_mode, fec_timeout, log_interval, fwmark, control_port, inject_retries, inject_retry_delay, mbit_close_enable, parity_ratio_q8 / 256.0, encrypt_data ? "on" : "off");
++                     /* Sentinel -1 means "auto-scale (n-k)/k from -k/-n";
++                      * a non-negative value is explicit Q8.8.  Format the
++                      * label out of band to avoid the misleading
++                      * "default -0.00" the raw division produced. */
++                     parity_ratio_q8_label);
++            WFB_INFO("Default: K='%s', k=%d, n=%d, fec_delay=%u [us], udp_port=%d, link_id=0x%06x, radio_port=%u, epoch=%" PRIu64 ", bandwidth=%d guard_interval=%s stbc=%d ldpc=%d mcs_index=%d vht_nss=%d, vht_mode=%d, fec_timeout=%d, log_interval=%d, rcv_buf=system_default, snd_buf=system_default, frame_type=data, mirror=false, use_qdisc=false, fwmark=%u, control_port=%d, inject_retries=%u, inject_retry_delay=%u, mbit_close=%d, parity_ratio=%s, aead=%s\n",
++                     keypair.c_str(), k, n, fec_delay, udp_port, link_id, radio_port, epoch, bandwidth, short_gi ? "short" : "long", stbc, ldpc, mcs_index, vht_nss, vht_mode, fec_timeout, log_interval, fwmark, control_port, inject_retries, inject_retry_delay, mbit_close_enable, parity_ratio_q8_label, encrypt_data ? "on" : "off");
              WFB_INFO("Radio MTU: %lu\n", (unsigned long)MAX_PAYLOAD_SIZE);
              WFB_INFO("WFB-ng version %s, FEC: %s\n", WFB_VERSION, zfex_opt);
              WFB_INFO("WFB-ng home page: <http://wfb-ng.org>\n");
-@@ -1862,11 +2659,30 @@ int main(int argc, char * const *argv)
+             exit(1);
+         }
++        }
+     }
+ 
+     if (optind >= argc) {
+         goto show_usage;
+     }
+ 
++    /* Final sanity on -k / -n.  zfex requires k <= n, n < 256 (each parity
++     * index fits in a byte).  Caught here so the operator gets a clear
++     * message rather than an abort() from the asserts inside init_session
++     * (or, with NDEBUG, a NULL-fec_p crash on the first packet). */
++    if (k > n || n < 1 || k < 1)
++    {
++        WFB_ERR("Invalid FEC params: -k=%u -n=%u (require 1 <= k <= n <= 255)\n",
++                (unsigned)k, (unsigned)n);
++        exit(1);
++    }
++
+     {
+         int fd;
+         int c;
+@@ -1862,11 +2706,30 @@ int main(int argc, char * const *argv)
          return 1;
      }
  
@@ -1513,7 +1601,7 @@ index 0dec131..0998c69 100644
          switch(tx_mode)
          {
          case INJECTOR:
-@@ -1880,7 +2696,17 @@ int main(int argc, char * const *argv)
+@@ -1880,7 +2743,17 @@ int main(int argc, char * const *argv)
                                  unix_socket, debug_port, k, n, keypair, fec_timeout,
                                  epoch, channel_id, fec_delay, use_qdisc, fwmark,
                                  radiotap_header, frame_type, control_port, mirror,
@@ -1532,7 +1620,7 @@ index 0dec131..0998c69 100644
              }
              else
              {
-@@ -1888,7 +2714,8 @@ int main(int argc, char * const *argv)
+@@ -1888,7 +2761,8 @@ int main(int argc, char * const *argv)
                                 udp_port, debug_port, k, n, keypair, fec_timeout,
                                 epoch, channel_id, fec_delay, use_qdisc, fwmark,
                                 radiotap_header, frame_type, control_port, mirror,
@@ -1542,7 +1630,7 @@ index 0dec131..0998c69 100644
              }
              break;
  
-@@ -1899,7 +2726,7 @@ int main(int argc, char * const *argv)
+@@ -1899,7 +2773,7 @@ int main(int argc, char * const *argv)
                                        unix_socket, k, n, keypair, fec_timeout,
                                        epoch, channel_id, fec_delay, use_qdisc, fwmark,
                                        radiotap_header, frame_type, control_port, mirror,
@@ -1551,7 +1639,7 @@ index 0dec131..0998c69 100644
              }
              else
              {
-@@ -1907,7 +2734,7 @@ int main(int argc, char * const *argv)
+@@ -1907,7 +2781,7 @@ int main(int argc, char * const *argv)
                                   udp_port, k, n, keypair, fec_timeout,
                                   epoch, channel_id, fec_delay, use_qdisc, fwmark,
                                   radiotap_header, frame_type, control_port, mirror,
