@@ -3881,6 +3881,11 @@ int main(int argc, char **argv)
 				 * shm-input).  Older receivers omit the key; default 0. */
 				(void)json_get_int_in(pkt_block, "diversity", &pkt_diversity);
 
+				/* pkt_data missing → older RX without the diversity patch.
+				 * Older RX also omits "diversity" so pkt_diversity is 0;
+				 * the ratio computes to 0 / pkt_uniq = 0 and the fallback
+				 * denominator is harmless.  Newer RX always provides
+				 * pkt_data >= pkt_uniq. */
 				Score score;
 				if (!scorer_update(&scorer, &cfg, dgram,
 				                   pkt_uniq, pkt_lost, pkt_fec_recovered,

@@ -1,5 +1,5 @@
 diff --git a/src/rx.cpp b/src/rx.cpp
-index 1603b6e..757f3a3 100644
+index 1603b6e..fd99b83 100644
 --- a/src/rx.cpp
 +++ b/src/rx.cpp
 @@ -52,6 +52,101 @@ extern "C"
@@ -136,7 +136,7 @@ index 1603b6e..757f3a3 100644
      IPC_MSG_SEND();
  
      if(count_p_override)
-@@ -518,6 +621,80 @@ void Aggregator::dump_stats(void)
+@@ -518,6 +621,84 @@ void Aggregator::dump_stats(void)
          WFB_ERR("%u packets lost\n", count_p_lost);
      }
  
@@ -195,18 +195,22 @@ index 1603b6e..757f3a3 100644
 +
 +        if (ok)
 +        {
++            // mode_mismatch surfaces a -x flag disagreement between TX and
++            // RX without requiring stdout/IPC attachment.  Programmatic
++            // consumers (link_controller, fec_controller) can flip a UI
++            // warning when this counter is non-zero.
 +            n = snprintf(dgram + pos, sizeof(dgram) - pos,
 +                         "],\"pkt\":{\"all\":%u,\"bytes\":%u,\"dec_err\":%u,"
 +                         "\"session\":%u,\"data\":%u,\"uniq\":%u,"
 +                         "\"fec_recovered\":%u,\"lost\":%u,\"bad\":%u,"
 +                         "\"outgoing\":%u,\"outgoing_bytes\":%u,"
-+                         "\"diversity\":%u}}\n",
++                         "\"diversity\":%u,\"mode_mismatch\":%u}}\n",
 +                         count_p_all, count_b_all, count_p_dec_err,
 +                         count_p_session, count_p_data,
 +                         (uint32_t)count_p_uniq.size(),
 +                         count_p_fec_recovered, count_p_lost, count_p_bad,
 +                         count_p_outgoing, count_b_outgoing,
-+                         count_p_diversity);
++                         count_p_diversity, count_p_mode_mismatch);
 +            if (n < 0 || n >= (int)sizeof(dgram) - pos) ok = false;
 +            else pos += n;
 +        }
@@ -217,7 +221,7 @@ index 1603b6e..757f3a3 100644
      clear_stats();
  }
  
-@@ -592,6 +769,10 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
+@@ -592,6 +773,10 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
      switch(buf[0])
      {
      case WFB_PACKET_DATA:
@@ -228,7 +232,7 @@ index 1603b6e..757f3a3 100644
          if(size < sizeof(wblock_hdr_t) + crypto_aead_chacha20poly1305_ABYTES + sizeof(wpacket_hdr_t))
          {
              WFB_ERR("Short packet (fec header)\n");
-@@ -600,6 +781,18 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
+@@ -600,6 +785,18 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
          }
          break;
  
@@ -247,7 +251,7 @@ index 1603b6e..757f3a3 100644
      case WFB_PACKET_SESSION:
          new_session_data = (wsession_data_t*)session_tmp;
  
-@@ -714,16 +907,31 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
+@@ -714,16 +911,31 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
      unsigned long long decrypted_len;
      wblock_hdr_t *block_hdr = (wblock_hdr_t*)buf;
  
@@ -288,7 +292,7 @@ index 1603b6e..757f3a3 100644
      }
  
      count_p_data += 1;
-@@ -735,7 +943,15 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
+@@ -735,7 +947,15 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
      uint64_t block_idx = be64toh(block_hdr->data_nonce) >> 8;
      uint8_t fragment_idx = (uint8_t)(be64toh(block_hdr->data_nonce) & 0xff);
  
@@ -305,7 +309,7 @@ index 1603b6e..757f3a3 100644
  
      // Should never happend due to generating new session key on tx side
      if (block_idx > MAX_BLOCK_IDX)
-@@ -745,6 +961,18 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
+@@ -745,6 +965,19 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
          return;
      }
  
@@ -315,16 +319,17 @@ index 1603b6e..757f3a3 100644
 +    // encrypt mode the decrypt above already rejected these; in plaintext
 +    // mode we need this guard explicitly or every pre-session fragment
 +    // hits the fragment_idx >= fec_n check below with a misleading error.
++    // Don't bump count_p_bad — that counter is reserved for actual protocol
++    // errors (oversize, fragment_idx out of range, etc).
 +    if (fec_n <= 0)
 +    {
-+        count_p_bad += 1;
 +        return;
 +    }
 +
      if (fragment_idx >= fec_n)
      {
          WFB_ERR("Invalid fragment_idx: %d\n", fragment_idx);
-@@ -836,6 +1064,15 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
+@@ -836,6 +1069,15 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
  
                  if(fec_count)
                  {
@@ -340,7 +345,7 @@ index 1603b6e..757f3a3 100644
                      count_p_fec_recovered += fec_count;
                      WFB_DBG("FEC recovered %u packets\n", fec_count);
                  }
-@@ -1147,8 +1384,10 @@ int main(int argc, char* const *argv)
+@@ -1147,8 +1389,10 @@ int main(int argc, char* const *argv)
  
      string keypair = "rx.key";
      string unix_socket = "";
@@ -352,7 +357,7 @@ index 1603b6e..757f3a3 100644
          switch (opt) {
          case 'K':
              keypair = optarg;
-@@ -1187,15 +1426,35 @@ int main(int argc, char* const *argv)
+@@ -1187,15 +1431,35 @@ int main(int argc, char* const *argv)
          case 'e':
              epoch = atoll(optarg);
              break;
@@ -392,7 +397,7 @@ index 1603b6e..757f3a3 100644
              WFB_INFO("WFB-ng version %s, FEC: %s\n", WFB_VERSION, zfex_opt);
              WFB_INFO("WFB-ng home page: <http://wfb-ng.org>\n");
              exit(1);
-@@ -1223,6 +1482,9 @@ int main(int argc, char* const *argv)
+@@ -1223,6 +1487,9 @@ int main(int argc, char* const *argv)
          return 1;
      }
  
@@ -402,7 +407,7 @@ index 1603b6e..757f3a3 100644
      try
      {
          uint32_t channel_id = (link_id << 8) + radio_port;
-@@ -1239,21 +1501,41 @@ int main(int argc, char* const *argv)
+@@ -1239,21 +1506,41 @@ int main(int argc, char* const *argv)
  
          unique_ptr<BaseAggregator> agg;
  
