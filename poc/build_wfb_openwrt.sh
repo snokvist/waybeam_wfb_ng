@@ -111,19 +111,30 @@ LIB="-L$TARGET_DIR/usr/lib"
 ZFEX="-DZFEX_UNROLL_ADDMUL_SIMD=8 -DZFEX_INLINE_ADDMUL -DZFEX_INLINE_ADDMUL_SIMD"
 
 # Size-minimization flags. Cumulative effect on wfb_rx + wfb_tx is large
-# (~30-40% reduction) thanks to -Wl,--gc-sections dropping unused libstdc++
-# / libsodium / libpcap chunks pulled in transitively by static linking.
-SIZE_CFLAGS="-Os -ffunction-sections -fdata-sections -fno-stack-protector"
+# (~80% reduction) thanks to:
+#   1) dynamic linking against the device's libsodium/libpcap/libstdc++/
+#      libatomic (already present on the OpenWRT rootfs — confirmed on
+#      stock build for CPE510).
+#   2) -flto across translation units → tighter dead-code elimination.
+#   3) -Wl,--gc-sections + -ffunction-sections → drop unreferenced sections.
+#   4) -fno-stack-protector / -fmerge-all-constants / -fno-asynchronous-
+#      unwind-tables → small per-fn savings that compound over the binary.
+#   5) -Wl,-s strips at link time; -Wl,--build-id=none drops the GNU note.
+#
+# If you need a fully self-contained binary (no on-device deps), add
+# -static back in CFLAGS_BASE/LDFLAGS_BASE — sizes go from ~100 KB back to
+# ~500 KB but everything bakes in.
+SIZE_CFLAGS="-Os -flto -ffunction-sections -fdata-sections -fno-stack-protector"
 SIZE_CFLAGS="$SIZE_CFLAGS -fmerge-all-constants -fno-asynchronous-unwind-tables"
-SIZE_LDFLAGS="-Wl,--gc-sections -Wl,-s -Wl,--build-id=none"
+SIZE_LDFLAGS="-flto -Wl,--gc-sections -Wl,-s -Wl,--build-id=none -Wl,--as-needed"
 
 CFLAGS_BASE="$SIZE_CFLAGS -Wall -fno-strict-aliasing $INC $ZFEX -DWFB_VERSION=\"shm-patched-mips24kc\""
-LDFLAGS_BASE="$LIB $SIZE_LDFLAGS -static"
-# musl + static C++ needs the unwinder pulled in explicitly (libstdc++.a only
-# references it). MIPS32 has no native 64-bit atomic ops, so the C++11
-# std::atomic<uint64_t> calls in tx.cpp need libatomic. Both are silent
-# pre-reqs that aren't required on the armv7l build.
-CXX_STATIC_EXTRA="-lgcc_eh -latomic"
+LDFLAGS_BASE="$LIB $SIZE_LDFLAGS"
+# MIPS32 has no native 64-bit atomic ops; std::atomic<uint64_t> in tx.cpp
+# needs libatomic. With dynamic linking we use libatomic.so from the
+# device (/lib/libatomic.so.1). C-only links (tx_cmd, keygen) don't need
+# this.
+CXX_STATIC_EXTRA="-latomic"
 
 cd "$WFB_DIR"
 
@@ -172,19 +183,22 @@ echo
 file "$BUILD_DIR/wfb_tx" | head -1
 
 if [ "$DO_DEPLOY" = "1" ]; then
+    # wfb_keygen is a one-shot host tool — keys can be generated anywhere
+    # and copied to the device, so we don't deploy it by default to save
+    # space. Pass DEPLOY_KEYGEN=1 to include it.
+    DEPLOY_FILES=("$BUILD_DIR/wfb_tx" "$BUILD_DIR/wfb_rx" "$BUILD_DIR/wfb_tx_cmd")
+    if [ "${DEPLOY_KEYGEN:-0}" = "1" ]; then
+        DEPLOY_FILES+=("$BUILD_DIR/wfb_keygen")
+    fi
     echo
     echo "=== Deploying to root@${DEPLOY_HOST}:${DEPLOY_DIR} ==="
-    scp -O \
-        "$BUILD_DIR/wfb_tx" \
-        "$BUILD_DIR/wfb_rx" \
-        "$BUILD_DIR/wfb_tx_cmd" \
-        "$BUILD_DIR/wfb_keygen" \
-        "root@${DEPLOY_HOST}:${DEPLOY_DIR}/"
-    echo "Deployed."
+    scp -O "${DEPLOY_FILES[@]}" "root@${DEPLOY_HOST}:${DEPLOY_DIR}/"
+    echo "Deployed (keygen excluded; set DEPLOY_KEYGEN=1 to include it)."
 else
     echo
-    echo "Manual deploy:"
-    echo "  scp -O $BUILD_DIR/{wfb_tx,wfb_rx,wfb_tx_cmd,wfb_keygen} root@$DEPLOY_HOST:$DEPLOY_DIR/"
+    echo "Manual deploy (keygen excluded by default):"
+    echo "  scp -O $BUILD_DIR/{wfb_tx,wfb_rx,wfb_tx_cmd} root@$DEPLOY_HOST:$DEPLOY_DIR/"
     echo "Or:"
     echo "  $0 --deploy"
+    echo "  DEPLOY_KEYGEN=1 $0 --deploy   # include wfb_keygen too"
 fi
