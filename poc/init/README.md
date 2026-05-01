@@ -1,7 +1,12 @@
 # Init scripts
 
-On-device init scripts for SigmaStar Infinity6E (OpenIPC) vehicles
-running the patched `wfb_tx` + `link_controller` stack from `poc/`.
+On-device init scripts for the patched `wfb_tx` / `wfb_rx` stack from
+`poc/`. One file per platform/role:
+
+| File | Role | Platform |
+|---|---|---|
+| `S99wfb` | Vehicle (broadcaster) | SigmaStar Infinity6E, OpenIPC, classic SysV `/etc/init.d/` |
+| `wfb-ng.sh` | Ground station (CPE510) | TP-Link CPE510 v3, OpenWrt + procd |
 
 ## `S99wfb` — opt-in WFB-NG broadcaster mode
 
@@ -80,3 +85,72 @@ failsafe-watch. FEC adaptation is unaffected. Once the `-Y` patch is
 ported to `wfb_rx`, swap the `wfb_rx -u 5801` line for
 `wfb_rx -Y 127.0.0.1:5801` and pass `--stats 127.0.0.1:5801` to
 `link_controller`.
+
+## `wfb-ng.sh` — CPE510 ground-station supervisor
+
+procd-foreground supervisor for a TP-Link CPE510 v3 ground station running
+the OpenWrt build from `poc/openwrt/` (cross-built `wfb_rx` / `wfb_tx`
+from PR [#36](https://github.com/snokvist/waybeam_wfb_ng/pull/36)).
+
+### What it does
+
+1. Reads `/etc/waybeam/current` (the "wbmode" pointer — values: `wfb`,
+   `client`, …)
+2. If `wfb`: invokes `/etc/waybeam/wfb/post-up.sh` to create `wlan0mon`
+   on `phy0` (monitor, ch161 HT40+, txpower 2000 mBm by default; HT40+
+   primary on 161 still receives a vehicle HT20 ch161 signal cleanly).
+3. Spawns `wfb_rx` (link 207, AEAD-cleartext data, decoded RTP forwarded
+   to `192.168.2.20:5600`, stats pushed via `-Y` to `127.0.0.1:5801`).
+4. Spawns `wfb_tx` (link 208, listens on UDP `5801`, control port `8000`,
+   `M=1 k=1 n=2`).
+5. Waits on both children. On SIGTERM/SIGINT/SIGHUP from procd: kills the
+   daemons and `iw dev wlan0mon del` for clean teardown.
+
+The `127.0.0.1:5801` collision is **intentional** — `wfb_rx`'s `-Y`
+JSON stats push lands on the same UDP port that `wfb_tx -u 5801` is
+listening on. `wfb_tx` packs the JSON into the uplink stream on link
+208, where the vehicle's `wfb_rx` receives it and forwards it to
+`link_controller` upstream. This is the GS→vehicle feedback path.
+
+### Install
+
+The procd unit `/etc/init.d/wfb-ng` (already present on the OpenWrt
+build) starts `/usr/sbin/wfb-ng.sh` at S99 and respawns it on exit.
+Drop the supervisor in:
+
+```bash
+scp -O poc/init/wfb-ng.sh root@192.168.2.2:/usr/sbin/wfb-ng.sh
+ssh root@192.168.2.2 'chmod +x /usr/sbin/wfb-ng.sh && /etc/init.d/wfb-ng restart'
+```
+
+### Verify
+
+```bash
+ssh root@192.168.2.2 '
+  iw dev                                   # wlan0mon, monitor, ch161
+  ps w | grep -E "wfb_(rx|tx)" | grep -v grep
+  ubus call service list | grep -A4 wfb-ng # running:true
+  logread | tail -20
+'
+```
+
+### Mode switch (no reboot needed)
+
+```bash
+# disable
+echo client > /etc/waybeam/current
+/etc/init.d/wfb-ng restart   # supervisor idles, no daemons spawned
+
+# re-enable
+echo wfb > /etc/waybeam/current
+/etc/init.d/wfb-ng restart
+```
+
+### Known gap
+
+`/etc/waybeam/{wfb,client}/{wireless,network}` profiles are not yet
+applied at boot — only `post-up.sh` is invoked by this supervisor.
+Switching profiles via `/etc/waybeam/current` does not currently swap
+`/etc/config/wireless` or `/etc/config/network`. Add a separate
+profile-loader (uci-defaults or hotplug) once the `client` profile is
+needed.
