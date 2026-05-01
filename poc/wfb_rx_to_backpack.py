@@ -20,6 +20,39 @@ Failsafe: if no rx_ant within --stale-timeout seconds, send 1000/1000/1000.
 The vehicle decoder should treat sel=1000 as "no data" and synthesize
 "100% loss + RSSI=lo" so link_controller drops to bucket 0.
 
+Wire contract for vehicle-side decoder
+--------------------------------------
+The 3 channels arrive on the vehicle as standard CRSF RC values 1000..2000 us.
+After applying --map (default sel=pan, val=roll, rssi=tilt):
+
+  Failsafe detection:
+      sel <= 1050 us  =>  ground link is dead; synthesize:
+          {"type":"rx_ant","ver":1,
+           "pkt":{"uniq":1,"lost":1,"fec_recovered":0,"adapters":0},
+           "rx_ant":[{"rssi":{"avg":<rssi_min>,"max":<rssi_min>}}]}
+      Result: link_controller drops to MCS bucket 0 within its 500ms watchdog.
+
+  Selector decoding (sel above failsafe band):
+      sel in [1075..1175]  -> val carries pre-FEC loss percent
+                              loss_pct = (val - 1000) / 10.0           (0..100%)
+      sel in [1450..1550]  -> val carries FEC recovered percent
+                              fec_pct  = (val - 1000) / 10.0           (0..100%)
+      sel in [1825..1925]  -> val carries adapter count
+                              adapters = round((val - 1100) / 200), >=0
+                              (encoding offset=1100, scale=200; values
+                               1100/1300/1500/1700/1900 for n=0..4, 2000
+                               for n>=5)
+
+  RSSI (always-on, full range each tick):
+      rssi_dbm = rssi_min + (rssi_us - 1000) / 1000.0 * (rssi_max - rssi_min)
+      where rssi_min/rssi_max match the ground-side --rssi-min/--rssi-max
+      (default -100..0 dBm).
+
+  Rate:
+      sel rotates at 30 Hz so each band is visible at ~10 Hz. Hold the most
+      recent value for each band. Emit the synthesized rx_ant JSON to
+      link_controller :5801 at ~1 Hz so its EWMA filters behave as designed.
+
 Usage
 -----
     wfb_rx -Y 127.0.0.1:5801 ...
@@ -39,11 +72,19 @@ import socket
 import struct
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
-import serial
-from serial.tools import list_ports
+# pyserial is the only runtime dep; import lazily so the unit tests can load
+# the module without it installed.
+try:
+    import serial  # type: ignore
+    from serial.tools import list_ports  # type: ignore
+    _SERIAL_AVAILABLE = True
+except ImportError:  # pragma: no cover - exercised by tests that don't need USB
+    serial = None  # type: ignore
+    list_ports = None  # type: ignore
+    _SERIAL_AVAILABLE = False
 
 
 # ---- MSP v2 framing (vendored from Waybeam-backpack-android/tools/msp.py) ---
@@ -62,6 +103,7 @@ def msp_encode(function: int, payload: bytes = b"", direction: str = "<", flag: 
     return b"$X" + direction.encode("ascii") + body + bytes([_crsf_crc8(body)])
 
 
+MSP_ELRS_GET_BACKPACK_VERSION = 0x0010
 MSP_ELRS_BACKPACK_SET_HEAD_TRACKING = 0x030D
 MSP_ELRS_BACKPACK_SET_PTR = 0x0383
 
@@ -100,6 +142,11 @@ SEL_ADAPTERS = 1900
 
 FAILSAFE_VALUE = 1000
 
+# Adapter-count encoding: offset 1100, scale 200. Picked so the val slot
+# never lands on the failsafe sentinel (1000) for any valid adapter count.
+ADAPTER_OFFSET_US = 1100
+ADAPTER_SCALE_US = 200
+
 
 def _clamp(v: int) -> int:
     if v < CRSF_LOW:
@@ -110,6 +157,7 @@ def _clamp(v: int) -> int:
 
 
 def encode_pct(pct: float) -> int:
+    """Map 0..100 percent to 1000..2000 us."""
     if pct < 0.0:
         pct = 0.0
     if pct > 100.0:
@@ -117,11 +165,19 @@ def encode_pct(pct: float) -> int:
     return _clamp(int(round(CRSF_LOW + pct * 10.0)))
 
 
-def encode_count(n: int, scale: int = 100) -> int:
-    return _clamp(CRSF_LOW + max(0, n) * scale)
+def encode_adapters(n: int) -> int:
+    """Map an adapter count (0+) to a CRSF us value distinct from failsafe.
+
+    n=0 -> 1100, n=1 -> 1300, n=2 -> 1500, n=3 -> 1700, n=4 -> 1900,
+    n>=5 -> 2000 (saturates). Never returns 1000 (reserved for failsafe).
+    """
+    if n < 0:
+        n = 0
+    return _clamp(ADAPTER_OFFSET_US + n * ADAPTER_SCALE_US)
 
 
 def encode_rssi(dbm: float, lo_dbm: float, hi_dbm: float) -> int:
+    """Linearly map a dBm value to 1000..2000 us. Caller must validate lo<hi."""
     if dbm <= lo_dbm:
         return CRSF_LOW
     if dbm >= hi_dbm:
@@ -194,7 +250,7 @@ def parse_rx_ant(raw: bytes) -> Optional[RxAntStats]:
 
     # Best-avg RSSI across every antenna entry — mirrors AGG_BEST_AVG default.
     best_avg: Optional[float] = None
-    candidates = []
+    candidates: list = []
     for key in ("rx_ant", "rx_ant_stats", "antennas"):
         v = j.get(key)
         if isinstance(v, list):
@@ -206,7 +262,7 @@ def parse_rx_ant(raw: bytes) -> Optional[RxAntStats]:
     for v in j.values():
         if isinstance(v, dict) and "rssi" in v:
             candidates.append(v)
-    seen = set()
+    seen: set = set()
     for ant in candidates:
         if not isinstance(ant, dict):
             continue
@@ -233,15 +289,27 @@ class Backpack:
     """USB-CDC writer: send PTR frames, auto-reconnect with exponential backoff."""
 
     def __init__(self, device: Optional[str], baud: int = 460800,
-                 reconnect_min: float = 0.5, reconnect_max: float = 5.0):
+                 reconnect_min: float = 0.5, reconnect_max: float = 5.0,
+                 write_timeout: float = 0.1) -> None:
+        if not _SERIAL_AVAILABLE:
+            raise RuntimeError(
+                "pyserial is required to drive the Backpack USB device "
+                "(install with `pip install pyserial`). For dry-run / unit "
+                "tests, run with --dry-run or import the module without "
+                "instantiating Backpack."
+            )
         self.device = device
         self.baud = baud
         self.reconnect_min = reconnect_min
         self.reconnect_max = reconnect_max
+        self.write_timeout = write_timeout
         self._ser: Optional[serial.Serial] = None
         self._next_attempt = 0.0
         self._backoff = reconnect_min
         self._log = logging.getLogger("backpack")
+        self.tx_frames = 0
+        self.write_errors = 0
+        self.reconnects = 0
 
     @staticmethod
     def autodetect() -> Optional[str]:
@@ -268,13 +336,19 @@ class Backpack:
             self._schedule_retry()
             return False
         try:
-            self._ser = serial.Serial(port=port, baudrate=self.baud, timeout=0)
+            self._ser = serial.Serial(
+                port=port,
+                baudrate=self.baud,
+                timeout=0,
+                write_timeout=self.write_timeout,
+            )
         except (serial.SerialException, OSError) as e:
             self._log.warning("open %s failed: %s; retry in %.1fs", port, e, self._backoff)
             self._ser = None
             self._schedule_retry()
             return False
         self._log.info("connected to %s @ %d", port, self.baud)
+        self.reconnects += 1
         try:
             self._ser.write(msp_encode(MSP_ELRS_BACKPACK_SET_HEAD_TRACKING, bytes([1])))
         except (serial.SerialException, OSError) as e:
@@ -287,7 +361,8 @@ class Backpack:
 
     def send_ptr(self, pan: int, roll: int, tilt: int) -> bool:
         """Send a PTR injection. Inputs are in 1000..2000 us; converted to
-        CRSF ticks 191..1792 on the wire (firmware's PTR decoder uses ticks)."""
+        CRSF ticks 191..1792 on the wire (firmware's PTR decoder uses ticks).
+        """
         if not self.ensure_open():
             return False
         payload = struct.pack(
@@ -300,11 +375,56 @@ class Backpack:
             assert self._ser is not None
             self._ser.write(msp_encode(MSP_ELRS_BACKPACK_SET_PTR, payload))
         except (serial.SerialException, OSError) as e:
+            self.write_errors += 1
             self._log.warning("write failed: %s; closing port", e)
             self._close_port()
             self._schedule_retry()
             return False
+        self.tx_frames += 1
         return True
+
+    def send_version_probe(self) -> bool:
+        if not self.is_open():
+            return False
+        try:
+            assert self._ser is not None
+            self._ser.write(msp_encode(MSP_ELRS_GET_BACKPACK_VERSION))
+        except (serial.SerialException, OSError) as e:
+            self._log.debug("probe write failed: %s", e)
+            self._close_port()
+            self._schedule_retry()
+            return False
+        return True
+
+    def read_pending(self) -> bytes:
+        """Drain any pending serial input non-blocking. Returns b'' if nothing
+        is queued or the port is gone. Failures close the port for reconnect."""
+        if not self.is_open():
+            return b""
+        try:
+            assert self._ser is not None
+            n = self._ser.in_waiting
+        except (serial.SerialException, OSError) as e:
+            self._log.debug("in_waiting failed: %s", e)
+            self._close_port()
+            self._schedule_retry()
+            return b""
+        if n == 0:
+            return b""
+        try:
+            assert self._ser is not None
+            return self._ser.read(n)
+        except (serial.SerialException, OSError) as e:
+            self._log.debug("read failed: %s", e)
+            self._close_port()
+            self._schedule_retry()
+            return b""
+
+    def force_reconnect(self) -> None:
+        if self.is_open():
+            self._log.warning("forcing reconnect")
+        self._close_port()
+        self._schedule_retry()
 
     def _schedule_retry(self) -> None:
         self._next_attempt = time.monotonic() + self._backoff
@@ -314,7 +434,7 @@ class Backpack:
         if self._ser is not None:
             try:
                 self._ser.close()
-            except Exception:
+            except (serial.SerialException, OSError):
                 pass
             self._ser = None
 
@@ -325,7 +445,7 @@ class Backpack:
 # ---- multiplex scheduler ----------------------------------------------------
 
 class Multiplex:
-    def __init__(self, rotation=(SEL_LOSS, SEL_FEC, SEL_ADAPTERS)):
+    def __init__(self, rotation: tuple = (SEL_LOSS, SEL_FEC, SEL_ADAPTERS)) -> None:
         self.rotation = rotation
         self.idx = 0
 
@@ -341,9 +461,16 @@ PTR_SLOTS = ("pan", "roll", "tilt")
 LOGICAL = ("sel", "val", "rssi")
 
 
-def parse_slot_map(spec: str) -> dict:
-    """`sel=pan,val=roll,rssi=tilt` -> {'sel':'pan','val':'roll','rssi':'tilt'}."""
-    out: dict = {}
+@dataclass
+class SlotMap:
+    """Logical->PTR mapping plus its precomputed inverse (PTR->logical)."""
+    forward: dict = field(default_factory=dict)
+    inverse: dict = field(default_factory=dict)
+
+
+def parse_slot_map(spec: str) -> SlotMap:
+    """`sel=pan,val=roll,rssi=tilt` -> SlotMap."""
+    forward: dict = {}
     for kv in spec.split(","):
         kv = kv.strip()
         if not kv:
@@ -353,17 +480,18 @@ def parse_slot_map(spec: str) -> dict:
         v = v.strip().lower()
         if k not in LOGICAL or v not in PTR_SLOTS:
             raise argparse.ArgumentTypeError(f"bad map entry {kv!r}")
-        out[k] = v
-    if set(out.keys()) != set(LOGICAL):
+        forward[k] = v
+    if set(forward.keys()) != set(LOGICAL):
         raise argparse.ArgumentTypeError(f"--map must define {','.join(LOGICAL)}")
-    if len(set(out.values())) != 3:
+    if len(set(forward.values())) != 3:
         raise argparse.ArgumentTypeError("--map slots must be unique")
-    return out
+    inverse = {v: k for k, v in forward.items()}
+    return SlotMap(forward=forward, inverse=inverse)
 
 
-def build_ptr(sel_v: int, val_v: int, rssi_v: int, slot_map: dict) -> tuple[int, int, int]:
+def build_ptr(sel_v: int, val_v: int, rssi_v: int, slot_map: SlotMap) -> tuple:
     by_logical = {"sel": sel_v, "val": val_v, "rssi": rssi_v}
-    inv = {v: k for k, v in slot_map.items()}  # 'pan' -> 'sel' etc.
+    inv = slot_map.inverse
     return (
         by_logical[inv["pan"]],
         by_logical[inv["roll"]],
@@ -371,9 +499,62 @@ def build_ptr(sel_v: int, val_v: int, rssi_v: int, slot_map: dict) -> tuple[int,
     )
 
 
+# ---- helpers ----------------------------------------------------------------
+
+def parse_addr(spec: str, default_port: int = 5801) -> tuple:
+    """Parse `host:port`, `:port`, `port`, `host`, `[ipv6]:port`. Returns (host, port)."""
+    s = spec.strip()
+    if not s:
+        raise argparse.ArgumentTypeError("--listen cannot be empty")
+    # IPv6 bracketed form: [::1]:5801 or [::]:5801
+    if s.startswith("["):
+        end = s.find("]")
+        if end < 0:
+            raise argparse.ArgumentTypeError(f"unmatched '[' in {spec!r}")
+        host = s[1:end]
+        rest = s[end + 1:]
+        if rest.startswith(":"):
+            port_s = rest[1:]
+        elif rest == "":
+            port_s = str(default_port)
+        else:
+            raise argparse.ArgumentTypeError(f"bad address {spec!r}")
+    elif ":" in s:
+        host, _, port_s = s.rpartition(":")
+        if not host:
+            host = "0.0.0.0"
+        if not port_s:
+            port_s = str(default_port)
+    else:
+        # Bare value: treat as port if numeric, else as host with default port.
+        if s.isdigit():
+            host = "0.0.0.0"
+            port_s = s
+        else:
+            host = s
+            port_s = str(default_port)
+    try:
+        port = int(port_s)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"bad port in {spec!r}")
+    if not 0 < port < 65536:
+        raise argparse.ArgumentTypeError(f"port {port} out of range in {spec!r}")
+    return host, port
+
+
+def positive_float(s: str) -> float:
+    try:
+        v = float(s)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{s!r} is not a number")
+    if v <= 0:
+        raise argparse.ArgumentTypeError(f"{s!r} must be > 0")
+    return v
+
+
 # ---- main loop --------------------------------------------------------------
 
-def main(argv=None) -> int:
+def main(argv: Optional[list] = None) -> int:
     ap = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -383,9 +564,9 @@ def main(argv=None) -> int:
     ap.add_argument("--baud", type=int, default=460800)
     ap.add_argument("--listen", default="0.0.0.0:5801",
                     help="UDP listener for wfb_rx -Y stats (default 0.0.0.0:5801)")
-    ap.add_argument("--rate", type=float, default=30.0,
-                    help="PTR send rate Hz cap (default 30)")
-    ap.add_argument("--stale-timeout", type=float, default=2.0,
+    ap.add_argument("--rate", type=positive_float, default=30.0,
+                    help="PTR send rate Hz cap (default 30, must be > 0)")
+    ap.add_argument("--stale-timeout", type=positive_float, default=2.0,
                     help="seconds with no rx_ant before failsafe (default 2.0)")
     ap.add_argument("--rssi-min", type=float, default=-100.0)
     ap.add_argument("--rssi-max", type=float, default=0.0)
@@ -393,6 +574,14 @@ def main(argv=None) -> int:
                     default=parse_slot_map("sel=pan,val=roll,rssi=tilt"),
                     dest="slot_map",
                     help="logical->PTR slot map (default: sel=pan,val=roll,rssi=tilt)")
+    ap.add_argument("--center-only", action="store_true",
+                    help="ignore wfb_rx; send 1500/1500/1500 indefinitely (wire test)")
+    ap.add_argument("--liveness-period", type=positive_float, default=10.0,
+                    help="send a version probe every N seconds (default 10)")
+    ap.add_argument("--liveness-timeout", type=positive_float, default=3.0,
+                    help="reconnect if no inbound bytes within N s of probe (default 3)")
+    ap.add_argument("--heartbeat", type=positive_float, default=10.0,
+                    help="emit a stats line every N seconds (default 10, 0 = off)")
     ap.add_argument("--dry-run", action="store_true",
                     help="don't open USB; log what would have been sent")
     ap.add_argument("--log-json", action="store_true",
@@ -400,16 +589,21 @@ def main(argv=None) -> int:
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args(argv)
 
+    if args.rssi_min >= args.rssi_max:
+        ap.error(f"--rssi-min ({args.rssi_min}) must be < --rssi-max ({args.rssi_max})")
+
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     log = logging.getLogger("main")
+    try:
+        host, listen_port = parse_addr(args.listen, default_port=5801)
+    except argparse.ArgumentTypeError as e:
+        ap.error(str(e))
 
-    host, _, port_s = args.listen.rpartition(":")
-    if not host:
-        host = "0.0.0.0"
-    listen_port = int(port_s)
+    log.info("slot map: %s (inverse %s)", args.slot_map.forward, args.slot_map.inverse)
+
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.bind((host, listen_port))
@@ -425,9 +619,21 @@ def main(argv=None) -> int:
     period = 1.0 / args.rate
     next_tick = time.monotonic()
     in_failsafe = False
+    rssi_missing_warned = False
     stop = False
 
-    def _sig(_signum, _frame):
+    # Liveness probe state.
+    last_probe_at = 0.0
+    probe_pending = False
+    last_inbound_at = time.monotonic()
+
+    # Heartbeat / stats.
+    rx_count = 0
+    drop_count = 0
+    failsafe_count = 0
+    last_heartbeat_at = time.monotonic()
+
+    def _sig(_signum: int, _frame: object) -> None:
         nonlocal stop
         stop = True
 
@@ -448,14 +654,23 @@ def main(argv=None) -> int:
                     break
                 stats = parse_rx_ant(data)
                 if stats is None:
+                    drop_count += 1
                     log.debug("skip non-rx_ant datagram (%d bytes)", len(data))
                     continue
                 last = stats
+                rx_count += 1
                 if args.log_json:
                     log.info("rx_ant uniq=%d lost=%d fec=%d adapters=%d rssi=%s",
                              stats.uniq, stats.lost, stats.fec_recovered,
                              stats.adapters,
                              f"{stats.rssi_best_avg:.1f}" if stats.rssi_best_avg is not None else "n/a")
+
+        # Drain serial input opportunistically (proves Backpack is alive).
+        if bp is not None:
+            inbound = bp.read_pending()
+            if inbound:
+                last_inbound_at = time.monotonic()
+                probe_pending = False
 
         now = time.monotonic()
         if now < next_tick:
@@ -465,35 +680,74 @@ def main(argv=None) -> int:
             # Fell behind (e.g. blocked on USB). Resync without spamming.
             next_tick = now + period
 
-        stale = last is None or (now - last.rx_ts) > args.stale_timeout
-        if stale:
-            sel_v = val_v = rssi_v = FAILSAFE_VALUE
-            if not in_failsafe:
-                log.warning("failsafe: no rx_ant within %.1fs — sending %d/%d/%d",
-                            args.stale_timeout, FAILSAFE_VALUE, FAILSAFE_VALUE, FAILSAFE_VALUE)
-                in_failsafe = True
-        else:
+        # Build channel values.
+        if args.center_only:
+            sel_v = val_v = rssi_v = 1500
             if in_failsafe:
-                log.info("failsafe cleared — rx_ant resumed")
                 in_failsafe = False
-            sel_id = mux.next()
-            assert last is not None
-            if sel_id == SEL_LOSS:
-                val_v = encode_pct(last.loss_pct)
-            elif sel_id == SEL_FEC:
-                val_v = encode_pct(last.fec_pct)
-            else:  # SEL_ADAPTERS
-                val_v = encode_count(last.adapters, scale=100)
-            sel_v = sel_id
-            rssi_dbm = last.rssi_best_avg if last.rssi_best_avg is not None else args.rssi_min
-            rssi_v = encode_rssi(rssi_dbm, args.rssi_min, args.rssi_max)
+        else:
+            stale = last is None or (now - last.rx_ts) > args.stale_timeout
+            if stale:
+                sel_v = val_v = rssi_v = FAILSAFE_VALUE
+                if not in_failsafe:
+                    log.warning("failsafe: no rx_ant within %.1fs — sending %d/%d/%d",
+                                args.stale_timeout, FAILSAFE_VALUE, FAILSAFE_VALUE,
+                                FAILSAFE_VALUE)
+                    in_failsafe = True
+                    failsafe_count += 1
+            else:
+                if in_failsafe:
+                    log.info("failsafe cleared — rx_ant resumed")
+                    in_failsafe = False
+                sel_id = mux.next()
+                assert last is not None
+                if sel_id == SEL_LOSS:
+                    val_v = encode_pct(last.loss_pct)
+                elif sel_id == SEL_FEC:
+                    val_v = encode_pct(last.fec_pct)
+                else:  # SEL_ADAPTERS
+                    val_v = encode_adapters(last.adapters)
+                sel_v = sel_id
+                if last.rssi_best_avg is None:
+                    if not rssi_missing_warned:
+                        log.warning("rx_ant has no parseable rssi avg; using rssi_min=%.0f dBm",
+                                    args.rssi_min)
+                        rssi_missing_warned = True
+                    rssi_dbm = args.rssi_min
+                else:
+                    rssi_dbm = last.rssi_best_avg
+                rssi_v = encode_rssi(rssi_dbm, args.rssi_min, args.rssi_max)
 
         pan, roll, tilt = build_ptr(sel_v, val_v, rssi_v, args.slot_map)
-        if args.verbose:
-            log.debug("tx pan=%d roll=%d tilt=%d (sel=%d val=%d rssi=%d)",
-                      pan, roll, tilt, sel_v, val_v, rssi_v)
+        log.debug("tx pan=%d roll=%d tilt=%d (sel=%d val=%d rssi=%d)",
+                  pan, roll, tilt, sel_v, val_v, rssi_v)
         if bp is not None:
             bp.send_ptr(pan, roll, tilt)
+
+            # Liveness probe: if we haven't sent one in a while, do so now.
+            if not probe_pending and (now - last_probe_at) >= args.liveness_period:
+                if bp.send_version_probe():
+                    last_probe_at = now
+                    probe_pending = True
+            # Probe timeout: declare port dead, force reconnect.
+            if probe_pending and (now - last_probe_at) >= args.liveness_timeout:
+                log.warning("backpack unresponsive (%.1fs since probe sent); reconnecting",
+                            now - last_probe_at)
+                bp.force_reconnect()
+                probe_pending = False
+                last_probe_at = now
+
+        # Heartbeat stats.
+        if args.heartbeat > 0 and (now - last_heartbeat_at) >= args.heartbeat:
+            tx = bp.tx_frames if bp else 0
+            werr = bp.write_errors if bp else 0
+            recon = bp.reconnects if bp else 0
+            connected = "yes" if (bp and bp.is_open()) else "no"
+            log.info(
+                "stats: rx=%d drop=%d failsafe=%d tx=%d werr=%d reconnects=%d connected=%s",
+                rx_count, drop_count, failsafe_count, tx, werr, recon, connected,
+            )
+            last_heartbeat_at = now
 
     sock.close()
     if bp is not None:
