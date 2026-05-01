@@ -109,8 +109,16 @@ cp "$WFB_NG_ROOT/src/venc_ring.c"     "$WFB_DIR/src/venc_ring.c"
 INC="-I$TARGET_DIR/usr/include -I$WFB_NG_ROOT/include"
 LIB="-L$TARGET_DIR/usr/lib"
 ZFEX="-DZFEX_UNROLL_ADDMUL_SIMD=8 -DZFEX_INLINE_ADDMUL -DZFEX_INLINE_ADDMUL_SIMD"
-CFLAGS_BASE="-Os -Wall -fno-strict-aliasing $INC $ZFEX -DWFB_VERSION=\"shm-patched-mips24kc\""
-LDFLAGS_BASE="$LIB -static"
+
+# Size-minimization flags. Cumulative effect on wfb_rx + wfb_tx is large
+# (~30-40% reduction) thanks to -Wl,--gc-sections dropping unused libstdc++
+# / libsodium / libpcap chunks pulled in transitively by static linking.
+SIZE_CFLAGS="-Os -ffunction-sections -fdata-sections -fno-stack-protector"
+SIZE_CFLAGS="$SIZE_CFLAGS -fmerge-all-constants -fno-asynchronous-unwind-tables"
+SIZE_LDFLAGS="-Wl,--gc-sections -Wl,-s -Wl,--build-id=none"
+
+CFLAGS_BASE="$SIZE_CFLAGS -Wall -fno-strict-aliasing $INC $ZFEX -DWFB_VERSION=\"shm-patched-mips24kc\""
+LDFLAGS_BASE="$LIB $SIZE_LDFLAGS -static"
 # musl + static C++ needs the unwinder pulled in explicitly (libstdc++.a only
 # references it). MIPS32 has no native 64-bit atomic ops, so the C++11
 # std::atomic<uint64_t> calls in tx.cpp need libatomic. Both are silent
