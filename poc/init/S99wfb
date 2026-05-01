@@ -1,0 +1,106 @@
+#!/bin/sh
+# S99wfb - optional WFB-NG broadcaster mode for wlan0
+# Enable:  fw_setenv wfbmode 1 ; reboot
+# Disable: fw_setenv wfbmode 0 ; reboot
+# Manual:  /etc/init.d/S99wfb {start|stop|restart|status}
+
+WFB_CHANNEL=161
+WFB_HTMODE=HT20
+WFB_TXPOWER=2000
+WFB_MCS=2
+WFB_BW=20
+WFB_K=8
+WFB_N=12
+WFB_TX_LINK=207
+WFB_RX_LINK=208
+WFB_CTRL=8000
+WFB_RX_FWD_PORT=5801
+SAFE_BITRATE=4096
+SHM_RING="local_shm"
+KEY="/etc/drone.key"
+
+PID_TX="/var/run/wfb_tx.pid"
+PID_RX="/var/run/wfb_rx.pid"
+PID_LC="/var/run/link_controller.pid"
+LOG="/tmp/wfb.log"
+
+fw_get() { fw_printenv -n "$1" 2>/dev/null || echo "$2"; }
+is_enabled() { [ "$(fw_get wfbmode 0)" = "1" ]; }
+log() { echo "[wfb] $*" | tee -a "$LOG"; }
+
+start_wfb() {
+    log "starting WFB-NG broadcaster"
+
+    # Tear down AP (kills hostapd + adapter monitor + flushes wlan0)
+    /usr/bin/adapter stop >> "$LOG" 2>&1
+    sleep 0.5
+
+    # Monitor mode + channel + txpower
+    iw dev wlan0 set monitor otherbss >> "$LOG" 2>&1
+    ip link set wlan0 up
+    iw dev wlan0 set channel $WFB_CHANNEL $WFB_HTMODE >> "$LOG" 2>&1
+    iw dev wlan0 set txpower fixed $WFB_TXPOWER >> "$LOG" 2>&1
+
+    # wfb_tx (SHM input from venc)
+    wfb_tx -K "$KEY" -M $WFB_MCS -B $WFB_BW -k $WFB_K -n $WFB_N \
+           -P 1 -Q -S 1 -L 1 -C $WFB_CTRL \
+           -H "$SHM_RING" -R 2097152 -s 2097152 \
+           -l 1000 -i $WFB_TX_LINK -p 0 -b 1 -x wlan0 \
+           >> "$LOG" 2>&1 &
+    echo $! > "$PID_TX"
+
+    # wfb_rx (uplink data forwarder - decoded packets to 127.0.0.1:5801)
+    wfb_rx -K "$KEY" -i $WFB_RX_LINK -u $WFB_RX_FWD_PORT -p 0 wlan0 \
+           >> "$LOG" 2>&1 &
+    echo $! > "$PID_RX"
+
+    # link_controller (writes safe bitrate to venc on startup, adaptive FEC,
+    # WebUI on :8765 reachable via eth0)
+    link_controller \
+        --wfb 127.0.0.1:$WFB_CTRL \
+        --venc 127.0.0.1:80 \
+        --safe-startup-bitrate $SAFE_BITRATE \
+        >> "$LOG" 2>&1 &
+    echo $! > "$PID_LC"
+
+    log "started (tx=$(cat $PID_TX) rx=$(cat $PID_RX) lc=$(cat $PID_LC))"
+}
+
+stop_wfb() {
+    log "stopping"
+    for f in "$PID_LC" "$PID_RX" "$PID_TX"; do
+        [ -f "$f" ] && { kill "$(cat $f)" 2>/dev/null; rm -f "$f"; }
+    done
+    sleep 0.5
+    killall -q link_controller wfb_rx wfb_tx 2>/dev/null
+    sleep 0.3
+    ip link set wlan0 down 2>/dev/null
+    # Return wlan0 to AP mode (or whatever wlanmode is set to)
+    /usr/bin/adapter start >> "$LOG" 2>&1
+    log "wlan0 restored via adapter"
+}
+
+status_wfb() {
+    echo "wfbmode env: $(fw_get wfbmode 0)"
+    for name in wfb_tx wfb_rx link_controller; do
+        pid=$(pidof "$name" 2>/dev/null)
+        echo "  $name: ${pid:-not running}"
+    done
+    echo "wlan0:"
+    iw dev wlan0 info 2>/dev/null | grep -E "type|channel|txpower" | sed 's/^/  /'
+}
+
+case "$1" in
+    start)
+        if is_enabled; then
+            start_wfb
+        else
+            log "disabled (fw_setenv wfbmode 1 to enable)"
+        fi
+        ;;
+    stop)    stop_wfb ;;
+    restart) stop_wfb; sleep 0.5; start_wfb ;;
+    status)  status_wfb ;;
+    *)       echo "Usage: $0 {start|stop|restart|status}"; exit 1 ;;
+esac
+exit 0
