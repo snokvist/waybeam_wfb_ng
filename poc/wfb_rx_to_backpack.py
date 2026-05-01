@@ -68,6 +68,25 @@ MSP_ELRS_BACKPACK_SET_PTR = 0x0383
 ESPRESSIF_VID = 0x303A
 ESPRESSIF_PID = 0x1001
 
+# CRSF channel "tick" range used by the Backpack firmware's PTR decoder
+# (devHeadTracker.cpp:264-266 calls fmap(val, CRSF_CHANNEL_VALUE_1000=191,
+# CRSF_CHANNEL_VALUE_2000=1792, ...)). The PTR payload must be in tick units,
+# NOT microseconds — sending 1000..2000 us makes the receiver squash to the
+# upper half (~1500..2000 us). See Waybeam-backpack-android Backpack.kt:853-861
+# for the canonical tick-mode PTR encoder.
+CRSF_TICK_1000_US = 191
+CRSF_TICK_2000_US = 1792
+
+
+def us_to_crsf_tick(us: int) -> int:
+    """Map a 1000..2000 microsecond value to CRSF tick units (191..1792)."""
+    if us < 1000:
+        us = 1000
+    if us > 2000:
+        us = 2000
+    span = CRSF_TICK_2000_US - CRSF_TICK_1000_US  # 1601
+    return int(round(CRSF_TICK_1000_US + (us - 1000) * span / 1000.0))
+
 
 # ---- channel encoding -------------------------------------------------------
 
@@ -267,9 +286,16 @@ class Backpack:
         return True
 
     def send_ptr(self, pan: int, roll: int, tilt: int) -> bool:
+        """Send a PTR injection. Inputs are in 1000..2000 us; converted to
+        CRSF ticks 191..1792 on the wire (firmware's PTR decoder uses ticks)."""
         if not self.ensure_open():
             return False
-        payload = struct.pack("<hhh", pan, roll, tilt)
+        payload = struct.pack(
+            "<hhh",
+            us_to_crsf_tick(pan),
+            us_to_crsf_tick(roll),
+            us_to_crsf_tick(tilt),
+        )
         try:
             assert self._ser is not None
             self._ser.write(msp_encode(MSP_ELRS_BACKPACK_SET_PTR, payload))
