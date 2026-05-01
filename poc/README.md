@@ -64,6 +64,7 @@ to stock wfb-ng.
 | `rtp_timing_probe.c` | source only | host build | Host-native RTP + sidecar timing diagnostic. |
 | `fec_controller.py` | source only | host/embedded | Older Python fec_controller. Superseded by the C version; kept for reference. |
 | `ground_rssi_forwarder.py` | source only | host | **DEPRECATED.** Bridged wfb_rx stdout → UDP. Use `wfb_rx -Y` instead. |
+| `wfb_rx_to_backpack.py` | source only | host | Ground-side bridge: `wfb_rx -Y` rx_ant JSON → 3-channel PTR injection over USB-CDC into an ELRS TX Backpack. Carries link-quality telemetry over the existing ELRS uplink as a backchannel for vehicle-side `link_controller`. See module docstring for the wire contract. |
 
 Deeper docs:
 - `SHM_HOWTO.md` — full SHM-ring protocol, wfb_tx `-H/-b/-r/-x/-Y` flag reference, on-device test recipes.
