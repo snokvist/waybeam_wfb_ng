@@ -89,6 +89,25 @@ cd poc
 ./build_wfb_tx.sh --deploy    # also scp to DEPLOY_HOST=192.168.1.10
 ```
 
+### OpenWRT MIPS24KC big-endian (TP-Link CPE510 et al)
+
+Reuses the same wfb-ng tree + shm-input.patch but cross-compiles for an
+OpenWRT `mips_24kc/musl` target. Requires an OpenWRT build tree at
+`<coord>/openwrt` with libsodium and libpcap already compiled into the
+target staging dir.
+
+```bash
+cd poc
+./build_wfb_openwrt.sh                      # build static MIPS BE binaries -> build-openwrt/
+./build_wfb_openwrt.sh --clean              # wipe build-openwrt/
+./build_wfb_openwrt.sh --deploy             # scp to DEPLOY_HOST=192.168.2.2:/usr/bin
+DEPLOY_DIR=/tmp ./build_wfb_openwrt.sh --deploy   # /tmp on flash-tight devices
+OPENWRT_ROOT=/path/to/openwrt ./build_wfb_openwrt.sh
+```
+
+Outputs (all static, MIPS32 MSB):
+- `build-openwrt/wfb_tx` (~565 KB), `wfb_rx` (~761 KB), `wfb_tx_cmd` (~68 KB), `wfb_keygen` (~276 KB)
+
 ### fec_controller (separate Makefile)
 
 ```bash
