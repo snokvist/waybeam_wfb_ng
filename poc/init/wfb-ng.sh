@@ -15,8 +15,9 @@ LOG_TAG="[wfb-ng]"
 log() { echo "$LOG_TAG $*"; }
 
 active_profile() {
-    [ -r "$CURRENT" ] || { echo ""; return; }
-    tr -d '[:space:]' < "$CURRENT"
+    local p=""
+    [ -r "$CURRENT" ] && read -r p < "$CURRENT"
+    echo "$p"
 }
 
 cleanup() {
@@ -35,10 +36,12 @@ trap cleanup TERM INT HUP
 PROFILE="$(active_profile)"
 log "profile=${PROFILE:-<empty>}"
 
+# Defensive: the procd init.d gate should only spawn us when profile=wfb.
+# If we land here in any other state, exit cleanly so procd's respawn
+# ratelimit kicks in and the unit goes idle.
 if [ "$PROFILE" != "wfb" ]; then
-    log "wbmode is not 'wfb' (got '${PROFILE}'); idling"
-    # Stay alive so procd doesn't respawn us in a hot loop, but do nothing.
-    while :; do sleep 3600; done
+    log "wbmode is not 'wfb' (got '${PROFILE}'); exiting"
+    exit 0
 fi
 
 POST_UP="$PROFILE_DIR/wfb/post-up.sh"

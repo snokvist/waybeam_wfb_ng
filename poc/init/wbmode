@@ -1,0 +1,84 @@
+#!/bin/sh
+# wbmode - Waybeam CPE510 mode switcher
+# Usage: wbmode {client|wfb|status}
+
+WBDIR=/etc/waybeam
+CUR_FILE="$WBDIR/current"
+LAN_PIN="192.168.2.2"
+
+usage() { echo "Usage: $0 {client|wfb|status}"; exit 1; }
+
+current_mode() { [ -f "$CUR_FILE" ] && cat "$CUR_FILE" || echo unknown; }
+
+print_status() {
+    echo "Mode:     $(current_mode)"
+    echo "Hostname: $(uci -q get system.@system[0].hostname)"
+    echo "LAN:      $(uci -q get network.lan.ipaddr)/$(uci -q get network.lan.netmask)"
+    echo
+    echo "Wireless interfaces:"
+    iw dev 2>/dev/null | awk '/Interface|type|ssid|channel/{print "  "$0}' | sed 's/^  \t/  /'
+    echo
+    echo "Mode-relevant processes:"
+    ps w | grep -E 'relayd|wfb_tx|wfb_rx|udhcpc' | grep -v grep | awk '{print "  "$0}' || echo "  (none)"
+}
+
+preflight() {
+    mode="$1"
+    netfile="$WBDIR/$mode/network"
+    wfile="$WBDIR/$mode/wireless"
+    [ -f "$netfile" ] || { echo "missing $netfile"; exit 1; }
+    [ -f "$wfile" ]   || { echo "missing $wfile"; exit 1; }
+    grep -q "option ipaddr '$LAN_PIN'" "$netfile" || {
+        echo "ERROR: $netfile does not pin LAN to $LAN_PIN -- refusing (lockout risk)"
+        exit 1
+    }
+}
+
+stop_services() {
+    iw dev wlan0mon del 2>/dev/null
+    /etc/init.d/network stop 2>/dev/null
+    killall relayd 2>/dev/null
+    killall wfb_tx wfb_rx 2>/dev/null
+    sleep 1
+}
+
+apply_mode() {
+    mode="$1"
+    case "$mode" in
+        client) hn=cpe-client ;;
+        wfb)    hn=cpe-wfb ;;
+    esac
+    cp "$WBDIR/$mode/network"  /etc/config/network
+    cp "$WBDIR/$mode/wireless" /etc/config/wireless
+    uci set system.@system[0].hostname="$hn"
+    uci commit system
+    echo "$hn" > /proc/sys/kernel/hostname
+    echo "$mode" > "$CUR_FILE"
+}
+
+case "$1" in
+    status) print_status; exit 0 ;;
+    client|wfb) ;;
+    *) usage ;;
+esac
+
+target="$1"
+cur="$(current_mode)"
+if [ "$target" = "$cur" ]; then
+    echo "Already in $target mode."
+    exit 0
+fi
+
+preflight "$target"
+echo "Switching: $cur -> $target"
+stop_services
+apply_mode "$target"
+/etc/init.d/network start
+sleep 3
+[ -x "$WBDIR/$target/post-up.sh" ] && "$WBDIR/$target/post-up.sh"
+# Re-evaluate the wfb-ng supervisor (gated on /etc/waybeam/current):
+# starts daemons when target=wfb, exits cleanly when target=client.
+[ -x /etc/init.d/wfb-ng ] && /etc/init.d/wfb-ng restart 2>&1
+echo
+echo "Switch complete."
+print_status

@@ -86,71 +86,81 @@ ported to `wfb_rx`, swap the `wfb_rx -u 5801` line for
 `wfb_rx -Y 127.0.0.1:5801` and pass `--stats 127.0.0.1:5801` to
 `link_controller`.
 
-## `wfb-ng.sh` — CPE510 ground-station supervisor
+## `wfb-ng.sh` / `wfb-ng.init` / `wbmode` — CPE510 ground-station
 
-procd-foreground supervisor for a TP-Link CPE510 v3 ground station running
-the OpenWrt build from `poc/openwrt/` (cross-built `wfb_rx` / `wfb_tx`
-from PR [#36](https://github.com/snokvist/waybeam_wfb_ng/pull/36)).
+Three-file set for a TP-Link CPE510 v3 (OpenWrt + procd) running the
+cross-built `wfb_rx` / `wfb_tx` from PR
+[#36](https://github.com/snokvist/waybeam_wfb_ng/pull/36):
 
-### What it does
+| File | Installs to | Role |
+|---|---|---|
+| `wfb-ng.init` | `/etc/init.d/wfb-ng` | procd unit; gates on `/etc/waybeam/current` and only opens an instance when profile = `wfb` |
+| `wfb-ng.sh` | `/usr/sbin/wfb-ng.sh` | foreground supervisor; runs `post-up.sh`, spawns `wfb_rx` + `wfb_tx`, traps signals for clean teardown |
+| `wbmode` | `/usr/bin/wbmode` | mode switcher; copies `/etc/waybeam/<mode>/{network,wireless}` into uci, runs `post-up.sh`, then `/etc/init.d/wfb-ng restart` to re-evaluate the gate |
 
-1. Reads `/etc/waybeam/current` (the "wbmode" pointer — values: `wfb`,
-   `client`, …)
-2. If `wfb`: invokes `/etc/waybeam/wfb/post-up.sh` to create `wlan0mon`
-   on `phy0` (monitor, ch161 HT40+, txpower 2000 mBm by default; HT40+
-   primary on 161 still receives a vehicle HT20 ch161 signal cleanly).
-3. Spawns `wfb_rx` (link 207, AEAD-cleartext data, decoded RTP forwarded
+### What `wfb-ng.sh` does (when profile = `wfb`)
+
+1. Invokes `/etc/waybeam/wfb/post-up.sh` to create `wlan0mon` on `phy0`
+   (monitor, ch161 HT40+, txpower 2000 mBm by default; HT40+ primary on
+   161 receives a vehicle HT20 ch161 signal cleanly).
+2. Spawns `wfb_rx` (link 207, AEAD-cleartext data, decoded RTP forwarded
    to `192.168.2.20:5600`, stats pushed via `-Y` to `127.0.0.1:5801`).
-4. Spawns `wfb_tx` (link 208, listens on UDP `5801`, control port `8000`,
+3. Spawns `wfb_tx` (link 208, listens on UDP `5801`, control port `8000`,
    `M=1 k=1 n=2`).
-5. Waits on both children. On SIGTERM/SIGINT/SIGHUP from procd: kills the
-   daemons and `iw dev wlan0mon del` for clean teardown.
+4. Waits on both children. SIGTERM/SIGINT/SIGHUP → kill daemons +
+   `iw dev wlan0mon del`.
 
 The `127.0.0.1:5801` collision is **intentional** — `wfb_rx`'s `-Y`
 JSON stats push lands on the same UDP port that `wfb_tx -u 5801` is
 listening on. `wfb_tx` packs the JSON into the uplink stream on link
-208, where the vehicle's `wfb_rx` receives it and forwards it to
-`link_controller` upstream. This is the GS→vehicle feedback path.
+208, where the vehicle's `wfb_rx` forwards it to `link_controller`
+upstream. This is the GS→vehicle feedback path.
 
 ### Install
 
-The procd unit `/etc/init.d/wfb-ng` (already present on the OpenWrt
-build) starts `/usr/sbin/wfb-ng.sh` at S99 and respawns it on exit.
-Drop the supervisor in:
-
 ```bash
-scp -O poc/init/wfb-ng.sh root@192.168.2.2:/usr/sbin/wfb-ng.sh
-ssh root@192.168.2.2 'chmod +x /usr/sbin/wfb-ng.sh && /etc/init.d/wfb-ng restart'
+scp -O poc/init/wfb-ng.sh   root@192.168.2.2:/usr/sbin/wfb-ng.sh
+scp -O poc/init/wfb-ng.init root@192.168.2.2:/etc/init.d/wfb-ng
+scp -O poc/init/wbmode      root@192.168.2.2:/usr/bin/wbmode
+ssh root@192.168.2.2 '
+  chmod +x /usr/sbin/wfb-ng.sh /etc/init.d/wfb-ng /usr/bin/wbmode
+  /etc/init.d/wfb-ng enable
+  /etc/init.d/wfb-ng restart
+'
 ```
 
 ### Verify
 
 ```bash
 ssh root@192.168.2.2 '
-  iw dev                                   # wlan0mon, monitor, ch161
+  iw dev                                       # wlan0mon, monitor, ch161
   ps w | grep -E "wfb_(rx|tx)" | grep -v grep
-  ubus call service list | grep -A4 wfb-ng # running:true
-  logread | tail -20
+  ubus call service list | grep -A4 wfb-ng     # running:true
+  logread | grep wfb-ng | tail
 '
 ```
 
-### Mode switch (no reboot needed)
+### Mode switch
+
+`wbmode` is the supported way to flip modes — it stops services, swaps
+the uci configs, restarts network, runs `post-up.sh`, then calls
+`/etc/init.d/wfb-ng restart` so the procd gate re-evaluates the new
+profile (starts daemons for `wfb`, leaves no process for `client`).
 
 ```bash
-# disable
-echo client > /etc/waybeam/current
-/etc/init.d/wfb-ng restart   # supervisor idles, no daemons spawned
-
-# re-enable
-echo wfb > /etc/waybeam/current
-/etc/init.d/wfb-ng restart
+ssh root@192.168.2.2 'wbmode wfb'        # bring up broadcaster mode
+ssh root@192.168.2.2 'wbmode client'     # back to managed-sta
+ssh root@192.168.2.2 'wbmode status'
 ```
 
-### Known gap
+### Notes
 
-`/etc/waybeam/{wfb,client}/{wireless,network}` profiles are not yet
-applied at boot — only `post-up.sh` is invoked by this supervisor.
-Switching profiles via `/etc/waybeam/current` does not currently swap
-`/etc/config/wireless` or `/etc/config/network`. Add a separate
-profile-loader (uci-defaults or hotplug) once the `client` profile is
-needed.
+- `active_profile()` uses `read -r p < /etc/waybeam/current` rather than
+  `tr -d '[:space:]'` — BusyBox `tr` does **not** support POSIX class
+  names, so `[:space:]` would be parsed as the literal char set
+  `[ : s p a c e ]` and stripping `c` and `e` from `client` would
+  silently produce `lint`.
+- The procd gate (`wfb-ng.init`) is the reason the supervisor never
+  hangs around in `client` mode; an earlier revision used an idle
+  `while sleep 3600` loop inside the supervisor itself, which was both
+  ugly and hard to interrupt cleanly.
