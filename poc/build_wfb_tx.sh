@@ -12,9 +12,10 @@
 #   ./build_wfb_tx.sh --deploy   # build + scp to device
 #
 # Output (all in build/):
-#   wfb_tx             - patched wfb_tx with -H (SHM), -b, -r, -x flags (cross, static)
-#   wfb_tx_cmd         - runtime control client (set_fec, set_radio, set_mbit, get_*) (cross, static)
-#   wfb_keygen         - key generator (cross, static)
+#   wfb_tx             - patched wfb_tx with -H (SHM), -b, -r, -x flags
+#                        (cross, dynamic — libsodium/libstdc++ from device rootfs)
+#   wfb_tx_cmd         - runtime control client (set_fec, set_radio, set_mbit, get_*) (cross, dynamic)
+#   wfb_keygen         - key generator (cross, dynamic)
 #   shm_ring_stats     - ring status checker (cross, dynamic)
 #   shm_consumer_test  - ring throughput tester (cross, dynamic)
 #   wfb_rx_native      - x86_64 native build for the ground-station laptop;
@@ -32,7 +33,10 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 VENC_ROOT="$(dirname "$SCRIPT_DIR")"
 BUILD_DIR="$SCRIPT_DIR/build"
-LIBSODIUM_VER="1.0.20"
+# Pin to 1.0.18: matches OpenIPC's libsodium SONAME (libsodium.so.23) so the
+# dynamic-linked wfb_tx finds it on-device. libsodium 1.0.19+ bumps to
+# libsodium.so.26 and breaks runtime. Bump only when OpenIPC bumps.
+LIBSODIUM_VER="1.0.18"
 DEPLOY_HOST="${DEPLOY_HOST:-192.168.1.10}"
 DEPLOY_DIR="${DEPLOY_DIR:-/usr/bin}"
 
@@ -71,7 +75,7 @@ mkdir -p "$BUILD_DIR"
 SODIUM_DIR="$BUILD_DIR/libsodium-${LIBSODIUM_VER}"
 SODIUM_PREFIX="$BUILD_DIR/sodium-install"
 
-if [ ! -f "$SODIUM_PREFIX/lib/libsodium.a" ]; then
+if [ ! -f "$SODIUM_PREFIX/lib/libsodium.so" ]; then
     echo "=== Building libsodium ${LIBSODIUM_VER} ==="
 
     if [ ! -d "$SODIUM_DIR" ]; then
@@ -79,17 +83,24 @@ if [ ! -f "$SODIUM_PREFIX/lib/libsodium.a" ]; then
         TARBALL="libsodium-${LIBSODIUM_VER}.tar.gz"
         if [ ! -f "$TARBALL" ]; then
             echo "Downloading libsodium..."
-            curl -L -o "$TARBALL" \
-                "https://download.libsodium.org/libsodium/releases/${TARBALL}"
+            # download.libsodium.org keeps only the latest few versions; pull
+            # older pinned releases from GitHub instead.
+            curl -fL -o "$TARBALL" \
+                "https://github.com/jedisct1/libsodium/releases/download/${LIBSODIUM_VER}-RELEASE/${TARBALL}" \
+                || curl -fL -o "$TARBALL" \
+                    "https://download.libsodium.org/libsodium/releases/${TARBALL}"
         fi
         tar xzf "$TARBALL"
     fi
 
     cd "$SODIUM_DIR"
+    # Build shared libsodium (and keep static for the native wfb_rx build).
+    # The .so here only satisfies the cross linker — at runtime the device's
+    # /usr/lib/libsodium.so.23 (from OpenIPC's wfb-bins-only deps) is used.
     ./configure \
         --host=arm-linux-gnueabihf \
         --prefix="$SODIUM_PREFIX" \
-        --disable-shared \
+        --enable-shared \
         --enable-static \
         --disable-asm \
         CC="$CROSS_CC" \
@@ -150,16 +161,39 @@ fi
 
 echo "=== Building wfb_tx ==="
 
-WFB_CFLAGS="-Wall -O2 -fno-strict-aliasing -I$SODIUM_PREFIX/include -I$VENC_ROOT/include -I$WFB_DIR/src/stub"
+# Size-minimization flags (mirrors poc/build_wfb_openwrt.sh CPE510 build).
+# Cumulative effect on wfb_tx + helpers is large (~75-80% reduction vs the
+# old `-O2 -static` build) thanks to:
+#   1) dynamic linking against the device's libsodium / libstdc++ / libgcc_s
+#      (already on the OpenIPC rootfs via the wfb-bins-only package deps).
+#   2) -Os + -flto across translation units → tighter dead-code elimination.
+#   3) -Wl,--gc-sections + -ffunction-sections / -fdata-sections.
+#   4) -fno-stack-protector / -fmerge-all-constants /
+#      -fno-asynchronous-unwind-tables → small per-fn savings that compound.
+#   5) -Wl,-s strips at link time; -Wl,--build-id=none drops the GNU note.
+#
+# If you need a fully self-contained binary (no on-device .so deps), add
+# -static back into WFB_LDFLAGS — sizes go from ~120 KB back to ~500 KB but
+# everything bakes in.
+SIZE_CFLAGS="-Os -flto -ffunction-sections -fdata-sections -fno-stack-protector"
+SIZE_CFLAGS="$SIZE_CFLAGS -fmerge-all-constants -fno-asynchronous-unwind-tables"
+SIZE_LDFLAGS="-flto -Wl,--gc-sections -Wl,-s -Wl,--build-id=none -Wl,--as-needed"
+
+WFB_CFLAGS="$SIZE_CFLAGS -Wall -fno-strict-aliasing -I$SODIUM_PREFIX/include -I$VENC_ROOT/include -I$WFB_DIR/src/stub"
 WFB_CFLAGS="$WFB_CFLAGS -DZFEX_UNROLL_ADDMUL_SIMD=8 -DZFEX_INLINE_ADDMUL -DZFEX_INLINE_ADDMUL_SIMD"
 # WFB_VERSION must reach the compiler as `"shm-patched"` (a string).  Single
 # quotes around the value would be interpreted by the C preprocessor as a
 # multi-character literal and gcc warns about it; escape the inner double
 # quotes only and let bash word-splitting deliver the token verbatim.
 WFB_CFLAGS="$WFB_CFLAGS -DWFB_VERSION=\"shm-patched\""
-WFB_LDFLAGS="-L$SODIUM_PREFIX/lib -lrt -lsodium -static"
+WFB_LDFLAGS="-L$SODIUM_PREFIX/lib $SIZE_LDFLAGS -lrt -lsodium"
 
 cd "$WFB_DIR"
+
+# Drop stale .o files from prior arch/flavour builds (e.g. an aarch64 run via
+# build_wfb_aarch64.sh, or an older `-O2 -static` run). LTO objects from a
+# different toolchain confuse the linker.
+rm -f src/*.o
 
 echo "  Compiling tx.cpp..."
 $CROSS_CXX $WFB_CFLAGS -std=gnu++11 -c -o src/tx.o src/tx.cpp

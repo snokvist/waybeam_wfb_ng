@@ -112,7 +112,15 @@ fi
 
 # ── Build flags ──────────────────────────────────────────────────────
 
-CFLAGS_COMMON="-Wall -O2 -fno-strict-aliasing"
+# Size-minimization flags (mirrors poc/build_wfb_openwrt.sh CPE510 build).
+# Dynamic link against Buildroot's libpcap / libsodium / libstdc++ /
+# libgcc_s (all present on the Radxa3 rootfs); -Os + -flto + gc-sections
+# trim ~75-80% off vs the unoptimised -O2 build.
+SIZE_CFLAGS="-Os -flto -ffunction-sections -fdata-sections -fno-stack-protector"
+SIZE_CFLAGS="$SIZE_CFLAGS -fmerge-all-constants -fno-asynchronous-unwind-tables"
+SIZE_LDFLAGS="-flto -Wl,--gc-sections -Wl,-s -Wl,--build-id=none -Wl,--as-needed"
+
+CFLAGS_COMMON="$SIZE_CFLAGS -Wall -fno-strict-aliasing"
 CFLAGS_COMMON="$CFLAGS_COMMON --sysroot=$SYSROOT"
 CFLAGS_COMMON="$CFLAGS_COMMON -I$WFB_ROOT/include"
 CFLAGS_COMMON="$CFLAGS_COMMON -DZFEX_UNROLL_ADDMUL_SIMD=8"
@@ -120,7 +128,7 @@ CFLAGS_COMMON="$CFLAGS_COMMON -DZFEX_INLINE_ADDMUL"
 CFLAGS_COMMON="$CFLAGS_COMMON -DZFEX_INLINE_ADDMUL_SIMD"
 CFLAGS_COMMON="$CFLAGS_COMMON -DWFB_VERSION=\"shm-patched-aarch64\""
 
-LDFLAGS_COMMON="--sysroot=$SYSROOT -lrt -lpthread"
+LDFLAGS_COMMON="--sysroot=$SYSROOT $SIZE_LDFLAGS -lrt -lpthread"
 
 # wfb_tx never calls libpcap; the stub from build_wfb_tx.sh keeps the
 # include lightweight even when the real pcap.h is in the sysroot.
