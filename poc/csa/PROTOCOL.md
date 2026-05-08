@@ -57,19 +57,28 @@ the `dt`-derived target if it lands within ±20 ms of the original
 ## Receiver guards
 
 Every `csa_commit` is filtered by these checks before entering the state
-machine. They are configured via `csa_agent` CLI flags:
+machine. They are configured via `csa_agent` CLI flags. By default all
+channels (DFS included) and all bandwidths are accepted; the only baseline
+guard is a sanity range check on `target_chan`.
 
 | Guard | Flag | Default |
 |---|---|---|
-| Channel allowlist | `--allowlist 149/HT20,153/HT20,161/HT40+` | unset (permissive) |
-| DFS guard (block 5GHz 52..144) | `--allow-dfs` to disable | enabled |
+| Range check (`target_chan ∈ [1,200]`) | always on | always on |
+| Channel allowlist | `--allowlist 149,153,157,161` | unset (any channel) |
+| Bandwidth allowlist | `--bandwidth HT20,HT40+` | unset (any bandwidth) |
 | Cooldown between switches | `--cooldown-ms N` (0 disables) | 2000 ms |
 
-A frame failing allowlist or DFS guard is dropped silently on the wire and
-logged as `REJECT … not in allowlist` / `… is DFS` on the agent. Cooldown
-gates only **new** sessions; same-session refresh frames are always allowed
-(they refine `T_switch` within ±20 ms of the original). Cooldown is anchored
-on every channel change, including auto-revert.
+`--allowlist` and `--bandwidth` are independent constraints: each acts as a
+filter when set, or is permissive when unset. Both must pass when both are
+configured. DFS is no longer special — exclude DFS channels by leaving them
+out of the allowlist if they're not wanted.
+
+A rejected frame is dropped on the wire and logged as
+`REJECT … not in --allowlist` / `… not in --bandwidth` /
+`… target_chan=X out of range` on the agent. Cooldown gates only **new**
+sessions; same-session refresh frames are always allowed (they refine
+`T_switch` within ±20 ms of the original). Cooldown is anchored on every
+channel change, including auto-revert.
 
 ## Receiver state machine
 
@@ -124,8 +133,8 @@ What `sess` does NOT cover:
   one hop per `cooldown_ms`.
 - **Fabrication on the LAN side** — anyone reachable on `cpe510:5802` (or
   the over-air uplink) can pick `sess > current` and inject a hop. This is
-  not replay; only a MAC (HMAC + shared key) can stop it. Allowlist + DFS
-  guard contain the blast radius if it happens.
+  not replay; only a MAC (HMAC + shared key) can stop it. `--allowlist` +
+  `--bandwidth` + cooldown contain the blast radius if it happens.
 
 `seq` is for logging and burst correlation only — not used for filtering.
 

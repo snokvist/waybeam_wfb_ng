@@ -15,26 +15,10 @@ import socket
 import sys
 import time
 
-# 5 GHz DFS channels (UNII-2 + UNII-2-extended). Hopping into these without
-# CAC is a regulatory violation in most regions, so refuse by default.
-DFS_CHANS = frozenset({
-    52, 56, 60, 64,
-    100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140, 144,
-})
-
-
-def parse_allowlist(spec: str) -> list[tuple[int, str]]:
-    """'149/HT20,153/HT20,161/HT40+' -> [(149,'HT20'), ...]."""
-    out: list[tuple[int, str]] = []
-    for piece in spec.split(","):
-        piece = piece.strip()
-        if not piece:
-            continue
-        if "/" not in piece:
-            raise ValueError(f"allowlist entry missing '/': {piece!r}")
-        chan_s, ht = piece.split("/", 1)
-        out.append((int(chan_s), ht))
-    return out
+def parse_csv(spec: str) -> list[str]:
+    """'149,153,157,161' -> ['149','153','157','161']. Trims whitespace,
+    drops empty entries. Returns [] for an empty spec (= permissive)."""
+    return [p.strip() for p in spec.split(",") if p.strip()]
 
 
 def build_frame(sess: int, seq: int,
@@ -77,26 +61,29 @@ def main() -> int:
     ap.add_argument("--cadence-ms", type=int, default=20)
     ap.add_argument("--sess", type=int, default=int(time.time()))
     ap.add_argument("--allowlist", default="",
-                    help="comma-separated CH/HT pairs (e.g. "
-                         "149/HT20,153/HT20,161/HT40+); empty = permissive")
-    ap.add_argument("--allow-dfs", action="store_true",
-                    help="permit hops into 5GHz DFS channels (52..144)")
+                    help="comma-separated channels (e.g. 149,153,157,161); "
+                         "empty = any channel (DFS included)")
+    ap.add_argument("--bandwidth", default="",
+                    help="comma-separated bandwidths (e.g. HT20,HT40+); "
+                         "empty = any bandwidth")
     args = ap.parse_args()
 
-    if args.target_chan in DFS_CHANS and not args.allow_dfs:
-        print(f"refusing DFS target ch{args.target_chan} "
-              f"(pass --allow-dfs to override)", file=sys.stderr)
-        return 2
-    if args.allowlist:
+    allow_chans = parse_csv(args.allowlist)
+    if allow_chans:
         try:
-            allow = parse_allowlist(args.allowlist)
-        except ValueError as e:
-            print(f"bad --allowlist: {e}", file=sys.stderr)
+            allow_set = {int(c) for c in allow_chans}
+        except ValueError:
+            print(f"bad --allowlist: {args.allowlist!r}", file=sys.stderr)
             return 2
-        if (args.target_chan, args.target_ht) not in allow:
-            print(f"target ch{args.target_chan} {args.target_ht} not in "
-                  f"allowlist {allow}", file=sys.stderr)
+        if args.target_chan not in allow_set:
+            print(f"target ch{args.target_chan} not in --allowlist "
+                  f"{sorted(allow_set)}", file=sys.stderr)
             return 2
+    allow_bws = parse_csv(args.bandwidth)
+    if allow_bws and args.target_ht not in allow_bws:
+        print(f"target bandwidth {args.target_ht} not in --bandwidth "
+              f"{allow_bws}", file=sys.stderr)
+        return 2
 
     print(f"CSA hop: ch{args.prev_chan} {args.prev_ht} -> "
           f"ch{args.target_chan} {args.target_ht}  "

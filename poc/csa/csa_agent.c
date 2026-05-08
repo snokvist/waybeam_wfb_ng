@@ -81,58 +81,73 @@ static bool get_int(const char *buf, const char *key, long long *out) {
     return true;
 }
 
-/* ----- allowlist + DFS guard + cooldown ----- */
-/* 5 GHz DFS channels (UNII-2 + UNII-2-extended). Hopping into these without
- * CAC is a regulatory violation in most regions, so they are blocked unless
- * --allow-dfs is set on the command line. */
-static const int DFS_CHANS[] = {
-    52, 56, 60, 64,
-    100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140, 144,
-};
-
-static bool is_dfs(int chan) {
-    for (size_t i = 0; i < sizeof(DFS_CHANS)/sizeof(DFS_CHANS[0]); i++) {
-        if (DFS_CHANS[i] == chan) return true;
-    }
-    return false;
-}
-
+/* ----- allowlist + bandwidth + cooldown -----
+ *
+ * Two independent allowlists that AND together when both are set. An unset
+ * list means permissive on that axis. By default both are unset, so any
+ * channel and any bandwidth (HT20/HT40+/HT40-) is accepted; range-checking
+ * on target_chan is the only baseline guard.
+ *
+ * DFS is no longer special: include or exclude DFS channels by listing them
+ * (or omitting them) in --allowlist. */
 #define MAX_ALLOW 32
-typedef struct { int chan; char ht[8]; } allow_t;
-static allow_t g_allow[MAX_ALLOW];
-static int g_allow_n = 0;
-static int g_allow_dfs = 0;
+static int g_allow_chan[MAX_ALLOW];
+static int g_allow_chan_n = 0;        /* 0 = permissive */
+static char g_allow_bw[MAX_ALLOW][8];
+static int g_allow_bw_n = 0;          /* 0 = permissive */
 static long long g_cooldown_ms = 2000;       /* 0 disables */
 static long long g_last_switch_ms = -1;      /* -1 = no prior switch */
 
-/* "149/HT20,153/HT20,161/HT40+" -> g_allow[]. Returns 0 on success, -1 on parse error. */
-static int parse_allowlist(const char *s) {
-    g_allow_n = 0;
+/* "149,153,157,161" -> g_allow_chan[]. Returns 0 on success, -1 on parse error. */
+static int parse_chan_list(const char *s) {
+    g_allow_chan_n = 0;
     const char *p = s;
-    while (*p && g_allow_n < MAX_ALLOW) {
+    while (*p && g_allow_chan_n < MAX_ALLOW) {
+        while (*p == ' ') p++;
         char *end;
         long c = strtol(p, &end, 10);
-        if (end == p || *end != '/') return -1;
-        p = end + 1;
-        const char *htstart = p;
-        while (*p && *p != ',') p++;
-        size_t htlen = (size_t)(p - htstart);
-        if (htlen == 0 || htlen >= sizeof(g_allow[0].ht)) return -1;
-        g_allow[g_allow_n].chan = (int)c;
-        memcpy(g_allow[g_allow_n].ht, htstart, htlen);
-        g_allow[g_allow_n].ht[htlen] = 0;
-        g_allow_n++;
+        if (end == p) return -1;
+        if (c < 1 || c > 200) return -1;
+        g_allow_chan[g_allow_chan_n++] = (int)c;
+        p = end;
+        while (*p == ' ') p++;
         if (*p == ',') p++;
+        else if (*p) return -1;
     }
-    return (*p == 0) ? 0 : -1;
+    return 0;
 }
 
-static bool allowlist_ok(int chan, const char *ht) {
-    if (g_allow_n == 0) return true;  /* unset == permissive */
-    for (int i = 0; i < g_allow_n; i++) {
-        if (g_allow[i].chan == chan && strcmp(g_allow[i].ht, ht) == 0)
-            return true;
+/* "HT20,HT40+" -> g_allow_bw[]. Returns 0 on success, -1 on parse error. */
+static int parse_bw_list(const char *s) {
+    g_allow_bw_n = 0;
+    const char *p = s;
+    while (*p && g_allow_bw_n < MAX_ALLOW) {
+        while (*p == ' ') p++;
+        const char *start = p;
+        while (*p && *p != ',') p++;
+        const char *end = p;
+        while (end > start && end[-1] == ' ') end--;
+        size_t len = (size_t)(end - start);
+        if (len == 0 || len >= sizeof(g_allow_bw[0])) return -1;
+        memcpy(g_allow_bw[g_allow_bw_n], start, len);
+        g_allow_bw[g_allow_bw_n][len] = 0;
+        g_allow_bw_n++;
+        if (*p == ',') p++;
     }
+    return 0;
+}
+
+static bool chan_ok(int chan) {
+    if (g_allow_chan_n == 0) return true;
+    for (int i = 0; i < g_allow_chan_n; i++)
+        if (g_allow_chan[i] == chan) return true;
+    return false;
+}
+
+static bool bw_ok(const char *bw) {
+    if (g_allow_bw_n == 0) return true;
+    for (int i = 0; i < g_allow_bw_n; i++)
+        if (strcmp(g_allow_bw[i], bw) == 0) return true;
     return false;
 }
 
@@ -190,22 +205,22 @@ static void on_commit(agent_t *a, const char *buf, ssize_t len) {
     long long t_switch = now + dt;
 
     /* Defense-in-depth target validation. Applied to every csa_commit so that
-     * even refresh frames carrying a tampered target are caught. The range
-     * check runs first so that DFS / allowlist comparisons cannot be tricked
-     * by a value that wraps under (int) truncation. */
+     * even refresh frames carrying a tampered target are caught. Range check
+     * runs first so allowlist comparisons cannot be tricked by a value that
+     * wraps under (int) truncation. */
     if (target_chan < 1 || target_chan > 200) {
         log_msg("REJECT sess=%lld seq=%lld: target_chan=%lld out of range",
                 sess, seq, target_chan);
         return;
     }
-    if (!g_allow_dfs && is_dfs((int)target_chan)) {
-        log_msg("REJECT sess=%lld seq=%lld: target ch%lld is DFS (use --allow-dfs)",
+    if (!chan_ok((int)target_chan)) {
+        log_msg("REJECT sess=%lld seq=%lld: target ch%lld not in --allowlist",
                 sess, seq, target_chan);
         return;
     }
-    if (!allowlist_ok((int)target_chan, target_ht)) {
-        log_msg("REJECT sess=%lld seq=%lld: target ch%lld %s not in allowlist",
-                sess, seq, target_chan, target_ht);
+    if (!bw_ok(target_ht)) {
+        log_msg("REJECT sess=%lld seq=%lld: target bandwidth %s not in --bandwidth",
+                sess, seq, target_ht);
         return;
     }
 
@@ -287,27 +302,30 @@ static void tick(agent_t *a) {
 
 static void usage(const char *argv0) {
     fprintf(stderr,
-        "usage: %s [--no-revert] [--allow-dfs] [--allowlist CH/HT,...] "
+        "usage: %s [--no-revert] [--allowlist CH,...] [--bandwidth BW,...] "
         "[--cooldown-ms N] <port> <iface>\n"
-        "  --allowlist  comma-separated CH/HT pairs accepted as targets\n"
-        "               (e.g. 149/HT20,153/HT20,161/HT40+); empty = permissive\n"
-        "  --allow-dfs  permit hops into 5GHz DFS channels (52..144)\n"
-        "  --cooldown-ms minimum gap between channel changes (default 2000, 0 disables)\n",
+        "  --allowlist   comma-separated channels accepted as targets\n"
+        "                (e.g. 149,153,157,161); empty = any channel\n"
+        "  --bandwidth   comma-separated bandwidths accepted as targets\n"
+        "                (e.g. HT20,HT40+); empty = any bandwidth\n"
+        "  --cooldown-ms minimum gap between channel changes\n"
+        "                (default 2000, 0 disables)\n",
         argv0);
 }
 
 int main(int argc, char **argv) {
     int no_revert = 0;
     const char *allowlist_arg = NULL;
+    const char *bandwidth_arg = NULL;
     int argi = 1;
     while (argi < argc && argv[argi][0] == '-' && argv[argi][1] == '-') {
         const char *flag = argv[argi];
         if (strcmp(flag, "--no-revert") == 0) {
             no_revert = 1; argi++;
-        } else if (strcmp(flag, "--allow-dfs") == 0) {
-            g_allow_dfs = 1; argi++;
         } else if (strcmp(flag, "--allowlist") == 0 && argi + 1 < argc) {
             allowlist_arg = argv[argi + 1]; argi += 2;
+        } else if (strcmp(flag, "--bandwidth") == 0 && argi + 1 < argc) {
+            bandwidth_arg = argv[argi + 1]; argi += 2;
         } else if (strcmp(flag, "--cooldown-ms") == 0 && argi + 1 < argc) {
             g_cooldown_ms = strtoll(argv[argi + 1], NULL, 10); argi += 2;
         } else {
@@ -316,23 +334,13 @@ int main(int argc, char **argv) {
             return 2;
         }
     }
-    if (allowlist_arg && parse_allowlist(allowlist_arg) < 0) {
+    if (allowlist_arg && parse_chan_list(allowlist_arg) < 0) {
         fprintf(stderr, "bad --allowlist: %s\n", allowlist_arg);
         return 2;
     }
-    /* Warn (don't fail) on a configuration that's effectively unreachable:
-     * an allowlist entry sitting on a DFS channel will always be killed by
-     * the DFS guard unless --allow-dfs is also set. Easy footgun otherwise. */
-    if (g_allow_n > 0 && !g_allow_dfs) {
-        for (int i = 0; i < g_allow_n; i++) {
-            if (is_dfs(g_allow[i].chan)) {
-                fprintf(stderr,
-                    "warning: allowlist entry %d/%s is a DFS channel and "
-                    "will always be rejected by the DFS guard. "
-                    "Pass --allow-dfs to enable it.\n",
-                    g_allow[i].chan, g_allow[i].ht);
-            }
-        }
+    if (bandwidth_arg && parse_bw_list(bandwidth_arg) < 0) {
+        fprintf(stderr, "bad --bandwidth: %s\n", bandwidth_arg);
+        return 2;
     }
     if (argc - argi < 2) { usage(argv[0]); return 2; }
     int port = atoi(argv[argi++]);
@@ -349,8 +357,9 @@ int main(int argc, char **argv) {
     agent_t ag = { .st = ST_IDLE, .no_revert = no_revert };
     snprintf(ag.iface, sizeof(ag.iface), "%s", iface);
     log_msg("csa_agent listening port=%d iface=%s no_revert=%d "
-            "allow_dfs=%d cooldown_ms=%lld allowlist=%d entries",
-            port, iface, no_revert, g_allow_dfs, g_cooldown_ms, g_allow_n);
+            "cooldown_ms=%lld allowlist=%d chan(s) bandwidth=%d entries",
+            port, iface, no_revert, g_cooldown_ms,
+            g_allow_chan_n, g_allow_bw_n);
 
     char buf[4096];
     struct timeval tv;
