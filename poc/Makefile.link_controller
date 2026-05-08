@@ -18,7 +18,8 @@ CROSS_STRIP ?= $(TOOLCHAIN)/bin/arm-openipc-linux-gnueabihf-strip
 BUILD_DIR   ?= build
 OUT          = $(BUILD_DIR)/link_controller
 OUT_HOST     = $(BUILD_DIR)/link_controller.host
-SRC          = link_controller.c
+SRC          = link_controller.c csa/csa.c
+CSA_HDR      = csa/csa.h
 WEBUI_SRC    = webui/index.html
 WEBUI_HDR    = webui_assets.h
 
@@ -48,16 +49,16 @@ $(WEBUI_HDR): $(WEBUI_SRC)
 $(BUILD_DIR):
 	@mkdir -p $@
 
-$(OUT): $(SRC) $(WEBUI_HDR) | $(BUILD_DIR)
-	$(CROSS_CC) $(CFLAGS_COMMON) -I. -o $@ $(SRC) $(LDFLAGS_COMMON)
+$(OUT): $(SRC) $(CSA_HDR) $(WEBUI_HDR) | $(BUILD_DIR)
+	$(CROSS_CC) $(CFLAGS_COMMON) -I. -Icsa -o $@ $(SRC) $(LDFLAGS_COMMON)
 	$(CROSS_STRIP) $@
 	@echo "[link] built $@"
 	@ls -la $@
 
 host: $(OUT_HOST)
 
-$(OUT_HOST): $(SRC) $(WEBUI_HDR) | $(BUILD_DIR)
-	cc $(CFLAGS_COMMON) -I. -g -o $@ $(SRC) $(LDFLAGS_COMMON)
+$(OUT_HOST): $(SRC) $(CSA_HDR) $(WEBUI_HDR) | $(BUILD_DIR)
+	cc $(CFLAGS_COMMON) -I. -Icsa -g -o $@ $(SRC) $(LDFLAGS_COMMON)
 	@echo "[link] host build: $@"
 
 clean:
