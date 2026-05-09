@@ -25,14 +25,16 @@ all: armhf mips24kc
 armhf: csa_agent.armhf udp_ts_recv.armhf
 mips24kc: csa_agent.mips24kc
 
-csa_agent.armhf: csa_agent.c
-	$(ARM_GCC) $(CFLAGS_COMMON) -o $@ $<
+CSA_LIB_SRC := csa.c csa.h
+
+csa_agent.armhf: csa_agent.c $(CSA_LIB_SRC)
+	$(ARM_GCC) $(CFLAGS_COMMON) -o $@ csa_agent.c csa.c
 
 udp_ts_recv.armhf: udp_ts_recv.c
 	$(ARM_GCC) $(CFLAGS_COMMON) -o $@ $<
 
-csa_agent.mips24kc: csa_agent.c
-	$(MIPS_GCC) $(CFLAGS_COMMON) -o $@ $<
+csa_agent.mips24kc: csa_agent.c $(CSA_LIB_SRC)
+	$(MIPS_GCC) $(CFLAGS_COMMON) -o $@ csa_agent.c csa.c
 
 clean:
 	rm -f csa_agent.armhf csa_agent.mips24kc udp_ts_recv.armhf

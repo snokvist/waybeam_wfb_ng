@@ -67,6 +67,12 @@
    static const unsigned int  webui_html_len = sizeof(webui_html) - 1;
 #endif
 
+/* CSA receiver library (poc/csa/csa.{h,c}). Multiplexed onto the rx_ant
+ * UDP listener: csa_feed handles "type":"csa_*" frames, falling through to
+ * the existing wfb_rx -Y parser for everything else. Off unless --csa-iface
+ * is set. */
+#include "csa/csa.h"
+
 /* Portable big-endian uint64 decode. */
 static inline uint64_t be64_read(const void *p)
 {
@@ -356,6 +362,19 @@ typedef struct {
 		bool     enabled;
 	} mcs;
 
+	/* ── CSA subsystem (Channel Switch Announcement receiver) ──
+	 * Off unless --csa-iface is set. CSA frames arrive on the existing
+	 * mcs.stats_port (5801 default = wfb_rx -Y output) and are demuxed
+	 * inside the rx_ant handler. */
+	struct {
+		bool      enabled;
+		char      iface[CSA_IFACE_LEN];
+		char      allow_chan[256];   /* raw CSV; parsed at startup */
+		char      allow_bw[256];
+		long long cooldown_ms;
+		bool      no_revert;
+	} csa;
+
 	/* ── Common ── */
 	char     wfb_host[64];           /* shared wfb_tx control endpoint */
 	uint16_t wfb_port;
@@ -424,6 +443,13 @@ static void log_emit(Subsys subsys, const char *fmt, ...)
 #define LOGV_COMMON(cfg, fmt, ...)  do { if ((cfg)->verbose) LOG_COMMON(fmt, ##__VA_ARGS__); } while (0)
 #define LOGV_FEC(cfg, fmt, ...)     do { if ((cfg)->verbose) LOG_FEC(fmt, ##__VA_ARGS__); } while (0)
 #define LOGV_MCS(cfg, fmt, ...)     do { if ((cfg)->verbose) LOG_MCS(fmt, ##__VA_ARGS__); } while (0)
+
+/* CSA library logger callback — routes csa.c log lines through SUB_COMMON
+ * so they appear in the same SSE/stderr stream as everything else. */
+static void csa_log_cb(const char *line)
+{
+	log_emit(SUB_COMMON, "csa: %s", line);
+}
 
 /* ── JSON scrapers (shared) ──────────────────────────────────────────── */
 
@@ -3023,6 +3049,13 @@ static void usage(const char *prog)
 		"  --osc-backoff F          up-cooldown multiplier when oscillating (default 3.0)\n"
 		"  --start-low              force range[0] mcs at startup (default off)\n"
 		"\n"
+		"CSA receiver (off unless --csa-iface set; reuses --stats listener):\n"
+		"  --csa-iface NAME         enable CSA receiver on iface (e.g. wlan0)\n"
+		"  --csa-allowlist CH,...   accepted target channels (default: any)\n"
+		"  --csa-bandwidth BW,...   accepted target bandwidths (default: any)\n"
+		"  --csa-cooldown-ms N      min gap between channel changes (default 2000)\n"
+		"  --csa-no-revert          do not auto-revert if link goes silent\n"
+		"\n"
 		"  -h, --help               this message\n",
 		prog);
 }
@@ -3188,6 +3221,14 @@ static void config_defaults(Config *c)
 	c->mcs.mcs_min = 0;
 	c->mcs.mcs_max = 11;
 	c->mcs.start_low = false;
+
+	/* CSA: off until --csa-iface is set. */
+	c->csa.enabled = false;
+	c->csa.iface[0] = '\0';
+	c->csa.allow_chan[0] = '\0';
+	c->csa.allow_bw[0] = '\0';
+	c->csa.cooldown_ms = 2000;
+	c->csa.no_revert = false;
 }
 
 /* ─────────────────────────────────────────────────────────────────────
@@ -3219,6 +3260,9 @@ int main(int argc, char **argv)
 		OPT_FAILSAFE, OPT_RECOVER_CONSEC,
 		OPT_OSC_WINDOW, OPT_OSC_THRESHOLD, OPT_OSC_BACKOFF,
 		OPT_START_LOW,
+		/* csa */
+		OPT_CSA_IFACE, OPT_CSA_ALLOWLIST, OPT_CSA_BANDWIDTH,
+		OPT_CSA_COOLDOWN, OPT_CSA_NO_REVERT,
 	};
 	static const struct option longopts[] = {
 		{"wfb",            required_argument, 0, OPT_WFB},
@@ -3272,6 +3316,11 @@ int main(int argc, char **argv)
 		{"osc-threshold",  required_argument, 0, OPT_OSC_THRESHOLD},
 		{"osc-backoff",    required_argument, 0, OPT_OSC_BACKOFF},
 		{"start-low",      no_argument,       0, OPT_START_LOW},
+		{"csa-iface",      required_argument, 0, OPT_CSA_IFACE},
+		{"csa-allowlist",  required_argument, 0, OPT_CSA_ALLOWLIST},
+		{"csa-bandwidth",  required_argument, 0, OPT_CSA_BANDWIDTH},
+		{"csa-cooldown-ms",required_argument, 0, OPT_CSA_COOLDOWN},
+		{"csa-no-revert",  no_argument,       0, OPT_CSA_NO_REVERT},
 		{"verbose",        no_argument,       0, 'v'},
 		{"help",           no_argument,       0, 'h'},
 		{0, 0, 0, 0},
@@ -3408,6 +3457,22 @@ int main(int argc, char **argv)
 		case OPT_OSC_THRESHOLD:  cfg.mcs.oscillation_threshold  = atoi(optarg); break;
 		case OPT_OSC_BACKOFF:    cfg.mcs.oscillation_backoff    = (float)atof(optarg); break;
 		case OPT_START_LOW:      cfg.mcs.start_low = true; break;
+		case OPT_CSA_IFACE:
+			snprintf(cfg.csa.iface, sizeof(cfg.csa.iface), "%s", optarg);
+			cfg.csa.enabled = true;
+			break;
+		case OPT_CSA_ALLOWLIST:
+			snprintf(cfg.csa.allow_chan, sizeof(cfg.csa.allow_chan), "%s", optarg);
+			break;
+		case OPT_CSA_BANDWIDTH:
+			snprintf(cfg.csa.allow_bw, sizeof(cfg.csa.allow_bw), "%s", optarg);
+			break;
+		case OPT_CSA_COOLDOWN:
+			cfg.csa.cooldown_ms = strtoll(optarg, NULL, 10);
+			break;
+		case OPT_CSA_NO_REVERT:
+			cfg.csa.no_revert = true;
+			break;
 		case 'v':                cfg.verbose = 1; break;
 		case 'h': default: usage(argv[0]); return (ch == 'h') ? 0 : 1;
 		}
@@ -3436,8 +3501,13 @@ int main(int argc, char **argv)
 		        (double)cfg.mcs.rssi_thresh_low, (double)cfg.mcs.rssi_thresh_high);
 		return 1;
 	}
-	if (!cfg.fec.enabled && !cfg.mcs.enabled) {
-		fprintf(stderr, "both subsystems disabled — nothing to do\n");
+	if (!cfg.fec.enabled && !cfg.mcs.enabled && !cfg.csa.enabled) {
+		fprintf(stderr, "all subsystems disabled — nothing to do\n");
+		return 1;
+	}
+	if (cfg.csa.enabled && !cfg.mcs.enabled) {
+		fprintf(stderr, "--csa-iface requires the MCS subsystem (rx_ant listener); "
+		                "remove --no-mcs or drop --csa-iface\n");
 		return 1;
 	}
 
@@ -3514,6 +3584,49 @@ int main(int argc, char **argv)
 		}
 		LOG_MCS("rx_ant: listening on udp:%u for wfb_rx -Y JSON",
 		    cfg.mcs.stats_port);
+	}
+
+	/* ── CSA bring-up ──
+	 * Multiplexed onto the rx_ant listener: csa_feed handles "csa_*"
+	 * frames inside the rx_ant handler, falling through to the existing
+	 * wfb_rx -Y parser for everything else. Requires the MCS subsystem
+	 * (which owns rx_ant_fd) to be enabled. */
+	CsaCfg csa_cfg;
+	CsaState csa_st;
+	memset(&csa_cfg, 0, sizeof(csa_cfg));
+	csa_init(&csa_st);
+	if (cfg.csa.enabled) {
+		if (!cfg.mcs.enabled || rx_ant_fd < 0) {
+			LOG_COMMON("csa: --csa-iface set but MCS rx_ant listener is disabled — refusing to start");
+			return 1;
+		}
+		snprintf(csa_cfg.iface, sizeof(csa_cfg.iface), "%s", cfg.csa.iface);
+		csa_cfg.cooldown_ms = cfg.csa.cooldown_ms;
+		csa_cfg.no_revert = cfg.csa.no_revert;
+		if (cfg.csa.allow_chan[0]) {
+			int n = csa_parse_chan_list(cfg.csa.allow_chan,
+			                            csa_cfg.allow_chan, CSA_MAX_ALLOW);
+			if (n < 0) {
+				LOG_COMMON("csa: bad --csa-allowlist: %s", cfg.csa.allow_chan);
+				return 1;
+			}
+			csa_cfg.allow_chan_n = n;
+		}
+		if (cfg.csa.allow_bw[0]) {
+			int n = csa_parse_bw_list(cfg.csa.allow_bw,
+			                          csa_cfg.allow_bw, CSA_MAX_ALLOW);
+			if (n < 0) {
+				LOG_COMMON("csa: bad --csa-bandwidth: %s", cfg.csa.allow_bw);
+				return 1;
+			}
+			csa_cfg.allow_bw_n = n;
+		}
+		csa_set_logger(csa_log_cb);
+		LOG_COMMON("csa: enabled iface=%s port=%u cooldown_ms=%lld no_revert=%d "
+		           "allowlist=%d chans bandwidth=%d entries",
+		    csa_cfg.iface, cfg.mcs.stats_port,
+		    csa_cfg.cooldown_ms, csa_cfg.no_revert ? 1 : 0,
+		    csa_cfg.allow_chan_n, csa_cfg.allow_bw_n);
 	}
 
 	/* MCS bootstrap GET_RADIO so we can preserve every non-mcs field on
@@ -3878,6 +3991,22 @@ int main(int argc, char **argv)
 			mcs_parse_log_us = now;
 		}
 
+		/* --- CSA tick ---
+		 * Fires the scheduled `iw set channel` when T_switch arrives, and
+		 * the auto-revert when no traffic is seen on the new channel.
+		 * Returns the next monotonic ms deadline (0 = IDLE / no timer).
+		 * Note: csa_tick may block ~50–300 ms inside fork+waitpid for iw;
+		 * acceptable since the link is in dead-zone during the switch. */
+		uint64_t csa_next_us = 0;
+		if (cfg.csa.enabled) {
+			long long csa_next_ms = csa_tick(&csa_st, &csa_cfg,
+			                                 (long long)(now / 1000ULL));
+			if (csa_next_ms > 0) {
+				csa_next_us = (uint64_t)csa_next_ms * 1000ULL;
+			}
+			now = now_us();  /* iw may have stretched wall-time */
+		}
+
 		/* --- Build pollfd set --- */
 		struct pollfd pfds[3 + API_MAX_CLIENTS];
 		int npfds = 0;
@@ -3924,6 +4053,8 @@ int main(int argc, char **argv)
 		    next_radio_us > 0 && next_radio_us < deadline) deadline = next_radio_us;
 		if (pending_drop.active && pending_drop.deadline_us < deadline)
 			deadline = pending_drop.deadline_us;
+		if (csa_next_us > 0 && csa_next_us < deadline)
+			deadline = csa_next_us;
 		int timeout_ms = 100;
 		if (deadline > now) {
 			uint64_t ahead_ms = (deadline - now) / 1000ULL;
@@ -4084,6 +4215,18 @@ int main(int argc, char **argv)
 					continue;
 				}
 				dgram[n] = '\0';
+
+				/* CSA dispatch: csa_feed consumes "csa_*" frames; non-CSA
+				 * datagrams fall through to the rx_ant parser below and
+				 * count as a VERIFY heartbeat. */
+				if (cfg.csa.enabled) {
+					long long now_ms_csa = (long long)(now / 1000ULL);
+					if (csa_feed(&csa_st, &csa_cfg, dgram,
+					             (size_t)n, now_ms_csa)) {
+						continue;
+					}
+					csa_link_alive(&csa_st, now_ms_csa);
+				}
 
 				if (!strstr(dgram, "\"type\":\"rx_ant\"")) continue;
 				if (!strstr(dgram, "\"ver\":1")) continue;
