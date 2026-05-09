@@ -24,6 +24,7 @@
  *   GET /status           → unified JSON snapshot
  *   GET /fec/status       → fec-only subset
  *   GET /mcs/status       → mcs-only subset
+ *   GET /cmd/status       → venc command-proxy subset
  *   GET /events           → text/event-stream — every log line as JSON
  *   GET /health           → "ok\n"
  *
@@ -72,6 +73,9 @@
  * the existing wfb_rx -Y parser for everything else. Off unless --csa-iface
  * is set. */
 #include "csa/csa.h"
+
+/* venc command proxy wire protocol (multiplexed onto the rx_ant listener). */
+#include "wcmd_proto.h"
 
 /* Portable big-endian uint64 decode. */
 static inline uint64_t be64_read(const void *p)
@@ -374,6 +378,41 @@ typedef struct {
 		long long cooldown_ms;
 		bool      no_revert;
 	} csa;
+
+	/* ── venc command proxy (multiplexed onto MCS rx_ant socket) ── */
+	struct {
+		/* Master switch. Off when the MCS rx_ant socket is not bound, since
+		 * the proxy reuses that listener; the runtime forces-off in that
+		 * case regardless of this flag. */
+		bool     enabled;
+
+		/* Reject requests whose source IP is not 127.0.0.1. Default off so
+		 * the ground station (any peer IP) can drive the proxy through the
+		 * existing rx_ant uplink. Flip on for vehicle-local-only setups. */
+		bool     loopback_only;
+
+		/* Per-key minimum interval between accepted applies (ms). A second
+		 * request to the same key inside this window is rejected with
+		 * WCMD_STATUS_RATE_LIMITED. 0 disables the limiter. */
+		int      rate_limit_ms;
+
+		/* Bitmask of WCMD_KEY_* values allowed through. Bit (key-1):
+		 *   bit 0 = BITRATE_KBPS, bit 1 = FPS,
+		 *   bit 2 = PAYLOAD_BYTES, bit 3 = FORCE_IDR.
+		 * Default 0x0F (all four enabled). Operators set 0 to make the
+		 * proxy purely diagnostic without disabling the rx_ant listener. */
+		int      allow_keys_mask;
+
+		/* Per-key value range (inclusive). Bitrate falls back to the FEC
+		 * subsystem's bitrate_min/max when those are non-zero so the
+		 * proxy and FEC controller agree on the safe envelope. */
+		int      bitrate_min_kbps;
+		int      bitrate_max_kbps;
+		int      fps_min;
+		int      fps_max;
+		int      payload_min;
+		int      payload_max;
+	} cmd;
 
 	/* ── Common ── */
 	char     wfb_host[64];           /* shared wfb_tx control endpoint */
@@ -1325,6 +1364,228 @@ static int venc_apply(const Config *cfg, long bitrate_kbps, int payload_bytes)
 	return (strstr(body, "\"ok\":true") || strstr(body, "\"ok\": true")) ? 0 : -1;
 }
 
+/* ── venc command proxy ─────────────────────────────────────────────────
+ * Multiplexed onto the MCS rx_ant UDP socket (default :5801, production
+ * :6600). Frames begin with the 4-byte WCMD magic which never collides
+ * with rx_ant JSON, so the dispatcher peels them off cheaply ahead of
+ * the JSON path. See poc/wcmd_proto.h for the wire format and
+ * poc/CMD_PROXY.md for the recipe. */
+
+#define WCMD_NUM_KEYS 4   /* highest defined WCMD_KEY_* value */
+
+typedef struct {
+	uint64_t recv_total;        /* every WCMD_REQ that passed magic/version */
+	uint64_t accepted;          /* applied (HTTP "ok":true) */
+	uint64_t rejected_format;
+	uint64_t rejected_disabled;
+	uint64_t rejected_unknown;
+	uint64_t rejected_blocked;
+	uint64_t rejected_range;
+	uint64_t rejected_rate;
+	uint64_t rejected_peer;
+	uint64_t http_errors;
+	uint64_t last_apply_us[WCMD_NUM_KEYS + 1]; /* indexed by key (1-based) */
+	uint64_t last_recv_us;
+	uint8_t  last_status;       /* WCMD_STATUS_* of most recent request */
+	uint8_t  last_key;
+	int32_t  last_value;
+	int      last_http_status;
+} WcmdState;
+
+/* Build the venc /api/v1 path for a given (key, value). path must be
+ * sized for at least 80 bytes. Returns 0 on success, -1 if key is not
+ * recognised. */
+static int wcmd_build_path(uint8_t key, int32_t value, char *path, size_t path_sz)
+{
+	int n = 0;
+	switch (key) {
+	case WCMD_KEY_BITRATE_KBPS:
+		n = snprintf(path, path_sz,
+		             "/api/v1/set?video0.bitrate=%ld", (long)value);
+		break;
+	case WCMD_KEY_FPS:
+		n = snprintf(path, path_sz,
+		             "/api/v1/set?video0.fps=%d", (int)value);
+		break;
+	case WCMD_KEY_PAYLOAD_BYTES:
+		n = snprintf(path, path_sz,
+		             "/api/v1/set?outgoing.maxPayloadSize=%d", (int)value);
+		break;
+	case WCMD_KEY_FORCE_IDR:
+		n = snprintf(path, path_sz, "/request/idr");
+		break;
+	default:
+		return -1;
+	}
+	if (n <= 0 || n >= (int)path_sz) return -1;
+	return 0;
+}
+
+/* Clamp value into the allowed range for key. Returns 0 if unmodified,
+ * 1 if clamped, -1 if value is out of plausible range (very large negative
+ * etc.). FORCE_IDR ignores value and always reports 0 unmodified. The
+ * BITRATE clamp prefers the FEC subsystem's bitrate window (if non-zero)
+ * so the proxy and FEC controller agree on the safe envelope. */
+static int wcmd_clamp_value(const Config *cfg, uint8_t key, int32_t *value)
+{
+	int32_t orig = *value;
+	int32_t lo = 0, hi = 0;
+
+	switch (key) {
+	case WCMD_KEY_BITRATE_KBPS: {
+		long fec_lo = (cfg->fec.enabled ? cfg->fec.bitrate_min_kbps : 0);
+		long fec_hi = (cfg->fec.enabled ? cfg->fec.bitrate_max_kbps : 0);
+		lo = (int32_t)(fec_lo > 0 ? fec_lo : cfg->cmd.bitrate_min_kbps);
+		hi = (int32_t)(fec_hi > 0 ? fec_hi : cfg->cmd.bitrate_max_kbps);
+		break;
+	}
+	case WCMD_KEY_FPS:
+		lo = cfg->cmd.fps_min;
+		hi = cfg->cmd.fps_max;
+		break;
+	case WCMD_KEY_PAYLOAD_BYTES:
+		lo = cfg->cmd.payload_min;
+		hi = cfg->cmd.payload_max;
+		break;
+	case WCMD_KEY_FORCE_IDR:
+		*value = 0;
+		return 0;
+	default:
+		return -1;
+	}
+
+	if (lo <= 0 || hi <= 0 || lo > hi) return -1;
+	if (*value < lo) { *value = lo; return 1; }
+	if (*value > hi) { *value = hi; return 1; }
+	return (*value == orig) ? 0 : 1;
+}
+
+/* Process one WCMD_REQ datagram (already validated for length and
+ * magic/version). Always populates *resp; the caller sends it on the
+ * rx_ant socket. Returns 0 on success, <0 only if dispatch was a no-op
+ * (e.g. unknown key — caller may want to log differently). */
+static int wcmd_dispatch(const Config *cfg, const WcmdReq *req,
+                         const struct sockaddr_in *peer,
+                         WcmdState *st, uint64_t now,
+                         WcmdResp *resp)
+{
+	memset(resp, 0, sizeof(*resp));
+	resp->magic    = htonl(WCMD_MAGIC);
+	resp->version  = WCMD_VERSION;
+	resp->msg_type = WCMD_MSG_RESP;
+	resp->seq      = req->seq;          /* echo, already network-order */
+	resp->key      = req->key;
+
+	st->recv_total++;
+	st->last_recv_us = now;
+	st->last_key     = req->key;
+
+	if (!cfg->cmd.enabled) {
+		resp->status = WCMD_STATUS_DISABLED;
+		st->rejected_disabled++;
+		st->last_status = resp->status;
+		return 0;
+	}
+
+	if (cfg->cmd.loopback_only &&
+	    peer->sin_addr.s_addr != htonl(INADDR_LOOPBACK)) {
+		resp->status = WCMD_STATUS_NOT_PERMITTED;
+		st->rejected_peer++;
+		st->last_status = resp->status;
+		return 0;
+	}
+
+	uint8_t key = req->key;
+	if (key == 0 || key > WCMD_NUM_KEYS) {
+		resp->status = WCMD_STATUS_UNKNOWN_KEY;
+		st->rejected_unknown++;
+		st->last_status = resp->status;
+		return -1;
+	}
+	if (!(cfg->cmd.allow_keys_mask & (1u << (key - 1)))) {
+		resp->status = WCMD_STATUS_KEY_BLOCKED;
+		st->rejected_blocked++;
+		st->last_status = resp->status;
+		return 0;
+	}
+
+	int32_t value = (int32_t)ntohl((uint32_t)req->value);
+	int clamp_rc  = wcmd_clamp_value(cfg, key, &value);
+	if (clamp_rc < 0) {
+		resp->status = WCMD_STATUS_OUT_OF_RANGE;
+		st->rejected_range++;
+		st->last_status = resp->status;
+		return 0;
+	}
+
+	if (cfg->cmd.rate_limit_ms > 0) {
+		uint64_t last = st->last_apply_us[key];
+		uint64_t min_us = (uint64_t)cfg->cmd.rate_limit_ms * 1000ULL;
+		if (last != 0 && now - last < min_us) {
+			resp->status = WCMD_STATUS_RATE_LIMITED;
+			st->rejected_rate++;
+			resp->applied_value = htonl((uint32_t)value);
+			st->last_status = resp->status;
+			return 0;
+		}
+	}
+
+	char path[160];
+	if (wcmd_build_path(key, value, path, sizeof(path)) != 0) {
+		resp->status = WCMD_STATUS_UNKNOWN_KEY;
+		st->rejected_unknown++;
+		st->last_status = resp->status;
+		return -1;
+	}
+
+	if (cfg->dry_run) {
+		resp->status = WCMD_STATUS_OK;
+		resp->http_status   = htons(200);
+		resp->applied_value = htonl((uint32_t)value);
+		st->last_apply_us[key] = now;
+		st->accepted++;
+		st->last_status = resp->status;
+		st->last_value  = value;
+		st->last_http_status = 200;
+		return 0;
+	}
+
+	char body[1024];
+	int got = http_get(cfg->fec.venc_host, cfg->fec.venc_port,
+	                   path, body, sizeof(body), 500);
+
+	int http_status = 0;
+	bool ok_body = false;
+	if (got > 0) {
+		ok_body = (strstr(body, "\"ok\":true") ||
+		           strstr(body, "\"ok\": true") ||
+		           /* /request/idr returns {"idr":true} */
+		           strstr(body, "\"idr\":true") ||
+		           strstr(body, "\"idr\": true"));
+		http_status = ok_body ? 200 : 400;
+	}
+
+	if (!ok_body) {
+		resp->status = WCMD_STATUS_HTTP_ERROR;
+		resp->http_status = htons((uint16_t)http_status);
+		st->http_errors++;
+		st->last_status = resp->status;
+		st->last_http_status = http_status;
+		return 0;
+	}
+
+	resp->status        = WCMD_STATUS_OK;
+	resp->http_status   = htons(200);
+	resp->applied_value = htonl((uint32_t)value);
+	st->last_apply_us[key] = now;
+	st->accepted++;
+	st->last_status      = resp->status;
+	st->last_value       = value;
+	st->last_http_status = http_status;
+	(void)clamp_rc;
+	return 0;
+}
+
 static int sidecar_open_and_bind(void)
 {
 	int fd = socket(AF_INET, SOCK_DGRAM, 0);
@@ -1918,6 +2179,7 @@ typedef struct {
 #define OFF(field)         offsetof(Config, field)
 #define OFF_FEC(field)     (offsetof(Config, fec) + offsetof(typeof(((Config*)0)->fec), field))
 #define OFF_MCS(field)     (offsetof(Config, mcs) + offsetof(typeof(((Config*)0)->mcs), field))
+#define OFF_CMD(field)     (offsetof(Config, cmd) + offsetof(typeof(((Config*)0)->cmd), field))
 
 static const TunableDesc TUNABLES[] = {
 	/* ── common ── */
@@ -1986,6 +2248,18 @@ static const TunableDesc TUNABLES[] = {
 	{"mcs.mcs_min",                       SUB_MCS, TF_INT,   OFF_MCS(mcs_min),                       0, 11,      "clamp emit lower bound"},
 	{"mcs.mcs_max",                       SUB_MCS, TF_INT,   OFF_MCS(mcs_max),                       0, 11,      "clamp emit upper bound"},
 	{"mcs.start_low",                     SUB_MCS, TF_BOOL,  OFF_MCS(start_low),                     0, 0,       "force range[0] mcs at startup (default off)"},
+
+	/* ── cmd (venc command proxy on the rx_ant socket) ── */
+	{"cmd.enabled",          SUB_COMMON, TF_BOOL, OFF_CMD(enabled),          0, 0,      "enable venc command proxy on rx_ant socket"},
+	{"cmd.loopback_only",    SUB_COMMON, TF_BOOL, OFF_CMD(loopback_only),    0, 0,      "reject WCMD requests not from 127.0.0.1"},
+	{"cmd.rate_limit_ms",    SUB_COMMON, TF_INT,  OFF_CMD(rate_limit_ms),    0, 60000,  "min ms between same-key applies (0 disables)"},
+	{"cmd.allow_keys_mask",  SUB_COMMON, TF_INT,  OFF_CMD(allow_keys_mask),  0, 0xFFFF, "bitmask of WCMD_KEY_* allowed (1=br,2=fps,4=pl,8=idr)"},
+	{"cmd.bitrate_min_kbps", SUB_COMMON, TF_INT,  OFF_CMD(bitrate_min_kbps), 1, 200000, "min accepted bitrate kbps (fallback when fec disabled)"},
+	{"cmd.bitrate_max_kbps", SUB_COMMON, TF_INT,  OFF_CMD(bitrate_max_kbps), 1, 200000, "max accepted bitrate kbps (fallback when fec disabled)"},
+	{"cmd.fps_min",          SUB_COMMON, TF_INT,  OFF_CMD(fps_min),          1, 240,    "min accepted fps"},
+	{"cmd.fps_max",          SUB_COMMON, TF_INT,  OFF_CMD(fps_max),          1, 240,    "max accepted fps"},
+	{"cmd.payload_min",      SUB_COMMON, TF_INT,  OFF_CMD(payload_min),      256, 4000, "min accepted RTP payload bytes"},
+	{"cmd.payload_max",      SUB_COMMON, TF_INT,  OFF_CMD(payload_max),      256, 4000, "max accepted RTP payload bytes"},
 };
 #define TUNABLES_COUNT (sizeof(TUNABLES) / sizeof(TUNABLES[0]))
 
@@ -2192,6 +2466,8 @@ typedef struct {
 	bool     pending_drop_active;
 	int      pending_drop_target_mcs;
 	int      pending_drop_ms_remaining;
+	/* venc command proxy snapshot (multiplexed onto rx_ant socket). */
+	const WcmdState *wcmd;
 } ApiSnapshot;
 
 static int append_score_json(char *buf, size_t cap, size_t pos,
@@ -2483,6 +2759,67 @@ static int mcs_status_to_json(const ApiSnapshot *s, char *buf, size_t cap)
 	return (int)pos;
 }
 
+/* /cmd/status — venc command-proxy counters and last-applied per key.
+ * Renders an empty wcmd block (with present=false) when the proxy is
+ * disabled so dashboards can grey it out without reflowing. */
+static int cmd_status_to_json(const ApiSnapshot *s, char *buf, size_t cap)
+{
+	const WcmdState *w = s->wcmd;
+	const Config    *c = s->cfg;
+	uint64_t now = now_us();
+	double last_recv_age_s = (w && w->last_recv_us != 0)
+		? (double)(now - w->last_recv_us) / 1e6 : -1.0;
+	double last_apply_age[WCMD_NUM_KEYS + 1] = {0};
+	for (int k = 1; k <= WCMD_NUM_KEYS; k++) {
+		last_apply_age[k] = (w && w->last_apply_us[k] != 0)
+			? (double)(now - w->last_apply_us[k]) / 1e6 : -1.0;
+	}
+	int n = snprintf(buf, cap,
+		"{\"uptime_s\":%.3f,"
+		"\"present\":%s,\"enabled\":%s,\"loopback_only\":%s,"
+		"\"rate_limit_ms\":%d,\"allow_keys_mask\":%d,"
+		"\"socket_port\":%u,"
+		"\"counters\":{"
+			"\"recv_total\":%llu,\"accepted\":%llu,"
+			"\"rejected_format\":%llu,\"rejected_disabled\":%llu,"
+			"\"rejected_unknown\":%llu,\"rejected_blocked\":%llu,"
+			"\"rejected_range\":%llu,\"rejected_rate\":%llu,"
+			"\"rejected_peer\":%llu,\"http_errors\":%llu"
+		"},"
+		"\"last\":{\"status\":%u,\"key\":%u,\"value\":%d,\"http_status\":%d,\"recv_age_s\":%.3f},"
+		"\"last_apply_age_s\":{"
+			"\"bitrate\":%.3f,\"fps\":%.3f,"
+			"\"payload\":%.3f,\"force_idr\":%.3f"
+		"}}",
+		log_rel_s(),
+		(w ? "true" : "false"),
+		(c->cmd.enabled ? "true" : "false"),
+		(c->cmd.loopback_only ? "true" : "false"),
+		c->cmd.rate_limit_ms, c->cmd.allow_keys_mask,
+		(unsigned)c->mcs.stats_port,
+		w ? (unsigned long long)w->recv_total       : 0ULL,
+		w ? (unsigned long long)w->accepted         : 0ULL,
+		w ? (unsigned long long)w->rejected_format  : 0ULL,
+		w ? (unsigned long long)w->rejected_disabled: 0ULL,
+		w ? (unsigned long long)w->rejected_unknown : 0ULL,
+		w ? (unsigned long long)w->rejected_blocked : 0ULL,
+		w ? (unsigned long long)w->rejected_range   : 0ULL,
+		w ? (unsigned long long)w->rejected_rate    : 0ULL,
+		w ? (unsigned long long)w->rejected_peer    : 0ULL,
+		w ? (unsigned long long)w->http_errors      : 0ULL,
+		w ? (unsigned)w->last_status : 0u,
+		w ? (unsigned)w->last_key    : 0u,
+		w ? w->last_value : 0,
+		w ? w->last_http_status : 0,
+		last_recv_age_s,
+		last_apply_age[WCMD_KEY_BITRATE_KBPS],
+		last_apply_age[WCMD_KEY_FPS],
+		last_apply_age[WCMD_KEY_PAYLOAD_BYTES],
+		last_apply_age[WCMD_KEY_FORCE_IDR]);
+	if (n < 0 || (size_t)n >= cap) return -1;
+	return n;
+}
+
 /* ── REST primitives ─────────────────────────────────────────────────── */
 
 typedef struct {
@@ -2549,6 +2886,7 @@ static int help_to_text(char *buf, size_t cap)
 		"  GET /status            unified JSON snapshot\n"
 		"  GET /fec/status        FEC subset\n"
 		"  GET /mcs/status        MCS subset\n"
+		"  GET /cmd/status        venc command-proxy subset\n"
 		"  GET /events            text/event-stream — every log line as JSON\n"
 		"                         (data: {\"t_s\":N,\"subsys\":\"fec|mcs|common\",\"msg\":\"...\"})\n"
 		"  GET /health            \"ok\\n\"\n"
@@ -2918,6 +3256,11 @@ static void api_handle_request(ApiClient *c, Config *cfg, ApiSnapshot *snap)
 		if (n > 0) api_send(c->fd, 200, "application/json", body, n);
 		else       api_send(c->fd, 500, "text/plain", "json overflow\n", 14);
 	}
+	else if (strcmp(path, "/cmd/status") == 0) {
+		n = cmd_status_to_json(snap, body, sizeof(body));
+		if (n > 0) api_send(c->fd, 200, "application/json", body, n);
+		else       api_send(c->fd, 500, "text/plain", "json overflow\n", 14);
+	}
 	else if (strcmp(path, "/health") == 0) {
 		api_send(c->fd, 200, "text/plain", "ok\n", 3);
 	}
@@ -3229,6 +3572,21 @@ static void config_defaults(Config *c)
 	c->csa.allow_bw[0] = '\0';
 	c->csa.cooldown_ms = 2000;
 	c->csa.no_revert = false;
+
+	/* venc command proxy defaults. Off when MCS is off (no rx_ant socket
+	 * to multiplex onto); the runtime forces-off in that case. Bitrate
+	 * range mirrors a reasonable Star6E envelope; FPS/payload bounds
+	 * cover the supported sensor modes and the venc API floor. */
+	c->cmd.enabled         = true;
+	c->cmd.loopback_only   = false;
+	c->cmd.rate_limit_ms   = 100;
+	c->cmd.allow_keys_mask = 0x0F;
+	c->cmd.bitrate_min_kbps = 100;
+	c->cmd.bitrate_max_kbps = 25000;
+	c->cmd.fps_min          = 1;
+	c->cmd.fps_max          = 240;
+	c->cmd.payload_min      = 576;
+	c->cmd.payload_max      = 1474;
 }
 
 /* ─────────────────────────────────────────────────────────────────────
@@ -3629,6 +3987,18 @@ int main(int argc, char **argv)
 		    csa_cfg.allow_chan_n, csa_cfg.allow_bw_n);
 	}
 
+	/* The venc command proxy multiplexes onto the rx_ant socket. When
+	 * rx_ant isn't bound there's nowhere to receive WCMD requests, so
+	 * force the proxy off regardless of cmd.enabled. */
+	if (rx_ant_fd < 0 && cfg.cmd.enabled) {
+		LOG_COMMON("cmd: proxy disabled (no rx_ant socket — set --stats and enable mcs)");
+		cfg.cmd.enabled = false;
+	} else if (cfg.cmd.enabled) {
+		LOG_COMMON("cmd: venc proxy on udp:%u (loopback_only=%d allow=0x%X rate_ms=%d)",
+		    cfg.mcs.stats_port, cfg.cmd.loopback_only ? 1 : 0,
+		    cfg.cmd.allow_keys_mask, cfg.cmd.rate_limit_ms);
+	}
+
 	/* MCS bootstrap GET_RADIO so we can preserve every non-mcs field on
 	 * subsequent SETs. Failure is non-fatal but blocks MCS emits until
 	 * a successful GET / drift-through. */
@@ -3734,6 +4104,11 @@ int main(int argc, char **argv)
 	int      mcs_sf_state = 0;
 	uint64_t mcs_sf_first_us = 0;
 	int      mcs_sf_target_mcs = -1;
+
+	/* venc command proxy state (multiplexed onto rx_ant socket). When
+	 * the rx_ant socket isn't bound the runtime forces cmd.enabled off
+	 * so the dispatcher is unreachable in any case. */
+	WcmdState wcmd_state = {0};
 
 	/* RadioState (FEC's view; written by both subsystems via radio_apply_observation). */
 	RadioState radio = {0};
@@ -4118,6 +4493,7 @@ int main(int argc, char **argv)
 				            ? (pending_drop.deadline_us - now_us()) / 1000ULL
 				            : 0)
 				    : 0,
+				.wcmd = &wcmd_state,
 			};
 			memcpy(snap.ant_avg, last_ant_avg, sizeof(snap.ant_avg));
 			for (int i = 0; i < API_MAX_CLIENTS; i++) {
@@ -4202,7 +4578,11 @@ int main(int argc, char **argv)
 			char dgram[2048];
 			/* Same 32-datagram cap as wfb_stats above. */
 			for (int drained = 0; drained < 32; drained++) {
-				ssize_t n = recv(rx_ant_fd, dgram, sizeof(dgram) - 1, MSG_TRUNC);
+				struct sockaddr_in peer;
+				socklen_t plen = sizeof(peer);
+				ssize_t n = recvfrom(rx_ant_fd, dgram, sizeof(dgram) - 1,
+				                     MSG_TRUNC,
+				                     (struct sockaddr *)&peer, &plen);
 				if (n <= 0) break;
 				if ((size_t)n >= sizeof(dgram)) {
 					mcs_truncations++;
@@ -4215,6 +4595,39 @@ int main(int argc, char **argv)
 					continue;
 				}
 				dgram[n] = '\0';
+
+				/* WCMD command-proxy dispatch — peel binary command
+				 * frames off the rx_ant socket before the JSON parsers
+				 * see them. The 4-byte magic ("WCMD") never collides
+				 * with a JSON datagram. */
+				if ((size_t)n >= sizeof(WcmdReq) &&
+				    plen >= sizeof(struct sockaddr_in) &&
+				    peer.sin_family == AF_INET) {
+					const WcmdReq *req = (const WcmdReq *)dgram;
+					if (ntohl(req->magic) == WCMD_MAGIC &&
+					    req->version == WCMD_VERSION &&
+					    req->msg_type == WCMD_MSG_REQ) {
+						WcmdResp resp;
+						(void)wcmd_dispatch(&cfg, req, &peer,
+						                    &wcmd_state, now_us(),
+						                    &resp);
+						(void)sendto(rx_ant_fd, &resp, sizeof(resp), 0,
+						             (const struct sockaddr *)&peer,
+						             sizeof(peer));
+						if (cfg.verbose >= 1) {
+							char ip[INET_ADDRSTRLEN];
+							inet_ntop(AF_INET, &peer.sin_addr, ip,
+							          sizeof(ip));
+							LOG_COMMON("cmd: peer=%s:%u key=%u value=%d status=%u http=%u",
+							    ip, (unsigned)ntohs(peer.sin_port),
+							    (unsigned)req->key,
+							    (int)ntohl((uint32_t)req->value),
+							    (unsigned)resp.status,
+							    (unsigned)ntohs(resp.http_status));
+						}
+						continue;
+					}
+				}
 
 				/* CSA dispatch: csa_feed consumes "csa_*" frames; non-CSA
 				 * datagrams fall through to the rx_ant parser below and

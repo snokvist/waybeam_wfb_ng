@@ -70,6 +70,7 @@ Deeper docs:
 - `SHM_HOWTO.md` — full SHM-ring protocol, wfb_tx `-H/-b/-r/-x/-Y` flag reference, on-device test recipes.
 - `FEC_CTRL_POC.md` — fec_controller design (anti-bounce, dwells, deadband, settle windows).
 - `SIDECAR_INFO.md` — RTP sidecar wire protocol (consumed by both `fec_controller` and `rtp_timing_probe`).
+- `CMD_PROXY.md` — venc command proxy multiplexed onto the rx_ant socket (whitelisted bitrate / fps / payload / IDR over UDP).
 
 ---
 
@@ -308,6 +309,7 @@ curl -s http://192.168.1.13:8765/status
 # Per-subsystem subset
 curl -s http://192.168.1.13:8765/fec/status
 curl -s http://192.168.1.13:8765/mcs/status
+curl -s http://192.168.1.13:8765/cmd/status   # venc command proxy
 
 # Live tuning (multi-namespace atomic write)
 curl -s "http://192.168.1.13:8765/set?fec.mtu=1400&mcs.rssi_thresh_low=-65"
@@ -346,6 +348,31 @@ into the binary at build time via `xxd -i`.
 - The legacy `mcs_settle_s` config name is kept verbatim — it's a FEC
   subsystem tunable that controls how long FEC ignores its own outputs
   after an MCS-driven radio change.
+
+**venc command proxy** (`cmd.*` tunables):
+
+A binary command channel multiplexed onto the rx_ant socket. The ground
+side already pushes `wfb_rx -Y` JSON to that port; the proxy peels off
+`WCMD`-magic-prefixed datagrams and translates each one into a single
+HTTP `GET` against the local venc `/api/v1`. Whitelisted to four keys:
+`video0.bitrate`, `video0.fps`, `outgoing.maxPayloadSize`, and
+`/request/idr`. The proxy auto-disables when no rx_ant socket is bound.
+
+```
+# Ground host — set vehicle bitrate to 8000 kbps:
+python3 - <<'PY'
+import socket, struct
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.sendto(struct.pack("!IBBHBBHi",
+                     0x57434D44, 1, 1,   # magic, version, MSG_REQ
+                     1, 1, 0, 0, 8000),  # seq, key=BITRATE, value=8000 kbps
+         ("192.168.1.13", 6600))
+print(s.recvfrom(64)[0].hex())
+PY
+```
+
+See `CMD_PROXY.md` for the full wire format, status codes, and clamp
+semantics.
 
 **Validation & input handling**:
 
@@ -916,6 +943,7 @@ matching `--range` preset.
 | 5801/udp | `wfb_rx -Y` → mcs_selector / dashboards | producer→consumer | rx_ant JSON (default mcs_selector listener) |
 | 6600/udp | ground `wfb_rx -Y` → vehicle mcs_selector | producer→consumer | rx_ant JSON (production example) |
 | 6666/udp | venc sidecar → fec_controller (default) | producer→consumer | per-frame metadata (default port) |
+| 5801 / 6600/udp | ground cmd injector → link_controller (multiplexed onto rx_ant) | request/response | venc command proxy (`WCMD` magic; see `CMD_PROXY.md`) |
 | 8000/udp | `wfb_tx -C` ← wfb_tx_cmd / fec_controller / mcs_selector | request/response | control: set_fec (fec_controller), set_radio (mcs_selector), etc. |
 | 8765/tcp | fec_controller HTTP API | server | REST + SSE |
 | 8766/tcp | mcs_selector HTTP API | server | REST + SSE |
