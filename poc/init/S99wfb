@@ -16,6 +16,16 @@ WFB_RX_LINK=208
 WFB_CTRL=8000
 WFB_RX_FWD_PORT=5801
 SAFE_BITRATE=4096
+# link_controller failsafe gating against rx_ant uplink burst loss.
+# Default 0.5 s is too tight for a wfb-ng -k 1 -n 2 (50 % parity)
+# rx_ant return path: occasional 0.5–2.0 s gaps from consecutive
+# fragmented-frame loss trip the watchdog and force MCS bucket 0
+# even when the radio link itself is fine. 2.0 s + 2 good samples
+# absorbs typical bursts; raise WFB_FAILSAFE_S further if your
+# uplink is lossier (or tighten the wfb-ng parity ratio of the
+# uplink instead). See poc/CMD_PROXY.md → "Failsafe tuning".
+WFB_FAILSAFE_S=2.0
+WFB_RECOVER_N=2
 SHM_RING="local_shm"
 KEY="/etc/drone.key"
 
@@ -55,11 +65,17 @@ start_wfb() {
     echo $! > "$PID_RX"
 
     # link_controller (writes safe bitrate to venc on startup, adaptive FEC,
-    # WebUI on :8765 reachable via eth0)
+    # WebUI on :8765 reachable via eth0). --stats binds the rx_ant socket
+    # for both MCS scoring and the venc command proxy (CMD_PROXY.md).
+    # --failsafe / --recover-consec absorb bursty rx_ant loss over the
+    # wfb-ng uplink — see WFB_FAILSAFE_S / WFB_RECOVER_N above.
     link_controller \
         --wfb 127.0.0.1:$WFB_CTRL \
         --venc 127.0.0.1:80 \
         --safe-startup-bitrate $SAFE_BITRATE \
+        --stats 0.0.0.0:$WFB_RX_FWD_PORT \
+        --failsafe $WFB_FAILSAFE_S \
+        --recover-consec $WFB_RECOVER_N \
         >> "$LOG" 2>&1 &
     echo $! > "$PID_LC"
 

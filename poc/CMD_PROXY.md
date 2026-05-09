@@ -209,6 +209,43 @@ radio uplink), keep `loopback_only=false` and rely on
 `cmd.allow_keys_mask` plus the FEC `bitrate_min/max` window to bound
 what an attacker can do.
 
+## Failsafe tuning (rx_ant uplink)
+
+The proxy reuses the MCS rx_ant socket, so MCS scoring and the cmd
+proxy are co-located on the same port. That means the MCS subsystem's
+**failsafe watchdog** observes the same uplink the proxy depends on,
+and a lossy uplink can flap MCS while still landing WCMD frames.
+
+The watchdog forces bucket 0 (lowest MCS in the active range) when no
+rx_ant datagram has arrived for `mcs.failsafe_timeout_s` (default
+`0.5 s`). On a wfb-ng `-k 1 -n 2` (50 % parity) uplink with 10 Hz rx_ant
+emit cadence, fragmented JSON datagrams lose ~5 consecutive frames as
+a single "bad burst", which produces 0.5–2.0 s rx_ant gaps on an
+otherwise-healthy radio link. With the default threshold each burst
+trips the failsafe → MCS=1 → bitrate pre-drop → SET_RADIO → recovery
+within ~3 s. The `commit_count` and `ordered drop` lines in the log
+show this clearly.
+
+**Recommended starting point** for typical FPV uplinks (set via
+`--failsafe` / `--recover-consec` at launch, or live via `/set`):
+
+```
+mcs.failsafe_timeout_s             = 2.0    (was 0.5)
+mcs.failsafe_recovery_consecutive  = 2      (was 3)
+```
+
+The bundled `poc/init/S99wfb` template wires these as
+`WFB_FAILSAFE_S=2.0` / `WFB_RECOVER_N=2` env vars. If your uplink is
+even lossier (counted in `wfb.log`: `grep -c 'no rx_ant' /tmp/wfb.log`
+shows the trip rate), raise `WFB_FAILSAFE_S` further or tighten the
+wfb-ng parity ratio of the rx_ant return path.
+
+The trade-off is direct: a longer failsafe window means a longer
+"blind" interval before the controller protects against a real ground
+outage. For bench operation 2–5 s is fine; for long-range flights you
+want to weigh that against how quickly you'd want MCS to drop on a
+genuine link failure.
+
 ## Security notes
 
 - The proxy only acts when `cmd.enabled` is true AND the MCS rx_ant
