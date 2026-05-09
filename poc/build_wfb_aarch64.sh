@@ -14,10 +14,11 @@
 #   ./build_wfb_aarch64.sh --deploy   # build + scp to DEPLOY_HOST
 #
 # Output (all in build/aarch64/):
-#   wfb_tx       - patched wfb_tx with -H (SHM), -b, -r, -x flags
+#   wfb_tx       - patched wfb_tx with -H (SHM), -x, -Y flags
 #   wfb_rx       - patched wfb_rx with cooperative RX diversity +
 #                  plaintext mode + JSON stats with diversity / adapters
-#   wfb_tx_cmd   - runtime control client (set_fec, set_radio, set_mbit, get_*)
+#   wfb_tx_cmd   - runtime control client (set_fec [-T fec_timeout_ms],
+#                  set_radio, get_fec, get_radio)
 #   wfb_keygen   - key generator
 #
 # Requirements:
