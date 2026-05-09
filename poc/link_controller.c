@@ -1278,10 +1278,16 @@ static int wfb_stats_handle_datagram(const char *body,
 	return 0;
 }
 
-/* venc HTTP client (tiny, blocking). */
+/* venc HTTP client (tiny, blocking). When http_status_out is non-NULL
+ * it is populated with the parsed numeric HTTP status code from the
+ * response status line (e.g. 200, 400, 500); 0 on transport failure or
+ * malformed response. */
 static int http_get(const char *host, uint16_t port, const char *path,
-                    char *out, size_t out_sz, int timeout_ms)
+                    char *out, size_t out_sz, int timeout_ms,
+                    int *http_status_out)
 {
+	if (http_status_out) *http_status_out = 0;
+
 	struct sockaddr_in dst;
 	int fd = socket(AF_INET, SOCK_STREAM, 0);
 	if (fd < 0) return -1;
@@ -1321,6 +1327,12 @@ static int http_get(const char *host, uint16_t port, const char *path,
 	if (total == 0) return -1;
 	buf[total] = '\0';
 
+	if (http_status_out) {
+		int code = 0;
+		if (sscanf(buf, "HTTP/%*d.%*d %d", &code) == 1 && code > 0)
+			*http_status_out = code;
+	}
+
 	char *body = strstr(buf, "\r\n\r\n");
 	if (!body) return -1;
 	body += 4;
@@ -1359,7 +1371,7 @@ static int venc_apply(const Config *cfg, long bitrate_kbps, int payload_bytes)
 
 	char body[1024];
 	int got = http_get(cfg->fec.venc_host, cfg->fec.venc_port,
-	                   path, body, sizeof(body), 500);
+	                   path, body, sizeof(body), 500, NULL);
 	if (got <= 0) return -1;
 	return (strstr(body, "\"ok\":true") || strstr(body, "\"ok\": true")) ? 0 : -1;
 }
@@ -1479,6 +1491,13 @@ static int wcmd_dispatch(const Config *cfg, const WcmdReq *req,
 	st->recv_total++;
 	st->last_recv_us = now;
 	st->last_key     = req->key;
+	/* Reset per-request fields so /cmd/status reflects this dispatch
+	 * rather than a mix of stale values from earlier requests. Each
+	 * branch below overrides what's relevant. last_value defaults to
+	 * the raw (pre-clamp) request value so the field is meaningful even
+	 * for early-rejection paths (UNKNOWN_KEY, KEY_BLOCKED, …). */
+	st->last_value       = (int32_t)ntohl((uint32_t)req->value);
+	st->last_http_status = 0;
 
 	if (!cfg->cmd.enabled) {
 		resp->status = WCMD_STATUS_DISABLED;
@@ -1526,6 +1545,7 @@ static int wcmd_dispatch(const Config *cfg, const WcmdReq *req,
 			st->rejected_rate++;
 			resp->applied_value = htonl((uint32_t)value);
 			st->last_status = resp->status;
+			st->last_value  = value;     /* would-have-applied */
 			return 0;
 		}
 	}
@@ -1551,18 +1571,21 @@ static int wcmd_dispatch(const Config *cfg, const WcmdReq *req,
 	}
 
 	char body[1024];
-	int got = http_get(cfg->fec.venc_host, cfg->fec.venc_port,
-	                   path, body, sizeof(body), 500);
-
 	int http_status = 0;
+	int got = http_get(cfg->fec.venc_host, cfg->fec.venc_port,
+	                   path, body, sizeof(body), 500, &http_status);
+
 	bool ok_body = false;
 	if (got > 0) {
+		/* `"ok":true` (true on /api/v1/set), or `"idr":true` from
+		 * /request/idr. venc returns HTTP 200 on validation failure
+		 * with `"ok":false`, so the body check is the authoritative
+		 * accept signal. http_status is populated separately for
+		 * observability — clients should branch on resp->status. */
 		ok_body = (strstr(body, "\"ok\":true") ||
 		           strstr(body, "\"ok\": true") ||
-		           /* /request/idr returns {"idr":true} */
 		           strstr(body, "\"idr\":true") ||
 		           strstr(body, "\"idr\": true"));
-		http_status = ok_body ? 200 : 400;
 	}
 
 	if (!ok_body) {
@@ -1575,7 +1598,7 @@ static int wcmd_dispatch(const Config *cfg, const WcmdReq *req,
 	}
 
 	resp->status        = WCMD_STATUS_OK;
-	resp->http_status   = htons(200);
+	resp->http_status   = htons((uint16_t)(http_status > 0 ? http_status : 200));
 	resp->applied_value = htonl((uint32_t)value);
 	st->last_apply_us[key] = now;
 	st->accepted++;

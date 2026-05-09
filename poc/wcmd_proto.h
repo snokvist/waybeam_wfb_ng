@@ -60,7 +60,9 @@
 #define WCMD_STATUS_OUT_OF_RANGE 4   /* value clamped or rejected           */
 #define WCMD_STATUS_RATE_LIMITED 5   /* per-key min interval not elapsed    */
 #define WCMD_STATUS_HTTP_ERROR   6   /* venc unreachable or returned !ok    */
-#define WCMD_STATUS_BAD_FORMAT   7   /* malformed datagram                  */
+#define WCMD_STATUS_BAD_FORMAT   7   /* reserved: malformed datagram (today
+                                      * such frames are dropped silently
+                                      * by the demux without dispatching)  */
 #define WCMD_STATUS_NOT_PERMITTED 8  /* peer rejected (loopback-only mode)  */
 
 #pragma pack(push, 1)
@@ -87,10 +89,17 @@ typedef struct {
  * Command response — proxy → injector, 16 bytes.
  *
  * Sent to the recvfrom() source address of the request. status reflects
- * proxy validation; http_status is the HTTP response code from venc, or
- * 0 if no HTTP request was issued (request rejected before dispatch).
- * applied_value is the value the proxy actually applied after clamping;
- * for FORCE_IDR it is 0.
+ * proxy validation; http_status is the parsed numeric HTTP status code
+ * from venc's response (e.g. 200, 400, 500) or 0 if no HTTP request was
+ * issued (request rejected before dispatch). applied_value is the
+ * post-clamp value the proxy applied to venc — or, on RATE_LIMITED, the
+ * value the proxy *would* have applied if the rate-limit window had
+ * elapsed. 0 for FORCE_IDR (value field is unused for that key).
+ *
+ * Clients must branch on `status` first; `http_status` is observability,
+ * not a contract. venc returns HTTP 200 even when it rejects a /set
+ * (body carries `"ok":false`), so http_status==200 + status==HTTP_ERROR
+ * means "venc reachable but rejected the value".
  */
 typedef struct {
 	uint32_t magic;        /* WCMD_MAGIC                                  */
@@ -100,7 +109,8 @@ typedef struct {
 	uint8_t  status;       /* WCMD_STATUS_*                               */
 	uint8_t  key;          /* echo of WcmdReq.key                         */
 	uint16_t http_status;  /* venc HTTP response code, or 0               */
-	int32_t  applied_value;/* post-clamp value; 0 for FORCE_IDR           */
+	int32_t  applied_value;/* post-clamp value; on RATE_LIMITED == "would
+	                        * have applied"; 0 for FORCE_IDR              */
 } WcmdResp;                /* 16 bytes */
 
 #pragma pack(pop)

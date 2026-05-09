@@ -77,9 +77,16 @@ back accordingly.
 | `KEY_BLOCKED`    | 3 | Key blocked by `cmd.allow_keys_mask` |
 | `OUT_OF_RANGE`   | 4 | Value rejected after clamp attempt |
 | `RATE_LIMITED`   | 5 | Same key applied < `cmd.rate_limit_ms` ago |
-| `HTTP_ERROR`     | 6 | venc unreachable or returned non-`ok` |
-| `BAD_FORMAT`     | 7 | Malformed datagram (reserved) |
-| `NOT_PERMITTED`  | 8 | Peer rejected (`cmd.loopback_only=true`) |
+| `HTTP_ERROR`     | 6 | venc unreachable or returned non-`ok` body |
+| `BAD_FORMAT`     | 7 | Reserved. The demux currently drops malformed frames silently rather than dispatching, so this status is never emitted today. The counter `rejected_format` in `/cmd/status` mirrors that and stays at 0; both fields are kept for forward-compat. |
+| `NOT_PERMITTED`  | 8 | Peer rejected (`cmd.loopback_only=true`; see "Topologies" below for the radio-uplink caveat) |
+
+`http_status` carries the parsed numeric HTTP status code from venc's
+response (200, 400, 500, …) or 0 if no HTTP request was issued. **Branch
+on `status` first.** venc returns HTTP `200 OK` even when it rejects a
+`/set` (the body carries `"ok":false`), so the combination
+`http_status=200` + `status=HTTP_ERROR` means "venc was reachable but
+refused the value".
 
 ### Validation pipeline (in order)
 
@@ -151,6 +158,57 @@ data, _ = s.recvfrom(64)   # blocks; consider settimeout()
 
 Decode the 16-byte response with the same struct format.
 
+## Topologies
+
+### Direct ethernet — vehicle reachable on a routed IP
+
+```
+ground ─ (IP) ─▶ vehicle:rx_ant_port ─▶ link_controller demux
+                                           │
+                                           └─▶ WCMD_RESP back to source IP
+```
+
+The peer address visible to the proxy is the actual ground-host IP. Both
+WCMD_REQ and WCMD_RESP traverse the IP path, so the response always
+makes it back to the sender (subject to normal UDP loss).
+
+### One-way wfb-ng radio uplink (typical FPV deployment)
+
+```
+ground host                         vehicle
+─────────────                       ─────────────────────────────
+WCMD_REQ ──▶ wfb_tx_native -u 6600 ─radio─▶ wfb_rx -u 5801
+                                              │ (decapsulated UDP
+                                              │  with src 127.0.0.1)
+                                              ▼
+                            link_controller --stats 0.0.0.0:5801
+                                              │
+WCMD_RESP ◀ ─ ─ ─ ─ ─ no return path ─ ─ ─ ─ ─┘
+```
+
+Two consequences of this topology that operators must keep in mind:
+
+1. **No return path.** `wfb_tx`/`wfb_rx` is one-way at the wire level.
+   The proxy still calls `sendto()` on the rx_ant socket, but the
+   datagram lands on the vehicle's loopback (where `wfb_rx` is the
+   sender) and never crosses the radio. Verify command landing via
+   `curl /cmd/status` or `/api/v1/config` over a sideband (eth or a
+   second radio link), not by waiting on `recvfrom`.
+
+2. **`cmd.loopback_only` does NOT gate radio peers.** Because
+   `wfb_rx -u <port>` decapsulates radio frames into local UDP
+   datagrams, every radio-uplinked WCMD frame appears to the proxy
+   with peer `127.0.0.1:<ephemeral>`. With `loopback_only=true` they
+   are accepted as if they were on-host. The trust boundary in this
+   topology is the wfb-ng drone key + stream id, not the IP path.
+   Use `cmd.allow_keys_mask` and per-key clamps as the real safety
+   boundary.
+
+For deployments that mix both topologies (e.g. ethernet provisioning +
+radio uplink), keep `loopback_only=false` and rely on
+`cmd.allow_keys_mask` plus the FEC `bitrate_min/max` window to bound
+what an attacker can do.
+
 ## Security notes
 
 - The proxy only acts when `cmd.enabled` is true AND the MCS rx_ant
@@ -158,12 +216,16 @@ Decode the 16-byte response with the same struct format.
 - The whitelist (`cmd.allow_keys_mask`) is the primary safety boundary;
   set it to 0 to make the proxy purely diagnostic without disabling the
   rx_ant listener.
-- For vehicle-local-only setups, set `cmd.loopback_only=true`.
 - All values are clamped before HTTP dispatch — a malicious client
-  cannot push the venc bitrate or payload outside the configured range.
+  cannot push the venc bitrate, fps, or payload outside the configured
+  range. For bitrate, the FEC subsystem's `bitrate_min/max` window
+  takes precedence when set, so the proxy and FEC controller agree on
+  the safe envelope.
 - The proxy issues exactly one HTTP `GET` per accepted request. The
-  rate limiter (`cmd.rate_limit_ms`) prevents accidental floods from
-  re-amplifying onto the venc HTTP server.
+  per-key rate limiter (`cmd.rate_limit_ms`, default 100 ms) absorbs
+  accidental floods so they don't re-amplify onto the venc HTTP server.
+- See "Topologies" above for the radio-uplink caveat on
+  `cmd.loopback_only`.
 
 ## Dispatch trade-offs
 
