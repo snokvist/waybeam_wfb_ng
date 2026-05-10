@@ -1690,6 +1690,14 @@ static int qs_get_int(const char *qs, const char *key, int *out)
 #define WCMD_KEY_FPS             2
 #define WCMD_KEY_PAYLOAD_BYTES   3
 #define WCMD_KEY_FORCE_IDR       4
+/* Vehicle-side wfb_tx control keys — see wcmd_proto.h. */
+#define WCMD_KEY_WFB_FEC_K       5
+#define WCMD_KEY_WFB_FEC_N       6
+#define WCMD_KEY_WFB_MCS         7
+#define WCMD_KEY_WFB_BANDWIDTH   8
+#define WCMD_KEY_WFB_LDPC        9
+#define WCMD_KEY_WFB_STBC       10
+#define WCMD_KEY_WFB_SHORT_GI   11
 
 #pragma pack(push, 1)
 typedef struct {
@@ -1705,7 +1713,7 @@ typedef struct {
 #pragma pack(pop)
 
 /* Per-key rate-limit state (single-process). Index = key id (1-based). */
-#define WCMD_KEY_MAX 8
+#define WCMD_KEY_MAX 16
 static uint64_t g_wcmd_last_send_ms[WCMD_KEY_MAX + 1] = { 0 };
 static uint16_t g_wcmd_seq = 0;
 
@@ -1715,6 +1723,13 @@ static int wcmd_key_from_str(const char *s, size_t n)
 	if (n ==  3 && !strncmp(s, "fps",            3)) return WCMD_KEY_FPS;
 	if (n == 13 && !strncmp(s, "payload_bytes", 13)) return WCMD_KEY_PAYLOAD_BYTES;
 	if (n ==  9 && !strncmp(s, "force_idr",      9)) return WCMD_KEY_FORCE_IDR;
+	if (n ==  9 && !strncmp(s, "wfb_fec_k",      9)) return WCMD_KEY_WFB_FEC_K;
+	if (n ==  9 && !strncmp(s, "wfb_fec_n",      9)) return WCMD_KEY_WFB_FEC_N;
+	if (n ==  7 && !strncmp(s, "wfb_mcs",        7)) return WCMD_KEY_WFB_MCS;
+	if (n == 13 && !strncmp(s, "wfb_bandwidth", 13)) return WCMD_KEY_WFB_BANDWIDTH;
+	if (n ==  8 && !strncmp(s, "wfb_ldpc",       8)) return WCMD_KEY_WFB_LDPC;
+	if (n ==  8 && !strncmp(s, "wfb_stbc",       8)) return WCMD_KEY_WFB_STBC;
+	if (n == 12 && !strncmp(s, "wfb_short_gi", 12))  return WCMD_KEY_WFB_SHORT_GI;
 	return -1;
 }
 
@@ -1725,6 +1740,13 @@ static const char *wcmd_key_name(int key)
 	case WCMD_KEY_FPS:           return "fps";
 	case WCMD_KEY_PAYLOAD_BYTES: return "payload_bytes";
 	case WCMD_KEY_FORCE_IDR:     return "force_idr";
+	case WCMD_KEY_WFB_FEC_K:     return "wfb_fec_k";
+	case WCMD_KEY_WFB_FEC_N:     return "wfb_fec_n";
+	case WCMD_KEY_WFB_MCS:       return "wfb_mcs";
+	case WCMD_KEY_WFB_BANDWIDTH: return "wfb_bandwidth";
+	case WCMD_KEY_WFB_LDPC:      return "wfb_ldpc";
+	case WCMD_KEY_WFB_STBC:      return "wfb_stbc";
+	case WCMD_KEY_WFB_SHORT_GI:  return "wfb_short_gi";
 	}
 	return "?";
 }
@@ -2098,7 +2120,9 @@ static void api_handle(ApiClient *cli, Config *c, uint64_t startup_us)
 		int key = wcmd_key_from_str(kstr, kl);
 		if (key < 0) {
 			api_send(cli->fd, 400, "text/plain",
-			         "key must be bitrate_kbps|fps|payload_bytes|force_idr\n", -1);
+			         "key must be bitrate_kbps|fps|payload_bytes|force_idr|"
+			         "wfb_fec_k|wfb_fec_n|wfb_mcs|wfb_bandwidth|"
+			         "wfb_ldpc|wfb_stbc|wfb_short_gi\n", -1);
 			return;
 		}
 		int32_t value = 0;

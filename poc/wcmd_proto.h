@@ -52,6 +52,24 @@
 #define WCMD_KEY_PAYLOAD_BYTES   3   /* outgoing.maxPayloadSize */
 #define WCMD_KEY_FORCE_IDR       4   /* GET /request/idr (value ignored) */
 
+/*
+ * Vehicle-side wfb_tx (video link) controls.  These tunnel a wfb_cmd
+ * SET_FEC / SET_RADIO into the proxy → vehicle wfb_tx control_port.
+ * The proxy reads current state via wfb_cmd GET_RADIO before mutating
+ * just the requested field, so callers can twiddle one knob at a time
+ * without losing the rest.  Caveat: link_controller's adaptive FEC and
+ * MCS subsystems will overwrite these values on their next tick — set
+ * fec.enabled=0 / mcs.enabled=0 first (via local /set?) for manual
+ * control to stick.
+ */
+#define WCMD_KEY_WFB_FEC_K       5   /* wfb_tx FEC k (n preserved) */
+#define WCMD_KEY_WFB_FEC_N       6   /* wfb_tx FEC n (k preserved) */
+#define WCMD_KEY_WFB_MCS         7   /* radio mcs_index */
+#define WCMD_KEY_WFB_BANDWIDTH   8   /* radio bandwidth (MHz) */
+#define WCMD_KEY_WFB_LDPC        9   /* radio ldpc (0/1) */
+#define WCMD_KEY_WFB_STBC       10   /* radio stbc */
+#define WCMD_KEY_WFB_SHORT_GI   11   /* radio short_gi (0/1) */
+
 /* Status codes returned in CMD_RESP */
 #define WCMD_STATUS_OK           0
 #define WCMD_STATUS_DISABLED     1   /* cmd subsystem off (cmd.enabled=false) */
