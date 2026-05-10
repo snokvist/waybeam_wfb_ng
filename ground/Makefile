@@ -1,27 +1,28 @@
-# Cross-build the gs_supervisor POC for ground-station targets.
+# Build gs_supervisor — the ground-side wfb supervisor.
 #
-# Defaults to a host build (debug); override CROSS_CC for the target.
+# Run from waybeam_wfb_ng/ground/:
+#   make                    # host build (debug, x86)
+#   make cross CROSS_CC=... # cross build for the target
+#   make deploy             # scp cross binary to DEPLOY_HOST
+#   make clean
 #
-# Usage (from waybeam_wfb_ng/poc/):
-#   make -f Makefile.gs_supervisor                         # host build
-#   make -f Makefile.gs_supervisor cross                   # cross build (set CROSS_CC)
-#   make -f Makefile.gs_supervisor clean
-#
-# Cross build examples (matches the existing ground-station builds):
-#   make -f Makefile.gs_supervisor cross \
+# Cross build examples:
+#   make cross \
 #        CROSS_CC=../toolchain/aarch64/bin/aarch64-openwrt-linux-gcc \
 #        OUT_CROSS=build/gs_supervisor.aarch64
-#
-#   make -f Makefile.gs_supervisor cross \
+#   make cross \
 #        CROSS_CC=../toolchain/openwrt-mips/bin/mips-openwrt-linux-gcc \
 #        OUT_CROSS=build/gs_supervisor.mipsel
 
 BUILD_DIR ?= build
 SRC        = gs_supervisor.c
 WEBUI_SRC  = webui/gs.html
-WEBUI_HDR  = gs_webui_assets.h
+WEBUI_HDR  = webui/gs_assets.h
 OUT_HOST   = $(BUILD_DIR)/gs_supervisor.host
 OUT_CROSS ?= $(BUILD_DIR)/gs_supervisor
+
+# `shared/` carries WCMD wire-format and other cross-side headers.
+SHARED_INC = -I../shared
 
 CFLAGS_COMMON  = -std=gnu99 -O2 -Wall -Wextra -Wno-missing-field-initializers
 LDFLAGS_COMMON =
@@ -42,6 +43,8 @@ webui: $(WEBUI_HDR)
 
 # xxd -i embeds the file as `unsigned char gs_webui_html[]` with a matching
 # `_len`. Promote both to const so the C side can put them in .rodata.
+# The C source still does `#if __has_include("gs_webui_assets.h")`; we keep
+# that filename for compatibility but generate it under webui/ now.
 $(WEBUI_HDR): $(WEBUI_SRC)
 	@echo "[gs_supervisor] embedding $(WEBUI_SRC) -> $@"
 	@xxd -i -n gs_webui_html $< > $@
@@ -53,7 +56,7 @@ $(BUILD_DIR):
 
 $(OUT_HOST): $(SRC) $(WEBUI_HDR) | $(BUILD_DIR)
 	@echo "[gs_supervisor] host -> $@"
-	$(CC) $(CFLAGS_COMMON) -I. -g -o $@ $(SRC) $(LDFLAGS_COMMON)
+	$(CC) $(CFLAGS_COMMON) $(SHARED_INC) -I. -Iwebui -g -o $@ $(SRC) $(LDFLAGS_COMMON)
 
 cross: $(OUT_CROSS)
 
@@ -62,7 +65,7 @@ $(OUT_CROSS): $(SRC) $(WEBUI_HDR) | $(BUILD_DIR)
 		echo "set CROSS_CC=<path-to-target-gcc>"; exit 2; \
 	fi
 	@echo "[gs_supervisor] cross ($(CROSS_CC)) -> $@"
-	$(CROSS_CC) $(CFLAGS_COMMON) -I. -o $@ $(SRC) $(LDFLAGS_COMMON)
+	$(CROSS_CC) $(CFLAGS_COMMON) $(SHARED_INC) -I. -Iwebui -o $@ $(SRC) $(LDFLAGS_COMMON)
 
 deploy: $(OUT_CROSS)
 	scp $(OUT_CROSS) root@$(DEPLOY_HOST):$(DEPLOY_DIR)/
