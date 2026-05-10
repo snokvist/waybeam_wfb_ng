@@ -1,4 +1,4 @@
-"""Tests for poc/wfb_rx_to_backpack.py — the wfb_rx -> Backpack PTR bridge."""
+"""Tests for ground/scripts/wfb_rx_to_backpack.py — the wfb_rx -> Backpack PTR bridge."""
 
 from __future__ import annotations
 
@@ -11,10 +11,12 @@ from pathlib import Path
 import pytest
 
 
-# Load the script as a module (it lives in poc/, not on the package path).
+# Load the script as a module (it lives under ground/scripts/, not on
+# the package path).  parents[3] = repo root from
+# archive/python/tests/test_*.py.
 _SPEC = importlib.util.spec_from_file_location(
     "wfb_rx_to_backpack",
-    Path(__file__).resolve().parents[1] / "poc" / "wfb_rx_to_backpack.py",
+    Path(__file__).resolve().parents[3] / "ground" / "scripts" / "wfb_rx_to_backpack.py",
 )
 assert _SPEC is not None and _SPEC.loader is not None
 mod = importlib.util.module_from_spec(_SPEC)

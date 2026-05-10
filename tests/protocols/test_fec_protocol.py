@@ -3,7 +3,7 @@
 import struct
 import pytest
 
-from fec_controller.protocol import (
+from tests.protocols._proto.fec_protocol import (
     FRAME_BASE_SIZE,
     FRAME_EXT_SIZE,
     ENC_TRAILER_SIZE,

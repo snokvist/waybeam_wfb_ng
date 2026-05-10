@@ -9,7 +9,7 @@ import struct
 
 import pytest
 
-from mcs_selector.protocol import (
+from tests.protocols._proto.mcs_protocol import (
     CMD_GET_RADIO,
     CMD_SET_RADIO,
     RadioParams,
@@ -160,7 +160,7 @@ class TestRxAntParser:
             parse_rx_ant(bad)
 
     def test_round_trip_via_encode(self):
-        from mcs_selector.protocol import AntStats, PktStats, RxAntDatagram
+        from tests.protocols._proto.mcs_protocol import AntStats, PktStats, RxAntDatagram
 
         d = RxAntDatagram(
             ts_ms=1000, seq=1, interval_ms=100,
