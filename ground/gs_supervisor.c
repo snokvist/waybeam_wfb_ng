@@ -1027,8 +1027,8 @@ static void supervisor_reap(Config *c)
 /* ---------- CSA orchestrator (channel switch announcement) ----------- *
  *
  * One-shot synchronized channel hop coordinated with vehicle's csa_feed
- * state machine in poc/csa/csa.c. Wire format is documented in
- * poc/csa/PROTOCOL.md (newline-terminated JSON `csa_commit` frames).
+ * state machine in vehicle/csa/csa.c. Wire format is documented in
+ * vehicle/csa/PROTOCOL.md (newline-terminated JSON `csa_commit` frames).
  *
  * Flow:
  *   1. POST /api/v1/system/csa records sess++/T_switch and queues N=5
@@ -1094,6 +1094,12 @@ static int run_iw_set_channel(const char *iface, int chan, const char *ht)
 	return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
 }
 
+/* Persistent UDP socket for csa_send_commit_frame().  Opened lazily on
+ * first send; closed only at process exit (kernel cleanup).  Avoids the
+ * old socket()/close() per-frame that burned 5 syscalls × 2 × per CSA
+ * burst (10 ifd churns in 100 ms when CSA fires). */
+static int g_csa_send_fd = -1;
+
 /* Send one csa_commit JSON frame to the uplink wfb_tx UDP input port.
  * dt_to_switch_ms is filled in fresh at send time so all frames in the
  * burst converge on the same absolute T_switch on the receiver. */
@@ -1126,18 +1132,18 @@ static int csa_send_commit_frame(const Config *c)
 		g_csa.prev_chan, g_csa.prev_ht);
 	if (n < 0 || (size_t)n >= sizeof(buf)) return -1;
 
-	int s = socket(AF_INET, SOCK_DGRAM, 0);
-	if (s < 0) return errno;
+	if (g_csa_send_fd < 0) {
+		g_csa_send_fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+		if (g_csa_send_fd < 0) return errno;
+	}
 	struct sockaddr_in dst = {
 		.sin_family = AF_INET,
 		.sin_port   = htons((uint16_t)up->udp_in_port),
 	};
 	dst.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-	ssize_t w = sendto(s, buf, (size_t)n, 0,
+	ssize_t w = sendto(g_csa_send_fd, buf, (size_t)n, 0,
 	                   (struct sockaddr *)&dst, sizeof(dst));
-	int err = (w == (ssize_t)n) ? 0 : errno;
-	close(s);
-	return err;
+	return (w == (ssize_t)n) ? 0 : errno;
 }
 
 /* Pick the first rx tunnel — used to track post-switch traffic for
@@ -1219,10 +1225,6 @@ static void scan_apply_step_drained(Config *c, int i)
 				;
 		}
 	}
-	/* Reset the flag again so any sample stats_drain consumed while
-	 * draining (stats_drain itself wasn't called, but the recv above is
-	 * harmless either way) doesn't contaminate. */
-	g_scan.step_saw_traffic = false;
 	g_scan.step_started_us = now_us();
 }
 
@@ -2037,12 +2039,8 @@ static int wait_iface_state(const Config *c, int timeout_ms, int interval_ms)
  * wfb_tx binds its control socket to 127.0.0.1 only — sendto must come
  * from a 127.x address. */
 
-#define WFB_CMD_SET_FEC          1
-#define WFB_CMD_SET_RADIO        2
-#define WFB_CMD_GET_FEC          3
-#define WFB_CMD_GET_RADIO        4
-#define WFB_FEC_TIMEOUT_KEEP     0xFFFFu
-#define WFB_CMD_REPLY_TIMEOUT_MS 200
+/* Opcodes, fixed-length wire sizes, and sentinels in shared/wfb_control.h. */
+#include "wfb_control.h"
 
 typedef struct {
 	uint32_t req_id;
@@ -2282,6 +2280,13 @@ typedef struct {
 static uint64_t g_wcmd_last_send_ms[WCMD_KEY_MAX + 1] = { 0 };
 static uint16_t g_wcmd_seq = 0;
 
+/* Emit-side observability — surfaced in /api/v1/status so the WebUI can
+ * show burst-dedup health without polling the vehicle directly. */
+static uint64_t g_wcmd_emit_total      = 0; /* logical WCMDs emitted (all keys) */
+static uint64_t g_wcmd_emit_frames     = 0; /* wire frames sent (bursts × copies actually sent) */
+static uint64_t g_wcmd_emit_rate_limit = 0; /* /api/v1/cmd rejections by per-key window */
+static uint64_t g_wcmd_emit_failed     = 0; /* sendto failed entirely (no copy on the wire) */
+
 /* Number of redundant copies emitted per logical WCMD.  Each copy carries
  * the same seq so the vehicle's seq-dedup window collapses them back to
  * one apply.  Loss of a single FEC block on the uplink can drop one copy
@@ -2385,7 +2390,12 @@ static int wcmd_emit(const Config *c, int key, int32_t value, uint16_t *seq_out)
 		else                  last_err = errno;
 	}
 	close(s);
-	if (sent > 0) return 0;
+	if (sent > 0) {
+		g_wcmd_emit_total++;
+		g_wcmd_emit_frames += (uint64_t)sent;
+		return 0;
+	}
+	g_wcmd_emit_failed++;
 	return last_err ? last_err : -1;
 }
 
@@ -2558,7 +2568,16 @@ static int json_emit_status(char *buf, size_t cap, const Config *c, uint64_t up_
 	#define APP(...) do { int _w = snprintf(buf+p, cap-p, __VA_ARGS__); \
 	                      if (_w < 0 || (size_t)_w >= cap-(size_t)p) return -1; \
 	                      p += _w; } while (0)
-	APP("{\"uptime_s\":%.1f,\"tunnels\":[", (double)up_us / 1e6);
+	APP("{\"uptime_s\":%.1f,\"wcmd\":{"
+	    "\"emit_total\":%llu,\"emit_frames\":%llu,"
+	    "\"rate_limited\":%llu,\"emit_failed\":%llu,"
+	    "\"burst_frames\":%d},\"tunnels\":[",
+	    (double)up_us / 1e6,
+	    (unsigned long long)g_wcmd_emit_total,
+	    (unsigned long long)g_wcmd_emit_frames,
+	    (unsigned long long)g_wcmd_emit_rate_limit,
+	    (unsigned long long)g_wcmd_emit_failed,
+	    WCMD_BURST_FRAMES);
 	for (int i = 0; i < c->tunnel_count; i++) {
 		if (i) APP(",");
 		int n = json_emit_tunnel(buf + p, cap - p, &c->tunnels[i], false);
@@ -2758,6 +2777,7 @@ static void api_handle(ApiClient *cli, Config *c, uint64_t startup_us)
 			uint64_t since = t_ms - g_wcmd_last_send_ms[key];
 			if (g_wcmd_last_send_ms[key] != 0 &&
 			    (int)since < c->venc_cmd_rate_limit_ms) {
+				g_wcmd_emit_rate_limit++;
 				char body[128];
 				int p = snprintf(body, sizeof(body),
 				                 "{\"ok\":false,\"error\":\"rate_limited\","
@@ -2966,7 +2986,13 @@ static void api_handle(ApiClient *cli, Config *c, uint64_t startup_us)
 		g_scan.iface_count = iface_count;
 		for (int i = 0; i < chan_count; i++) {
 			g_scan.chans[i] = chans[i];
-			snprintf(g_scan.hts[i], sizeof(g_scan.hts[i]), "%s", hts[i]);
+			/* hts[i] is parsed/validated to ≤7 + NUL above (see L<8
+			 * guard).  Use explicit length copy so gcc-13's stricter
+			 * -Wformat-truncation doesn't trip on snprintf("%s", src)
+			 * when src and dst are both char[8]. */
+			size_t hl = strnlen(hts[i], sizeof(hts[i]) - 1);
+			memcpy(g_scan.hts[i], hts[i], hl);
+			g_scan.hts[i][hl] = '\0';
 		}
 		g_scan.step_count = chan_count;
 		g_scan.step_dwell_us = (uint64_t)dwell_ms * 1000ULL;
@@ -3013,7 +3039,9 @@ static void api_handle(ApiClient *cli, Config *c, uint64_t startup_us)
 		    ? g_scan.chans[g_scan.cur_step] : -1;
 		const char *cur_ht = (g_scan.cur_step < g_scan.step_count)
 		    ? g_scan.hts[g_scan.cur_step] : "";
-		char body2[480];
+		/* Sized for worst case: 4 ifaces (≈19 chars each) + 32 chans
+		 * (4 chars each) + JSON envelope ≈ 360 B; 768 leaves headroom. */
+		char body2[768];
 		int p = snprintf(body2, sizeof(body2),
 		    "{\"phase\":%d,\"sess\":%u,\"cur_step\":%d,\"step_count\":%d,"
 		    "\"hops_done\":%d,\"dwell_left_ms\":%.0f,"

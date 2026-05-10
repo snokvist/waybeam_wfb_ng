@@ -41,6 +41,7 @@
 #include <getopt.h>
 #include <limits.h>
 #include <math.h>
+#include <net/if.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <signal.h>
@@ -151,29 +152,17 @@ _Static_assert(sizeof(SidecarTransportInfo) == 16,
 
 /* ── wfb_tx control protocol (matches poc/build/wfb-ng/src/tx_cmd.h) ───── */
 
-#define CMD_SET_FEC    1
-#define CMD_SET_RADIO  2
-#define CMD_GET_FEC    3
-#define CMD_GET_RADIO  4
-
-/* Wire layout: req_id(4) + cmd_id(1) = 5-byte CmdReq header. SET_FEC adds
- * 4 bytes (k, n, fec_timeout_ms); SET_RADIO adds RadioBody (7 bytes).
- * GET_RADIO is just the header. Centralised so the sendto() length args
- * don't drift from the struct definitions. */
-#define CMD_REQ_HEADER         5
-#define CMD_REQ_GET_RADIO_LEN  CMD_REQ_HEADER
-#define CMD_REQ_SET_FEC_LEN    (CMD_REQ_HEADER + 4)
-#define CMD_REQ_SET_RADIO_LEN  (CMD_REQ_HEADER + 7)   /* + sizeof(RadioBody) */
-
-/* Sentinel for set_fec.fec_timeout_ms meaning "leave the running value
- * unchanged".  link_controller doesn't compute a frame-period-based
- * fec_timeout today, so it always sends KEEP — the operator sets the
- * timeout via wfb_tx -T at boot.
- *
- * Canonical definition lives in shm-input.patch (src/tx_cmd.h); also
- * mirrored in fec_controller/wfb_control.py.  Keep all three in sync
- * if the value ever changes — there is no shared header. */
-#define WFB_FEC_TIMEOUT_KEEP   0xFFFFu
+/* Opcodes / fixed lengths / sentinels live in shared/wfb_control.h.
+ * Local short aliases are kept so the existing call sites read clean. */
+#include "wfb_control.h"
+#define CMD_SET_FEC            WFB_CMD_SET_FEC
+#define CMD_SET_RADIO          WFB_CMD_SET_RADIO
+#define CMD_GET_FEC            WFB_CMD_GET_FEC
+#define CMD_GET_RADIO          WFB_CMD_GET_RADIO
+#define CMD_REQ_HEADER         WFB_CMD_REQ_HEADER
+#define CMD_REQ_GET_RADIO_LEN  WFB_CMD_REQ_GET_RADIO_LEN
+#define CMD_REQ_SET_FEC_LEN    WFB_CMD_REQ_SET_FEC_LEN
+#define CMD_REQ_SET_RADIO_LEN  WFB_CMD_REQ_SET_RADIO_LEN
 
 #pragma pack(push, 1)
 typedef struct {
@@ -445,7 +434,7 @@ typedef struct {
 		/* WLAN iface that wfb_tx is bound to.  Optional; when empty the
 		 * txpower dispatch falls back to csa.iface. Set explicitly when
 		 * CSA is disabled. */
-		char     wfb_iface[16];
+		char     wfb_iface[IFNAMSIZ];
 	} cmd;
 
 	/* ── Common ── */
