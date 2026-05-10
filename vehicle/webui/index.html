@@ -88,14 +88,22 @@ main{padding:1.2rem;overflow:auto;height:calc(100vh - 86px);max-width:1100px;mar
 .tune-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:.4rem}
 .tune-row{display:grid;grid-template-columns:170px 1fr 64px;gap:.4rem;align-items:center;padding:.4rem .6rem;background:var(--panel);border:1px solid var(--border);border-radius:4px;border-left:3px solid transparent;transition:all .15s}
 .tune-row:hover{border-color:var(--border-hi)}
-.tune-row .name{font-size:.78rem;color:var(--text)}
-.tune-row .name .help{display:block;color:var(--mute);font-size:.7rem;font-family:'DM Sans',sans-serif;margin-top:1px}
+.tune-row .name{font-size:.78rem;color:var(--text);display:flex;align-items:center;gap:.4rem;min-width:0}
+.tune-row .name .label{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+/* "?" hover-tip — replaces the inline two-line description that used
+ * to wrap behind the input on narrow grids. Range is still inline so
+ * operators don't have to hover to see [lo..hi]. */
+.tune-row .name .tip{flex:0 0 auto;display:inline-flex;align-items:center;justify-content:center;width:14px;height:14px;border:1px solid var(--border-hi);border-radius:50%;color:var(--mute);font-size:.62rem;font-family:'JetBrains Mono',monospace;cursor:help;user-select:none}
+.tune-row .name .tip:hover{color:var(--text-bright);border-color:var(--accent)}
+.tune-row .name .range{flex:0 0 auto;color:var(--mute);font-size:.7rem;font-family:'JetBrains Mono',monospace}
 .tune-row input{background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:3px;padding:4px 6px;font-family:'JetBrains Mono',monospace;font-size:.78rem;width:100%;transition:border-color .15s}
 .tune-row input:focus{outline:none;border-color:var(--accent)}
 .tune-row input[type="number"]{-moz-appearance:textfield}
 .tune-row input[type="number"]::-webkit-outer-spin-button,.tune-row input[type="number"]::-webkit-inner-spin-button{-webkit-appearance:none;margin:0}
-.tune-row button{background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:3px;padding:4px 8px;font-family:'JetBrains Mono',monospace;font-size:.72rem;font-weight:600;cursor:pointer;text-transform:uppercase;letter-spacing:.04em;transition:all .15s}
-.tune-row button:hover{background:var(--accent);border-color:var(--accent);color:#fff}
+/* Apply buttons: solid orange (matches the "modify state" affordance
+ * used for primary action buttons elsewhere in the UI). */
+.tune-row button{background:var(--warn);color:#000;border:1px solid var(--warn);border-radius:3px;padding:4px 8px;font-family:'JetBrains Mono',monospace;font-size:.72rem;font-weight:700;cursor:pointer;text-transform:uppercase;letter-spacing:.04em;transition:all .15s}
+.tune-row button:hover{background:#d97706;border-color:#d97706;transform:translateY(-1px)}
 .tune-row.applied{border-left-color:var(--ok);animation:flash-ok 1s ease-out}
 .tune-row.error{border-left-color:var(--bad);animation:flash-bad 1.5s ease-out}
 @keyframes flash-ok{0%{background:rgba(34,197,94,.18)}100%{background:var(--panel)}}
@@ -540,8 +548,20 @@ function buildTuneRow(f) {
   const row = document.createElement("div"); row.className = "tune-row";
   row.dataset.name = f.name;
   const name = document.createElement("div"); name.className = "name";
-  const help = (f.lo === f.hi || f.type === "bool") ? "" : "  ["+f.lo+".."+f.hi+"]";
-  name.innerHTML = '<span>'+f.name+'</span><span class="help">'+(f.help||"")+help+'</span>';
+  // Just the parameter name + a small "?" hover-tip that carries the
+  // long-form description in `title` so it never wraps behind the input.
+  // [lo..hi] still shown inline so operators see the valid range without
+  // having to hover.
+  const showRange = !(f.lo === f.hi || f.type === "bool");
+  const tipText   = (f.help || f.name) + (showRange ? "  ["+f.lo+".."+f.hi+"]" : "");
+  const labelEl   = document.createElement("span"); labelEl.className = "label"; labelEl.textContent = f.name;
+  const tipEl     = document.createElement("span"); tipEl.className   = "tip";   tipEl.textContent   = "?"; tipEl.title = tipText;
+  name.append(labelEl, tipEl);
+  if (showRange) {
+    const rangeEl = document.createElement("span"); rangeEl.className = "range";
+    rangeEl.textContent = "["+f.lo+".."+f.hi+"]";
+    name.appendChild(rangeEl);
+  }
   const inp = document.createElement("input");
   inp.type = (f.type === "bool") ? "text" : "number";
   if (f.type !== "bool" && f.lo !== f.hi) {
@@ -551,7 +571,7 @@ function buildTuneRow(f) {
   }
   inp.value = (typeof f.value === "boolean") ? (f.value ? "1" : "0") : String(f.value);
   inp.addEventListener("keydown", e => { if (e.key === "Enter") apply(); });
-  const btn = document.createElement("button"); btn.textContent = "apply";
+  const btn = document.createElement("button"); btn.textContent = "APPLY";
   btn.addEventListener("click", apply);
   row.append(name, inp, btn);
   async function apply() {

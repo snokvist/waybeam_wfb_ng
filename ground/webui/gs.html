@@ -106,6 +106,12 @@ select{cursor:pointer;-webkit-appearance:none;appearance:none;background-image:u
 .btn-apply:hover:not(:disabled){background:#16a34a;transform:translateY(-1px)}
 .btn-fire{background:var(--accent);color:#fff}
 .btn-fire:hover:not(:disabled){background:#d63b54;transform:translateY(-1px)}
+/* Outline-warn variant — matches the .btn-mini.btn-stop look in the
+ * Tunnels tab.  Without this rule, .btn (border:none, no background)
+ * combined with .btn-stop (warn text only) renders white-on-yellow,
+ * which is unreadable. */
+.btn.btn-stop{background:var(--bg);color:var(--warn);border:1px solid var(--warn)}
+.btn.btn-stop:hover:not(:disabled){background:var(--warn-bg);transform:translateY(-1px)}
 
 /* Compact key/value grid for combined cards (label : input pairs).
  * Inputs all line up against a fixed-width label column. */
@@ -299,6 +305,7 @@ select{cursor:pointer;-webkit-appearance:none;appearance:none;background-image:u
             <option value="HT20">HT20</option>
             <option value="HT40+">HT40+</option>
             <option value="HT40-">HT40-</option>
+            <option value="HT80">HT80</option>
           </select>
         </div>
       </div>
@@ -360,6 +367,16 @@ select{cursor:pointer;-webkit-appearance:none;appearance:none;background-image:u
         <button class="btn btn-fire" onclick="cmdFire()">Send</button>
       </div>
       <div class="reply" id="reply-cmd"></div>
+      <div class="tunnel-kv" style="margin-top:.5rem">
+        <dt title="Logical WCMDs emitted (one per /api/v1/cmd success)">commands</dt>
+        <dd id="wcmd-emit-total">—</dd>
+        <dt title="Wire frames sent (= commands × burst copies actually placed on the wire)">wire frames</dt>
+        <dd id="wcmd-emit-frames">—</dd>
+        <dt title="Per-key rate-limit rejections (HTTP 429) since boot">rate-limited</dt>
+        <dd id="wcmd-rate-limited">—</dd>
+        <dt title="Bursts where every copy failed sendto() (sock down, ENOBUFS, …)">emit failed</dt>
+        <dd id="wcmd-emit-failed">—</dd>
+      </div>
     </div>
   </div>
 
@@ -404,10 +421,7 @@ select{cursor:pointer;-webkit-appearance:none;appearance:none;background-image:u
       <button class="btn-mini btn-start" onclick="cmdQuick('wfb_ldpc',1)">ldpc 1</button>
       <button class="btn-mini btn-stop" onclick="cmdQuick('wfb_short_gi',0)">sgi 0</button>
       <button class="btn-mini btn-start" onclick="cmdQuick('wfb_short_gi',1)">sgi 1</button>
-      <button class="btn-mini btn-start" onclick="cmdQuick('wfb_txpower',500)">txp 5 dBm</button>
-      <button class="btn-mini btn-start" onclick="cmdQuick('wfb_txpower',1500)">txp 15 dBm</button>
-      <button class="btn-mini btn-start" onclick="cmdQuick('wfb_txpower',2000)">txp 20 dBm</button>
-      <button class="btn-mini btn-start" onclick="cmdQuick('wfb_txpower',2500)">txp 25 dBm</button>
+      <span id="quick-txpower-row" style="display:contents"></span>
     </div>
   </div>
 </div>
@@ -415,6 +429,21 @@ select{cursor:pointer;-webkit-appearance:none;appearance:none;background-image:u
 <script>
 const $=s=>document.querySelector(s);
 const $$=s=>document.querySelectorAll(s);
+
+/* Per-iface txpower presets in mBm (1 dBm = 100 mBm). Single source of
+ * truth for both the vehicle quick-fire row and the per-iface GS row. */
+const TXPOWER_PRESETS_MBM=[500,1500,2000,2500];
+
+/* Build the static "quick-fire vehicle txpower" buttons once on load
+ * from TXPOWER_PRESETS_MBM. */
+function renderQuickTxpowerRow(){
+  const host=$('#quick-txpower-row');
+  if(!host) return;
+  host.innerHTML=TXPOWER_PRESETS_MBM.map(m=>{
+    const dbm=(m/100).toFixed(0);
+    return `<button class="btn-mini btn-start" onclick="cmdQuick('wfb_txpower',${m})">txp ${dbm} dBm</button>`;
+  }).join('');
+}
 
 /* Escape a value for safe interpolation into HTML element content or
  * attribute strings. Tunnel/iface names come from the supervisor's
@@ -465,6 +494,14 @@ async function refresh(){
     const j=await r.json();
     $('#tbar-up').textContent=fmtUptime(j.uptime_s);
     $('#tbar-tunnels').textContent=(j.tunnels||[]).length;
+    if(j.wcmd){
+      const w=j.wcmd;
+      const set=(id,v)=>{const e=$(id);if(e)e.textContent=String(v);};
+      set('#wcmd-emit-total',`${w.emit_total||0}`);
+      set('#wcmd-emit-frames',`${w.emit_frames||0} (${w.burst_frames||3}×)`);
+      set('#wcmd-rate-limited',`${w.rate_limited||0}`);
+      set('#wcmd-emit-failed',`${w.emit_failed||0}`);
+    }
     setConn(true);
     // pull /tunnels for full detail
     const r2=await fetch('/api/v1/tunnels');
@@ -515,8 +552,7 @@ function renderGsTxpowerRow(ts){
     row.innerHTML='<span class="muted">no ifaces configured</span>';
     return;
   }
-  // For each iface, a label (with current state) + four mBm presets.
-  const presets=[500,1500,2000,2500];
+  // For each iface, a label (with current state) + per-preset buttons.
   let h='';
   ifaces.forEach(i=>{
     const s=ifaceLookup(i);
@@ -524,7 +560,7 @@ function renderGsTxpowerRow(ts){
     const ch=s && s.chan>0 ? `ch ${s.chan} ${s.ht||''}` : 'ch ?';
     h+=`<div style="display:flex;align-items:center;gap:.4rem;flex-wrap:wrap">`;
     h+=`<code>${esc(i)}</code><span class="muted">${esc(ch)} · current ${esc(cur)}</span>`;
-    presets.forEach(m=>{
+    TXPOWER_PRESETS_MBM.forEach(m=>{
       const dbm=(m/100).toFixed(0);
       h+=`<button class="btn-mini btn-start" onclick="gsTxpower('${jsAttr(i)}',${m})">${dbm} dBm</button>`;
     });
@@ -586,7 +622,12 @@ function csaAutofillPrev(){
   const prev=$('#csa-prev-chan');
   const prevHt=$('#csa-prev-ht');
   if(prev) prev.value=s.chan;
-  if(prevHt && s.ht) prevHt.value=s.ht;
+  if(prevHt && s.ht){
+    const known=Array.from(prevHt.options).some(o=>o.value===s.ht);
+    if(known) prevHt.value=s.ht;
+    else { prevHt.value='HT20';
+      toast(`prev_ht=${s.ht} not in list — defaulting to HT20`,'err'); }
+  }
 }
 
 async function refreshCsaState(){
@@ -929,6 +970,7 @@ $$('.tab').forEach(t=>{
   });
 });
 
+renderQuickTxpowerRow();
 refresh();
 setInterval(refresh, 1000);
 </script>
