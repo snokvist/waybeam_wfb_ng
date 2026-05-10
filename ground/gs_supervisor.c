@@ -1262,9 +1262,24 @@ static void scan_apply_step_drained(Config *c, int i)
 	if (g_scan.baseline_rx_idx >= 0) {
 		Tunnel *rx = &c->tunnels[g_scan.baseline_rx_idx];
 		if (rx->stats_local_fd >= 0) {
+			/* Drain pending datagrams off the rx_ant socket so the
+			 * fresh dwell starts with a clean baseline.  Re-emit each
+			 * datagram to stats_fwd_addr if the tunnel was configured
+			 * with `stats_out` — local consumption is intentionally
+			 * skipped during scan dwells (counters are stale during
+			 * channel hops) but downstream consumers should keep
+			 * receiving samples without a hole every dwell. */
 			char drain[4096];
-			while (recv(rx->stats_local_fd, drain, sizeof(drain), MSG_DONTWAIT) > 0)
-				;
+			ssize_t got;
+			while ((got = recv(rx->stats_local_fd, drain,
+			                   sizeof(drain), MSG_DONTWAIT)) > 0) {
+				if (rx->stats_fwd_active) {
+					(void)sendto(rx->stats_local_fd,
+					    drain, (size_t)got, 0,
+					    (struct sockaddr *)&rx->stats_fwd_addr,
+					    sizeof(rx->stats_fwd_addr));
+				}
+			}
 		}
 	}
 	g_scan.step_started_us = now_us();
@@ -1424,11 +1439,71 @@ static void supervisor_tick(Config *c)
 
 /* ---------- system commands ------------------------------------------ */
 
-static int run_system_cmd(const char *cmd)
+/* Per-command deadline for system.up / system.down.  Generous enough to
+ * cover a `sleep 0.5` plus the surrounding `iw` calls without nuisance
+ * timeouts; operators running heavyweight bring-up (e.g. `wifi restart`)
+ * may hit this and need to wrap the heavy work in a separate script. */
+#define GS_SYSTEM_CMD_DEADLINE_MS 10000
+#define GS_SYSTEM_CMD_MAX_ARGV    32
+
+/* Tokenize a single-line command string into an argv-style array, in
+ * place (NUL-terminators inserted between tokens).  Splits on
+ * ASCII whitespace.  Refuses tokens that would change meaning under
+ * `sh -c` interpretation — operators using shell features (||, $(),
+ * redirection, env-var assignment) need a wrapper script.  argv[argc]
+ * is set to NULL on success.
+ *
+ * Returns argc on success, -1 on shell-metachar reject, -2 on overflow. */
+static int tokenize_argv(char *cmd, char **out_argv, int max_argv)
 {
-	LOG_INFO("system: %s", cmd);
-	int rc = system(cmd);     /* TODO: replace with fork+execvp + arg parsing */
-	if (rc != 0) LOG_WARN("system: '%s' rc=%d", cmd, rc);
+	static const char metachars[] = ";|&<>$`(){}[]*?'\"\\";
+	if (strpbrk(cmd, metachars)) return -1;
+	int argc = 0;
+	char *save = NULL;
+	for (char *tok = strtok_r(cmd, " \t", &save); tok;
+	     tok = strtok_r(NULL, " \t", &save)) {
+		if (argc + 1 >= max_argv) return -2;
+		out_argv[argc++] = tok;
+	}
+	out_argv[argc] = NULL;
+	return argc;
+}
+
+/* Run one system.{up,down} command.  Replaces an earlier system() that
+ * funneled JSON-config strings through `sh -c` — convert to a tokenized
+ * fork+execvp so a typo'd iface name can no longer accidentally invoke
+ * shell features.  Bounded by GS_SYSTEM_CMD_DEADLINE_MS. */
+static int run_system_cmd(const char *cmd_const)
+{
+	LOG_INFO("system: %s", cmd_const);
+	char cmd[GS_PATH_MAX];
+	snprintf(cmd, sizeof(cmd), "%s", cmd_const);
+	char *argv[GS_SYSTEM_CMD_MAX_ARGV];
+	int argc = tokenize_argv(cmd, argv, GS_SYSTEM_CMD_MAX_ARGV);
+	if (argc < 0) {
+		const char *why = (argc == -1)
+		    ? "shell metachar — strip features or wrap in a script"
+		    : "argv overflow";
+		LOG_WARN("system: '%s' refused (%s)", cmd_const, why);
+		return -1;
+	}
+	if (argc == 0) return 0;
+	pid_t pid = fork();
+	if (pid < 0) {
+		LOG_WARN("system: '%s' fork failed: %s", cmd_const, strerror(errno));
+		return -1;
+	}
+	if (pid == 0) {
+		execvp(argv[0], argv);
+		_exit(127);
+	}
+	int rc = waitpid_deadline(pid, GS_SYSTEM_CMD_DEADLINE_MS);
+	if (rc == -2) {
+		LOG_WARN("system: '%s' deadline %d ms — SIGKILL'd",
+		         cmd_const, GS_SYSTEM_CMD_DEADLINE_MS);
+		return -1;
+	}
+	if (rc != 0) LOG_WARN("system: '%s' rc=%d", cmd_const, rc);
 	return rc;
 }
 
