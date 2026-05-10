@@ -12,15 +12,11 @@ vehicle/build/
 probes/build/
 wfb-ng/build/
 wfb-ng/install/
-poc/build/
-poc/build-openwrt/
 
 # xxd-generated WebUI asset headers (regenerate via the per-component
 # `make webui` target).
 ground/webui/gs_assets.h
 vehicle/webui/index_assets.h
-poc/webui_assets.h
-poc/gs_webui_assets.h
 
 # Developer-machine convenience symlinks that some local workflows expect at
 # the repo root (not part of the canonical tree).  Typically point at the
