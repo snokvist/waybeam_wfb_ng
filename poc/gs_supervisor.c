@@ -44,6 +44,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <getopt.h>
+#include <limits.h>
 #include <net/if.h>
 #include <netinet/in.h>
 #include <poll.h>
@@ -388,6 +389,48 @@ typedef struct {
 	uint64_t    next_start_ms;         /* 0 = ASAP */
 	bool        autostart_on_exit;     /* cleared by explicit /stop */
 	uint64_t    stop_deadline_ms;      /* SIGTERM→SIGKILL transition */
+
+	/* rx-only stats listener.  We always bind a local UDP port and pass it
+	 * to wfb_rx -Y so the supervisor can surface rx_ant counters in the
+	 * Tunnels WebUI.  If the user configured a `stats_out` for downstream
+	 * consumers (e.g. uplink TX → vehicle), supervisor re-emits each
+	 * datagram to that target verbatim — preserving the existing pipeline.
+	 *
+	 *   wfb_rx ── -Y 127.0.0.1:<stats_local_port> ──▶ supervisor
+	 *                                                  │
+	 *                                                  ├─▶ parse → Tunnel.st_*
+	 *                                                  └─▶ stats_fwd_addr (re-emit)
+	 */
+	int                 stats_local_fd;
+	uint16_t            stats_local_port;
+	struct sockaddr_in  stats_fwd_addr;
+	int                 stats_fwd_active;
+	char                stats_local_arg[GS_ARG_MAX]; /* "127.0.0.1:port" passed to -Y */
+
+	/* parsed rx_ant snapshot (rx tunnels only) */
+	uint64_t    st_first_us;
+	uint64_t    st_last_us;
+	uint32_t    st_pkt_all;
+	uint32_t    st_pkt_lost;
+	uint32_t    st_pkt_fec;
+	uint32_t    st_pkt_outgoing;
+	uint32_t    st_pkt_dec_err;
+	uint32_t    st_pkt_bytes;
+	uint32_t    st_pkt_uniq;
+	uint32_t    st_interval_ms;
+	uint32_t    st_msg_count;
+	int         st_ant_count;
+	int         st_rssi_best;          /* highest avg over antennas */
+
+	/* tx-only runtime cache (echoes wfb_tx live state via wfb_cmd) */
+	int         short_gi;              /* -1 = unset */
+	int         vht_mode;
+	int         vht_nss;
+	int         fec_timeout_ms;        /* runtime, -1 = unknown */
+	int         radio_cache_have;
+	int         fec_cache_have;
+	uint64_t    radio_cache_us;
+	uint64_t    tx_init_query_after_us; /* schedule a get_radio/get_fec */
 } Tunnel;
 
 typedef struct {
@@ -426,6 +469,10 @@ static int cfg_parse_tunnel(const char *js, JTok *toks, int n, int t_idx, Tunnel
 {
 	memset(t, 0, sizeof(*t));
 	t->mcs_index = -1; t->stbc = -1; t->ldpc = -1;
+	t->short_gi = -1; t->vht_mode = -1; t->vht_nss = -1;
+	t->fec_timeout_ms = -1;
+	t->stats_local_fd = -1;
+	t->st_rssi_best = INT_MIN;
 	t->autostart = true;
 
 	int v;
@@ -690,7 +737,12 @@ static int build_argv_rx(const Tunnel *t, const char *key_file, ArgvBuilder *ab)
 	}
 	if (ab_push(ab, "-i") < 0 || ab_push(ab, "%d", t->link_id) < 0) return -1;
 	if (ab_push(ab, "-p") < 0 || ab_push(ab, "%d", t->radio_port) < 0) return -1;
-	if (t->stats_out[0]) {
+	/* Always wire wfb_rx -Y into the supervisor's local listener so the
+	 * Tunnels WebUI can show pkt counters / RSSI.  Forwarding to the user's
+	 * configured stats_out happens in stats_drain(). */
+	if (t->stats_local_arg[0]) {
+		if (ab_push(ab, "-Y") < 0 || ab_push(ab, "%s", t->stats_local_arg) < 0) return -1;
+	} else if (t->stats_out[0]) {
 		if (ab_push(ab, "-Y") < 0 || ab_push(ab, "%s", t->stats_out) < 0) return -1;
 	}
 	for (int i = 0; i < t->extra_arg_count; i++)
@@ -740,8 +792,22 @@ static int build_argv_tx(const Tunnel *t, const char *key_file, ArgvBuilder *ab)
 
 /* ---------- supervisor ----------------------------------------------- */
 
+/* forward declarations: stats helpers live in the iface-validation block
+ * further down to keep them grouped with the rest of the runtime/IPC code. */
+static int  stats_listener_open(Tunnel *t);
+static void stats_listener_close(Tunnel *t);
+static void stats_drain(Tunnel *t);
+static int  wfb_cmd_refresh_radio(Tunnel *t);
+static int  wfb_cmd_refresh_fec(Tunnel *t);
+
 static int tunnel_spawn(Tunnel *t, const char *key_file)
 {
+	/* Lazy-open the rx stats listener — once per tunnel lifetime, port stays
+	 * stable across respawns so the argv stays cacheable. */
+	if (!strcmp(t->role, "rx") && t->stats_local_fd < 0) {
+		(void)stats_listener_open(t);
+	}
+
 	ArgvBuilder ab = {0};
 	int rc = !strcmp(t->role, "rx")
 	       ? build_argv_rx(t, key_file, &ab)
@@ -791,6 +857,23 @@ static int tunnel_spawn(Tunnel *t, const char *key_file)
 	t->started_us    = now_us();
 	t->autostart_on_exit = true;
 	t->stop_deadline_ms  = 0;
+
+	/* For tx tunnels with a control_port, schedule a one-shot
+	 * get_radio + get_fec ~500 ms after spawn to populate the live cache.
+	 * wfb_tx needs a moment to bind its control socket. */
+	if (!strcmp(t->role, "tx") && t->control_port > 0)
+		t->tx_init_query_after_us = t->started_us + 500000ull;
+
+	/* Reset stats counters — wfb_rx restarts its own monotonic counters
+	 * on respawn, so old values would lie. */
+	if (!strcmp(t->role, "rx")) {
+		t->st_pkt_all = t->st_pkt_lost = t->st_pkt_fec = 0;
+		t->st_pkt_outgoing = t->st_pkt_dec_err = t->st_pkt_bytes = 0;
+		t->st_pkt_uniq = t->st_interval_ms = t->st_msg_count = 0;
+		t->st_ant_count = 0;
+		t->st_rssi_best = INT_MIN;
+		t->st_first_us = t->st_last_us = 0;
+	}
 
 	/* Promote to RUNNING after a short settle window in supervisor_tick;
 	 * for now treat exec as success unless SIGCHLD says otherwise. */
@@ -867,10 +950,13 @@ static void supervisor_reap(Config *c)
 	}
 }
 
-/* Periodic tick: handle SIGKILL escalation + backoff respawn. */
+/* Periodic tick: handle SIGKILL escalation + backoff respawn, plus
+ * deferred TX state queries (~500 ms after spawn so wfb_tx has bound
+ * its control socket). */
 static void supervisor_tick(Config *c)
 {
 	uint64_t t_ms = now_ms();
+	uint64_t t_us = now_us();
 	for (int i = 0; i < c->tunnel_count; i++) {
 		Tunnel *t = &c->tunnels[i];
 
@@ -884,6 +970,21 @@ static void supervisor_tick(Config *c)
 			LOG_INFO("tunnel '%s' respawning (attempt %d)",
 			         t->name, t->restart_count + 1);
 			tunnel_spawn(t, c->key_file);
+		}
+
+		if (t->tx_init_query_after_us && t_us >= t->tx_init_query_after_us &&
+		    t->pid > 0 && t->state == TS_RUNNING) {
+			t->tx_init_query_after_us = 0;
+			if (wfb_cmd_refresh_radio(t) == 0) {
+				LOG_INFO("tunnel '%s' radio cache: bw=%d mcs=%d stbc=%d "
+				         "ldpc=%d sgi=%d vht_mode=%d vht_nss=%d",
+				         t->name, t->bandwidth_mhz, t->mcs_index, t->stbc,
+				         t->ldpc, t->short_gi, t->vht_mode, t->vht_nss);
+			} else {
+				/* Likely too soon — retry once 1 s later. */
+				t->tx_init_query_after_us = t_us + 1000000ull;
+			}
+			(void)wfb_cmd_refresh_fec(t);
 		}
 	}
 }
@@ -904,6 +1005,277 @@ static void run_system_block(const char *label, char cmds[][GS_PATH_MAX], int n)
 	LOG_INFO("running %s commands (%d)", label, n);
 	for (int i = 0; i < n; i++) {
 		if (cmds[i][0]) (void)run_system_cmd(cmds[i]);
+	}
+}
+
+/* ---------- rx stats listener + rx_ant parser ------------------------ *
+ *
+ * One UDP socket per rx tunnel.  wfb_rx is launched with `-Y` pointing at
+ * this socket; the parser extracts pkt counters and antenna RSSI for the
+ * Tunnels WebUI.  If the user originally configured `stats_out` to a
+ * different host:port (e.g. forwarding rx_ant to the uplink TX so the
+ * vehicle's link_controller sees ground RSSI), the supervisor re-emits
+ * each datagram verbatim — the local consumption is purely additive.
+ */
+
+/* Parse "host:port" → sockaddr_in.  Returns 0 on success. */
+static int parse_host_port(const char *s, struct sockaddr_in *out)
+{
+	if (!s || !*s) return -1;
+	const char *colon = strrchr(s, ':');
+	if (!colon || colon == s) return -1;
+	char host[64];
+	size_t hl = (size_t)(colon - s);
+	if (hl >= sizeof(host)) return -1;
+	memcpy(host, s, hl);
+	host[hl] = 0;
+	int port = atoi(colon + 1);
+	if (port <= 0 || port > 65535) return -1;
+	memset(out, 0, sizeof(*out));
+	out->sin_family = AF_INET;
+	out->sin_port   = htons((uint16_t)port);
+	if (inet_pton(AF_INET, host, &out->sin_addr) != 1) return -1;
+	return 0;
+}
+
+/* Open a non-blocking UDP listener on 127.0.0.1:0 and stash the assigned
+ * port in t->stats_local_port + a "127.0.0.1:port" string in
+ * t->stats_local_arg (for handing to wfb_rx -Y). */
+static int stats_listener_open(Tunnel *t)
+{
+	if (t->stats_local_fd >= 0) return 0;
+	int fd = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+	if (fd < 0) {
+		LOG_ERR("tunnel '%s': stats listener socket: %s", t->name, strerror(errno));
+		return -1;
+	}
+	int rcvbuf = 256 * 1024;
+	(void)setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+	struct sockaddr_in sa = {0};
+	sa.sin_family      = AF_INET;
+	sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	sa.sin_port        = 0;
+	if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
+		LOG_ERR("tunnel '%s': stats bind 127.0.0.1:0: %s",
+		        t->name, strerror(errno));
+		close(fd);
+		return -1;
+	}
+	socklen_t slen = sizeof(sa);
+	if (getsockname(fd, (struct sockaddr *)&sa, &slen) < 0) {
+		LOG_ERR("tunnel '%s': stats getsockname: %s",
+		        t->name, strerror(errno));
+		close(fd);
+		return -1;
+	}
+	t->stats_local_fd   = fd;
+	t->stats_local_port = ntohs(sa.sin_port);
+	snprintf(t->stats_local_arg, sizeof(t->stats_local_arg),
+	         "127.0.0.1:%u", (unsigned)t->stats_local_port);
+
+	/* If user configured stats_out, parse for re-emit. */
+	if (t->stats_out[0]) {
+		if (parse_host_port(t->stats_out, &t->stats_fwd_addr) == 0) {
+			t->stats_fwd_active = 1;
+			LOG_INFO("tunnel '%s': stats listening on udp:%u (forward to %s)",
+			         t->name, (unsigned)t->stats_local_port, t->stats_out);
+		} else {
+			t->stats_fwd_active = 0;
+			LOG_WARN("tunnel '%s': stats_out '%s' unparseable; not forwarding",
+			         t->name, t->stats_out);
+		}
+	} else {
+		t->stats_fwd_active = 0;
+		LOG_INFO("tunnel '%s': stats listening on udp:%u",
+		         t->name, (unsigned)t->stats_local_port);
+	}
+	return 0;
+}
+
+/* Pull an unsigned-decimal field out of a pinned JSON window.  We
+ * intentionally avoid a real parser — the rx_ant payload is generated
+ * by a single producer with a stable shape and we just want the named
+ * counters. */
+static int json_pick_u32(const char *js, size_t jl, const char *key, uint32_t *out)
+{
+	size_t kl = strlen(key);
+	for (size_t i = 0; i + kl + 2 < jl; i++) {
+		if (js[i] != '"') continue;
+		if (memcmp(js + i + 1, key, kl) != 0) continue;
+		size_t p = i + 1 + kl;
+		if (p >= jl || js[p] != '"') continue;
+		p++;
+		while (p < jl && (js[p] == ' ' || js[p] == ':')) p++;
+		if (p >= jl) continue;
+		if (js[p] == '-') return -1; /* refuse negative for u32 */
+		uint64_t v = 0;
+		int seen = 0;
+		while (p < jl && js[p] >= '0' && js[p] <= '9') {
+			v = v * 10u + (uint32_t)(js[p] - '0');
+			p++;
+			seen = 1;
+			if (v > 0xFFFFFFFFull) return -1;
+		}
+		if (!seen) continue;
+		*out = (uint32_t)v;
+		return 0;
+	}
+	return -1;
+}
+
+/* Pull a signed integer field. */
+static int json_pick_i32(const char *js, size_t jl, const char *key, int32_t *out)
+{
+	size_t kl = strlen(key);
+	for (size_t i = 0; i + kl + 2 < jl; i++) {
+		if (js[i] != '"') continue;
+		if (memcmp(js + i + 1, key, kl) != 0) continue;
+		size_t p = i + 1 + kl;
+		if (p >= jl || js[p] != '"') continue;
+		p++;
+		while (p < jl && (js[p] == ' ' || js[p] == ':')) p++;
+		if (p >= jl) continue;
+		int neg = 0;
+		if (js[p] == '-') { neg = 1; p++; }
+		int64_t v = 0;
+		int seen = 0;
+		while (p < jl && js[p] >= '0' && js[p] <= '9') {
+			v = v * 10 + (js[p] - '0');
+			p++;
+			seen = 1;
+		}
+		if (!seen) continue;
+		*out = (int32_t)(neg ? -v : v);
+		return 0;
+	}
+	return -1;
+}
+
+/* Slice a JSON value by key — returns pointer + length of the substring
+ * starting at the value (object, array, or scalar).  We only need this to
+ * carve out the "pkt":{...} block so json_pick_u32 ranges stay scoped. */
+static int json_slice_object(const char *js, size_t jl, const char *key,
+                              const char **out_start, size_t *out_len)
+{
+	size_t kl = strlen(key);
+	for (size_t i = 0; i + kl + 3 < jl; i++) {
+		if (js[i] != '"') continue;
+		if (memcmp(js + i + 1, key, kl) != 0) continue;
+		size_t p = i + 1 + kl;
+		if (p >= jl || js[p] != '"') continue;
+		p++;
+		while (p < jl && (js[p] == ' ' || js[p] == ':')) p++;
+		if (p >= jl) continue;
+		char open  = js[p];
+		char close = (open == '{') ? '}' : (open == '[') ? ']' : 0;
+		if (!close) return -1;
+		int depth = 0;
+		size_t start = p;
+		for (; p < jl; p++) {
+			if (js[p] == open)  depth++;
+			if (js[p] == close) depth--;
+			if (depth == 0) {
+				*out_start = js + start;
+				*out_len   = (p - start) + 1;
+				return 0;
+			}
+		}
+		return -1;
+	}
+	return -1;
+}
+
+/* Drain pending rx_ant datagrams off a single tunnel's stats fd. */
+static void stats_drain(Tunnel *t)
+{
+	for (;;) {
+		char buf[4096];
+		ssize_t got = recv(t->stats_local_fd, buf, sizeof(buf) - 1, 0);
+		if (got < 0) {
+			if (errno == EAGAIN || errno == EWOULDBLOCK) return;
+			if (errno == EINTR) continue;
+			LOG_WARN("tunnel '%s': stats recv: %s", t->name, strerror(errno));
+			return;
+		}
+		if (got == 0) continue;
+		buf[got] = 0;
+
+		/* Re-emit to user's stats_out before parsing — keeps latency
+		 * for the downstream consumer minimal. */
+		if (t->stats_fwd_active) {
+			(void)sendto(t->stats_local_fd, buf, (size_t)got, 0,
+			             (struct sockaddr *)&t->stats_fwd_addr,
+			             sizeof(t->stats_fwd_addr));
+		}
+
+		/* Filter on type=rx_ant (the only thing wfb_rx -Y emits, but the
+		 * fallback is harmless). */
+		if (!strstr(buf, "\"type\":\"rx_ant\"")) continue;
+
+		/* "pkt":{...} block */
+		const char *pkt = NULL;
+		size_t pkl = 0;
+		if (json_slice_object(buf, (size_t)got, "pkt", &pkt, &pkl) == 0) {
+			uint32_t u;
+			if (json_pick_u32(pkt, pkl, "all",            &u) == 0) t->st_pkt_all      = u;
+			if (json_pick_u32(pkt, pkl, "lost",           &u) == 0) t->st_pkt_lost     = u;
+			if (json_pick_u32(pkt, pkl, "fec_recovered",  &u) == 0) t->st_pkt_fec      = u;
+			if (json_pick_u32(pkt, pkl, "outgoing",       &u) == 0) t->st_pkt_outgoing = u;
+			if (json_pick_u32(pkt, pkl, "dec_err",        &u) == 0) t->st_pkt_dec_err  = u;
+			if (json_pick_u32(pkt, pkl, "outgoing_bytes", &u) == 0) t->st_pkt_bytes    = u;
+			if (json_pick_u32(pkt, pkl, "uniq",           &u) == 0) t->st_pkt_uniq     = u;
+		}
+		uint32_t iv;
+		if (json_pick_u32(buf, (size_t)got, "interval_ms", &iv) == 0)
+			t->st_interval_ms = iv;
+
+		/* Walk antenna list for best avg rssi.  rssi.avg is signed. */
+		const char *ant = NULL;
+		size_t al = 0;
+		int ant_count = 0;
+		int best_rssi = INT_MIN;
+		if (json_slice_object(buf, (size_t)got, "ant", &ant, &al) == 0 && al >= 2) {
+			/* Each antenna is a {} object inside the array. */
+			int depth = 0;
+			size_t obj_start = 0;
+			for (size_t i = 0; i < al; i++) {
+				char ch = ant[i];
+				if (ch == '{') {
+					if (depth == 0) obj_start = i;
+					depth++;
+				} else if (ch == '}') {
+					depth--;
+					if (depth == 0) {
+						const char *o = ant + obj_start;
+						size_t ol = (i - obj_start) + 1;
+						const char *rblock;
+						size_t rbl;
+						if (json_slice_object(o, ol, "rssi", &rblock, &rbl) == 0) {
+							int32_t avg;
+							if (json_pick_i32(rblock, rbl, "avg", &avg) == 0) {
+								if (avg > best_rssi) best_rssi = avg;
+							}
+						}
+						ant_count++;
+					}
+				}
+			}
+		}
+		t->st_ant_count = ant_count;
+		if (best_rssi != INT_MIN) t->st_rssi_best = best_rssi;
+
+		uint64_t now = now_us();
+		if (t->st_msg_count == 0) t->st_first_us = now;
+		t->st_last_us = now;
+		t->st_msg_count++;
+	}
+}
+
+static void stats_listener_close(Tunnel *t)
+{
+	if (t->stats_local_fd >= 0) {
+		close(t->stats_local_fd);
+		t->stats_local_fd = -1;
 	}
 }
 
@@ -944,36 +1316,73 @@ static int iface_is_admin_up(const char *iface)
 	return (flags & IFF_UP_BIT) ? 0 : -1;
 }
 
-/* Returns 0 if all ifaces in all tunnels look correct; -1 on failure
- * (with LOG_ERR diagnostics for each bad iface). */
-static int validate_iface_state(const Config *c)
+/* Block up to `timeout_ms` waiting for every tunnel iface to be both
+ * admin-UP and in monitor mode.  Polled every `interval_ms`.  This
+ * absorbs the nondeterministic delay between `iw dev … set monitor` and
+ * the iface becoming usable for pcap_open_live — a fixed `sleep` in the
+ * config is fragile (driver/USB/load dependent).  Returns 0 if every
+ * iface is ready before the deadline, -1 otherwise. */
+static int wait_iface_state(const Config *c, int timeout_ms, int interval_ms)
 {
-	int bad = 0;
-	for (int i = 0; i < c->tunnel_count; i++) {
-		const Tunnel *t = &c->tunnels[i];
-		for (int k = 0; k < t->iface_count; k++) {
-			const char *ifc = t->ifaces[k];
-			if (iface_is_admin_up(ifc) != 0) {
-				LOG_ERR("iface '%s' is not administratively UP after "
-				        "system.up — check 'ip link set %s up'",
-				        ifc, ifc);
-				bad++;
-				continue;
-			}
-			if (iface_is_monitor(ifc) != 0) {
-				LOG_ERR("iface '%s' is not in monitor mode after "
-				        "system.up — check 'iw dev %s set monitor'",
-				        ifc, ifc);
-				bad++;
+	uint64_t deadline = now_ms() + (uint64_t)timeout_ms;
+	int prev_bad = -1;
+	for (;;) {
+		int bad = 0;
+		const char *first_bad = NULL;
+		const char *first_reason = NULL;
+		for (int i = 0; i < c->tunnel_count; i++) {
+			const Tunnel *t = &c->tunnels[i];
+			for (int k = 0; k < t->iface_count; k++) {
+				const char *ifc = t->ifaces[k];
+				if (iface_is_admin_up(ifc) != 0) {
+					bad++;
+					if (!first_bad) { first_bad = ifc; first_reason = "down"; }
+					continue;
+				}
+				if (iface_is_monitor(ifc) != 0) {
+					bad++;
+					if (!first_bad) { first_bad = ifc; first_reason = "not-monitor"; }
+				}
 			}
 		}
+		if (bad == 0) {
+			LOG_INFO("iface state OK on %d tunnel(s)", c->tunnel_count);
+			return 0;
+		}
+		if (bad != prev_bad) {
+			LOG_INFO("waiting for iface readiness — %d pending (first: %s %s)",
+			         bad, first_bad ? first_bad : "?",
+			         first_reason ? first_reason : "?");
+			prev_bad = bad;
+		}
+		if (now_ms() >= deadline) {
+			/* One last detailed report so the operator knows which iface
+			 * timed out and why. */
+			for (int i = 0; i < c->tunnel_count; i++) {
+				const Tunnel *t = &c->tunnels[i];
+				for (int k = 0; k < t->iface_count; k++) {
+					const char *ifc = t->ifaces[k];
+					if (iface_is_admin_up(ifc) != 0) {
+						LOG_ERR("iface '%s' is not administratively UP "
+						        "after %d ms — check 'ip link set %s up' "
+						        "or extend the system.up sleep",
+						        ifc, timeout_ms, ifc);
+					} else if (iface_is_monitor(ifc) != 0) {
+						LOG_ERR("iface '%s' is not in monitor mode "
+						        "after %d ms — check 'iw dev %s set monitor'",
+						        ifc, timeout_ms, ifc);
+					}
+				}
+			}
+			LOG_ERR("iface readiness timed out; refusing to spawn tunnels");
+			return -1;
+		}
+		struct timespec ts = {
+			.tv_sec  = interval_ms / 1000,
+			.tv_nsec = (long)(interval_ms % 1000) * 1000000L,
+		};
+		nanosleep(&ts, NULL);
 	}
-	if (bad) {
-		LOG_ERR("%d iface check(s) failed; refusing to spawn tunnels", bad);
-		return -1;
-	}
-	LOG_INFO("iface state OK on %d tunnel(s)", c->tunnel_count);
-	return 0;
 }
 
 /* ---------- wfb_cmd passthrough -------------------------------------- *
@@ -1094,6 +1503,55 @@ static int wfb_cmd_round_trip(int control_port,
 		*out_rc = ntohl(rc_nb);
 	}
 	return (int)r;
+}
+
+/* Fetch live radio params via get_radio and stash into the tunnel's
+ * runtime cache.  Single-shot (~200ms timeout); caller throttles. */
+static int wfb_cmd_refresh_radio(Tunnel *t)
+{
+	if (t->control_port <= 0) return -1;
+	WfbCmdGetReq req = {
+		.req_id = wfb_cmd_next_req_id(),
+		.cmd_id = WFB_CMD_GET_RADIO,
+	};
+	char buf[64];
+	uint32_t rc_out = 0xFFFFFFFFu;
+	int n = wfb_cmd_round_trip(t->control_port, &req, sizeof(req),
+	                           buf, sizeof(buf), &rc_out);
+	if (n < (int)sizeof(WfbCmdGetRadioResp) || rc_out != 0) return -1;
+	WfbCmdGetRadioResp gr;
+	memcpy(&gr, buf, sizeof(gr));
+	t->stbc           = gr.stbc;
+	t->ldpc           = gr.ldpc;
+	t->short_gi       = gr.short_gi;
+	t->bandwidth_mhz  = gr.bandwidth;
+	t->mcs_index      = gr.mcs_index;
+	t->vht_mode       = gr.vht_mode;
+	t->vht_nss        = gr.vht_nss;
+	t->radio_cache_have = 1;
+	t->radio_cache_us   = now_us();
+	return 0;
+}
+
+static int wfb_cmd_refresh_fec(Tunnel *t)
+{
+	if (t->control_port <= 0) return -1;
+	WfbCmdGetReq req = {
+		.req_id = wfb_cmd_next_req_id(),
+		.cmd_id = WFB_CMD_GET_FEC,
+	};
+	char buf[64];
+	uint32_t rc_out = 0xFFFFFFFFu;
+	int n = wfb_cmd_round_trip(t->control_port, &req, sizeof(req),
+	                           buf, sizeof(buf), &rc_out);
+	if (n < (int)sizeof(WfbCmdGetFecResp) || rc_out != 0) return -1;
+	WfbCmdGetFecResp gf;
+	memcpy(&gf, buf, sizeof(gf));
+	t->fec_k          = gf.k;
+	t->fec_n          = gf.n;
+	t->fec_timeout_ms = ntohs(gf.fec_timeout_ms);
+	t->fec_cache_have = 1;
+	return 0;
 }
 
 /* Tiny query-string scanner: find &key=...& and copy value (URL-decoded
@@ -1350,13 +1808,41 @@ static int json_emit_tunnel(char *buf, size_t cap, const Tunnel *t, bool full)
 			if (t->stats_out[0]) APP(",\"stats_out\":\"%s\"", t->stats_out);
 		} else {
 			APP(",\"udp_in_port\":%d,\"control_port\":%d,"
-			    "\"fec\":{\"k\":%d,\"n\":%d},"
-			    "\"radio\":{\"bw\":%d,\"mcs\":%d,\"stbc\":%d,\"ldpc\":%d}",
+			    "\"fec\":{\"k\":%d,\"n\":%d,\"timeout_ms\":%d,\"have\":%s},"
+			    "\"radio\":{\"bw\":%d,\"mcs\":%d,\"stbc\":%d,\"ldpc\":%d,"
+			    "\"short_gi\":%d,\"vht_mode\":%d,\"vht_nss\":%d,\"have\":%s}",
 			    t->udp_in_port, t->control_port,
-			    t->fec_k, t->fec_n,
-			    t->bandwidth_mhz, t->mcs_index, t->stbc, t->ldpc);
+			    t->fec_k, t->fec_n, t->fec_timeout_ms,
+			    t->fec_cache_have ? "true" : "false",
+			    t->bandwidth_mhz, t->mcs_index, t->stbc, t->ldpc,
+			    t->short_gi, t->vht_mode, t->vht_nss,
+			    t->radio_cache_have ? "true" : "false");
 		}
 		APP(",\"autostart\":%s", t->autostart ? "true" : "false");
+	}
+	/* Always include stats for rx tunnels — even if empty, the WebUI
+	 * uses the presence of `msg_count` to decide whether to render the
+	 * stats panel.  age_ms tells the UI how stale the snapshot is. */
+	if (!strcmp(t->role, "rx")) {
+		uint64_t age_ms = 0;
+		if (t->st_last_us) {
+			uint64_t now_u = now_us();
+			age_ms = (now_u > t->st_last_us) ? (now_u - t->st_last_us) / 1000 : 0;
+		}
+		APP(",\"stats\":{"
+		    "\"msg_count\":%u,\"interval_ms\":%u,"
+		    "\"pkt_all\":%u,\"pkt_lost\":%u,\"pkt_fec_recovered\":%u,"
+		    "\"pkt_outgoing\":%u,\"pkt_dec_err\":%u,\"pkt_uniq\":%u,"
+		    "\"outgoing_bytes\":%u,\"ant_count\":%d",
+		    t->st_msg_count, t->st_interval_ms,
+		    t->st_pkt_all, t->st_pkt_lost, t->st_pkt_fec,
+		    t->st_pkt_outgoing, t->st_pkt_dec_err, t->st_pkt_uniq,
+		    t->st_pkt_bytes, t->st_ant_count);
+		if (t->st_rssi_best != INT_MIN) APP(",\"rssi_best\":%d", t->st_rssi_best);
+		APP(",\"age_ms\":%llu", (unsigned long long)age_ms);
+		if (t->stats_local_port)
+			APP(",\"listen_port\":%u", (unsigned)t->stats_local_port);
+		APP("}");
 	}
 	APP("}");
 	return p;
@@ -1614,6 +2100,12 @@ static void api_handle(ApiClient *cli, Config *c, uint64_t startup_us)
 				};
 				rlen = wfb_cmd_round_trip(t->control_port, &req, sizeof(req),
 				                          respbuf, sizeof(respbuf), &rc_out);
+				if (rlen > 0 && rc_out == 0) {
+					t->fec_k = k;
+					t->fec_n = nn;
+					if (to != WFB_FEC_TIMEOUT_KEEP) t->fec_timeout_ms = to;
+					t->fec_cache_have = 1;
+				}
 			} else if (cl == 9 && !strncmp(cmd, "set_radio", 9)) {
 				int stbc=0, ldpc=0, sgi=0, bw=20, mcs=1, vhtm=0, vhtn=1;
 				qs_get_int(qstr, "stbc",      &stbc);
@@ -1636,6 +2128,17 @@ static void api_handle(ApiClient *cli, Config *c, uint64_t startup_us)
 				};
 				rlen = wfb_cmd_round_trip(t->control_port, &req, sizeof(req),
 				                          respbuf, sizeof(respbuf), &rc_out);
+				if (rlen > 0 && rc_out == 0) {
+					t->stbc           = stbc;
+					t->ldpc           = (ldpc != 0);
+					t->short_gi       = (sgi  != 0);
+					t->bandwidth_mhz  = bw;
+					t->mcs_index      = mcs;
+					t->vht_mode       = (vhtm != 0);
+					t->vht_nss        = vhtn;
+					t->radio_cache_have = 1;
+					t->radio_cache_us   = now_us();
+				}
 			} else if ((cl == 7 && !strncmp(cmd, "get_fec",   7)) ||
 			           (cl == 9 && !strncmp(cmd, "get_radio", 9))) {
 				uint8_t cmd_id = (cl == 7) ? WFB_CMD_GET_FEC : WFB_CMD_GET_RADIO;
@@ -1674,6 +2177,11 @@ static void api_handle(ApiClient *cli, Config *c, uint64_t startup_us)
 					p += snprintf(body2 + p, sizeof(body2) - p,
 					              ",\"k\":%u,\"n\":%u,\"fec_timeout_ms\":%u",
 					              gf.k, gf.n, ntohs(gf.fec_timeout_ms));
+					/* Refresh runtime cache on the way through. */
+					t->fec_k          = gf.k;
+					t->fec_n          = gf.n;
+					t->fec_timeout_ms = ntohs(gf.fec_timeout_ms);
+					t->fec_cache_have = 1;
 				} else if (cl == 9 && !strncmp(cmd, "get_radio", 9) &&
 				           rlen >= (int)sizeof(WfbCmdGetRadioResp)) {
 					WfbCmdGetRadioResp gr;
@@ -1685,6 +2193,15 @@ static void api_handle(ApiClient *cli, Config *c, uint64_t startup_us)
 					              gr.stbc, gr.ldpc, gr.short_gi,
 					              gr.bandwidth, gr.mcs_index,
 					              gr.vht_mode, gr.vht_nss);
+					t->stbc             = gr.stbc;
+					t->ldpc             = gr.ldpc;
+					t->short_gi         = gr.short_gi;
+					t->bandwidth_mhz    = gr.bandwidth;
+					t->mcs_index        = gr.mcs_index;
+					t->vht_mode         = gr.vht_mode;
+					t->vht_nss          = gr.vht_nss;
+					t->radio_cache_have = 1;
+					t->radio_cache_us   = now_us();
 				}
 			}
 			snprintf(body2 + p, sizeof(body2) - p, "}");
@@ -1786,7 +2303,10 @@ int main(int argc, char **argv)
 
 	run_system_block("system.up", cfg.system_up, cfg.system_up_count);
 
-	if (validate_iface_state(&cfg) != 0) {
+	/* Drivers (notably rtl88xxau and friends) take a variable amount of
+	 * time to flip an iface UP after `iw set monitor otherbss` — fixed
+	 * sleeps in system.up are fragile.  Poll up to 5 s before giving up. */
+	if (wait_iface_state(&cfg, 5000, 100) != 0) {
 		/* Bring back what system.up touched, then exit. The operator
 		 * needs to fix the bring-up sequence (typo'd iface name, missing
 		 * sudo, kernel module not loaded, etc.) before we can serve. */
@@ -1812,17 +2332,31 @@ int main(int argc, char **argv)
 	}
 
 	while (!g_shutdown) {
-		struct pollfd pfds[1 + API_MAX_CLIENTS];
-		int           pfd_slot[1 + API_MAX_CLIENTS];   /* -1 = listener */
+		/* pfd_slot encodes:
+		 *   -1  : api listen socket (slot 0)
+		 *   0..API_MAX_CLIENTS-1 : api client at clients[idx]
+		 *   -1000-i : rx tunnel stats listener for tunnel i  */
+		#define GS_SLOT_LISTEN  (-1)
+		#define GS_SLOT_STATS_BASE (-1000)
+		struct pollfd pfds[1 + API_MAX_CLIENTS + GS_MAX_TUNNELS];
+		int           pfd_slot[1 + API_MAX_CLIENTS + GS_MAX_TUNNELS];
 		int nfds = 0;
 		pfds[nfds].fd = api_fd; pfds[nfds].events = POLLIN;
-		pfd_slot[nfds] = -1;
+		pfd_slot[nfds] = GS_SLOT_LISTEN;
 		nfds++;
 		for (int i = 0; i < API_MAX_CLIENTS; i++) {
 			if (clients[i].fd >= 0) {
 				pfds[nfds].fd = clients[i].fd;
 				pfds[nfds].events = POLLIN;
 				pfd_slot[nfds] = i;
+				nfds++;
+			}
+		}
+		for (int i = 0; i < cfg.tunnel_count; i++) {
+			if (cfg.tunnels[i].stats_local_fd >= 0) {
+				pfds[nfds].fd = cfg.tunnels[i].stats_local_fd;
+				pfds[nfds].events = POLLIN;
+				pfd_slot[nfds] = GS_SLOT_STATS_BASE - i;
 				nfds++;
 			}
 		}
@@ -1866,10 +2400,19 @@ int main(int argc, char **argv)
 		 * trigger a spurious recv() returning EAGAIN, then close the fresh
 		 * socket — symptom: "Empty reply from server". */
 		for (int p = 1; p < nfds; p++) {
-			int i = pfd_slot[p];
-			if (i < 0 || clients[i].fd < 0) continue;
+			int slot = pfd_slot[p];
 			short re = pfds[p].revents;
 			if (!(re & (POLLIN | POLLERR | POLLHUP))) continue;
+
+			if (slot <= GS_SLOT_STATS_BASE) {
+				int ti = GS_SLOT_STATS_BASE - slot;
+				if (ti >= 0 && ti < cfg.tunnel_count)
+					stats_drain(&cfg.tunnels[ti]);
+				continue;
+			}
+
+			int i = slot;
+			if (i < 0 || clients[i].fd < 0) continue;
 			ssize_t got = recv(clients[i].fd,
 			                   clients[i].buf + clients[i].pos,
 			                   sizeof(clients[i].buf) - clients[i].pos - 1, 0);
@@ -1887,6 +2430,8 @@ int main(int argc, char **argv)
 				close(clients[i].fd); clients[i].fd = -1;
 			}
 		}
+		#undef GS_SLOT_LISTEN
+		#undef GS_SLOT_STATS_BASE
 	}
 
 	LOG_INFO("shutdown signal received");
@@ -1894,6 +2439,8 @@ int main(int argc, char **argv)
 		if (clients[i].fd >= 0) close(clients[i].fd);
 	close(api_fd);
 	shutdown_all(&cfg);
+	for (int i = 0; i < cfg.tunnel_count; i++)
+		stats_listener_close(&cfg.tunnels[i]);
 	run_system_block("system.down", cfg.system_down, cfg.system_down_count);
 	LOG_INFO("bye");
 	return 0;

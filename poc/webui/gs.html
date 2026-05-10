@@ -33,6 +33,7 @@ code,pre,.mono{font-family:'JetBrains Mono',monospace;font-size:.85em}
 .tbar-dot.on{background:var(--live);box-shadow:0 0 8px rgba(34,197,94,.5);animation:pulse-dot 2s ease infinite}
 .tbar-dot.off{background:var(--text-dim);opacity:.4}
 .tbar-dot.bad{background:var(--bad);box-shadow:0 0 8px var(--bad)}
+.tbar-dot.warn{background:var(--warn);box-shadow:0 0 8px rgba(245,158,11,.5)}
 @keyframes pulse-dot{0%,100%{opacity:1}50%{opacity:.5}}
 .tbar-right{margin-left:auto;display:flex;align-items:center;gap:.8rem}
 .tbar-btn{background:none;border:1px solid var(--border);color:var(--text-dim);padding:4px 10px;border-radius:4px;cursor:pointer;font-size:.75rem;font-family:'JetBrains Mono',monospace;transition:all .15s}
@@ -65,6 +66,10 @@ code,pre,.mono{font-family:'JetBrains Mono',monospace;font-size:.85em}
 .tunnel-kv{display:grid;grid-template-columns:auto 1fr;gap:3px 1rem;font-size:.78rem;margin-bottom:.6rem}
 .tunnel-kv dt{color:var(--text-dim);font-family:'JetBrains Mono',monospace}
 .tunnel-kv dd{margin:0;color:var(--text);font-variant-numeric:tabular-nums;font-family:'JetBrains Mono',monospace}
+.stats-panel{margin:.4rem 0 .6rem;padding:.5rem .7rem;background:var(--bg2);border:1px solid var(--border);border-radius:4px}
+.stats-panel.stats-empty{opacity:.55}
+.stats-head{display:flex;align-items:center;gap:.5rem;font-size:.7rem;letter-spacing:.06em;text-transform:uppercase;color:var(--text-dim);margin-bottom:.35rem;font-family:'JetBrains Mono',monospace}
+.stats-grid{margin-bottom:0;font-size:.74rem}
 .tunnel-actions{display:flex;gap:.4rem;flex-wrap:wrap}
 .btn-mini{padding:3px 10px;border-radius:4px;cursor:pointer;font-size:.72rem;font-weight:600;font-family:'JetBrains Mono',monospace;border:1px solid var(--border);background:var(--bg);color:var(--text);transition:all .15s;text-transform:uppercase;letter-spacing:.04em}
 .btn-mini:hover:not(:disabled){border-color:var(--text-dim);color:var(--text-bright)}
@@ -328,18 +333,63 @@ function setConn(ok){
   lbl.textContent=ok?'live':'offline';
 }
 
+function fmtUnset(v, label){
+  return v===undefined||v===null||v<0 ? `<span class="muted">${label||'unset'}</span>` : v;
+}
+function fmtBytes(n){
+  if(!n) return '0 B';
+  const u=['B','kB','MB','GB']; let i=0; let v=n;
+  while(v>=1024 && i<u.length-1){ v/=1024; i++; }
+  return v.toFixed(v<10?2:v<100?1:0)+' '+u[i];
+}
+function fmtRate(bytes, ms){
+  if(!bytes||!ms) return '-';
+  const bps = (bytes*8)*(1000/ms);
+  if(bps>=1e6) return (bps/1e6).toFixed(2)+' Mbps';
+  if(bps>=1e3) return (bps/1e3).toFixed(1)+' kbps';
+  return Math.round(bps)+' bps';
+}
+
 function renderTunnels(ts){
   const g=$('#tunnel-grid');
   if(!ts || !ts.length){ g.innerHTML='<div class="empty">no tunnels configured</div>'; return; }
   g.innerHTML=ts.map(t=>{
     const ifs=(t.interfaces||[]).join(', ');
-    const detail = t.role==='rx'
-      ? `<dt>udp_out</dt><dd>${t.udp_out||'<span class="muted">(default 127.0.0.1:5600)</span>'}</dd>
-         <dt>stats_out</dt><dd>${t.stats_out||'<span class="muted">-</span>'}</dd>`
-      : `<dt>udp_in</dt><dd>${t.udp_in_port}</dd>
+    let detail, statsBlock='';
+    if(t.role==='rx'){
+      detail = `<dt>udp_out</dt><dd>${t.udp_out||'<span class="muted">(default 127.0.0.1:5600)</span>'}</dd>
+         <dt>stats_out</dt><dd>${t.stats_out||'<span class="muted">-</span>'}</dd>`;
+      const s=t.stats||{};
+      const live = s.msg_count>0;
+      const stale = !live || (s.age_ms!==undefined && s.age_ms>3000);
+      const dot = !live ? 'bad' : (stale ? 'warn' : 'on');
+      const dotLbl = !live ? 'no datagrams' : (stale ? `stale ${Math.round((s.age_ms||0)/1000)}s` : `${s.interval_ms||0} ms`);
+      const lossPct = (s.pkt_all>0) ? ((s.pkt_lost||0)*100/s.pkt_all) : 0;
+      statsBlock = `<div class="stats-panel ${live?'':'stats-empty'}">
+        <div class="stats-head">
+          <span class="tbar-dot ${dot}"></span>
+          <span>live</span>
+          <span class="muted">${dotLbl}</span>
+        </div>
+        <dl class="tunnel-kv stats-grid">
+          <dt>pkts</dt><dd>${s.pkt_all||0} <span class="muted">(uniq ${s.pkt_uniq||0})</span></dd>
+          <dt>outgoing</dt><dd>${s.pkt_outgoing||0} · ${fmtBytes(s.outgoing_bytes||0)} · ${fmtRate(s.outgoing_bytes||0, s.interval_ms||0)}</dd>
+          <dt>lost</dt><dd>${s.pkt_lost||0} (${lossPct.toFixed(2)}%)</dd>
+          <dt>fec rec</dt><dd>${s.pkt_fec_recovered||0}</dd>
+          <dt>dec_err</dt><dd>${s.pkt_dec_err||0}</dd>
+          <dt>antennas</dt><dd>${s.ant_count||0}${s.rssi_best!==undefined?` · best rssi ${s.rssi_best} dBm`:''}</dd>
+        </dl>
+      </div>`;
+    } else {
+      const r=t.radio||{}, f=t.fec||{};
+      const radioOK = r.have;
+      const fecOK   = f.have;
+      detail = `<dt>udp_in</dt><dd>${t.udp_in_port}</dd>
          <dt>control</dt><dd>${t.control_port||'<span class="muted">-</span>'}</dd>
-         <dt>fec</dt><dd>k=${t.fec.k} n=${t.fec.n}</dd>
-         <dt>radio</dt><dd>bw=${t.radio.bw} mcs=${t.radio.mcs===-1?'<span class="muted">unset</span>':t.radio.mcs}</dd>`;
+         <dt>fec</dt><dd>k=${fmtUnset(f.k,'?')} n=${fmtUnset(f.n,'?')} timeout=${fmtUnset(f.timeout_ms,'?')}ms ${fecOK?'<span class="muted">live</span>':'<span class="muted">cfg</span>'}</dd>
+         <dt>radio</dt><dd>bw=${r.bw||0} mcs=${fmtUnset(r.mcs)} stbc=${fmtUnset(r.stbc,'0')} ldpc=${fmtUnset(r.ldpc,'0')} ${radioOK?'<span class="muted">live</span>':'<span class="muted">cfg</span>'}</dd>
+         <dt>radio2</dt><dd>sgi=${fmtUnset(r.short_gi,'0')} vht=${fmtUnset(r.vht_mode,'0')}/${fmtUnset(r.vht_nss,'0')}</dd>`;
+    }
     return `<div class="tunnel">
       <div class="tunnel-head">
         <div class="tunnel-name">${t.name}</div>
@@ -355,6 +405,7 @@ function renderTunnels(ts){
           ${detail}
           ${t.last_exit!==undefined?`<dt>last_exit</dt><dd>${t.last_exit}</dd>`:''}
         </dl>
+        ${statsBlock}
         <div class="tunnel-actions">
           <button class="btn-mini btn-start" ${t.state==='running'?'disabled':''} onclick="tunnelAction('${t.name}','start')">Start</button>
           <button class="btn-mini btn-stop" ${t.state==='running'||t.state==='backoff'?'':'disabled'} onclick="tunnelAction('${t.name}','stop')">Stop</button>
