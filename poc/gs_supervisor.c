@@ -1047,6 +1047,107 @@ static int qs_get_int(const char *qs, const char *key, int *out)
 	return 0;
 }
 
+/* ---------- WCMD emit ------------------------------------------------ *
+ *
+ * 16-byte WCMD_MSG_REQ, layout per poc/wcmd_proto.h. Sent to the uplink
+ * tunnel's udp_in_port (127.0.0.1) where wfb_tx forwards it over the air.
+ * The vehicle's link_controller demuxes WCMD frames from rx_ant JSON via
+ * the WCMD_MAGIC ("WCMD" BE) prefix and proxies to the venc HTTP API.
+ *
+ * Fire-and-forget on this side — link_controller's WcmdResp goes back via
+ * the rx_ant return path, which the ground supervisor does not yet bind.
+ * Response correlation is deferred to v2 per the design doc.
+ */
+
+#define WCMD_MAGIC          0x57434D44u   /* "WCMD" big-endian */
+#define WCMD_VERSION        1
+#define WCMD_MSG_REQ        1
+#define WCMD_KEY_BITRATE_KBPS    1
+#define WCMD_KEY_FPS             2
+#define WCMD_KEY_PAYLOAD_BYTES   3
+#define WCMD_KEY_FORCE_IDR       4
+
+#pragma pack(push, 1)
+typedef struct {
+	uint32_t magic;
+	uint8_t  version;
+	uint8_t  msg_type;
+	uint16_t seq;          /* NB */
+	uint8_t  key;
+	uint8_t  flags;        /* must be 0 */
+	uint16_t _pad;         /* must be 0 */
+	int32_t  value;        /* NB */
+} WcmdReq;
+#pragma pack(pop)
+
+/* Per-key rate-limit state (single-process). Index = key id (1-based). */
+#define WCMD_KEY_MAX 8
+static uint64_t g_wcmd_last_send_ms[WCMD_KEY_MAX + 1] = { 0 };
+static uint16_t g_wcmd_seq = 0;
+
+static int wcmd_key_from_str(const char *s, size_t n)
+{
+	if (n == 12 && !strncmp(s, "bitrate_kbps",  12)) return WCMD_KEY_BITRATE_KBPS;
+	if (n ==  3 && !strncmp(s, "fps",            3)) return WCMD_KEY_FPS;
+	if (n == 13 && !strncmp(s, "payload_bytes", 13)) return WCMD_KEY_PAYLOAD_BYTES;
+	if (n ==  9 && !strncmp(s, "force_idr",      9)) return WCMD_KEY_FORCE_IDR;
+	return -1;
+}
+
+static const char *wcmd_key_name(int key)
+{
+	switch (key) {
+	case WCMD_KEY_BITRATE_KBPS:  return "bitrate_kbps";
+	case WCMD_KEY_FPS:           return "fps";
+	case WCMD_KEY_PAYLOAD_BYTES: return "payload_bytes";
+	case WCMD_KEY_FORCE_IDR:     return "force_idr";
+	}
+	return "?";
+}
+
+/* Send a WCMD_MSG_REQ packet. Returns 0 on success, errno code (positive)
+ * on send failure, -1 if the uplink tunnel is missing/disabled. */
+static int wcmd_emit(const Config *c, int key, int32_t value, uint16_t *seq_out)
+{
+	if (!c->venc_cmd_enabled) return -1;
+	const Tunnel *up = NULL;
+	for (int i = 0; i < c->tunnel_count; i++) {
+		if (!strcmp(c->tunnels[i].name, c->venc_cmd_uplink) &&
+		    !strcmp(c->tunnels[i].role, "tx")) {
+			up = &c->tunnels[i];
+			break;
+		}
+	}
+	if (!up || up->udp_in_port <= 0) return -1;
+
+	int s = socket(AF_INET, SOCK_DGRAM, 0);
+	if (s < 0) return errno;
+	struct sockaddr_in dst = {
+		.sin_family = AF_INET,
+		.sin_port   = htons((uint16_t)up->udp_in_port),
+	};
+	dst.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+
+	uint16_t seq = ++g_wcmd_seq;
+	if (seq_out) *seq_out = seq;
+
+	WcmdReq req = {
+		.magic    = htonl(WCMD_MAGIC),
+		.version  = WCMD_VERSION,
+		.msg_type = WCMD_MSG_REQ,
+		.seq      = htons(seq),
+		.key      = (uint8_t)key,
+		.flags    = 0,
+		._pad     = 0,
+		.value    = (int32_t)htonl((uint32_t)value),
+	};
+	ssize_t w = sendto(s, &req, sizeof(req), 0,
+	                   (struct sockaddr *)&dst, sizeof(dst));
+	int err = (w == sizeof(req)) ? 0 : errno;
+	close(s);
+	return err;
+}
+
 /* ---------- HTTP API ------------------------------------------------- */
 
 typedef struct {
@@ -1212,6 +1313,74 @@ static void api_handle(ApiClient *cli, Config *c, uint64_t startup_us)
 			p += w;
 		}
 		p += snprintf(body + p, sizeof(body) - p, "]");
+		api_send(cli->fd, 200, "application/json", body, p);
+		return;
+	}
+	if (!strcmp(path, "/api/v1/cmd")) {
+		size_t kl;
+		const char *kstr = qs_get(qstr, "key", &kl);
+		if (!kstr) {
+			api_send(cli->fd, 400, "text/plain", "missing ?key=\n", -1);
+			return;
+		}
+		int key = wcmd_key_from_str(kstr, kl);
+		if (key < 0) {
+			api_send(cli->fd, 400, "text/plain",
+			         "key must be bitrate_kbps|fps|payload_bytes|force_idr\n", -1);
+			return;
+		}
+		int32_t value = 0;
+		int v;
+		if (qs_get_int(qstr, "value", &v) == 0) value = (int32_t)v;
+		else if (key != WCMD_KEY_FORCE_IDR) {
+			api_send(cli->fd, 400, "text/plain",
+			         "this key requires ?value=\n", -1);
+			return;
+		}
+		/* Rate limit per key. */
+		if (c->venc_cmd_rate_limit_ms > 0 && key >= 1 && key <= WCMD_KEY_MAX) {
+			uint64_t t_ms = now_ms();
+			uint64_t since = t_ms - g_wcmd_last_send_ms[key];
+			if (g_wcmd_last_send_ms[key] != 0 &&
+			    (int)since < c->venc_cmd_rate_limit_ms) {
+				char body[128];
+				int p = snprintf(body, sizeof(body),
+				                 "{\"ok\":false,\"error\":\"rate_limited\","
+				                 "\"key\":\"%s\",\"retry_after_ms\":%d}",
+				                 wcmd_key_name(key),
+				                 c->venc_cmd_rate_limit_ms - (int)since);
+				api_send(cli->fd, 429, "application/json", body, p);
+				return;
+			}
+		}
+		uint16_t seq = 0;
+		int rc = wcmd_emit(c, key, value, &seq);
+		if (rc == -1) {
+			api_send(cli->fd, 503, "application/json",
+			         "{\"ok\":false,\"error\":\"venc_cmd disabled or uplink missing\"}",
+			         -1);
+			return;
+		}
+		if (rc != 0) {
+			char body[128];
+			int p = snprintf(body, sizeof(body),
+			                 "{\"ok\":false,\"error\":\"sendto: %s\"}",
+			                 strerror(rc));
+			api_send(cli->fd, 502, "application/json", body, p);
+			return;
+		}
+		g_wcmd_last_send_ms[key] = now_ms();
+		char body[128];
+		int p;
+		if (key == WCMD_KEY_FORCE_IDR) {
+			p = snprintf(body, sizeof(body),
+			             "{\"ok\":true,\"seq\":%u,\"key\":\"%s\"}",
+			             (unsigned)seq, wcmd_key_name(key));
+		} else {
+			p = snprintf(body, sizeof(body),
+			             "{\"ok\":true,\"seq\":%u,\"key\":\"%s\",\"value\":%d}",
+			             (unsigned)seq, wcmd_key_name(key), (int)value);
+		}
 		api_send(cli->fd, 200, "application/json", body, p);
 		return;
 	}

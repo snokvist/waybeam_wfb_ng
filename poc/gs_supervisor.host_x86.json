@@ -59,7 +59,7 @@
   ],
 
   "venc_cmd": {
-    "enabled": false,
+    "enabled": true,
     "uplink_tunnel": "uplink",
     "rate_limit_ms": 50
   }
