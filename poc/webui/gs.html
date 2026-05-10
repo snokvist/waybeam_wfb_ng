@@ -420,7 +420,12 @@ const $$=s=>document.querySelectorAll(s);
  * attribute strings. Tunnel/iface names come from the supervisor's
  * config (root-edited), so the blast radius is small, but we still
  * round-trip everything through this so a config typo can't break
- * page rendering or smuggle </script> into innerHTML. */
+ * page rendering or smuggle a closing-script tag into innerHTML.
+ *
+ * (Don't write that tag literally inside a JS comment — the HTML
+ * tokenizer scans script bodies for `<` followed by `/script>` and
+ * closes the script element early, leaving the rest of this file as
+ * stray markup.  That bit me; hence this note.) */
 function esc(v){
   return String(v==null?'':v)
     .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
