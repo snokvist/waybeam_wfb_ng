@@ -1,14 +1,14 @@
-# Cross-build the link_controller POC for SigmaStar Infinity6E (armv7l).
+# Build link_controller — the vehicle-side wfb adaptive FEC + WCMD/CSA daemon.
 #
-# Usage (from waybeam_wfb_ng/poc/):
-#   make -f Makefile.link_controller                # cross-build (incl. WebUI)
-#   make -f Makefile.link_controller webui          # regen embedded WebUI only
-#   make -f Makefile.link_controller host           # native host build (debug)
-#   make -f Makefile.link_controller deploy         # scp to DEPLOY_HOST
-#   make -f Makefile.link_controller clean
+# Run from waybeam_wfb_ng/vehicle/:
+#   make             # cross-build for SigmaStar Infinity6E (armv7l), incl. WebUI
+#   make webui       # regenerate the embedded WebUI header
+#   make host        # native host build (debug, x86)
+#   make deploy      # scp the cross binary to DEPLOY_HOST
+#   make clean
 #
 # Env:
-#   DEPLOY_HOST=192.168.1.13   target star6e IP (default)
+#   DEPLOY_HOST=192.168.1.13   target armv7l vehicle IP (default)
 #   DEPLOY_DIR=/tmp            destination dir
 
 TOOLCHAIN   ?= ../toolchain/toolchain.sigmastar-infinity6e
@@ -21,7 +21,10 @@ OUT_HOST     = $(BUILD_DIR)/link_controller.host
 SRC          = link_controller.c csa/csa.c
 CSA_HDR      = csa/csa.h
 WEBUI_SRC    = webui/index.html
-WEBUI_HDR    = webui_assets.h
+WEBUI_HDR    = webui/index_assets.h
+
+# `shared/` carries WCMD wire-format and other cross-side headers.
+SHARED_INC   = -I../shared
 
 CFLAGS_COMMON = -std=gnu99 -O2 -Wall -Wextra -Wno-missing-field-initializers
 LDFLAGS_COMMON = -lm
@@ -50,7 +53,7 @@ $(BUILD_DIR):
 	@mkdir -p $@
 
 $(OUT): $(SRC) $(CSA_HDR) $(WEBUI_HDR) | $(BUILD_DIR)
-	$(CROSS_CC) $(CFLAGS_COMMON) -I. -Icsa -o $@ $(SRC) $(LDFLAGS_COMMON)
+	$(CROSS_CC) $(CFLAGS_COMMON) $(SHARED_INC) -I. -Icsa -Iwebui -o $@ $(SRC) $(LDFLAGS_COMMON)
 	$(CROSS_STRIP) $@
 	@echo "[link] built $@"
 	@ls -la $@
@@ -58,7 +61,7 @@ $(OUT): $(SRC) $(CSA_HDR) $(WEBUI_HDR) | $(BUILD_DIR)
 host: $(OUT_HOST)
 
 $(OUT_HOST): $(SRC) $(CSA_HDR) $(WEBUI_HDR) | $(BUILD_DIR)
-	cc $(CFLAGS_COMMON) -I. -Icsa -g -o $@ $(SRC) $(LDFLAGS_COMMON)
+	cc $(CFLAGS_COMMON) $(SHARED_INC) -I. -Icsa -Iwebui -g -o $@ $(SRC) $(LDFLAGS_COMMON)
 	@echo "[link] host build: $@"
 
 clean:
@@ -69,8 +72,8 @@ deploy: $(OUT)
 	@echo "[link] deployed to root@$(DEPLOY_HOST):$(DEPLOY_DIR)/link_controller"
 
 help:
-	@echo "make -f Makefile.link_controller         # cross-build (incl. WebUI)"
-	@echo "make -f Makefile.link_controller webui   # regen embedded WebUI only"
-	@echo "make -f Makefile.link_controller host    # native host build"
-	@echo "make -f Makefile.link_controller deploy  # scp to root@\$$DEPLOY_HOST"
-	@echo "make -f Makefile.link_controller clean"
+	@echo "make             # cross-build for armv7l (incl. WebUI)"
+	@echo "make webui       # regenerate embedded WebUI header"
+	@echo "make host        # native host build"
+	@echo "make deploy      # scp to root@\$$DEPLOY_HOST"
+	@echo "make clean"
