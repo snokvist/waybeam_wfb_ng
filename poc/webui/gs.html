@@ -107,6 +107,22 @@ select{cursor:pointer;-webkit-appearance:none;appearance:none;background-image:u
 .btn-fire{background:var(--accent);color:#fff}
 .btn-fire:hover:not(:disabled){background:#d63b54;transform:translateY(-1px)}
 
+/* Compact key/value grid for combined cards (label : input pairs).
+ * Inputs all line up against a fixed-width label column. */
+.kv-grid{display:grid;grid-template-columns:160px 200px;gap:.4rem .8rem;
+         align-items:center;padding:.4rem 0;font-family:'JetBrains Mono',monospace}
+.kv-grid label{font-size:.78rem;color:var(--text);font-family:'JetBrains Mono',monospace}
+.kv-grid label .help{display:block;font-size:.7rem;color:var(--text-dim);margin-top:1px;font-family:'DM Sans',sans-serif}
+.kv-grid input,.kv-grid select{max-width:200px}
+
+/* Subsection heading inside a card. */
+.subhead{margin:.8rem 0 .2rem 0;font-size:.78rem;font-weight:600;
+         color:var(--text-bright);font-family:'JetBrains Mono',monospace}
+
+/* Left-aligned action-button row. */
+.action-row{display:flex;gap:.5rem;justify-content:flex-start;
+            align-items:center;flex-wrap:wrap;padding:.5rem 0 .2rem 0}
+
 /* Result/last-reply pane */
 .reply{background:var(--bg);border:1px solid var(--border);border-radius:4px;padding:.5rem .8rem;margin-top:.5rem;font-family:'JetBrains Mono',monospace;font-size:.75rem;color:var(--text);white-space:pre-wrap;word-break:break-all;min-height:1.4em}
 .reply.ok{border-left:3px solid var(--live)}
@@ -183,11 +199,9 @@ select{cursor:pointer;-webkit-appearance:none;appearance:none;background-image:u
         <div class="field-label">dwell_ms <span class="help">600–1000 ms is typical for RTL88x2</span></div>
         <input type="number" id="scan-dwell" value="800" min="200" max="10000">
       </div>
-      <div class="field" style="grid-template-columns:auto auto 1fr auto;gap:.5rem">
+      <div class="action-row">
         <button class="btn btn-fire" onclick="scanFire()">Start scan</button>
-        <button class="btn-mini btn-stop" onclick="scanCancel()">Cancel</button>
-        <span></span>
-        <span></span>
+        <button class="btn btn-stop" onclick="scanCancel()">Cancel</button>
       </div>
       <div class="reply" id="reply-scan"></div>
       <div class="muted" id="scan-state" style="margin-top:.4rem">scan idle</div>
@@ -204,7 +218,10 @@ select{cursor:pointer;-webkit-appearance:none;appearance:none;background-image:u
     <div class="reply" id="reply-gs-txpower"></div>
   </div>
 
-  <!-- Local wfb_tx control: target + FEC + Radio combined into one card -->
+  <!-- Local wfb_tx control: target + FEC + Radio combined into one card.
+       All input rows share a single 2-column grid (label : input) so the
+       inputs line up vertically; action buttons are left-aligned in their
+       own row beneath each subsection. -->
   <div class="section">
     <div class="section-header"><h3>Local wfb_tx (uplink) — fec / radio</h3>
       <span class="help">Direct wfb_cmd into the GS-side tx tunnel's control_port. Affects this ground-side TX only; vehicle RX adapts to whatever it sees.</span></div>
@@ -215,39 +232,36 @@ select{cursor:pointer;-webkit-appearance:none;appearance:none;background-image:u
         <span></span>
       </div>
 
-      <h4 style="margin:.6rem 0 .2rem 0">FEC (set_fec / get_fec)</h4>
-      <div class="field" style="grid-template-columns:auto 5rem auto 5rem auto 8rem auto auto;gap:.4rem;align-items:center;flex-wrap:wrap">
-        <span class="muted">k</span>
+      <h4 class="subhead">FEC (set_fec / get_fec)</h4>
+      <div class="kv-grid">
+        <label for="fec-k">k <span class="help">data shards per FEC block</span></label>
         <input type="number" id="fec-k" min="1" max="255" value="1">
-        <span class="muted">n</span>
+
+        <label for="fec-n">n <span class="help">total shards (k + parity)</span></label>
         <input type="number" id="fec-n" min="1" max="255" value="2">
-        <span class="muted">timeout_ms <span class="help">(keep)</span></span>
+
+        <label for="fec-to">timeout_ms <span class="help">empty = leave running value</span></label>
         <input type="number" id="fec-to" min="0" max="65534" placeholder="(keep)">
-        <button class="btn-mini btn-fire" onclick="ctrlGetFec()">Get</button>
-        <button class="btn-mini btn-apply" onclick="ctrlSetFec()">Set</button>
+      </div>
+      <div class="action-row">
+        <button class="btn btn-fire"  onclick="ctrlGetFec()">Get FEC</button>
+        <button class="btn btn-apply" onclick="ctrlSetFec()">Set FEC</button>
       </div>
       <div class="reply" id="reply-fec"></div>
 
-      <h4 style="margin:.8rem 0 .2rem 0">Radio (set_radio / get_radio)</h4>
-      <div class="field" style="grid-template-columns:repeat(7,auto);gap:.4rem;align-items:center;flex-wrap:wrap">
-        <span class="muted">stbc</span>     <input type="number" id="r-stbc" min="0" max="3" value="0" style="width:4rem">
-        <span class="muted">ldpc</span>     <input type="number" id="r-ldpc" min="0" max="1" value="0" style="width:4rem">
-        <span class="muted">sgi</span>      <input type="number" id="r-sgi"  min="0" max="1" value="0" style="width:4rem">
-        <span></span>
+      <h4 class="subhead">Radio (set_radio / get_radio)</h4>
+      <div class="kv-grid">
+        <label for="r-stbc">stbc</label>      <input type="number" id="r-stbc" min="0" max="3" value="0">
+        <label for="r-ldpc">ldpc</label>      <input type="number" id="r-ldpc" min="0" max="1" value="0">
+        <label for="r-sgi">short_gi</label>   <input type="number" id="r-sgi"  min="0" max="1" value="0">
+        <label for="r-bw">bandwidth (MHz)</label> <input type="number" id="r-bw" min="5" max="80" value="20">
+        <label for="r-mcs">mcs_index</label>  <input type="number" id="r-mcs"  min="0" max="31" value="1">
+        <label for="r-vhtm">vht_mode</label>  <input type="number" id="r-vhtm" min="0" max="1" value="0">
+        <label for="r-vhtn">vht_nss</label>   <input type="number" id="r-vhtn" min="1" max="4" value="1">
       </div>
-      <div class="field" style="grid-template-columns:repeat(7,auto);gap:.4rem;align-items:center;flex-wrap:wrap;margin-top:.3rem">
-        <span class="muted">bw MHz</span>   <input type="number" id="r-bw"   min="5" max="80" value="20" style="width:5rem">
-        <span class="muted">mcs</span>      <input type="number" id="r-mcs"  min="0" max="31" value="1"  style="width:4rem">
-        <span></span>
-      </div>
-      <div class="field" style="grid-template-columns:repeat(7,auto);gap:.4rem;align-items:center;flex-wrap:wrap;margin-top:.3rem">
-        <span class="muted">vht_mode</span> <input type="number" id="r-vhtm" min="0" max="1" value="0" style="width:4rem">
-        <span class="muted">vht_nss</span>  <input type="number" id="r-vhtn" min="1" max="4" value="1" style="width:4rem">
-        <span></span>
-        <span></span>
-        <span></span>
-        <button class="btn-mini btn-fire"  onclick="ctrlGetRadio()">Get</button>
-        <button class="btn-mini btn-apply" onclick="ctrlSetRadio()">Set</button>
+      <div class="action-row">
+        <button class="btn btn-fire"  onclick="ctrlGetRadio()">Get Radio</button>
+        <button class="btn btn-apply" onclick="ctrlSetRadio()">Set Radio</button>
       </div>
       <div class="reply" id="reply-radio"></div>
     </div>
@@ -296,10 +310,9 @@ select{cursor:pointer;-webkit-appearance:none;appearance:none;background-image:u
         <div class="field-label">t_revert_ms</div>
         <input type="number" id="csa-revert" value="3000" min="500" max="30000">
       </div>
-      <div class="field" style="grid-template-columns:auto 1fr auto;gap:.5rem">
-        <label style="display:flex;align-items:center;gap:.3rem"><input type="checkbox" id="csa-no-revert"> no_revert</label>
-        <span></span>
+      <div class="action-row">
         <button class="btn btn-fire" onclick="csaFire()">Hop</button>
+        <label style="display:flex;align-items:center;gap:.3rem;font-size:.78rem;color:var(--text)"><input type="checkbox" id="csa-no-revert"> no_revert</label>
       </div>
       <div class="reply" id="reply-csa"></div>
       <div class="muted" id="csa-state" style="margin-top:.4rem">phase: idle</div>
@@ -342,8 +355,7 @@ select{cursor:pointer;-webkit-appearance:none;appearance:none;background-image:u
         <input type="number" id="cmd-value" placeholder="e.g. 4000">
         <span></span>
       </div>
-      <div class="field" style="grid-template-columns:1fr auto;gap:.5rem">
-        <span></span>
+      <div class="action-row">
         <button class="btn btn-fire" onclick="cmdFire()">Send</button>
       </div>
       <div class="reply" id="reply-cmd"></div>
