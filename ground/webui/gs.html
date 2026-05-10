@@ -106,6 +106,12 @@ select{cursor:pointer;-webkit-appearance:none;appearance:none;background-image:u
 .btn-apply:hover:not(:disabled){background:#16a34a;transform:translateY(-1px)}
 .btn-fire{background:var(--accent);color:#fff}
 .btn-fire:hover:not(:disabled){background:#d63b54;transform:translateY(-1px)}
+/* Outline-warn variant — matches the .btn-mini.btn-stop look in the
+ * Tunnels tab.  Without this rule, .btn (border:none, no background)
+ * combined with .btn-stop (warn text only) renders white-on-yellow,
+ * which is unreadable. */
+.btn.btn-stop{background:var(--bg);color:var(--warn);border:1px solid var(--warn)}
+.btn.btn-stop:hover:not(:disabled){background:var(--warn-bg);transform:translateY(-1px)}
 
 /* Compact key/value grid for combined cards (label : input pairs).
  * Inputs all line up against a fixed-width label column. */
