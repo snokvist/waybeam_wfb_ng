@@ -66,6 +66,13 @@ The first batch (everything ticked below) shipped in PR #47
 verbatim so the original wording, file:line references, and rationale
 stay searchable.
 
+## link_controller (vehicle)
+
+- ~~No first-class way to set the wlan iface MTU.~~  PR #48 adds
+  `--iface-mtu N` (range [576, 9000]) which fork+execvp's
+  `ip link set dev <iface> mtu N` against `{csa.iface, cmd.wfb_iface}`
+  at startup.  Skipped under `--dry-run`.
+
 ## WCMD / link_controller
 
 - **Spaced WCMD burst across FEC blocks.** `wcmd_emit()` currently sends
@@ -92,6 +99,10 @@ stay searchable.
 
 ## gs_supervisor
 
+- ~~Empty `system.up`/`system.down` arrays were undocumented as the
+  "trust host OS" mode.~~  PR #48 adds an explicit startup log line
+  ("trusting host OS for iface bring-up …") and a `_comment_system`
+  hint in `ground/config/example.json`.
 - ~~Stale CSA reference in comment.~~  Updated to point at
   `vehicle/csa/csa.c` and `vehicle/csa/PROTOCOL.md`.
 - **Drain swallows packets that should re-emit downstream.**
@@ -121,7 +132,8 @@ stay searchable.
 
 - **`populate*Select` rebuild on every refresh** — preserves selection
   but blows away listeners and DOM nodes wastefully.  Move to a diff
-  rather than full rebuild.
+  rather than full rebuild.  (Note: `populateIfaceChecks` from PR #48
+  inherits the same full-rebuild pattern; same diff treatment applies.)
 - **`set_radio` form doesn't pre-populate from the live cache.**
   Operator has to read the cache and type.  Auto-fill the inputs from
   `t.radio` on tunnel selection.
@@ -130,6 +142,9 @@ stay searchable.
 - ~~`csa-prev-ht` falls back silently if iface state reports `HT80`.~~
   Added HT80 option and a toast when iface state contains an unknown
   width (defaults to HT20 with operator notification).
+- ~~`<select multiple>` iface pickers need Ctrl+click and don't work
+  on touch devices.~~  Replaced with checkbox lists (`.iface-checks`)
+  in PR #48 — tap-friendly, ≥36 px row targets, multi-select.
 - **Stats columns are still per-100 ms-interval, not running totals.**
   This PR fixed the misleading `kB` label by dropping it; if operators
   want a "total bytes sent this session" view, the supervisor needs to

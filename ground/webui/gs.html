@@ -113,6 +113,23 @@ select{cursor:pointer;-webkit-appearance:none;appearance:none;background-image:u
 .btn.btn-stop{background:var(--bg);color:var(--warn);border:1px solid var(--warn)}
 .btn.btn-stop:hover:not(:disabled){background:var(--warn-bg);transform:translateY(-1px)}
 
+/* Mobile-friendly multi-iface picker — replaces <select multiple> which
+ * needs Ctrl+click on desktop and is broken on touch devices. Each row is
+ * a single tap target ≥36px tall; multiple rows can be selected
+ * independently. */
+.iface-checks{display:flex;flex-direction:column;gap:.25rem;
+  border:1px solid var(--border);border-radius:5px;background:var(--bg);
+  padding:.35rem;max-height:11rem;overflow-y:auto}
+.iface-check{display:flex;align-items:center;gap:.6rem;
+  padding:.45rem .55rem;border-radius:4px;cursor:pointer;
+  font-size:.82rem;color:var(--text);font-family:'JetBrains Mono',monospace;
+  user-select:none;min-height:36px;transition:background .1s}
+.iface-check:hover{background:var(--bg2)}
+.iface-check input[type="checkbox"]{width:18px;height:18px;cursor:pointer;
+  accent-color:var(--accent);margin:0;flex:0 0 auto}
+.iface-check.empty{color:var(--text-dim);cursor:default;font-style:italic}
+.iface-check.empty:hover{background:transparent}
+
 /* Compact key/value grid for combined cards (label : input pairs).
  * Inputs all line up against a fixed-width label column. */
 .kv-grid{display:grid;grid-template-columns:160px 200px;gap:.4rem .8rem;
@@ -186,8 +203,8 @@ select{cursor:pointer;-webkit-appearance:none;appearance:none;background-image:u
       <span class="help">Cycle the GS adapter(s) through a channel list, dwelling on each combo. Stops on the first one where wfb_rx successfully decrypts a packet — the vehicle is on that channel. Vehicle does not need to cooperate.</span></div>
     <div class="section-body">
       <div class="field">
-        <div class="field-label">ifaces <span class="help">copies the same selection used in CSA</span></div>
-        <select id="scan-iface" multiple size="3" style="width:100%"></select>
+        <div class="field-label">ifaces <span class="help">tap to toggle — copies the same selection used in CSA</span></div>
+        <div id="scan-iface" class="iface-checks"></div>
       </div>
       <div class="field">
         <div class="field-label">chans <span class="help">comma-separated channel list</span></div>
@@ -282,8 +299,8 @@ select{cursor:pointer;-webkit-appearance:none;appearance:none;background-image:u
       <span class="help">Sends 5 <code>csa_commit</code> JSON frames to the vehicle over the uplink, then runs <code>iw set channel</code> locally at T_switch. Vehicle's csa_tick mirrors the same timing. Auto-revert if no rx traffic within t_revert_ms.</span></div>
     <div class="section-body">
       <div class="field">
-        <div class="field-label">ifaces <span class="help">GS-side adapter(s) to switch — pick one or more (Ctrl+click for multi)</span></div>
-        <select id="csa-iface" multiple size="3" style="width:100%"></select>
+        <div class="field-label">ifaces <span class="help">tap to toggle — GS-side adapter(s) to switch (multi-select)</span></div>
+        <div id="csa-iface" class="iface-checks"></div>
       </div>
       <div class="field">
         <div class="field-label">target chan</div>
@@ -578,31 +595,61 @@ async function gsTxpower(iface, mbm){
   }catch(e){ toast(`txpower failed: ${e.message||e}`,'err'); }
 }
 
+/* Pull the checked-iface list out of an .iface-checks container. Works
+ * for both the scan-iface and csa-iface pickers. */
+function getIfaceChecked(id){
+  const root=document.getElementById(id);
+  if(!root) return [];
+  return Array.from(root.querySelectorAll('input[type=checkbox]:checked'))
+    .map(cb=>cb.value);
+}
+
+/* Rebuild a checkbox iface picker. Preserves the operator's prior
+ * selection across refreshes; on first load, selects everything so the
+ * diversity case "just works". `onChange` fires after each tap so callers
+ * (e.g. csaAutofillPrev) can react. */
+function populateIfaceChecks(rootId, ifaces, onChange){
+  const root=document.getElementById(rootId);
+  if(!root) return;
+  const wasFirst=root.dataset.firstLoad!=='no';
+  // Capture current selection BEFORE we wipe the DOM.
+  const cur=new Set(Array.from(root.querySelectorAll('input[type=checkbox]:checked'))
+    .map(cb=>cb.value));
+  root.innerHTML='';
+  if(!ifaces.length){
+    const empty=document.createElement('div');
+    empty.className='iface-check empty';
+    empty.textContent='no ifaces — check tunnels config';
+    root.appendChild(empty);
+    return;
+  }
+  ifaces.forEach(name=>{
+    const lbl=document.createElement('label');
+    lbl.className='iface-check';
+    const cb=document.createElement('input');
+    cb.type='checkbox';
+    cb.value=name;
+    if((cur.size===0 && wasFirst) || cur.has(name)) cb.checked=true;
+    if(typeof onChange==='function') cb.addEventListener('change', onChange);
+    const span=document.createElement('span');
+    span.textContent=ifaceLabel(name);
+    lbl.appendChild(cb);
+    lbl.appendChild(span);
+    root.appendChild(lbl);
+  });
+  root.dataset.firstLoad='no';
+}
+
 function populateCsaIfaceSelect(ts){
-  const sel=$('#csa-iface');
-  if(!sel) return;
   const seen=new Set();
   const ifaces=[];
   (ts||[]).forEach(t=>(t.interfaces||[]).forEach(i=>{
     if(!seen.has(i)){ seen.add(i); ifaces.push(i); }
   }));
-  // Preserve current selection set if still present.
-  const cur=new Set(Array.from(sel.selectedOptions||[]).map(o=>o.value));
-  const wasFirst=sel.dataset.firstLoad!=='no';
-  sel.innerHTML='';
-  ifaces.forEach(i=>{
-    const o=document.createElement('option');
-    o.value=i;
-    o.textContent=ifaceLabel(i);
-    // First load: select all by default so the diversity case "just works".
-    if((cur.size===0 && wasFirst) || cur.has(i)) o.selected=true;
-    sel.appendChild(o);
-  });
-  if(wasFirst){
-    sel.dataset.firstLoad='no';
-    sel.addEventListener('change', csaAutofillPrev);
-    csaAutofillPrev();
-  }
+  const root=document.getElementById('csa-iface');
+  const wasFirst=root && root.dataset.firstLoad!=='no';
+  populateIfaceChecks('csa-iface', ifaces, csaAutofillPrev);
+  if(wasFirst) csaAutofillPrev();
 }
 
 /* Pull prev_chan/prev_ht from the first selected iface's current state.
@@ -613,9 +660,7 @@ function populateCsaIfaceSelect(ts){
  * Does NOT run on every refresh — that would clobber a deliberate
  * operator edit between selection and clicking Hop. */
 function csaAutofillPrev(){
-  const sel=$('#csa-iface');
-  if(!sel) return;
-  const first=Array.from(sel.selectedOptions||[]).map(o=>o.value)[0];
+  const first=getIfaceChecked('csa-iface')[0];
   if(!first) return;
   const s=ifaceLookup(first);
   if(!s||s.chan<=0) return;
@@ -653,24 +698,12 @@ async function refreshCsaState(){
 }
 
 function populateScanIfaceSelect(ts){
-  const sel=$('#scan-iface');
-  if(!sel) return;
   const seen=new Set();
   const ifaces=[];
   (ts||[]).forEach(t=>(t.interfaces||[]).forEach(i=>{
     if(!seen.has(i)){ seen.add(i); ifaces.push(i); }
   }));
-  const cur=new Set(Array.from(sel.selectedOptions||[]).map(o=>o.value));
-  const wasFirst=sel.dataset.firstLoad!=='no';
-  sel.innerHTML='';
-  ifaces.forEach(i=>{
-    const o=document.createElement('option');
-    o.value=i;
-    o.textContent=ifaceLabel(i);
-    if((cur.size===0 && wasFirst) || cur.has(i)) o.selected=true;
-    sel.appendChild(o);
-  });
-  sel.dataset.firstLoad='no';
+  populateIfaceChecks('scan-iface', ifaces, null);
 }
 
 async function refreshScanState(){
@@ -695,8 +728,7 @@ async function refreshScanState(){
 }
 
 async function scanFire(){
-  const sel=$('#scan-iface');
-  const ifaceList=Array.from(sel.selectedOptions).map(o=>o.value);
+  const ifaceList=getIfaceChecked('scan-iface');
   const chans=$('#scan-chans').value.trim();
   const ht=$('#scan-ht').value;
   const dwell=parseInt($('#scan-dwell').value,10);
@@ -731,8 +763,7 @@ async function scanCancel(){
 }
 
 async function csaFire(){
-  const sel=$('#csa-iface');
-  const ifaceList=Array.from(sel.selectedOptions).map(o=>o.value);
+  const ifaceList=getIfaceChecked('csa-iface');
   const chan=parseInt($('#csa-chan').value,10);
   const ht=$('#csa-ht').value;
   const prev_chan=parseInt($('#csa-prev-chan').value,10);

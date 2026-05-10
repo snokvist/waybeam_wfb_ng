@@ -3,6 +3,7 @@
 
   "http": { "bind": "0.0.0.0", "port": 9080 },
 
+  "_comment_system": "Empty up/down arrays mean the host OS owns the link layer. Add commands to manage monitor mode, MTU, txpower etc. — examples: 'iw dev wlan0 set monitor otherbss', 'ip link set wlan0 mtu 1600', 'ip link set wlan0 up'.",
   "system": {
     "up":   [],
     "down": []

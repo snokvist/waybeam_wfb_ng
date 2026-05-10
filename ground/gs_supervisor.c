@@ -3664,6 +3664,11 @@ int main(int argc, char **argv)
 	sigaction(SIGHUP,  &sa, NULL);
 	signal(SIGPIPE, SIG_IGN);
 
+	if (cfg.system_up_count == 0 && cfg.system_down_count == 0) {
+		LOG_INFO("system.up/down empty — trusting host OS for iface "
+		         "bring-up (monitor mode, MTU, txpower) and skipping "
+		         "managed link-layer setup");
+	}
 	run_system_block("system.up", cfg.system_up, cfg.system_up_count);
 
 	/* Drivers (notably rtl88xxau and friends) take a variable amount of
