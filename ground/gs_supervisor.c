@@ -1074,6 +1074,47 @@ static struct {
 
 static uint32_t g_csa_seq_in_burst = 0;
 
+/* Bounded waitpid: like waitpid(pid, NULL, 0) but returns by deadline_ms.
+ * If the child doesn't exit before the deadline, sends SIGKILL and waits
+ * up to ~250 ms for the kernel to deliver and reap.  Used to bound the
+ * synchronous fork+exec helpers that an api_handle path drives — without
+ * this a wedged USB driver or stuck `iw` could block the supervisor's
+ * event loop for tens of seconds.
+ *
+ * Returns:
+ *   >=0  WEXITSTATUS of normally-exited child
+ *   -1   child crashed/signaled (no clean exit status)
+ *   -2   deadline expired (SIGKILL sent; child reaped)
+ *   -3   waitpid error (errno preserved)
+ */
+static int waitpid_deadline(pid_t pid, int deadline_ms)
+{
+	uint64_t end = now_ms() + (uint64_t)deadline_ms;
+	const struct timespec sleep_5ms = { .tv_sec = 0, .tv_nsec = 5 * 1000 * 1000 };
+	for (;;) {
+		int st = 0;
+		pid_t r = waitpid(pid, &st, WNOHANG);
+		if (r == pid) return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+		if (r < 0) return -3;
+		if (now_ms() >= end) {
+			kill(pid, SIGKILL);
+			for (int i = 0; i < 50; i++) {
+				pid_t r2 = waitpid(pid, &st, WNOHANG);
+				if (r2 == pid || r2 < 0) break;
+				nanosleep(&sleep_5ms, NULL);
+			}
+			return -2;
+		}
+		nanosleep(&sleep_5ms, NULL);
+	}
+}
+
+/* Default per-call deadline for the iw / ip-link forks driven by api
+ * handlers.  iw set channel / set txpower normally returns in 30–80 ms
+ * on RTL88x2; 1 s gives a wedged driver enough time to recover before
+ * we SIGKILL and report a 502 to the operator. */
+#define GS_FORK_DEADLINE_MS 1000
+
 /* fork+exec `iw dev <iface> set channel <chan> <ht>`. */
 static int run_iw_set_channel(const char *iface, int chan, const char *ht)
 {
@@ -1089,9 +1130,10 @@ static int run_iw_set_channel(const char *iface, int chan, const char *ht)
 		       cs, ht, (char*)NULL);
 		_exit(127);
 	}
-	int st;
-	waitpid(pid, &st, 0);
-	return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+	int rc = waitpid_deadline(pid, GS_FORK_DEADLINE_MS);
+	if (rc == -2) LOG_WARN("iw set channel %s: deadline %d ms — SIGKILL'd",
+	                       iface, GS_FORK_DEADLINE_MS);
+	return rc;
 }
 
 /* Persistent UDP socket for csa_send_commit_frame().  Opened lazily on
@@ -1780,21 +1822,43 @@ static int run_capture(char *const argv[], char *out, size_t cap)
 		_exit(127);
 	}
 	close(pipefd[1]);
+	int rfd = pipefd[0];
+	int flags = fcntl(rfd, F_GETFL, 0);
+	if (flags >= 0) fcntl(rfd, F_SETFL, flags | O_NONBLOCK);
 	size_t pos = 0;
+	const uint64_t deadline = now_ms() + GS_FORK_DEADLINE_MS;
+	bool timed_out = false;
 	while (pos + 1 < cap) {
-		ssize_t r = read(pipefd[0], out + pos, cap - 1 - pos);
-		if (r < 0) {
+		uint64_t now = now_ms();
+		if (now >= deadline) { timed_out = true; break; }
+		struct pollfd p = { .fd = rfd, .events = POLLIN };
+		int pr = poll(&p, 1, (int)(deadline - now));
+		if (pr < 0) {
 			if (errno == EINTR) continue;
+			break;
+		}
+		if (pr == 0) { timed_out = true; break; }
+		ssize_t r = read(rfd, out + pos, cap - 1 - pos);
+		if (r < 0) {
+			if (errno == EINTR || errno == EAGAIN) continue;
 			break;
 		}
 		if (r == 0) break;
 		pos += (size_t)r;
 	}
 	out[pos] = 0;
-	close(pipefd[0]);
-	int st;
-	if (waitpid(pid, &st, 0) < 0) return -1;
-	return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+	close(rfd);
+	if (timed_out) {
+		kill(pid, SIGKILL);
+		(void)waitpid_deadline(pid, 250);
+		LOG_WARN("run_capture(%s): deadline %d ms — SIGKILL'd",
+		         argv[0] ? argv[0] : "?", GS_FORK_DEADLINE_MS);
+		return -1;
+	}
+	int rc = waitpid_deadline(pid, GS_FORK_DEADLINE_MS);
+	if (rc == -2) LOG_WARN("run_capture(%s): waitpid deadline — SIGKILL'd",
+	                       argv[0] ? argv[0] : "?");
+	return (rc < 0) ? -1 : rc;
 }
 
 static int iface_is_monitor(const char *iface)
@@ -3326,9 +3390,10 @@ static void api_handle(ApiClient *cli, Config *c, uint64_t startup_us)
 			_exit(127);
 		}
 		if (pid > 0) {
-			int st;
-			waitpid(pid, &st, 0);
-			rc = WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+			rc = waitpid_deadline(pid, GS_FORK_DEADLINE_MS);
+			if (rc == -2) LOG_WARN("REST /system/txpower: iw dev %s "
+			                       "deadline %d ms — SIGKILL'd",
+			                       iface, GS_FORK_DEADLINE_MS);
 		}
 		IfaceState *ist = iface_state_find(iface);
 		if (ist) (void)iface_state_query(ist);

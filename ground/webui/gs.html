@@ -503,10 +503,28 @@ function toast(msg, kind){
   setTimeout(()=>t.remove(),3000);
 }
 
+/* AbortController-backed fetch with a default 1 s deadline.  Without
+ * this, a stuck `wfb_cmd` (200 ms recv timeout) or `iw` fork (~80 ms)
+ * piles up if the operator spams a button — each request waits for the
+ * full handler chain on the supervisor side.  Pass `timeout_ms` to
+ * override per call (e.g. scan/csa endpoints that arm a state machine
+ * still return in <100 ms; the 1 s default is fine). */
+async function fetchT(url, opts){
+  const o = opts || {};
+  const ctrl = new AbortController();
+  const timeout_ms = o.timeout_ms || 1000;
+  const timer = setTimeout(()=>ctrl.abort(), timeout_ms);
+  try {
+    return await fetch(url, {...o, signal: ctrl.signal});
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 let lastTunnels=[];
 async function refresh(){
   try{
-    const r=await fetch('/api/v1/status');
+    const r=await fetchT('/api/v1/status');
     if(!r.ok) throw new Error('HTTP '+r.status);
     const j=await r.json();
     $('#tbar-up').textContent=fmtUptime(j.uptime_s);
@@ -521,7 +539,7 @@ async function refresh(){
     }
     setConn(true);
     // pull /tunnels for full detail
-    const r2=await fetch('/api/v1/tunnels');
+    const r2=await fetchT('/api/v1/tunnels');
     const tj=await r2.json();
     lastTunnels=tj;
     renderTunnels(tj);
@@ -529,7 +547,7 @@ async function refresh(){
     // /api/v1/ifaces returns the current chan/ht/txpower per adapter.
     let ij=[];
     try{
-      const ri=await fetch('/api/v1/ifaces');
+      const ri=await fetchT('/api/v1/ifaces');
       ij=await ri.json();
     }catch(e){}
     lastIfaces=ij;
@@ -588,7 +606,7 @@ function renderGsTxpowerRow(ts){
 
 async function gsTxpower(iface, mbm){
   try{
-    const r=await fetch(`/api/v1/system/txpower?iface=${encodeURIComponent(iface)}&mbm=${mbm}`);
+    const r=await fetchT(`/api/v1/system/txpower?iface=${encodeURIComponent(iface)}&mbm=${mbm}`);
     const j=await r.json();
     setReply('#reply-gs-txpower', j, j.ok);
     toast(`${iface} → ${(mbm/100).toFixed(0)} dBm: ${j.ok?'ok':'iw rc='+j.iw_rc}`, j.ok?'ok':'err');
@@ -677,7 +695,7 @@ function csaAutofillPrev(){
 
 async function refreshCsaState(){
   try{
-    const r=await fetch('/api/v1/csa');
+    const r=await fetchT('/api/v1/csa');
     const j=await r.json();
     const phaseLabel=['idle','burst','armed','verify'][j.phase]||'?';
     const el=$('#csa-state');
@@ -708,7 +726,7 @@ function populateScanIfaceSelect(ts){
 
 async function refreshScanState(){
   try{
-    const r=await fetch('/api/v1/scan');
+    const r=await fetchT('/api/v1/scan');
     const j=await r.json();
     const phaseLabel=['idle','running','found','stopped'][j.phase]||'?';
     const el=$('#scan-state');
@@ -742,7 +760,7 @@ async function scanFire(){
            `&ht=${encodeURIComponent(ht)}&dwell_ms=${dwell}`;
   if(!confirm(`Scan ${ifaceList.length} iface(s) across [${chans}] @ ${dwell} ms each?\n\nVideo will drop until the vehicle's channel is found.`)) return;
   try{
-    const r=await fetch(`/api/v1/system/scan?${qs}`);
+    const r=await fetchT(`/api/v1/system/scan?${qs}`);
     const ctype=r.headers.get('content-type')||'';
     let j;
     if(ctype.includes('application/json')) j=await r.json();
@@ -755,7 +773,7 @@ async function scanFire(){
 
 async function scanCancel(){
   try{
-    const r=await fetch('/api/v1/system/scan/cancel');
+    const r=await fetchT('/api/v1/system/scan/cancel');
     const j=await r.json();
     toast(j.cancelled?'scan cancelled':'scan was idle', 'ok');
     refreshScanState();
@@ -782,7 +800,7 @@ async function csaFire(){
            `&lead_ms=${lead_ms}&t_revert_ms=${t_revert_ms}&no_revert=${no_revert}`;
   if(!confirm(`Hop ${ifaceList.length} iface(s) [${ifacesLabel}] → chan ${chan} ${ht} (revert to ${prev_chan} ${prev_ht} in ${t_revert_ms} ms if no traffic)?\n\nVideo will drop briefly during the switch.`)) return;
   try{
-    const r=await fetch(`/api/v1/system/csa?${qs}`);
+    const r=await fetchT(`/api/v1/system/csa?${qs}`);
     const ctype=r.headers.get('content-type')||'';
     let j;
     if(ctype.includes('application/json')){
@@ -902,6 +920,11 @@ function renderTunnels(ts){
   }).join('');
 }
 
+/* Last tunnel name we successfully auto-filled the set_radio form
+ * from.  Reset on operator-initiated select change so the new tunnel
+ * gets one auto-fill pass, then is left alone. */
+let lastRadioFilled='';
+
 function populateCtrlTunnels(ts){
   const sel=$('#ctrl-tunnel');
   const cur=sel.value;
@@ -910,11 +933,47 @@ function populateCtrlTunnels(ts){
     ? txs.map(t=>`<option value="${esc(t.name)}">${esc(t.name)} (control_port ${esc(t.control_port)})</option>`).join('')
     : `<option value="">no tx tunnels with control_port</option>`;
   if(txs.find(t=>t.name===cur)) sel.value=cur;
+  if(sel.dataset.firstLoad!=='no'){
+    sel.dataset.firstLoad='no';
+    sel.addEventListener('change', ()=>{
+      // Operator picked a different tunnel — drop the no-overwrite guard
+      // and refill immediately from the new tunnel's live cache.
+      lastRadioFilled='';
+      populateRadioFormFromTunnel(sel.value);
+    });
+  }
+  // Auto-fill if we haven't successfully filled this tunnel yet.  If the
+  // cache had have:false at first refresh, this retries until the
+  // wfb_cmd_refresh_radio tick lands; once filled, lastRadioFilled is
+  // set and we stop touching the form so operator edits stick.
+  if(sel.value && lastRadioFilled !== sel.value){
+    populateRadioFormFromTunnel(sel.value);
+  }
+}
+
+/* Pre-populate the set_radio form from the tx tunnel's live wfb_cmd
+ * cache so the operator doesn't have to read t.radio off the dashboard
+ * and re-type it.  Skips when have:false so the form isn't filled with
+ * -1 sentinels before the first wfb_cmd round-trip lands. */
+function populateRadioFormFromTunnel(name){
+  if(!name) return;
+  const t=(lastTunnels||[]).find(x=>x.name===name);
+  if(!t || !t.radio || t.radio.have===false) return;
+  const r=t.radio;
+  const setV=(id,v)=>{ if(v!==undefined && v!==null && v>=0){ const el=$(id); if(el) el.value=v; } };
+  setV('#r-stbc', r.stbc);
+  setV('#r-ldpc', r.ldpc);
+  setV('#r-sgi',  r.short_gi);
+  setV('#r-bw',   r.bw);
+  setV('#r-mcs',  r.mcs);
+  setV('#r-vhtm', r.vht_mode);
+  setV('#r-vhtn', r.vht_nss);
+  lastRadioFilled=name;
 }
 
 async function tunnelAction(name, action){
   try{
-    const r=await fetch(`/api/v1/tunnels/${name}/${action}`);
+    const r=await fetchT(`/api/v1/tunnels/${name}/${action}`);
     const j=await r.json();
     if(j.ok===false) throw new Error(j.error||'failed');
     toast(`${name}: ${action} ok`, 'ok');
@@ -932,7 +991,7 @@ async function ctrlReq(qs, replyId){
   const tunnel=$('#ctrl-tunnel').value;
   if(!tunnel){ toast('no tx tunnel selected','err'); return; }
   try{
-    const r=await fetch(`/api/v1/tunnels/${tunnel}/control?${qs}`);
+    const r=await fetchT(`/api/v1/tunnels/${tunnel}/control?${qs}`);
     const j=await r.json();
     setReply(replyId, j, j.ok);
     if(!j.ok) toast(`control failed: ${j.error||'rc='+j.rc}`,'err');
@@ -958,7 +1017,7 @@ async function cmdFire(){
   let qs=`key=${encodeURIComponent(key)}`;
   if(val!=='' && key!=='force_idr') qs+=`&value=${encodeURIComponent(val)}`;
   try{
-    const r=await fetch(`/api/v1/cmd?${qs}`);
+    const r=await fetchT(`/api/v1/cmd?${qs}`);
     const j=await r.json();
     setReply('#reply-cmd', j, j.ok);
     if(!j.ok) toast(`cmd failed: ${j.error||'?'}`,'err');
@@ -969,7 +1028,7 @@ async function cmdQuick(key, value){
   let qs=`key=${encodeURIComponent(key)}`;
   if(value!==undefined) qs+=`&value=${value}`;
   try{
-    const r=await fetch(`/api/v1/cmd?${qs}`);
+    const r=await fetchT(`/api/v1/cmd?${qs}`);
     const j=await r.json();
     setReply('#reply-cmd', j, j.ok);
     toast(`${key}${value!==undefined?'='+value:''}: ${j.ok?'sent':j.error}`, j.ok?'ok':'err');
@@ -982,7 +1041,7 @@ async function systemReinit(){
   if(!confirm('Reinit will:\n  • stop every tunnel\n  • run system.down then system.up\n  • respawn autostart tunnels\n\nVideo stream will drop for ~6–8 s. Proceed?')) return;
   toast('reinit: tearing down…', 'warn');
   try{
-    const r=await fetch('/api/v1/system/reinit');
+    const r=await fetchT('/api/v1/system/reinit');
     const j=await r.json();
     if(j.ok===false) throw new Error(j.error||'reinit failed');
     toast(`reinit ok — ${j.tunnels_spawned||0} tunnel(s) respawned`, 'ok');
