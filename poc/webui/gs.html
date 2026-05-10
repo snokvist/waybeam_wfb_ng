@@ -529,14 +529,25 @@ async function csaFire(){
   const t_revert_ms=parseInt($('#csa-revert').value,10);
   const no_revert=$('#csa-no-revert').checked?1:0;
   if(!ifaceList.length){ toast('select at least one iface','err'); return; }
-  const ifaces=ifaceList.join(',');
-  const qs=`iface=${encodeURIComponent(ifaces)}&chan=${chan}&ht=${encodeURIComponent(ht)}`+
+  // Encode each iface, then join with literal ',' — encoding the comma
+  // would percent-escape it and the server's query parser splits on raw
+  // ',' to enumerate ifaces.
+  const ifacesParam=ifaceList.map(encodeURIComponent).join(',');
+  const ifacesLabel=ifaceList.join(',');
+  const qs=`iface=${ifacesParam}&chan=${chan}&ht=${encodeURIComponent(ht)}`+
            `&prev_chan=${prev_chan}&prev_ht=${encodeURIComponent(prev_ht)}`+
            `&lead_ms=${lead_ms}&t_revert_ms=${t_revert_ms}&no_revert=${no_revert}`;
-  if(!confirm(`Hop ${ifaceList.length} iface(s) [${ifaces}] → chan ${chan} ${ht} (revert to ${prev_chan} ${prev_ht} in ${t_revert_ms} ms if no traffic)?\n\nVideo will drop briefly during the switch.`)) return;
+  if(!confirm(`Hop ${ifaceList.length} iface(s) [${ifacesLabel}] → chan ${chan} ${ht} (revert to ${prev_chan} ${prev_ht} in ${t_revert_ms} ms if no traffic)?\n\nVideo will drop briefly during the switch.`)) return;
   try{
     const r=await fetch(`/api/v1/system/csa?${qs}`);
-    const j=await r.json();
+    const ctype=r.headers.get('content-type')||'';
+    let j;
+    if(ctype.includes('application/json')){
+      j=await r.json();
+    }else{
+      const txt=(await r.text()).trim();
+      j={ok:r.ok, error:txt, http_status:r.status};
+    }
     setReply('#reply-csa', j, j.ok);
     toast(`csa ${j.ok?'armed':'rejected'}: ${j.error||'sess='+j.sess}`, j.ok?'ok':'err');
     refreshCsaState();
