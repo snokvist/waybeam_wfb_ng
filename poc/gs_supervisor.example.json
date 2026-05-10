@@ -1,0 +1,43 @@
+{
+  "key_file": "/etc/drone.key",
+
+  "http": { "bind": "0.0.0.0", "port": 9080 },
+
+  "system": {
+    "up":   [],
+    "down": []
+  },
+
+  "tunnels": [
+    {
+      "name": "video",
+      "role": "rx",
+      "interfaces": ["wlan0mon"],
+      "link_id": 207,
+      "radio_port": 0,
+      "udp_out": "192.168.2.20:5600",
+      "stats_out": "127.0.0.1:5801",
+      "extra_args": ["-l", "100", "-x"],
+      "autostart": true
+    },
+    {
+      "name": "uplink",
+      "role": "tx",
+      "interfaces": ["wlan0mon"],
+      "link_id": 208,
+      "radio_port": 0,
+      "udp_in_port": 5801,
+      "control_port": 8000,
+      "fec":   { "k": 1, "n": 2 },
+      "radio": { "bandwidth_mhz": 20, "mcs_index": 1, "stbc": 1, "ldpc": 1 },
+      "extra_args": ["-Q", "-P", "1"],
+      "autostart": true
+    }
+  ],
+
+  "venc_cmd": {
+    "enabled": true,
+    "uplink_tunnel": "uplink",
+    "rate_limit_ms": 50
+  }
+}

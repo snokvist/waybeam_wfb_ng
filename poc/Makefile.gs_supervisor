@@ -1,0 +1,59 @@
+# Cross-build the gs_supervisor POC for ground-station targets.
+#
+# Defaults to a host build (debug); override CROSS_CC for the target.
+#
+# Usage (from waybeam_wfb_ng/poc/):
+#   make -f Makefile.gs_supervisor                         # host build
+#   make -f Makefile.gs_supervisor cross                   # cross build (set CROSS_CC)
+#   make -f Makefile.gs_supervisor clean
+#
+# Cross build examples (matches the existing ground-station builds):
+#   make -f Makefile.gs_supervisor cross \
+#        CROSS_CC=../toolchain/aarch64/bin/aarch64-openwrt-linux-gcc \
+#        OUT_CROSS=build/gs_supervisor.aarch64
+#
+#   make -f Makefile.gs_supervisor cross \
+#        CROSS_CC=../toolchain/openwrt-mips/bin/mips-openwrt-linux-gcc \
+#        OUT_CROSS=build/gs_supervisor.mipsel
+
+BUILD_DIR ?= build
+SRC        = gs_supervisor.c
+OUT_HOST   = $(BUILD_DIR)/gs_supervisor.host
+OUT_CROSS ?= $(BUILD_DIR)/gs_supervisor
+
+CFLAGS_COMMON  = -std=gnu99 -O2 -Wall -Wextra -Wno-missing-field-initializers
+LDFLAGS_COMMON =
+
+CC       ?= cc
+CROSS_CC ?=
+
+DEPLOY_HOST ?= 192.168.1.20
+DEPLOY_DIR  ?= /tmp
+
+.PHONY: all host cross clean deploy
+
+all: host
+
+host: $(OUT_HOST)
+
+$(BUILD_DIR):
+	@mkdir -p $@
+
+$(OUT_HOST): $(SRC) | $(BUILD_DIR)
+	@echo "[gs_supervisor] host -> $@"
+	$(CC) $(CFLAGS_COMMON) -g -o $@ $(SRC) $(LDFLAGS_COMMON)
+
+cross: $(OUT_CROSS)
+
+$(OUT_CROSS): $(SRC) | $(BUILD_DIR)
+	@if [ -z "$(CROSS_CC)" ]; then \
+		echo "set CROSS_CC=<path-to-target-gcc>"; exit 2; \
+	fi
+	@echo "[gs_supervisor] cross ($(CROSS_CC)) -> $@"
+	$(CROSS_CC) $(CFLAGS_COMMON) -o $@ $(SRC) $(LDFLAGS_COMMON)
+
+deploy: $(OUT_CROSS)
+	scp $(OUT_CROSS) root@$(DEPLOY_HOST):$(DEPLOY_DIR)/
+
+clean:
+	rm -rf $(BUILD_DIR)

@@ -1,7 +1,8 @@
-# Ground-side wfb supervisor (design)
+# Ground-side wfb supervisor
 
-Status: design sketch, no code yet. Working name: `gs_supervisor`
-(rename freely — `wfb_supervisor`, `ground_controller`, etc.).
+Status: scaffolding landed (`gs_supervisor.c`). Lifecycle + REST work;
+WCMD emit, `wfb_cmd` passthrough, system-up commands, and SSE are
+stubbed for follow-up. Name `gs_supervisor` is provisional.
 
 ## Why
 
@@ -73,7 +74,6 @@ Single file, default `/etc/waybeam/gs_supervisor.json`. Reload via
 
 ```json
 {
-  "iface": "wlan0mon",
   "key_file": "/etc/drone.key",
 
   "http": { "bind": "0.0.0.0", "port": 9080 },
@@ -87,6 +87,7 @@ Single file, default `/etc/waybeam/gs_supervisor.json`. Reload via
     {
       "name": "video",
       "role": "rx",
+      "interfaces": ["wlan0mon", "wlan1mon"],
       "link_id": 207,
       "radio_port": 0,
       "udp_out": "192.168.2.20:5600",
@@ -95,8 +96,18 @@ Single file, default `/etc/waybeam/gs_supervisor.json`. Reload via
       "autostart": true
     },
     {
+      "name": "telem",
+      "role": "rx",
+      "interfaces": ["wlan0mon", "wlan1mon"],
+      "link_id": 209,
+      "radio_port": 0,
+      "udp_out": "127.0.0.1:14550",
+      "autostart": true
+    },
+    {
       "name": "uplink",
       "role": "tx",
+      "interfaces": ["wlan0mon"],
       "link_id": 208,
       "radio_port": 0,
       "udp_in_port": 5801,
@@ -105,7 +116,6 @@ Single file, default `/etc/waybeam/gs_supervisor.json`. Reload via
       "radio": {
         "bandwidth_mhz": 20,
         "mcs_index": 1,
-        "guard_interval": "long",
         "stbc": 1,
         "ldpc": 1
       },
@@ -125,8 +135,13 @@ Single file, default `/etc/waybeam/gs_supervisor.json`. Reload via
 
 Mapping rules:
 
-- `role: "rx"`  → `wfb_rx -K key_file -i link_id -p radio_port -c <ip> -u <port> -Y <stats_out> ... iface`
-- `role: "tx"`  → `wfb_tx -K key_file -i link_id -p radio_port -u udp_in_port -C control_port -k <fec.k> -n <fec.n> -B <bw> -M <mcs> ... iface`
+- `role: "rx"`  → `wfb_rx -K key_file -i link_id -p radio_port -c <ip> -u <port> [-Y <stats_out>] <extra_args...> iface1 iface2 ...`
+- `role: "tx"`  → `wfb_tx -K key_file -i link_id -p radio_port -u udp_in_port -C control_port -k <fec.k> -n <fec.n> -B <bw> -M <mcs> -S <stbc> -L <ldpc> <extra_args...> iface1 iface2 ...`
+- `interfaces` is a list — wfb-ng natively accepts multiple positional
+  iface args. Use it for diversity rx (recommended whenever the ground
+  has more than one adapter) and for `wfb_tx` mirror mode (uncommon —
+  usually one tx adapter is enough). Different tunnels can share an
+  iface or use different ones; the supervisor doesn't care.
 - `extra_args` is appended verbatim — no parsing, lets us pass through
   any flag we haven't modeled yet
 - unknown keys at top level are rejected at load time (typos surface
@@ -219,16 +234,44 @@ stopped ──start──▶ starting ──exec ok──▶ running ──exit�
 `stop` via REST clears the autostart-on-exit flag so a stopped tunnel
 stays stopped until explicitly started or `reload` re-enables it.
 
-## File layout (proposed)
+## File layout
 
 ```
 poc/
-  gs_supervisor.c          new — main, HTTP, supervisor threads, WCMD emit
-  Makefile.gs_supervisor   new — same cross-build pattern as link_controller
-  GS_SUPERVISOR.md         this doc
+  gs_supervisor.c              main: JSON parser, supervisor loop, REST
+  Makefile.gs_supervisor       host + cross builds
+  gs_supervisor.example.json   reference config matching the schema above
+  GS_SUPERVISOR.md             this doc
   webui/
-    gs.html                later — minimal status/control page
+    gs.html                    later — minimal status/control page
 ```
+
+## Build & smoke test
+
+```bash
+# Host build (debug):
+cd poc/
+make -f Makefile.gs_supervisor host
+
+# Run against the example config (port 19080 to avoid clash):
+./build/gs_supervisor.host --config gs_supervisor.example.json --port 19080
+
+# Probe the API:
+curl -s http://127.0.0.1:19080/api/v1/health
+curl -s http://127.0.0.1:19080/api/v1/status   | jq
+curl -s http://127.0.0.1:19080/api/v1/tunnels  | jq
+curl -s http://127.0.0.1:19080/api/v1/tunnels/uplink/stop
+curl -s http://127.0.0.1:19080/api/v1/tunnels/uplink/start
+
+# Cross build (set CROSS_CC to the target toolchain gcc):
+make -f Makefile.gs_supervisor cross \
+     CROSS_CC=../toolchain/aarch64/bin/aarch64-openwrt-linux-gcc \
+     OUT_CROSS=build/gs_supervisor.aarch64
+```
+
+If `wfb_rx` / `wfb_tx` aren't on `$PATH` (host development), children
+exit 127 and the supervisor backs off — the REST API stays responsive,
+which is the right behaviour to verify on host before deploying.
 
 ## Open questions before implementation
 
