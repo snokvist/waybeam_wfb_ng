@@ -3160,7 +3160,8 @@ static int cmd_status_to_json(const ApiSnapshot *s, char *buf, size_t cap)
 			"\"rejected_format\":%llu,\"rejected_disabled\":%llu,"
 			"\"rejected_unknown\":%llu,\"rejected_blocked\":%llu,"
 			"\"rejected_range\":%llu,\"rejected_rate\":%llu,"
-			"\"rejected_peer\":%llu,\"http_errors\":%llu"
+			"\"rejected_peer\":%llu,\"http_errors\":%llu,"
+			"\"coalesced_burst\":%llu"
 		"},"
 		"\"last\":{\"status\":%u,\"key\":%u,\"value\":%d,\"http_status\":%d,\"recv_age_s\":%.3f},"
 		"\"last_apply_age_s\":{"
@@ -3188,6 +3189,7 @@ static int cmd_status_to_json(const ApiSnapshot *s, char *buf, size_t cap)
 		w ? (unsigned long long)w->rejected_rate    : 0ULL,
 		w ? (unsigned long long)w->rejected_peer    : 0ULL,
 		w ? (unsigned long long)w->http_errors      : 0ULL,
+		w ? (unsigned long long)w->coalesced_burst  : 0ULL,
 		w ? (unsigned)w->last_status : 0u,
 		w ? (unsigned)w->last_key    : 0u,
 		w ? w->last_value : 0,
