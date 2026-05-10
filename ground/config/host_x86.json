@@ -14,8 +14,9 @@
       "iw dev wlx40a5ef2f229b set monitor otherbss",
       "sleep 0.5",
       "ip link set wlx40a5ef2f229b up",
-      "sleep 0.3",
+      "sleep 0.5",
       "iw dev wlx40a5ef2f229b set channel 161",
+      "sleep 0.5",
       "iw dev wlx40a5ef2f229b set txpower fixed 2000",
 
       "nmcli device set wlx40a5ef2f2308 managed no",
@@ -23,8 +24,9 @@
       "iw dev wlx40a5ef2f2308 set monitor otherbss",
       "sleep 0.5",
       "ip link set wlx40a5ef2f2308 up",
-      "sleep 0.3",
+      "sleep 0.5",
       "iw dev wlx40a5ef2f2308 set channel 161",
+      "sleep 0.5",
       "iw dev wlx40a5ef2f2308 set txpower fixed 2000"
     ],
     "down": [
