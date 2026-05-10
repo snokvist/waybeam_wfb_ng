@@ -441,6 +441,10 @@ typedef struct {
 	char     wfb_host[64];           /* shared wfb_tx control endpoint */
 	uint16_t wfb_port;
 	int      api_port;               /* HTTP API on 127.0.0.1:N (0 disables) */
+	int      iface_mtu;              /* startup-only: ip link set dev <iface> mtu N
+	                                  * across {csa.iface, cmd.wfb_iface}. 0 = off.
+	                                  * Used with --max-payload above 1472 to keep
+	                                  * the kernel from rejecting jumbo payloads. */
 	bool     dry_run;
 	int      verbose;
 } Config;
@@ -1429,6 +1433,28 @@ static int wfb_run_iw_txpower(const char *iface, int mbm)
 		      "fixed", mbm_s, (char*)NULL);
 		execlp("iw", "iw", "dev", iface, "set", "txpower",
 		       "fixed", mbm_s, (char*)NULL);
+		_exit(127);
+	}
+	int st;
+	waitpid(pid, &st, 0);
+	return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+}
+
+/* fork+exec `ip link set dev <iface> mtu <N>`; returns ip's exit status
+ * (0 on success). Called once at startup when --iface-mtu is set, so the
+ * wlan iface accepts payloads above the default 1500-byte MTU. */
+static int wfb_run_ip_link_mtu(const char *iface, int mtu)
+{
+	if (!iface || !iface[0] || mtu <= 0) return -1;
+	char mtu_s[16];
+	snprintf(mtu_s, sizeof(mtu_s), "%d", mtu);
+	pid_t pid = fork();
+	if (pid < 0) return -1;
+	if (pid == 0) {
+		execl("/sbin/ip", "ip", "link", "set", "dev", iface,
+		      "mtu", mtu_s, (char*)NULL);
+		execlp("ip", "ip", "link", "set", "dev", iface,
+		       "mtu", mtu_s, (char*)NULL);
 		_exit(127);
 	}
 	int st;
@@ -3713,6 +3739,9 @@ static void usage(const char *prog)
 		"  --wfb HOST:PORT          wfb_tx control endpoint (default 127.0.0.1:8000)\n"
 		"  --api-port N             HTTP API + WebUI on :N (default 8765; 0 disables)\n"
 		"  --dry-run                compute but do not send wfb_tx commands\n"
+		"  --iface-mtu N            ip link set dev <iface> mtu N at startup on\n"
+		"                           {csa.iface, wfb-iface}; range [576, 9000].\n"
+		"                           Use with --max-payload above 1472.\n"
 		"  -v, --verbose            extra logs\n"
 		"\n"
 		"FEC subsystem (--fec-* / disable with --no-fec):\n"
@@ -3869,6 +3898,7 @@ static void config_defaults(Config *c)
 	c->api_port = 8765;
 	c->dry_run = false;
 	c->verbose = 0;
+	c->iface_mtu = 0;
 
 	/* FEC defaults (lifted from fec_controller.c). */
 	c->fec.enabled = true;
@@ -4023,6 +4053,8 @@ int main(int argc, char **argv)
 		OPT_CSA_COOLDOWN, OPT_CSA_NO_REVERT,
 		/* cmd */
 		OPT_WFB_IFACE,
+		/* system */
+		OPT_IFACE_MTU,
 	};
 	static const struct option longopts[] = {
 		{"wfb",            required_argument, 0, OPT_WFB},
@@ -4082,6 +4114,7 @@ int main(int argc, char **argv)
 		{"csa-cooldown-ms",required_argument, 0, OPT_CSA_COOLDOWN},
 		{"csa-no-revert",  no_argument,       0, OPT_CSA_NO_REVERT},
 		{"wfb-iface",      required_argument, 0, OPT_WFB_IFACE},
+		{"iface-mtu",      required_argument, 0, OPT_IFACE_MTU},
 		{"verbose",        no_argument,       0, 'v'},
 		{"help",           no_argument,       0, 'h'},
 		{0, 0, 0, 0},
@@ -4238,6 +4271,16 @@ int main(int argc, char **argv)
 			snprintf(cfg.cmd.wfb_iface, sizeof(cfg.cmd.wfb_iface),
 			         "%s", optarg);
 			break;
+		case OPT_IFACE_MTU: {
+			int m = atoi(optarg);
+			if (m < 576 || m > 9000) {
+				fprintf(stderr,
+				    "invalid --iface-mtu %d: must be in [576, 9000]\n", m);
+				return 1;
+			}
+			cfg.iface_mtu = m;
+			break;
+		}
 		case 'v':                cfg.verbose = 1; break;
 		case 'h': default: usage(argv[0]); return (ch == 'h') ? 0 : 1;
 		}
@@ -4285,6 +4328,35 @@ int main(int argc, char **argv)
 	    cfg.wfb_host, cfg.wfb_port, cfg.api_port, cfg.dry_run ? 1 : 0,
 	    cfg.fec.enabled ? "on" : "off",
 	    cfg.mcs.enabled ? "on" : "off");
+
+	/* Apply --iface-mtu to each unique iface in {csa.iface, cmd.wfb_iface}
+	 * before any subsystem opens its sockets. Skipped under --dry-run so a
+	 * test invocation never modifies the host network state. */
+	if (cfg.iface_mtu > 0 && !cfg.dry_run) {
+		const char *ifaces[2] = { NULL, NULL };
+		int n_ifaces = 0;
+		if (cfg.csa.iface[0])      ifaces[n_ifaces++] = cfg.csa.iface;
+		if (cfg.cmd.wfb_iface[0] &&
+		    (n_ifaces == 0 || strcmp(cfg.cmd.wfb_iface, ifaces[0]) != 0))
+			ifaces[n_ifaces++] = cfg.cmd.wfb_iface;
+		if (n_ifaces == 0) {
+			LOG_COMMON("iface-mtu: %d requested but no iface "
+			    "(--csa-iface / --wfb-iface) — skipping",
+			    cfg.iface_mtu);
+		}
+		for (int i = 0; i < n_ifaces; i++) {
+			int rc = wfb_run_ip_link_mtu(ifaces[i], cfg.iface_mtu);
+			if (rc == 0) {
+				LOG_COMMON("iface-mtu: %s → %d (ok)",
+				    ifaces[i], cfg.iface_mtu);
+			} else {
+				LOG_COMMON("iface-mtu: %s → %d failed (ip rc=%d) "
+				    "— iface may not exist or driver rejected the size",
+				    ifaces[i], cfg.iface_mtu, rc);
+			}
+		}
+	}
+
 	if (cfg.fec.enabled) {
 		LOG_FEC("subsys: sidecar=%s:%u venc=%s:%u mtu=%d safety=%.2f stats_port=%u keepalive=%.1fs",
 		    cfg.fec.sidecar_host, cfg.fec.sidecar_port,
