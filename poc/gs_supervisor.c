@@ -473,6 +473,42 @@ typedef struct {
 	int      venc_cmd_rate_limit_ms;
 } Config;
 
+/* ---------- iface radio state cache --------------------------------- *
+ *
+ * Each WLAN adapter the supervisor manages has a current-channel /
+ * current-HT / current-txpower triple that we expose via /api/v1/ifaces
+ * and use to pre-fill prev_chan/prev_ht for a CSA hop.  Refreshed
+ * lazily by `iw dev <name> info` once every 2 s, plus on demand right
+ * after we drive a channel change ourselves.
+ *
+ * Keyed by iface name (deduped across all tunnels).  Global rather than
+ * tunnel-local because a single iface can appear in multiple tunnels
+ * (diversity RX + uplink TX share an adapter in the host_x86 config).
+ */
+#define GS_MAX_GLOBAL_IFACES (GS_MAX_TUNNELS * GS_MAX_IFACES)
+#define GS_IFACE_REFRESH_US  2000000ULL
+
+typedef struct {
+	char     name[IFNAMSIZ];
+	int      chan;             /* -1 unknown */
+	int      freq_mhz;         /* -1 unknown */
+	char     ht[8];            /* "HT20" / "HT40+" / "HT40-" / "" */
+	int      txpower_mbm;      /* -1 unknown */
+	uint64_t last_query_us;    /* 0 = never */
+	int      last_rc;          /* iw exit status; 0 ok */
+} IfaceState;
+
+static IfaceState g_iface_state[GS_MAX_GLOBAL_IFACES];
+static int        g_iface_state_count = 0;
+
+/* Forward decls — definitions are grouped with the iface_is_monitor /
+ * wait_iface_state helpers further down. */
+static IfaceState *iface_state_find(const char *name);
+static IfaceState *iface_state_intern(const char *name);
+static int  iface_state_query(IfaceState *st);
+static void iface_state_init(const Config *c);
+static void iface_state_refresh_one(uint64_t now_us_arg);
+
 static const char *tunnel_state_name(TunnelState s)
 {
 	switch (s) {
@@ -1108,6 +1144,83 @@ static int csa_pick_rx_tunnel_idx(const Config *c)
 	return -1;
 }
 
+/* ---------- Scanner --------------------------------------------------- *
+ *
+ * Cycles the GS-side iface(s) through a channel/HT list, dwelling on each
+ * combo for `dwell_ms`. After each dwell, the rx tunnel's pkt_all counter
+ * is compared against the per-step baseline; an increase means traffic
+ * was decoded on that channel — which is enough to declare we found the
+ * vehicle. Useful when the operator doesn't know which channel the
+ * vehicle is on (lost contact, fresh boot, regulator switch, etc.).
+ *
+ * No vehicle cooperation needed — purely a passive sweep on the GS.
+ *
+ * One scan in flight at a time; concurrent CSA blocks scan and vice
+ * versa.
+ */
+
+#define SCAN_MAX_STEPS 32
+
+typedef enum {
+	SCAN_IDLE = 0,
+	SCAN_RUNNING,
+	SCAN_FOUND,
+	SCAN_STOPPED,
+} ScanPhase;
+
+static struct {
+	ScanPhase phase;
+	uint32_t  sess;
+	char      ifaces[GS_CSA_MAX_IFACES][IFNAMSIZ];
+	int       iface_count;
+	int       chans[SCAN_MAX_STEPS];
+	char      hts[SCAN_MAX_STEPS][8];
+	int       step_count;
+	int       cur_step;
+	uint64_t  step_started_us;
+	uint64_t  step_dwell_us;
+	int       baseline_rx_idx;     /* -1 if no rx tunnel */
+	bool      step_saw_traffic;    /* set by stats_drain when uniq>0 */
+	int       found_chan;
+	char      found_ht[8];
+	int       hops_done;           /* completed dwells (incl. this step) */
+} g_scan = { .phase = SCAN_IDLE, .sess = 0 };
+
+/* Hop the scan iface set to step index `i`. Skips the per-iface state
+ * query (caller can do it post-scan) — every fork inside the dwell
+ * window steals decode time and risks missing the vehicle's burst.
+ *
+ * After the hops, drains any rx-tunnel stats blobs that were already
+ * queued by wfb_rx before we changed channels — those blobs reflect the
+ * OLD channel's pkt.uniq and would falsely trip step_saw_traffic on the
+ * very first dwell. */
+static void scan_apply_step_drained(Config *c, int i)
+{
+	if (i < 0 || i >= g_scan.step_count) return;
+	int chan = g_scan.chans[i];
+	const char *ht = g_scan.hts[i];
+	for (int k = 0; k < g_scan.iface_count; k++) {
+		int rc = run_iw_set_channel(g_scan.ifaces[k], chan, ht);
+		if (rc != 0)
+			LOG_WARN("scan: iw on %s rc=%d", g_scan.ifaces[k], rc);
+	}
+	g_scan.cur_step = i;
+	g_scan.step_saw_traffic = false;
+	if (g_scan.baseline_rx_idx >= 0) {
+		Tunnel *rx = &c->tunnels[g_scan.baseline_rx_idx];
+		if (rx->stats_local_fd >= 0) {
+			char drain[4096];
+			while (recv(rx->stats_local_fd, drain, sizeof(drain), MSG_DONTWAIT) > 0)
+				;
+		}
+	}
+	/* Reset the flag again so any sample stats_drain consumed while
+	 * draining (stats_drain itself wasn't called, but the recv above is
+	 * harmless either way) doesn't contaminate. */
+	g_scan.step_saw_traffic = false;
+	g_scan.step_started_us = now_us();
+}
+
 /* Periodic tick: handle SIGKILL escalation + backoff respawn, plus
  * deferred TX state queries (~500 ms after spawn so wfb_tx has bound
  * its control socket). */
@@ -1115,6 +1228,10 @@ static void supervisor_tick(Config *c)
 {
 	uint64_t t_ms = now_ms();
 	uint64_t t_us = now_us();
+
+	/* Round-robin one iface refresh per tick so the /api/v1/ifaces
+	 * cache stays current without forking iw on every loop. */
+	iface_state_refresh_one(t_us);
 	for (int i = 0; i < c->tunnel_count; i++) {
 		Tunnel *t = &c->tunnels[i];
 
@@ -1183,8 +1300,53 @@ static void supervisor_tick(Config *c)
 			    g_csa.target_chan, g_csa.target_ht);
 			if (rc != 0)
 				LOG_WARN("csa: iw on %s rc=%d", g_csa.ifaces[i], rc);
+			/* Refresh cache so /api/v1/ifaces reflects the hop
+			 * before the periodic round-robin gets to it. */
+			IfaceState *ist = iface_state_find(g_csa.ifaces[i]);
+			if (ist) (void)iface_state_query(ist);
 		}
 		g_csa.phase = CSA_VERIFY;
+	}
+
+	/* Scanner state machine: at each step deadline, decide whether the
+	 * dwell window saw any decryptable traffic. step_saw_traffic is
+	 * OR-set by stats_drain on every non-zero rx pkt.uniq sample — a
+	 * 100 ms interval count, not cumulative — so any "1" anywhere in the
+	 * window counts. */
+	if (g_scan.phase == SCAN_RUNNING &&
+	    t_us >= g_scan.step_started_us + g_scan.step_dwell_us) {
+		bool found = g_scan.step_saw_traffic;
+		g_scan.hops_done++;
+		LOG_INFO("scan: step %d/%d ch %d %s — %s",
+		         g_scan.cur_step + 1, g_scan.step_count,
+		         g_scan.chans[g_scan.cur_step], g_scan.hts[g_scan.cur_step],
+		         found ? "FOUND" : "no traffic");
+		if (found) {
+			g_scan.found_chan = g_scan.chans[g_scan.cur_step];
+			snprintf(g_scan.found_ht, sizeof(g_scan.found_ht), "%s",
+			         g_scan.hts[g_scan.cur_step]);
+			LOG_INFO("scan: locked on chan %d %s after %d hop(s)",
+			         g_scan.found_chan, g_scan.found_ht, g_scan.hops_done);
+			g_scan.phase = SCAN_FOUND;
+			for (int j = 0; j < g_scan.iface_count; j++) {
+				IfaceState *ist = iface_state_find(g_scan.ifaces[j]);
+				if (ist) (void)iface_state_query(ist);
+			}
+		} else {
+			int next = g_scan.cur_step + 1;
+			if (next >= g_scan.step_count) {
+				LOG_WARN("scan: no traffic across %d step(s) — stopping",
+				         g_scan.step_count);
+				g_scan.phase = SCAN_STOPPED;
+				for (int j = 0; j < g_scan.iface_count; j++) {
+					IfaceState *ist = iface_state_find(g_scan.ifaces[j]);
+					if (ist) (void)iface_state_query(ist);
+				}
+			} else {
+				scan_apply_step_drained(c, next);
+				g_scan.step_saw_traffic = false;
+			}
+		}
 	}
 
 	if (g_csa.phase == CSA_VERIFY && t_us >= g_csa.t_revert_us) {
@@ -1203,6 +1365,8 @@ static void supervisor_tick(Config *c)
 			for (int i = 0; i < g_csa.iface_count; i++) {
 				(void)run_iw_set_channel(g_csa.ifaces[i],
 				    g_csa.prev_chan, g_csa.prev_ht);
+				IfaceState *ist = iface_state_find(g_csa.ifaces[i]);
+				if (ist) (void)iface_state_query(ist);
 			}
 		}
 		g_csa.phase = CSA_IDLE;
@@ -1450,10 +1614,23 @@ static void stats_drain(Tunnel *t)
 				if (json_pick_u32(pkt, pkl, "outgoing",       &u) == 0) t->st_pkt_outgoing = u;
 				if (json_pick_u32(pkt, pkl, "dec_err",        &u) == 0) t->st_pkt_dec_err  = u;
 				if (json_pick_u32(pkt, pkl, "outgoing_bytes", &u) == 0) t->st_pkt_bytes    = u;
-				if (json_pick_u32(pkt, pkl, "uniq",           &u) == 0) t->st_pkt_uniq     = u;
-			}
+				if (json_pick_u32(pkt, pkl, "uniq",           &u) == 0) {
+					t->st_pkt_uniq = u;
+					/* Scanner: any non-zero `uniq` sample during the
+					 * current step's dwell counts as "we found the
+					 * vehicle on this channel". `pkt.uniq` is the
+					 * per-100ms-interval count (not cumulative), so a
+					 * simple before/after diff doesn't work — sample
+					 * continuously and OR-set a step-local flag. */
+					if (u > 0 &&
+					    g_scan.phase == SCAN_RUNNING &&
+					    !strcmp(t->role, "rx")) {
+						g_scan.step_saw_traffic = true;
+					}
+				}
+				}
 
-			/* Walk antenna list for best avg rssi.  rssi.avg is signed. */
+				/* Walk antenna list for best avg rssi.  rssi.avg is signed. */
 			const char *ant = NULL;
 			size_t al = 0;
 			int ant_count = 0;
@@ -1564,6 +1741,132 @@ static int iface_is_monitor(const char *iface)
 	if (n < 0 || n >= (int)sizeof(cmd)) return -1;
 	int rc = system(cmd);
 	return (rc == 0) ? 0 : -1;
+}
+
+/* ---------- iface state cache: helpers ------------------------------ */
+
+static IfaceState *iface_state_find(const char *name)
+{
+	for (int i = 0; i < g_iface_state_count; i++)
+		if (!strcmp(g_iface_state[i].name, name))
+			return &g_iface_state[i];
+	return NULL;
+}
+
+static IfaceState *iface_state_intern(const char *name)
+{
+	IfaceState *st = iface_state_find(name);
+	if (st) return st;
+	if (g_iface_state_count >= GS_MAX_GLOBAL_IFACES) return NULL;
+	st = &g_iface_state[g_iface_state_count++];
+	memset(st, 0, sizeof(*st));
+	snprintf(st->name, sizeof(st->name), "%s", name);
+	st->chan = -1;
+	st->freq_mhz = -1;
+	st->txpower_mbm = -1;
+	return st;
+}
+
+/* Parse one line out of `iw dev <iface> info` output.  Tolerates the
+ * various phrasings iw uses across versions:
+ *
+ *   channel 161 (5805 MHz), width: 20 MHz, center1: 5805 MHz
+ *   channel 36 (5180 MHz), width: 40 MHz (no HT), center1: 5190 MHz
+ *   txpower 20.00 dBm
+ *
+ * Sets st->chan, st->freq_mhz, st->ht ("HT20" / "HT40+" / "HT40-"),
+ * st->txpower_mbm where each appears.  Caller resets fields to "unknown"
+ * before invoking. */
+static void iface_state_absorb_line(IfaceState *st, const char *line)
+{
+	const char *p = strstr(line, "channel ");
+	if (p) {
+		int ch = -1, freq = -1;
+		if (sscanf(p, "channel %d (%d MHz)", &ch, &freq) >= 1) {
+			st->chan = ch;
+			if (freq > 0) st->freq_mhz = freq;
+		}
+		const char *w = strstr(p, "width:");
+		const char *cn = strstr(p, "center1:");
+		if (w) {
+			int width = 20;
+			(void)sscanf(w, "width: %d MHz", &width);
+			if (width <= 20) {
+				snprintf(st->ht, sizeof(st->ht), "HT20");
+			} else if (width == 40) {
+				int center1 = 0;
+				if (cn) (void)sscanf(cn, "center1: %d MHz", &center1);
+				/* HT40+ if center1 > primary, HT40- if below. */
+				if (center1 > 0 && st->freq_mhz > 0) {
+					snprintf(st->ht, sizeof(st->ht),
+					    center1 > st->freq_mhz ? "HT40+" : "HT40-");
+				} else {
+					snprintf(st->ht, sizeof(st->ht), "HT40+");
+				}
+			} else if (width > 0 && width < 1000) {
+				snprintf(st->ht, sizeof(st->ht), "HT%d", width % 1000);
+			}
+		}
+	}
+	p = strstr(line, "txpower ");
+	if (p) {
+		double dbm = 0.0;
+		if (sscanf(p, "txpower %lf", &dbm) == 1)
+			st->txpower_mbm = (int)(dbm * 100.0 + 0.5);
+	}
+}
+
+/* Pull a fresh snapshot via `iw dev <name> info`.  Synchronous fork+exec;
+ * blocks ~30–80 ms on RTL88x2CU/EU.  Updates st->last_query_us regardless
+ * of success so we don't hammer iw on a busted iface. */
+static int iface_state_query(IfaceState *st)
+{
+	st->last_query_us = now_us();
+	st->chan = -1;
+	st->freq_mhz = -1;
+	st->ht[0] = 0;
+	st->txpower_mbm = -1;
+
+	char cmd[128];
+	int n = snprintf(cmd, sizeof(cmd), "iw dev %s info 2>/dev/null", st->name);
+	if (n < 0 || n >= (int)sizeof(cmd)) { st->last_rc = -1; return -1; }
+	FILE *f = popen(cmd, "r");
+	if (!f) { st->last_rc = -1; return -1; }
+	char line[256];
+	while (fgets(line, sizeof(line), f))
+		iface_state_absorb_line(st, line);
+	int rc = pclose(f);
+	st->last_rc = WIFEXITED(rc) ? WEXITSTATUS(rc) : -1;
+	return st->last_rc == 0 ? 0 : -1;
+}
+
+/* Walk every tunnel's iface list, intern each unique name, and run an
+ * initial state query so the WebUI has truth on the first refresh.
+ * Called once after system.up has finished. */
+static void iface_state_init(const Config *c)
+{
+	for (int i = 0; i < c->tunnel_count; i++) {
+		for (int k = 0; k < c->tunnels[i].iface_count; k++) {
+			IfaceState *st = iface_state_intern(c->tunnels[i].ifaces[k]);
+			if (st) (void)iface_state_query(st);
+		}
+	}
+}
+
+/* Refresh one stale iface per tick (round-robin), so we don't fork iw
+ * on every tick yet still keep the cache fresh. */
+static void iface_state_refresh_one(uint64_t now_us_arg)
+{
+	static int rr_idx = 0;
+	if (g_iface_state_count == 0) return;
+	for (int tries = 0; tries < g_iface_state_count; tries++) {
+		IfaceState *st = &g_iface_state[rr_idx];
+		rr_idx = (rr_idx + 1) % g_iface_state_count;
+		if (now_us_arg - st->last_query_us >= GS_IFACE_REFRESH_US) {
+			(void)iface_state_query(st);
+			return;
+		}
+	}
 }
 
 static int iface_is_admin_up(const char *iface)
@@ -2228,6 +2531,29 @@ static void api_handle(ApiClient *cli, Config *c, uint64_t startup_us)
 		api_send(cli->fd, 200, "text/plain", "ok\n", -1);
 		return;
 	}
+	if (!strcmp(path, "/api/v1/ifaces")) {
+		/* Per-iface current chan/ht/txpower snapshot.  Cached value is
+		 * up to GS_IFACE_REFRESH_US (2 s) old by default; we report
+		 * `age_ms` so the UI can grey out stale rows. */
+		uint64_t now = now_us();
+		int p = 0;
+		p += snprintf(body + p, sizeof(body) - p, "[");
+		for (int i = 0; i < g_iface_state_count; i++) {
+			const IfaceState *st = &g_iface_state[i];
+			double age_ms = st->last_query_us
+			    ? (double)(now - st->last_query_us) / 1000.0 : -1.0;
+			if (i) p += snprintf(body + p, sizeof(body) - p, ",");
+			p += snprintf(body + p, sizeof(body) - p,
+			    "{\"name\":\"%s\",\"chan\":%d,\"freq_mhz\":%d,"
+			    "\"ht\":\"%s\",\"txpower_mbm\":%d,"
+			    "\"age_ms\":%.0f,\"iw_rc\":%d}",
+			    st->name, st->chan, st->freq_mhz, st->ht,
+			    st->txpower_mbm, age_ms, st->last_rc);
+		}
+		p += snprintf(body + p, sizeof(body) - p, "]");
+		api_send(cli->fd, 200, "application/json", body, p);
+		return;
+	}
 	if (!strcmp(path, "/api/v1/status")) {
 		n = json_emit_status(body, sizeof(body), c, now_us() - startup_us);
 		if (n < 0) { api_send(cli->fd, 500, "text/plain", "overflow\n", -1); return; }
@@ -2377,6 +2703,224 @@ static void api_handle(ApiClient *cli, Config *c, uint64_t startup_us)
 			             (unsigned)seq, wcmd_key_name(key), (int)value);
 		}
 		api_send(cli->fd, 200, "application/json", body, p);
+		return;
+	}
+	if (!strcmp(path, "/api/v1/system/scan")) {
+		/* Required: iface (comma-sep), chans (comma-sep). Optional: ht /
+		 * hts (single HT for all steps, or comma-sep per step), dwell_ms
+		 * (default 600). Refuses if a CSA hop or another scan is in flight. */
+		if (g_csa.phase != CSA_IDLE) {
+			api_send(cli->fd, 409, "application/json",
+			    "{\"ok\":false,\"error\":\"csa active\"}", -1);
+			return;
+		}
+		if (g_scan.phase == SCAN_RUNNING) {
+			api_send(cli->fd, 409, "application/json",
+			    "{\"ok\":false,\"error\":\"scan already running\"}", -1);
+			return;
+		}
+		size_t il, cl, hl_ht, hl_hts;
+		const char *istr = qs_get(qstr, "iface", &il);
+		const char *cstr = qs_get(qstr, "chans", &cl);
+		const char *htstr = qs_get(qstr, "ht", &hl_ht);
+		const char *htsstr = qs_get(qstr, "hts", &hl_hts);
+		if (!istr || il == 0 || !cstr || cl == 0) {
+			api_send(cli->fd, 400, "application/json",
+			    "{\"ok\":false,\"error\":\"need iface=&chans=\"}", -1);
+			return;
+		}
+		/* parse iface list */
+		char ifaces[GS_CSA_MAX_IFACES][IFNAMSIZ];
+		int  iface_count = 0;
+		const char *p = istr, *e = istr + il;
+		while (p < e && iface_count < GS_CSA_MAX_IFACES) {
+			const char *q = p;
+			while (q < e && *q != ',') q++;
+			size_t L = (size_t)(q - p);
+			if (L == 0 || L >= IFNAMSIZ) {
+				api_send(cli->fd, 400, "application/json",
+				    "{\"ok\":false,\"error\":\"bad iface in list\"}", -1);
+				return;
+			}
+			memcpy(ifaces[iface_count], p, L);
+			ifaces[iface_count][L] = 0;
+			iface_count++;
+			p = q + 1;
+		}
+		if (iface_count == 0) {
+			api_send(cli->fd, 400, "application/json",
+			    "{\"ok\":false,\"error\":\"no iface\"}", -1);
+			return;
+		}
+		for (int j = 0; j < iface_count; j++) {
+			bool known = false;
+			for (int i = 0; i < c->tunnel_count && !known; i++)
+				for (int k = 0; k < c->tunnels[i].iface_count; k++)
+					if (!strcmp(c->tunnels[i].ifaces[k], ifaces[j])) {
+						known = true; break;
+					}
+			if (!known) {
+				char b[96];
+				int bp = snprintf(b, sizeof(b),
+				    "{\"ok\":false,\"error\":\"iface '%s' not in any tunnel\"}",
+				    ifaces[j]);
+				api_send(cli->fd, 404, "application/json", b, bp);
+				return;
+			}
+		}
+		/* parse chan list */
+		int  chans[SCAN_MAX_STEPS];
+		int  chan_count = 0;
+		p = cstr; e = cstr + cl;
+		while (p < e && chan_count < SCAN_MAX_STEPS) {
+			char buf[8]; int bn = 0;
+			while (p < e && *p != ',' && bn < (int)sizeof(buf) - 1) buf[bn++] = *p++;
+			buf[bn] = 0;
+			if (bn == 0) {
+				api_send(cli->fd, 400, "application/json",
+				    "{\"ok\":false,\"error\":\"empty chan in list\"}", -1);
+				return;
+			}
+			char *endp = NULL;
+			long ch = strtol(buf, &endp, 10);
+			if (endp == buf || ch < 1 || ch > 200) {
+				api_send(cli->fd, 400, "application/json",
+				    "{\"ok\":false,\"error\":\"chan out of range (1..200)\"}", -1);
+				return;
+			}
+			chans[chan_count++] = (int)ch;
+			if (p < e) p++;
+		}
+		if (chan_count == 0) {
+			api_send(cli->fd, 400, "application/json",
+			    "{\"ok\":false,\"error\":\"no chans\"}", -1);
+			return;
+		}
+		/* parse hts: prefer 'hts=' (per-step) over 'ht=' (single).
+		 * If neither given, default everything to HT20. */
+		char hts[SCAN_MAX_STEPS][8];
+		for (int i = 0; i < chan_count; i++) snprintf(hts[i], 8, "HT20");
+		if (htsstr && hl_hts > 0) {
+			int hi = 0;
+			p = htsstr; e = htsstr + hl_hts;
+			while (p < e && hi < SCAN_MAX_STEPS) {
+				const char *q = p;
+				while (q < e && *q != ',') q++;
+				size_t L = (size_t)(q - p);
+				if (L == 0 || L >= 8) {
+					api_send(cli->fd, 400, "application/json",
+					    "{\"ok\":false,\"error\":\"bad ht\"}", -1);
+					return;
+				}
+				memcpy(hts[hi], p, L); hts[hi][L] = 0;
+				hi++;
+				p = q + 1;
+			}
+			if (hi == 1 && chan_count > 1) {
+				/* repeat first across all */
+				for (int i = 1; i < chan_count; i++)
+					snprintf(hts[i], 8, "%s", hts[0]);
+			} else if (hi != chan_count) {
+				api_send(cli->fd, 400, "application/json",
+				    "{\"ok\":false,\"error\":\"hts count != chans count\"}", -1);
+				return;
+			}
+		} else if (htstr && hl_ht > 0 && hl_ht < 8) {
+			char one[8];
+			memcpy(one, htstr, hl_ht); one[hl_ht] = 0;
+			for (int i = 0; i < chan_count; i++)
+				snprintf(hts[i], 8, "%s", one);
+		}
+		for (int i = 0; i < chan_count; i++) {
+			if (strcmp(hts[i], "HT20") &&
+			    strcmp(hts[i], "HT40+") &&
+			    strcmp(hts[i], "HT40-")) {
+				api_send(cli->fd, 400, "application/json",
+				    "{\"ok\":false,\"error\":\"ht must be HT20|HT40+|HT40-\"}", -1);
+				return;
+			}
+		}
+		int dwell_ms = 600;
+		(void)qs_get_int(qstr, "dwell_ms", &dwell_ms);
+		if (dwell_ms < 100)  dwell_ms = 100;
+		if (dwell_ms > 10000) dwell_ms = 10000;
+
+		/* Arm scan state. */
+		memset(&g_scan, 0, sizeof(g_scan));
+		g_scan.sess++;
+		for (int j = 0; j < iface_count; j++)
+			snprintf(g_scan.ifaces[j], sizeof(g_scan.ifaces[j]),
+			    "%s", ifaces[j]);
+		g_scan.iface_count = iface_count;
+		for (int i = 0; i < chan_count; i++) {
+			g_scan.chans[i] = chans[i];
+			snprintf(g_scan.hts[i], sizeof(g_scan.hts[i]), "%s", hts[i]);
+		}
+		g_scan.step_count = chan_count;
+		g_scan.step_dwell_us = (uint64_t)dwell_ms * 1000ULL;
+		g_scan.baseline_rx_idx = csa_pick_rx_tunnel_idx(c);
+		g_scan.step_saw_traffic = false;
+		g_scan.found_chan = -1;
+		g_scan.phase = SCAN_RUNNING;
+		scan_apply_step_drained(c, 0);
+		LOG_INFO("scan: armed sess=%u %d iface(s) %d step(s) dwell=%d ms",
+		         g_scan.sess, iface_count, chan_count, dwell_ms);
+
+		char buf[400];
+		int bp = snprintf(buf, sizeof(buf),
+		    "{\"ok\":true,\"sess\":%u,\"step_count\":%d,\"dwell_ms\":%d,"
+		    "\"ifaces\":[",
+		    g_scan.sess, chan_count, dwell_ms);
+		for (int j = 0; j < iface_count; j++)
+			bp += snprintf(buf + bp, sizeof(buf) - bp, "%s\"%s\"",
+			    j ? "," : "", ifaces[j]);
+		bp += snprintf(buf + bp, sizeof(buf) - bp, "]}");
+		api_send(cli->fd, 200, "application/json", buf, bp);
+		return;
+	}
+	if (!strcmp(path, "/api/v1/system/scan/cancel")) {
+		if (g_scan.phase != SCAN_RUNNING) {
+			api_send(cli->fd, 200, "application/json",
+			    "{\"ok\":true,\"already_idle\":true}", -1);
+			return;
+		}
+		LOG_INFO("scan: cancel requested at step %d/%d",
+		         g_scan.cur_step + 1, g_scan.step_count);
+		g_scan.phase = SCAN_STOPPED;
+		api_send(cli->fd, 200, "application/json",
+		    "{\"ok\":true,\"cancelled\":true}", -1);
+		return;
+	}
+	if (!strcmp(path, "/api/v1/scan")) {
+		uint64_t t_us = now_us();
+		double dwell_left_ms = (g_scan.phase == SCAN_RUNNING)
+		    ? (double)((int64_t)(g_scan.step_started_us + g_scan.step_dwell_us)
+		               - (int64_t)t_us) / 1000.0
+		    : 0.0;
+		int cur_chan = (g_scan.cur_step < g_scan.step_count)
+		    ? g_scan.chans[g_scan.cur_step] : -1;
+		const char *cur_ht = (g_scan.cur_step < g_scan.step_count)
+		    ? g_scan.hts[g_scan.cur_step] : "";
+		char body2[480];
+		int p = snprintf(body2, sizeof(body2),
+		    "{\"phase\":%d,\"sess\":%u,\"cur_step\":%d,\"step_count\":%d,"
+		    "\"hops_done\":%d,\"dwell_left_ms\":%.0f,"
+		    "\"cur_chan\":%d,\"cur_ht\":\"%s\","
+		    "\"found_chan\":%d,\"found_ht\":\"%s\","
+		    "\"ifaces\":[",
+		    (int)g_scan.phase, g_scan.sess, g_scan.cur_step, g_scan.step_count,
+		    g_scan.hops_done, dwell_left_ms,
+		    cur_chan, cur_ht,
+		    g_scan.found_chan, g_scan.found_ht);
+		for (int j = 0; j < g_scan.iface_count; j++)
+			p += snprintf(body2 + p, sizeof(body2) - p, "%s\"%s\"",
+			    j ? "," : "", g_scan.ifaces[j]);
+		p += snprintf(body2 + p, sizeof(body2) - p, "],\"chans\":[");
+		for (int i = 0; i < g_scan.step_count; i++)
+			p += snprintf(body2 + p, sizeof(body2) - p, "%s%d",
+			    i ? "," : "", g_scan.chans[i]);
+		p += snprintf(body2 + p, sizeof(body2) - p, "]}");
+		api_send(cli->fd, 200, "application/json", body2, p);
 		return;
 	}
 	if (!strcmp(path, "/api/v1/system/csa")) {
@@ -2626,6 +3170,8 @@ static void api_handle(ApiClient *cli, Config *c, uint64_t startup_us)
 			waitpid(pid, &st, 0);
 			rc = WIFEXITED(st) ? WEXITSTATUS(st) : -1;
 		}
+		IfaceState *ist = iface_state_find(iface);
+		if (ist) (void)iface_state_query(ist);
 		char body[160];
 		int p = snprintf(body, sizeof(body),
 		                 "{\"ok\":%s,\"iface\":\"%s\",\"mbm\":%d,\"iw_rc\":%d}",
@@ -2937,6 +3483,10 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
+	/* Snapshot every iface's chan/ht/txpower right after system.up so the
+	 * /api/v1/ifaces endpoint has truth on the very first poll. */
+	iface_state_init(&cfg);
+
 	int api_fd = api_listen_open(cfg.http_bind, cfg.http_port);
 	if (api_fd < 0) {
 		LOG_ERR("api listen %s:%u: %s", cfg.http_bind, cfg.http_port, strerror(errno));
@@ -2999,6 +3549,13 @@ int main(int argc, char **argv)
 			if (wait < poll_to_ms) poll_to_ms = wait;
 		} else if (g_csa.phase == CSA_VERIFY) {
 			poll_to_ms = 50; /* tight enough for revert deadline */
+		}
+		if (g_scan.phase == SCAN_RUNNING) {
+			uint64_t now = now_us();
+			uint64_t next = g_scan.step_started_us + g_scan.step_dwell_us;
+			int wait = (next > now) ? (int)((next - now + 999ULL) / 1000ULL) : 1;
+			if (wait < 25) wait = 25;
+			if (wait < poll_to_ms) poll_to_ms = wait;
 		}
 		int r = poll(pfds, nfds, poll_to_ms);
 		/* Capture poll's errno before subsequent syscalls clobber it

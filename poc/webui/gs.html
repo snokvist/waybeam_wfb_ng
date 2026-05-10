@@ -346,6 +346,41 @@ select{cursor:pointer;-webkit-appearance:none;appearance:none;background-image:u
   </div>
 
   <div class="section">
+    <div class="section-header"><h3>Channel scan</h3>
+      <span class="help">Cycle the GS adapter(s) through a channel list, dwelling on each combo. Stops on the first one where wfb_rx successfully decrypts a packet — the vehicle is on that channel. Vehicle does not need to cooperate.</span></div>
+    <div class="section-body">
+      <div class="field">
+        <div class="field-label">ifaces <span class="help">copies the same selection used in CSA</span></div>
+        <select id="scan-iface" multiple size="3" style="width:100%"></select>
+      </div>
+      <div class="field">
+        <div class="field-label">chans <span class="help">comma-separated channel list</span></div>
+        <input type="text" id="scan-chans" value="36,40,44,48,52,56,60,64,149,153,157,161,165">
+      </div>
+      <div class="field">
+        <div class="field-label">ht</div>
+        <select id="scan-ht">
+          <option value="HT20" selected>HT20 (all)</option>
+          <option value="HT40+">HT40+ (all)</option>
+          <option value="HT40-">HT40- (all)</option>
+        </select>
+      </div>
+      <div class="field">
+        <div class="field-label">dwell_ms <span class="help">600–1000 ms is typical for RTL88x2</span></div>
+        <input type="number" id="scan-dwell" value="800" min="200" max="10000">
+      </div>
+      <div class="field" style="grid-template-columns:auto auto 1fr auto;gap:.5rem">
+        <button class="btn btn-fire" onclick="scanFire()">Start scan</button>
+        <button class="btn-mini btn-stop" onclick="scanCancel()">Cancel</button>
+        <span></span>
+        <span></span>
+      </div>
+      <div class="reply" id="reply-scan"></div>
+      <div class="muted" id="scan-state" style="margin-top:.4rem">scan idle</div>
+    </div>
+  </div>
+
+  <div class="section">
     <div class="section-header"><h3>Synchronized channel hop (CSA)</h3>
       <span class="help">Sends 5 <code>csa_commit</code> JSON frames to the vehicle over the uplink, then runs <code>iw set channel</code> locally at T_switch. Vehicle's csa_tick mirrors the same timing. Auto-revert if no rx traffic within t_revert_ms.</span></div>
     <div class="section-body">
@@ -431,12 +466,32 @@ async function refresh(){
     lastTunnels=tj;
     renderTunnels(tj);
     populateCtrlTunnels(tj);
-    renderGsTxpowerRow(tj);
-    populateCsaIfaceSelect(tj);
+    // /api/v1/ifaces returns the current chan/ht/txpower per adapter.
+    let ij=[];
+    try{
+      const ri=await fetch('/api/v1/ifaces');
+      ij=await ri.json();
+    }catch(e){}
+    lastIfaces=ij;
+    renderGsTxpowerRow(tj, ij);
+    populateCsaIfaceSelect(tj, ij);
+    populateScanIfaceSelect(tj, ij);
     refreshCsaState();
+    refreshScanState();
   }catch(e){
     setConn(false);
   }
+}
+
+let lastIfaces=[];
+function ifaceLookup(name){
+  return (lastIfaces||[]).find(i=>i.name===name);
+}
+function ifaceLabel(name){
+  const s=ifaceLookup(name);
+  if(!s||s.chan<=0) return name+' [?]';
+  const dbm=(s.txpower_mbm>=0)?` ${(s.txpower_mbm/100).toFixed(0)} dBm`:'';
+  return `${name} [ch ${s.chan} ${s.ht||'?'}${dbm}]`;
 }
 
 function renderGsTxpowerRow(ts){
@@ -451,12 +506,15 @@ function renderGsTxpowerRow(ts){
     row.innerHTML='<span class="muted">no ifaces configured</span>';
     return;
   }
-  // For each iface, a label + four mBm presets.
+  // For each iface, a label (with current state) + four mBm presets.
   const presets=[500,1500,2000,2500];
   let h='';
   ifaces.forEach(i=>{
-    h+=`<div style="display:flex;align-items:center;gap:.4rem">`;
-    h+=`<code>${i}</code>`;
+    const s=ifaceLookup(i);
+    const cur=s && s.txpower_mbm>=0 ? `${(s.txpower_mbm/100).toFixed(0)} dBm` : '?';
+    const ch=s && s.chan>0 ? `ch ${s.chan} ${s.ht||''}` : 'ch ?';
+    h+=`<div style="display:flex;align-items:center;gap:.4rem;flex-wrap:wrap">`;
+    h+=`<code>${i}</code><span class="muted">${ch} · current ${cur}</span>`;
     presets.forEach(m=>{
       const dbm=(m/100).toFixed(0);
       h+=`<button class="btn-mini btn-start" onclick="gsTxpower('${i}',${m})">${dbm} dBm</button>`;
@@ -485,15 +543,41 @@ function populateCsaIfaceSelect(ts){
   }));
   // Preserve current selection set if still present.
   const cur=new Set(Array.from(sel.selectedOptions||[]).map(o=>o.value));
+  const wasFirst=sel.dataset.firstLoad!=='no';
   sel.innerHTML='';
   ifaces.forEach(i=>{
     const o=document.createElement('option');
-    o.value=i; o.textContent=i;
+    o.value=i;
+    o.textContent=ifaceLabel(i);
     // First load: select all by default so the diversity case "just works".
-    if((cur.size===0 && sel.dataset.firstLoad!=='no') || cur.has(i)) o.selected=true;
+    if((cur.size===0 && wasFirst) || cur.has(i)) o.selected=true;
     sel.appendChild(o);
   });
-  sel.dataset.firstLoad='no';
+  if(wasFirst){
+    sel.dataset.firstLoad='no';
+    sel.addEventListener('change', csaAutofillPrev);
+    csaAutofillPrev();
+  }
+}
+
+/* Pull prev_chan/prev_ht from the first selected iface's current state.
+ * Runs:
+ *   - on first WebUI load (so the form starts truthy, not "always 161")
+ *   - on iface-selection change (so the revert target follows the
+ *     adapter you just clicked)
+ * Does NOT run on every refresh — that would clobber a deliberate
+ * operator edit between selection and clicking Hop. */
+function csaAutofillPrev(){
+  const sel=$('#csa-iface');
+  if(!sel) return;
+  const first=Array.from(sel.selectedOptions||[]).map(o=>o.value)[0];
+  if(!first) return;
+  const s=ifaceLookup(first);
+  if(!s||s.chan<=0) return;
+  const prev=$('#csa-prev-chan');
+  const prevHt=$('#csa-prev-ht');
+  if(prev) prev.value=s.chan;
+  if(prevHt && s.ht) prevHt.value=s.ht;
 }
 
 async function refreshCsaState(){
@@ -516,6 +600,81 @@ async function refreshCsaState(){
         `T_revert in ${j.t_to_revert_ms.toFixed(0)} ms`;
     }
   }catch(e){}
+}
+
+function populateScanIfaceSelect(ts){
+  const sel=$('#scan-iface');
+  if(!sel) return;
+  const seen=new Set();
+  const ifaces=[];
+  (ts||[]).forEach(t=>(t.interfaces||[]).forEach(i=>{
+    if(!seen.has(i)){ seen.add(i); ifaces.push(i); }
+  }));
+  const cur=new Set(Array.from(sel.selectedOptions||[]).map(o=>o.value));
+  const wasFirst=sel.dataset.firstLoad!=='no';
+  sel.innerHTML='';
+  ifaces.forEach(i=>{
+    const o=document.createElement('option');
+    o.value=i;
+    o.textContent=ifaceLabel(i);
+    if((cur.size===0 && wasFirst) || cur.has(i)) o.selected=true;
+    sel.appendChild(o);
+  });
+  sel.dataset.firstLoad='no';
+}
+
+async function refreshScanState(){
+  try{
+    const r=await fetch('/api/v1/scan');
+    const j=await r.json();
+    const phaseLabel=['idle','running','found','stopped'][j.phase]||'?';
+    const el=$('#scan-state');
+    if(!el) return;
+    if(j.phase===0){
+      el.textContent='scan idle';
+    } else if(j.phase===1){
+      el.textContent=`scanning sess=${j.sess} step ${j.cur_step+1}/${j.step_count} `+
+        `→ ch ${j.cur_chan} ${j.cur_ht} (dwell ${j.dwell_left_ms.toFixed(0)} ms)`;
+    } else if(j.phase===2){
+      el.innerHTML=`<b>found</b> traffic on chan <b>${j.found_chan} ${j.found_ht}</b> `+
+        `after ${j.hops_done} hop(s) — adapters now on this channel`;
+    } else {
+      el.textContent=`scan stopped after ${j.hops_done} hop(s) — no traffic found`;
+    }
+  }catch(e){}
+}
+
+async function scanFire(){
+  const sel=$('#scan-iface');
+  const ifaceList=Array.from(sel.selectedOptions).map(o=>o.value);
+  const chans=$('#scan-chans').value.trim();
+  const ht=$('#scan-ht').value;
+  const dwell=parseInt($('#scan-dwell').value,10);
+  if(!ifaceList.length){ toast('select at least one iface','err'); return; }
+  if(!chans){ toast('chan list empty','err'); return; }
+  const ifacesParam=ifaceList.map(encodeURIComponent).join(',');
+  const qs=`iface=${ifacesParam}&chans=${encodeURIComponent(chans)}`+
+           `&ht=${encodeURIComponent(ht)}&dwell_ms=${dwell}`;
+  if(!confirm(`Scan ${ifaceList.length} iface(s) across [${chans}] @ ${dwell} ms each?\n\nVideo will drop until the vehicle's channel is found.`)) return;
+  try{
+    const r=await fetch(`/api/v1/system/scan?${qs}`);
+    const ctype=r.headers.get('content-type')||'';
+    let j;
+    if(ctype.includes('application/json')) j=await r.json();
+    else j={ok:r.ok, error:(await r.text()).trim(), http_status:r.status};
+    setReply('#reply-scan', j, j.ok);
+    toast(`scan ${j.ok?'started':'rejected'}: ${j.error||'sess='+j.sess}`, j.ok?'ok':'err');
+    refreshScanState();
+  }catch(e){ toast(`scan failed: ${e.message||e}`,'err'); }
+}
+
+async function scanCancel(){
+  try{
+    const r=await fetch('/api/v1/system/scan/cancel');
+    const j=await r.json();
+    toast(j.cancelled?'scan cancelled':'scan was idle', 'ok');
+    refreshScanState();
+  }catch(e){ toast(`cancel failed: ${e.message||e}`,'err'); }
 }
 
 async function csaFire(){
