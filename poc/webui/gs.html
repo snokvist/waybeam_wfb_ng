@@ -652,8 +652,11 @@ async function scanFire(){
   const dwell=parseInt($('#scan-dwell').value,10);
   if(!ifaceList.length){ toast('select at least one iface','err'); return; }
   if(!chans){ toast('chan list empty','err'); return; }
+  // Same trick as CSA: encode each token individually so the literal ','
+  // separators survive into the server's qs parser.
   const ifacesParam=ifaceList.map(encodeURIComponent).join(',');
-  const qs=`iface=${ifacesParam}&chans=${encodeURIComponent(chans)}`+
+  const chansParam=chans.split(',').map(s=>encodeURIComponent(s.trim())).join(',');
+  const qs=`iface=${ifacesParam}&chans=${chansParam}`+
            `&ht=${encodeURIComponent(ht)}&dwell_ms=${dwell}`;
   if(!confirm(`Scan ${ifaceList.length} iface(s) across [${chans}] @ ${dwell} ms each?\n\nVideo will drop until the vehicle's channel is found.`)) return;
   try{

@@ -1621,10 +1621,18 @@ static void stats_drain(Tunnel *t)
 					 * vehicle on this channel". `pkt.uniq` is the
 					 * per-100ms-interval count (not cumulative), so a
 					 * simple before/after diff doesn't work — sample
-					 * continuously and OR-set a step-local flag. */
+					 * continuously and OR-set a step-local flag.
+					 *
+					 * 200 ms post-hop grace: wfb_rx's own pcap kernel
+					 * buffer can hold ~1 stats interval of pre-hop
+					 * packets, which would falsely trip the flag on the
+					 * very first sample. Skipping the first 200 ms of
+					 * each dwell drops that "in-flight" blob without
+					 * meaningfully shrinking the detection window. */
 					if (u > 0 &&
 					    g_scan.phase == SCAN_RUNNING &&
-					    !strcmp(t->role, "rx")) {
+					    !strcmp(t->role, "rx") &&
+					    now_us() >= g_scan.step_started_us + 200000ULL) {
 						g_scan.step_saw_traffic = true;
 					}
 				}
