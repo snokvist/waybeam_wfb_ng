@@ -3350,6 +3350,13 @@ static void api_handle(ApiClient *cli, Config *c, uint64_t startup_us)
 			tunnel_request_stop(t);
 			t->autostart_on_exit = true;
 			t->backoff_idx = 0;
+			/* If the child was already gone (TS_BACKOFF or TS_STOPPED
+			 * after tunnel_request_stop's early-return), queue an
+			 * immediate respawn instead of leaving it parked. */
+			if (t->pid <= 0) {
+				t->state = TS_BACKOFF;
+				t->next_start_ms = now_ms();
+			}
 			api_send(cli->fd, 200, "application/json", "{\"ok\":true}", -1);
 			return;
 		}
