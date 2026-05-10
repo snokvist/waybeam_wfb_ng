@@ -18,6 +18,8 @@
 
 BUILD_DIR ?= build
 SRC        = gs_supervisor.c
+WEBUI_SRC  = webui/gs.html
+WEBUI_HDR  = gs_webui_assets.h
 OUT_HOST   = $(BUILD_DIR)/gs_supervisor.host
 OUT_CROSS ?= $(BUILD_DIR)/gs_supervisor
 
@@ -27,33 +29,43 @@ LDFLAGS_COMMON =
 CC       ?= cc
 CROSS_CC ?=
 
-DEPLOY_HOST ?= 192.168.1.20
+DEPLOY_HOST ?= 192.168.2.20
 DEPLOY_DIR  ?= /tmp
 
-.PHONY: all host cross clean deploy
+.PHONY: all host cross clean deploy webui
 
 all: host
 
 host: $(OUT_HOST)
 
+webui: $(WEBUI_HDR)
+
+# xxd -i embeds the file as `unsigned char gs_webui_html[]` with a matching
+# `_len`. Promote both to const so the C side can put them in .rodata.
+$(WEBUI_HDR): $(WEBUI_SRC)
+	@echo "[gs_supervisor] embedding $(WEBUI_SRC) -> $@"
+	@xxd -i -n gs_webui_html $< > $@
+	@sed -i 's/^unsigned char gs_webui_html/const unsigned char gs_webui_html/' $@
+	@sed -i 's/^unsigned int gs_webui_html_len/const unsigned int gs_webui_html_len/' $@
+
 $(BUILD_DIR):
 	@mkdir -p $@
 
-$(OUT_HOST): $(SRC) | $(BUILD_DIR)
+$(OUT_HOST): $(SRC) $(WEBUI_HDR) | $(BUILD_DIR)
 	@echo "[gs_supervisor] host -> $@"
-	$(CC) $(CFLAGS_COMMON) -g -o $@ $(SRC) $(LDFLAGS_COMMON)
+	$(CC) $(CFLAGS_COMMON) -I. -g -o $@ $(SRC) $(LDFLAGS_COMMON)
 
 cross: $(OUT_CROSS)
 
-$(OUT_CROSS): $(SRC) | $(BUILD_DIR)
+$(OUT_CROSS): $(SRC) $(WEBUI_HDR) | $(BUILD_DIR)
 	@if [ -z "$(CROSS_CC)" ]; then \
 		echo "set CROSS_CC=<path-to-target-gcc>"; exit 2; \
 	fi
 	@echo "[gs_supervisor] cross ($(CROSS_CC)) -> $@"
-	$(CROSS_CC) $(CFLAGS_COMMON) -o $@ $(SRC) $(LDFLAGS_COMMON)
+	$(CROSS_CC) $(CFLAGS_COMMON) -I. -o $@ $(SRC) $(LDFLAGS_COMMON)
 
 deploy: $(OUT_CROSS)
 	scp $(OUT_CROSS) root@$(DEPLOY_HOST):$(DEPLOY_DIR)/
 
 clean:
-	rm -f $(OUT_HOST) $(OUT_CROSS)
+	rm -f $(OUT_HOST) $(OUT_CROSS) $(WEBUI_HDR)

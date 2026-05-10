@@ -6,3 +6,7 @@ __pycache__/
 # Claude Code session files
 .claude/settings.local.json
 poc/build-openwrt/
+
+# xxd-generated headers from poc/webui/*.html (regenerate via Makefile webui targets)
+poc/webui_assets.h
+poc/gs_webui_assets.h

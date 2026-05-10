@@ -1,0 +1,457 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>waybeam_gs</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=DM+Sans:wght@400;500;600;700&display=swap');
+
+*{margin:0;padding:0;box-sizing:border-box}
+:root{
+  --bg:#0a0a12;--bg2:#0f1019;--card:#141520;--card-hover:#191a2a;
+  --border:#1e2035;--border-hi:#2a2d4a;
+  --text:#c8cad0;--text-dim:#6b6e7a;--text-bright:#eef0f4;
+  --accent:#e94560;--accent-glow:rgba(233,69,96,.15);
+  --live:#22c55e;--live-bg:rgba(34,197,94,.1);
+  --warn:#f59e0b;--warn-bg:rgba(245,158,11,.1);
+  --bad:#ef4444;--bad-bg:rgba(239,68,68,.1);
+  --blue:#3b82f6;--blue-bg:rgba(59,130,246,.1);
+}
+html{font-size:13px}
+body{background:var(--bg);color:var(--text);font-family:'DM Sans',system-ui,sans-serif;min-height:100vh;overflow-x:hidden}
+code,pre,.mono{font-family:'JetBrains Mono',monospace;font-size:.85em}
+
+/* Telemetry Bar */
+.tbar{position:sticky;top:0;z-index:100;background:var(--bg2);border-bottom:1px solid var(--border);padding:0 1.2rem;height:44px;display:flex;align-items:center;gap:1rem;backdrop-filter:blur(12px)}
+.tbar-title{font-family:'JetBrains Mono',monospace;font-weight:700;font-size:1rem;color:var(--text-bright);letter-spacing:-.02em;white-space:nowrap}
+.tbar-title span{color:var(--accent);font-weight:400}
+.tbar-sep{width:1px;height:20px;background:var(--border)}
+.tbar-item{display:flex;align-items:center;gap:.4rem;font-size:.8rem;color:var(--text-dim);white-space:nowrap}
+.tbar-item b{color:var(--text);font-weight:600}
+.tbar-dot{width:7px;height:7px;border-radius:50%;flex-shrink:0}
+.tbar-dot.on{background:var(--live);box-shadow:0 0 8px rgba(34,197,94,.5);animation:pulse-dot 2s ease infinite}
+.tbar-dot.off{background:var(--text-dim);opacity:.4}
+.tbar-dot.bad{background:var(--bad);box-shadow:0 0 8px var(--bad)}
+@keyframes pulse-dot{0%,100%{opacity:1}50%{opacity:.5}}
+.tbar-right{margin-left:auto;display:flex;align-items:center;gap:.8rem}
+.tbar-btn{background:none;border:1px solid var(--border);color:var(--text-dim);padding:4px 10px;border-radius:4px;cursor:pointer;font-size:.75rem;font-family:'JetBrains Mono',monospace;transition:all .15s}
+.tbar-btn:hover{border-color:var(--text-dim);color:var(--text)}
+
+/* Tabs */
+.tabs{display:flex;background:var(--bg2);border-bottom:1px solid var(--border);padding:0 1.2rem;gap:0}
+.tab{padding:.7rem 1.2rem;cursor:pointer;color:var(--text-dim);font-weight:500;font-size:.85rem;border-bottom:2px solid transparent;transition:all .15s;user-select:none}
+.tab:hover{color:var(--text)}
+.tab.active{color:var(--accent);border-bottom-color:var(--accent)}
+.tab-content{display:none;padding:1.2rem;max-width:1100px;margin:0 auto}
+.tab-content.active{display:block;animation:fadeIn .2s ease}
+@keyframes fadeIn{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
+
+/* Tunnels Tab */
+.tunnel-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:.8rem}
+.tunnel{background:var(--card);border:1px solid var(--border);border-radius:6px;overflow:hidden;transition:border-color .15s}
+.tunnel:hover{border-color:var(--border-hi)}
+.tunnel-head{display:flex;align-items:center;gap:.6rem;padding:.7rem 1rem;border-bottom:1px solid var(--border);background:var(--bg2)}
+.tunnel-name{font-family:'JetBrains Mono',monospace;font-weight:700;font-size:.95rem;color:var(--text-bright);flex:1}
+.role-badge{font-size:.65rem;padding:2px 7px;border-radius:3px;font-weight:600;font-family:'JetBrains Mono',monospace;letter-spacing:.04em;text-transform:uppercase}
+.role-rx{color:var(--blue);background:var(--blue-bg);border:1px solid var(--blue)}
+.role-tx{color:var(--accent);background:var(--accent-glow);border:1px solid var(--accent)}
+.state-badge{font-size:.65rem;padding:2px 7px;border-radius:3px;font-weight:600;font-family:'JetBrains Mono',monospace;letter-spacing:.04em;text-transform:uppercase}
+.state-running{color:var(--live);background:var(--live-bg);border:1px solid var(--live)}
+.state-backoff{color:var(--warn);background:var(--warn-bg);border:1px solid var(--warn)}
+.state-stopped{color:var(--text-dim);background:var(--bg);border:1px solid var(--border-hi)}
+.state-failed,.state-starting{color:var(--accent);background:var(--accent-glow);border:1px solid var(--accent)}
+.tunnel-body{padding:.7rem 1rem}
+.tunnel-kv{display:grid;grid-template-columns:auto 1fr;gap:3px 1rem;font-size:.78rem;margin-bottom:.6rem}
+.tunnel-kv dt{color:var(--text-dim);font-family:'JetBrains Mono',monospace}
+.tunnel-kv dd{margin:0;color:var(--text);font-variant-numeric:tabular-nums;font-family:'JetBrains Mono',monospace}
+.tunnel-actions{display:flex;gap:.4rem;flex-wrap:wrap}
+.btn-mini{padding:3px 10px;border-radius:4px;cursor:pointer;font-size:.72rem;font-weight:600;font-family:'JetBrains Mono',monospace;border:1px solid var(--border);background:var(--bg);color:var(--text);transition:all .15s;text-transform:uppercase;letter-spacing:.04em}
+.btn-mini:hover:not(:disabled){border-color:var(--text-dim);color:var(--text-bright)}
+.btn-mini:disabled{opacity:.35;cursor:not-allowed}
+.btn-start{color:var(--live);border-color:var(--live)}
+.btn-start:hover:not(:disabled){background:var(--live-bg)}
+.btn-stop{color:var(--warn);border-color:var(--warn)}
+.btn-stop:hover:not(:disabled){background:var(--warn-bg)}
+.btn-restart{color:var(--accent);border-color:var(--accent)}
+.btn-restart:hover:not(:disabled){background:var(--accent-glow)}
+
+/* Sections */
+.section{background:var(--card);border:1px solid var(--border);border-radius:6px;margin-bottom:.8rem;overflow:hidden}
+.section-header{display:flex;align-items:center;padding:.6rem 1rem;gap:.5rem;border-bottom:1px solid var(--border);background:var(--bg2)}
+.section-header h3{font-size:.85rem;font-weight:600;color:var(--text-bright);flex:1}
+.section-header .help{font-size:.7rem;color:var(--text-dim)}
+.section-body{padding:.8rem 1rem}
+
+/* Controls form */
+.field{display:grid;grid-template-columns:160px 1fr auto;align-items:center;padding:.4rem 0;gap:.8rem;border-bottom:1px solid var(--border)}
+.field:last-child{border-bottom:none}
+.field-label{font-size:.78rem;color:var(--text);font-family:'JetBrains Mono',monospace}
+.field-label .help{display:block;font-size:.7rem;color:var(--text-dim);margin-top:1px;font-family:'DM Sans',sans-serif}
+input[type="text"],input[type="number"],select{
+  background:var(--bg);border:1px solid var(--border);color:var(--text);padding:5px 8px;border-radius:4px;font-size:.8rem;font-family:'JetBrains Mono',monospace;width:100%;max-width:200px;transition:border-color .15s
+}
+input:focus,select:focus{outline:none;border-color:var(--accent)}
+input[type="number"]{-moz-appearance:textfield}
+input[type="number"]::-webkit-outer-spin-button,input[type="number"]::-webkit-inner-spin-button{-webkit-appearance:none;margin:0}
+select{cursor:pointer;-webkit-appearance:none;appearance:none;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M0 0l5 6 5-6z' fill='%236b6e7a'/%3E%3C/svg%3E");background-repeat:no-repeat;background-position:right 8px center;padding-right:24px}
+.btn{padding:.45rem 1rem;border:none;border-radius:5px;cursor:pointer;font-size:.78rem;font-weight:600;transition:all .15s;font-family:'DM Sans',sans-serif}
+.btn:disabled{opacity:.35;cursor:not-allowed}
+.btn-apply{background:var(--live);color:#000}
+.btn-apply:hover:not(:disabled){background:#16a34a;transform:translateY(-1px)}
+.btn-fire{background:var(--accent);color:#fff}
+.btn-fire:hover:not(:disabled){background:#d63b54;transform:translateY(-1px)}
+
+/* Result/last-reply pane */
+.reply{background:var(--bg);border:1px solid var(--border);border-radius:4px;padding:.5rem .8rem;margin-top:.5rem;font-family:'JetBrains Mono',monospace;font-size:.75rem;color:var(--text);white-space:pre-wrap;word-break:break-all;min-height:1.4em}
+.reply.ok{border-left:3px solid var(--live)}
+.reply.err{border-left:3px solid var(--bad)}
+
+/* Toast */
+.toast-container{position:fixed;top:52px;right:1rem;z-index:200;display:flex;flex-direction:column;gap:.4rem}
+.toast{padding:.5rem 1rem;border-radius:5px;font-size:.8rem;color:#fff;animation:toastIn .3s ease,toastOut .3s ease 2.7s forwards;max-width:360px;font-weight:500;border-left:3px solid}
+.toast-ok{background:rgba(34,197,94,.15);border-left-color:var(--live);color:var(--live)}
+.toast-err{background:rgba(239,68,68,.15);border-left-color:var(--bad);color:var(--bad)}
+@keyframes toastIn{from{opacity:0;transform:translateX(20px)}to{opacity:1;transform:none}}
+@keyframes toastOut{to{opacity:0;transform:translateX(20px)}}
+
+::-webkit-scrollbar{width:6px;height:6px}
+::-webkit-scrollbar-track{background:var(--bg)}
+::-webkit-scrollbar-thumb{background:var(--border-hi);border-radius:3px}
+::-webkit-scrollbar-thumb:hover{background:var(--text-dim)}
+
+.muted{color:var(--text-dim)}
+.empty{color:var(--text-dim);text-align:center;padding:2rem;font-size:.85rem;border:1px dashed var(--border);border-radius:6px}
+</style>
+</head>
+<body>
+
+<div class="tbar">
+  <div class="tbar-title">waybeam<span>_gs</span></div>
+  <div class="tbar-sep"></div>
+  <div class="tbar-item">uptime <b id="tbar-up">-</b></div>
+  <div class="tbar-item">tunnels <b id="tbar-tunnels">-</b></div>
+  <div class="tbar-item"><div class="tbar-dot off" id="tbar-conn"></div><span id="tbar-conn-label">connecting</span></div>
+  <div class="tbar-right">
+    <button class="tbar-btn" onclick="manualRefresh()">Refresh</button>
+  </div>
+</div>
+
+<div class="tabs">
+  <div class="tab active" data-tab="tunnels">Tunnels</div>
+  <div class="tab" data-tab="control">Control</div>
+  <div class="tab" data-tab="cmd">Cmd</div>
+</div>
+
+<div class="toast-container" id="toasts"></div>
+
+<!-- Tunnels -->
+<div class="tab-content active" id="tab-tunnels">
+  <div id="tunnel-grid" class="tunnel-grid"></div>
+</div>
+
+<!-- Control (wfb_cmd passthrough) -->
+<div class="tab-content" id="tab-control">
+  <div class="section">
+    <div class="section-header">
+      <h3>wfb_cmd target</h3>
+      <span class="help">Selects which tx tunnel's control_port the requests go to.</span>
+    </div>
+    <div class="section-body">
+      <div class="field">
+        <div class="field-label">Tunnel
+          <span class="help">Only tx tunnels with control_port set are valid targets.</span>
+        </div>
+        <select id="ctrl-tunnel"></select>
+        <span></span>
+      </div>
+    </div>
+  </div>
+
+  <div class="section">
+    <div class="section-header"><h3>FEC (set_fec / get_fec)</h3>
+      <span class="help">k/n &amp; per-block fec_timeout.</span></div>
+    <div class="section-body">
+      <div class="field">
+        <div class="field-label">k <span class="help">data shards per FEC block</span></div>
+        <input type="number" id="fec-k" min="1" max="255" value="1">
+        <span></span>
+      </div>
+      <div class="field">
+        <div class="field-label">n <span class="help">total shards (k + parity)</span></div>
+        <input type="number" id="fec-n" min="1" max="255" value="2">
+        <span></span>
+      </div>
+      <div class="field">
+        <div class="field-label">fec_timeout_ms <span class="help">empty = leave running value</span></div>
+        <input type="number" id="fec-to" min="0" max="65534" placeholder="(keep)">
+        <span></span>
+      </div>
+      <div class="field" style="grid-template-columns:1fr auto auto;gap:.5rem">
+        <span></span>
+        <button class="btn btn-fire" onclick="ctrlGetFec()">Get</button>
+        <button class="btn btn-apply" onclick="ctrlSetFec()">Set</button>
+      </div>
+      <div class="reply" id="reply-fec"></div>
+    </div>
+  </div>
+
+  <div class="section">
+    <div class="section-header"><h3>Radio (set_radio / get_radio)</h3>
+      <span class="help">Note: changes affect this ground-side TX only; vehicle RX adapts to whatever it sees.</span></div>
+    <div class="section-body">
+      <div class="field">
+        <div class="field-label">stbc</div>
+        <input type="number" id="r-stbc" min="0" max="3" value="0"><span></span>
+      </div>
+      <div class="field">
+        <div class="field-label">ldpc</div>
+        <input type="number" id="r-ldpc" min="0" max="1" value="0"><span></span>
+      </div>
+      <div class="field">
+        <div class="field-label">short_gi</div>
+        <input type="number" id="r-sgi" min="0" max="1" value="0"><span></span>
+      </div>
+      <div class="field">
+        <div class="field-label">bandwidth (MHz)</div>
+        <input type="number" id="r-bw" min="5" max="80" value="20"><span></span>
+      </div>
+      <div class="field">
+        <div class="field-label">mcs_index</div>
+        <input type="number" id="r-mcs" min="0" max="31" value="1"><span></span>
+      </div>
+      <div class="field">
+        <div class="field-label">vht_mode</div>
+        <input type="number" id="r-vhtm" min="0" max="1" value="0"><span></span>
+      </div>
+      <div class="field">
+        <div class="field-label">vht_nss</div>
+        <input type="number" id="r-vhtn" min="1" max="4" value="1"><span></span>
+      </div>
+      <div class="field" style="grid-template-columns:1fr auto auto;gap:.5rem">
+        <span></span>
+        <button class="btn btn-fire" onclick="ctrlGetRadio()">Get</button>
+        <button class="btn btn-apply" onclick="ctrlSetRadio()">Set</button>
+      </div>
+      <div class="reply" id="reply-radio"></div>
+    </div>
+  </div>
+</div>
+
+<!-- Cmd (WCMD venc proxy) -->
+<div class="tab-content" id="tab-cmd">
+  <div class="section">
+    <div class="section-header"><h3>venc command (WCMD over uplink)</h3>
+      <span class="help">Fire-and-forget. Vehicle's link_controller proxies to the venc HTTP API.</span></div>
+    <div class="section-body">
+      <div class="field">
+        <div class="field-label">key
+          <span class="help">force_idr ignores value</span></div>
+        <select id="cmd-key">
+          <option value="bitrate_kbps">bitrate_kbps</option>
+          <option value="fps">fps</option>
+          <option value="payload_bytes">payload_bytes</option>
+          <option value="force_idr">force_idr</option>
+        </select>
+        <span></span>
+      </div>
+      <div class="field">
+        <div class="field-label">value <span class="help">int32; ignored for force_idr</span></div>
+        <input type="number" id="cmd-value" placeholder="e.g. 4000">
+        <span></span>
+      </div>
+      <div class="field" style="grid-template-columns:1fr auto;gap:.5rem">
+        <span></span>
+        <button class="btn btn-fire" onclick="cmdFire()">Send</button>
+      </div>
+      <div class="reply" id="reply-cmd"></div>
+    </div>
+  </div>
+
+  <div class="section">
+    <div class="section-header"><h3>Quick fires</h3><span class="help">Common one-shots.</span></div>
+    <div class="section-body" style="display:flex;gap:.5rem;flex-wrap:wrap">
+      <button class="btn-mini btn-restart" onclick="cmdQuick('force_idr')">force_idr</button>
+      <button class="btn-mini btn-start" onclick="cmdQuick('bitrate_kbps',2000)">bitrate 2 Mbps</button>
+      <button class="btn-mini btn-start" onclick="cmdQuick('bitrate_kbps',4000)">bitrate 4 Mbps</button>
+      <button class="btn-mini btn-start" onclick="cmdQuick('bitrate_kbps',8000)">bitrate 8 Mbps</button>
+      <button class="btn-mini btn-start" onclick="cmdQuick('fps',60)">fps 60</button>
+      <button class="btn-mini btn-start" onclick="cmdQuick('fps',120)">fps 120</button>
+    </div>
+  </div>
+</div>
+
+<script>
+const $=s=>document.querySelector(s);
+const $$=s=>document.querySelectorAll(s);
+
+function fmtUptime(s){
+  s=Math.floor(s||0);
+  const d=Math.floor(s/86400),h=Math.floor((s%86400)/3600),m=Math.floor((s%3600)/60),ss=s%60;
+  if(d) return d+'d '+h+'h';
+  if(h) return h+'h '+m+'m';
+  if(m) return m+'m '+ss+'s';
+  return ss+'s';
+}
+
+function toast(msg, kind){
+  const t=document.createElement('div');
+  t.className='toast toast-'+(kind||'ok');
+  t.textContent=msg;
+  $('#toasts').appendChild(t);
+  setTimeout(()=>t.remove(),3000);
+}
+
+let lastTunnels=[];
+async function refresh(){
+  try{
+    const r=await fetch('/api/v1/status');
+    if(!r.ok) throw new Error('HTTP '+r.status);
+    const j=await r.json();
+    $('#tbar-up').textContent=fmtUptime(j.uptime_s);
+    $('#tbar-tunnels').textContent=(j.tunnels||[]).length;
+    setConn(true);
+    // pull /tunnels for full detail
+    const r2=await fetch('/api/v1/tunnels');
+    const tj=await r2.json();
+    lastTunnels=tj;
+    renderTunnels(tj);
+    populateCtrlTunnels(tj);
+  }catch(e){
+    setConn(false);
+  }
+}
+
+function setConn(ok){
+  const dot=$('#tbar-conn'), lbl=$('#tbar-conn-label');
+  dot.className='tbar-dot '+(ok?'on':'bad');
+  lbl.textContent=ok?'live':'offline';
+}
+
+function renderTunnels(ts){
+  const g=$('#tunnel-grid');
+  if(!ts || !ts.length){ g.innerHTML='<div class="empty">no tunnels configured</div>'; return; }
+  g.innerHTML=ts.map(t=>{
+    const ifs=(t.interfaces||[]).join(', ');
+    const detail = t.role==='rx'
+      ? `<dt>udp_out</dt><dd>${t.udp_out||'<span class="muted">(default 127.0.0.1:5600)</span>'}</dd>
+         <dt>stats_out</dt><dd>${t.stats_out||'<span class="muted">-</span>'}</dd>`
+      : `<dt>udp_in</dt><dd>${t.udp_in_port}</dd>
+         <dt>control</dt><dd>${t.control_port||'<span class="muted">-</span>'}</dd>
+         <dt>fec</dt><dd>k=${t.fec.k} n=${t.fec.n}</dd>
+         <dt>radio</dt><dd>bw=${t.radio.bw} mcs=${t.radio.mcs===-1?'<span class="muted">unset</span>':t.radio.mcs}</dd>`;
+    return `<div class="tunnel">
+      <div class="tunnel-head">
+        <div class="tunnel-name">${t.name}</div>
+        <span class="role-badge role-${t.role}">${t.role}</span>
+        <span class="state-badge state-${t.state}">${t.state}</span>
+      </div>
+      <div class="tunnel-body">
+        <dl class="tunnel-kv">
+          <dt>pid</dt><dd>${t.pid>0?t.pid:'<span class="muted">-</span>'}</dd>
+          <dt>restarts</dt><dd>${t.restarts||0}</dd>
+          <dt>link_id</dt><dd>${t.link_id} / radio_port ${t.radio_port}</dd>
+          <dt>ifaces</dt><dd>${ifs}</dd>
+          ${detail}
+          ${t.last_exit!==undefined?`<dt>last_exit</dt><dd>${t.last_exit}</dd>`:''}
+        </dl>
+        <div class="tunnel-actions">
+          <button class="btn-mini btn-start" ${t.state==='running'?'disabled':''} onclick="tunnelAction('${t.name}','start')">Start</button>
+          <button class="btn-mini btn-stop" ${t.state==='running'||t.state==='backoff'?'':'disabled'} onclick="tunnelAction('${t.name}','stop')">Stop</button>
+          <button class="btn-mini btn-restart" onclick="tunnelAction('${t.name}','restart')">Restart</button>
+        </div>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+function populateCtrlTunnels(ts){
+  const sel=$('#ctrl-tunnel');
+  const cur=sel.value;
+  const txs=(ts||[]).filter(t=>t.role==='tx' && t.control_port>0);
+  sel.innerHTML=txs.length
+    ? txs.map(t=>`<option value="${t.name}">${t.name} (control_port ${t.control_port})</option>`).join('')
+    : `<option value="">no tx tunnels with control_port</option>`;
+  if(txs.find(t=>t.name===cur)) sel.value=cur;
+}
+
+async function tunnelAction(name, action){
+  try{
+    const r=await fetch(`/api/v1/tunnels/${name}/${action}`);
+    const j=await r.json();
+    if(j.ok===false) throw new Error(j.error||'failed');
+    toast(`${name}: ${action} ok`, 'ok');
+    setTimeout(refresh, 200);
+  }catch(e){ toast(`${name}: ${action} failed: ${e.message||e}`, 'err'); }
+}
+
+function setReply(id, j, ok){
+  const el=$(id);
+  el.className='reply '+(ok?'ok':'err');
+  el.textContent=JSON.stringify(j,null,2);
+}
+
+async function ctrlReq(qs, replyId){
+  const tunnel=$('#ctrl-tunnel').value;
+  if(!tunnel){ toast('no tx tunnel selected','err'); return; }
+  try{
+    const r=await fetch(`/api/v1/tunnels/${tunnel}/control?${qs}`);
+    const j=await r.json();
+    setReply(replyId, j, j.ok);
+    if(!j.ok) toast(`control failed: ${j.error||'rc='+j.rc}`,'err');
+  }catch(e){ setReply(replyId, {ok:false,error:String(e)}, false); }
+}
+
+function ctrlGetFec(){ ctrlReq('cmd=get_fec','#reply-fec'); }
+function ctrlSetFec(){
+  const k=$('#fec-k').value, n=$('#fec-n').value, to=$('#fec-to').value;
+  let qs=`cmd=set_fec&k=${k}&n=${n}`;
+  if(to!=='') qs+=`&fec_timeout_ms=${to}`;
+  ctrlReq(qs,'#reply-fec');
+}
+function ctrlGetRadio(){ ctrlReq('cmd=get_radio','#reply-radio'); }
+function ctrlSetRadio(){
+  const qs=`cmd=set_radio&stbc=${$('#r-stbc').value}&ldpc=${$('#r-ldpc').value}&short_gi=${$('#r-sgi').value}&bandwidth=${$('#r-bw').value}&mcs_index=${$('#r-mcs').value}&vht_mode=${$('#r-vhtm').value}&vht_nss=${$('#r-vhtn').value}`;
+  ctrlReq(qs,'#reply-radio');
+}
+
+async function cmdFire(){
+  const key=$('#cmd-key').value;
+  const val=$('#cmd-value').value;
+  let qs=`key=${encodeURIComponent(key)}`;
+  if(val!=='' && key!=='force_idr') qs+=`&value=${encodeURIComponent(val)}`;
+  try{
+    const r=await fetch(`/api/v1/cmd?${qs}`);
+    const j=await r.json();
+    setReply('#reply-cmd', j, j.ok);
+    if(!j.ok) toast(`cmd failed: ${j.error||'?'}`,'err');
+  }catch(e){ setReply('#reply-cmd', {ok:false,error:String(e)}, false); }
+}
+
+async function cmdQuick(key, value){
+  let qs=`key=${encodeURIComponent(key)}`;
+  if(value!==undefined) qs+=`&value=${value}`;
+  try{
+    const r=await fetch(`/api/v1/cmd?${qs}`);
+    const j=await r.json();
+    setReply('#reply-cmd', j, j.ok);
+    toast(`${key}${value!==undefined?'='+value:''}: ${j.ok?'sent':j.error}`, j.ok?'ok':'err');
+  }catch(e){ toast(`cmd failed: ${e.message||e}`,'err'); }
+}
+
+function manualRefresh(){ refresh(); }
+
+$$('.tab').forEach(t=>{
+  t.addEventListener('click', ()=>{
+    $$('.tab').forEach(x=>x.classList.remove('active'));
+    $$('.tab-content').forEach(x=>x.classList.remove('active'));
+    t.classList.add('active');
+    document.getElementById('tab-'+t.dataset.tab).classList.add('active');
+  });
+});
+
+refresh();
+setInterval(refresh, 1000);
+</script>
+</body>
+</html>

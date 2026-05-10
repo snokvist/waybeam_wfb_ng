@@ -1237,6 +1237,29 @@ static int wcmd_emit(const Config *c, int key, int32_t value, uint16_t *seq_out)
 	return err;
 }
 
+/* ---------- Embedded WebUI ------------------------------------------- *
+ *
+ * webui/gs.html is xxd-i embedded by Makefile.gs_supervisor's `webui`
+ * target as a const byte array. Served at `/` when the request carries
+ * Accept: text/html (browser path); curl with no overrides gets the
+ * /api/v1/health-style help text instead. */
+#if __has_include("gs_webui_assets.h")
+#  include "gs_webui_assets.h"
+#else
+   static const unsigned char gs_webui_html[] =
+       "<!doctype html><h1>gs_webui_assets.h missing — run "
+       "`make -f Makefile.gs_supervisor webui`.</h1>";
+   static const unsigned int  gs_webui_html_len = sizeof(gs_webui_html) - 1;
+#endif
+
+static bool request_wants_html(const char *req)
+{
+	const char *eol = strchr(req, '\n');
+	const char *headers = eol ? eol + 1 : req;
+	return strstr(headers, "Accept: text/html") != NULL ||
+	       strstr(headers, "accept: text/html") != NULL;
+}
+
 /* ---------- HTTP API ------------------------------------------------- */
 
 typedef struct {
@@ -1282,6 +1305,22 @@ static void api_send(int fd, int code, const char *ctype, const char *body, int 
 		code, reason, ctype, body_len);
 	if (hl > 0 && write_all(fd, hdr, (size_t)hl) == 0)
 		(void)write_all(fd, body, (size_t)body_len);
+}
+
+/* Send an arbitrary byte blob (e.g. embedded HTML). */
+static void api_send_blob(int fd, const char *ctype,
+                          const unsigned char *body, unsigned int len)
+{
+	char hdr[256];
+	int hl = snprintf(hdr, sizeof(hdr),
+		"HTTP/1.0 200 OK\r\n"
+		"Content-Type: %s\r\n"
+		"Content-Length: %u\r\n"
+		"Cache-Control: no-store\r\n"
+		"Connection: close\r\n\r\n",
+		ctype, len);
+	if (hl > 0 && write_all(fd, hdr, (size_t)hl) == 0)
+		(void)write_all(fd, body, (size_t)len);
 }
 
 static int json_emit_tunnel(char *buf, size_t cap, const Tunnel *t, bool full)
@@ -1370,6 +1409,7 @@ static void api_handle(ApiClient *cli, Config *c, uint64_t startup_us)
 		api_send(cli->fd, 405, "text/plain", "expected GET\n", -1);
 		return;
 	}
+	bool wants_html = request_wants_html(cli->buf);
 	char *path = cli->buf + 4;
 	char *sp = strchr(path, ' ');
 	if (!sp) { api_send(cli->fd, 400, "text/plain", "bad request\n", -1); return; }
@@ -1381,6 +1421,17 @@ static void api_handle(ApiClient *cli, Config *c, uint64_t startup_us)
 	char body[8192];
 	int n;
 
+	if (!strcmp(path, "/")) {
+		if (wants_html) {
+			api_send_blob(cli->fd, "text/html; charset=utf-8",
+			              gs_webui_html, gs_webui_html_len);
+		} else {
+			api_send(cli->fd, 200, "text/plain",
+			    "gs_supervisor — see /api/v1/health|status|tunnels|cmd. "
+			    "Open this URL in a browser for the WebUI.\n", -1);
+		}
+		return;
+	}
 	if (!strcmp(path, "/api/v1/health")) {
 		api_send(cli->fd, 200, "text/plain", "ok\n", -1);
 		return;
