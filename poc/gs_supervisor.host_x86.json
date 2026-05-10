@@ -43,7 +43,7 @@
       "autostart": true
     },
     {
-      "_comment": "Uplink TX. -T 1 sets fec_timeout=1ms. Add -C <port> later to enable wfb_cmd passthrough.",
+      "_comment": "Uplink TX. -T 1 sets fec_timeout=1ms. control_port=8000 enables wfb_cmd passthrough via /api/v1/tunnels/uplink/control.",
       "name": "uplink",
       "role": "tx",
       "binary": "./build/wfb_tx_native",
@@ -51,6 +51,7 @@
       "link_id": 208,
       "radio_port": 0,
       "udp_in_port": 6600,
+      "control_port": 8000,
       "fec": { "k": 1, "n": 2 },
       "extra_args": ["-T", "1"],
       "autostart": true

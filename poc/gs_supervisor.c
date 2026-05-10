@@ -887,6 +887,166 @@ static void run_system_block(const char *label, char cmds[][GS_PATH_MAX], int n)
 	}
 }
 
+/* ---------- wfb_cmd passthrough -------------------------------------- *
+ *
+ * Wire format mirrors poc/build/wfb-ng/src/tx_cmd.h (the patched wfb-ng
+ * shipped via build_wfb_tx.sh). Keep the layout in sync if tx_cmd.h
+ * changes — values are network byte order on the wire.
+ *
+ * Request:  uint32_t req_id; uint8_t cmd_id; <union body>
+ *   set_fec    body (4 B):  k, n, fec_timeout_ms (NB)
+ *   set_radio  body (7 B):  stbc, ldpc, short_gi, bw, mcs, vht_mode, vht_nss
+ *   get_fec / get_radio:    no body
+ *
+ * Response: uint32_t req_id; uint32_t rc (NB); <union body>
+ *   On error (rc != 0): only req_id+rc are sent (body omitted).
+ *
+ * wfb_tx binds its control socket to 127.0.0.1 only — sendto must come
+ * from a 127.x address. */
+
+#define WFB_CMD_SET_FEC          1
+#define WFB_CMD_SET_RADIO        2
+#define WFB_CMD_GET_FEC          3
+#define WFB_CMD_GET_RADIO        4
+#define WFB_FEC_TIMEOUT_KEEP     0xFFFFu
+#define WFB_CMD_REPLY_TIMEOUT_MS 200
+
+typedef struct {
+	uint32_t req_id;
+	uint8_t  cmd_id;
+	uint8_t  k;
+	uint8_t  n;
+	uint16_t fec_timeout_ms;     /* NB */
+} __attribute__((packed)) WfbCmdSetFecReq;     /* 9 B */
+
+typedef struct {
+	uint32_t req_id;
+	uint8_t  cmd_id;
+	uint8_t  stbc;
+	uint8_t  ldpc;
+	uint8_t  short_gi;
+	uint8_t  bandwidth;
+	uint8_t  mcs_index;
+	uint8_t  vht_mode;
+	uint8_t  vht_nss;
+} __attribute__((packed)) WfbCmdSetRadioReq;   /* 12 B */
+
+typedef struct {
+	uint32_t req_id;
+	uint8_t  cmd_id;
+} __attribute__((packed)) WfbCmdGetReq;        /* 5 B */
+
+typedef struct {
+	uint32_t req_id;
+	uint32_t rc;                 /* NB; 0 = success */
+	uint8_t  k;
+	uint8_t  n;
+	uint16_t fec_timeout_ms;     /* NB */
+} __attribute__((packed)) WfbCmdGetFecResp;    /* 12 B */
+
+typedef struct {
+	uint32_t req_id;
+	uint32_t rc;                 /* NB */
+	uint8_t  stbc;
+	uint8_t  ldpc;
+	uint8_t  short_gi;
+	uint8_t  bandwidth;
+	uint8_t  mcs_index;
+	uint8_t  vht_mode;
+	uint8_t  vht_nss;
+} __attribute__((packed)) WfbCmdGetRadioResp;  /* 15 B */
+
+/* Returns next req_id (32-bit rolling). Single-threaded => static is fine. */
+static uint32_t wfb_cmd_next_req_id(void)
+{
+	static uint32_t s_req_id = 0;
+	return ++s_req_id;
+}
+
+/* Send a wfb_cmd request to 127.0.0.1:control_port and wait briefly for a
+ * reply. Returns the number of bytes received (0 on timeout, -1 on send
+ * failure). On a successful recv, *out_rc is set to the parsed rc field.
+ *
+ * `req` is the packed request payload; `req_len` its size on the wire.
+ * `resp_buf` is a caller-provided buffer big enough for the largest
+ * possible response (sizeof(WfbCmdGetRadioResp)).
+ */
+static int wfb_cmd_round_trip(int control_port,
+                              const void *req, size_t req_len,
+                              void *resp_buf, size_t resp_cap,
+                              uint32_t *out_rc)
+{
+	if (out_rc) *out_rc = 0xFFFFFFFFu;
+	int s = socket(AF_INET, SOCK_DGRAM, 0);
+	if (s < 0) return -1;
+	struct timeval tv = {
+		.tv_sec  = WFB_CMD_REPLY_TIMEOUT_MS / 1000,
+		.tv_usec = (WFB_CMD_REPLY_TIMEOUT_MS % 1000) * 1000,
+	};
+	setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+	struct sockaddr_in dst = {
+		.sin_family = AF_INET,
+		.sin_port   = htons((uint16_t)control_port),
+	};
+	dst.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+
+	ssize_t w = sendto(s, req, req_len, 0,
+	                   (struct sockaddr *)&dst, sizeof(dst));
+	if (w != (ssize_t)req_len) {
+		close(s);
+		return -1;
+	}
+	ssize_t r = recv(s, resp_buf, resp_cap, 0);
+	close(s);
+	if (r <= 0) return 0;          /* timeout or peer error */
+	if (out_rc && r >= 8) {
+		uint32_t rc_nb;
+		memcpy(&rc_nb, (char *)resp_buf + 4, 4);
+		*out_rc = ntohl(rc_nb);
+	}
+	return (int)r;
+}
+
+/* Tiny query-string scanner: find &key=...& and copy value (URL-decoded
+ * for + and %xx is not needed for our integer args). On hit, returns
+ * pointer into qs at start of value and *len_out is value length. NULL on
+ * miss. qs is the part after '?', already de-prefixed. */
+static const char *qs_get(const char *qs, const char *key, size_t *len_out)
+{
+	if (!qs) return NULL;
+	size_t klen = strlen(key);
+	const char *p = qs;
+	while (*p) {
+		const char *eq = strchr(p, '=');
+		const char *amp = strchr(p, '&');
+		if (!eq) break;
+		size_t kl = (size_t)(eq - p);
+		const char *val = eq + 1;
+		size_t vl = amp ? (size_t)(amp - val) : strlen(val);
+		if (kl == klen && !strncmp(p, key, klen)) {
+			if (len_out) *len_out = vl;
+			return val;
+		}
+		if (!amp) break;
+		p = amp + 1;
+	}
+	return NULL;
+}
+
+static int qs_get_int(const char *qs, const char *key, int *out)
+{
+	size_t vl;
+	const char *v = qs_get(qs, key, &vl);
+	if (!v || vl == 0 || vl > 10) return -1;
+	char buf[12];
+	memcpy(buf, v, vl); buf[vl] = 0;
+	char *end = NULL;
+	long iv = strtol(buf, &end, 10);
+	if (!end || *end) return -1;
+	*out = (int)iv;
+	return 0;
+}
+
 /* ---------- HTTP API ------------------------------------------------- */
 
 typedef struct {
@@ -1007,6 +1167,10 @@ static Tunnel *cfg_find_tunnel(Config *c, const char *name)
  *   GET /api/v1/tunnels/{name}/start
  *   GET /api/v1/tunnels/{name}/stop
  *   GET /api/v1/tunnels/{name}/restart
+ *   GET /api/v1/tunnels/{name}/control?cmd=set_fec&k=1&n=2[&fec_timeout_ms=50]
+ *   GET /api/v1/tunnels/{name}/control?cmd=set_radio&stbc=&ldpc=&short_gi=&bandwidth=&mcs_index=&vht_mode=&vht_nss=
+ *   GET /api/v1/tunnels/{name}/control?cmd=get_fec
+ *   GET /api/v1/tunnels/{name}/control?cmd=get_radio
  */
 static void api_handle(ApiClient *cli, Config *c, uint64_t startup_us)
 {
@@ -1021,7 +1185,8 @@ static void api_handle(ApiClient *cli, Config *c, uint64_t startup_us)
 	if (!sp) { api_send(cli->fd, 400, "text/plain", "bad request\n", -1); return; }
 	*sp = 0;
 	char *qs = strchr(path, '?');
-	if (qs) *qs = 0;
+	const char *qstr = NULL;
+	if (qs) { *qs = 0; qstr = qs + 1; }
 
 	char body[8192];
 	int n;
@@ -1090,6 +1255,131 @@ static void api_handle(ApiClient *cli, Config *c, uint64_t startup_us)
 			t->autostart_on_exit = true;
 			t->backoff_idx = 0;
 			api_send(cli->fd, 200, "application/json", "{\"ok\":true}", -1);
+			return;
+		}
+		if (!strcmp(action, "control")) {
+			if (strcmp(t->role, "tx") != 0) {
+				api_send(cli->fd, 400, "text/plain",
+				         "control only valid on tx tunnels\n", -1);
+				return;
+			}
+			if (t->control_port <= 0) {
+				api_send(cli->fd, 409, "text/plain",
+				         "tunnel has no control_port set; add -C in config\n", -1);
+				return;
+			}
+			size_t cl;
+			const char *cmd = qs_get(qstr, "cmd", &cl);
+			if (!cmd) {
+				api_send(cli->fd, 400, "text/plain", "missing ?cmd=\n", -1);
+				return;
+			}
+			char respbuf[64];
+			uint32_t rc_out = 0xFFFFFFFFu;
+			int rlen = 0;
+
+			if (cl == 7 && !strncmp(cmd, "set_fec", 7)) {
+				int k = -1, nn = -1, to = WFB_FEC_TIMEOUT_KEEP;
+				if (qs_get_int(qstr, "k", &k) < 0 ||
+				    qs_get_int(qstr, "n", &nn) < 0 ||
+				    k < 0 || k > 255 || nn < 0 || nn > 255) {
+					api_send(cli->fd, 400, "text/plain",
+					         "set_fec needs k,n in [0,255]\n", -1);
+					return;
+				}
+				int to_arg;
+				if (qs_get_int(qstr, "fec_timeout_ms", &to_arg) == 0) {
+					if (to_arg < 0 || to_arg > 0xFFFE) {
+						api_send(cli->fd, 400, "text/plain",
+						         "fec_timeout_ms out of range\n", -1);
+						return;
+					}
+					to = to_arg;
+				}
+				WfbCmdSetFecReq req = {
+					.req_id         = wfb_cmd_next_req_id(),
+					.cmd_id         = WFB_CMD_SET_FEC,
+					.k              = (uint8_t)k,
+					.n              = (uint8_t)nn,
+					.fec_timeout_ms = htons((uint16_t)to),
+				};
+				rlen = wfb_cmd_round_trip(t->control_port, &req, sizeof(req),
+				                          respbuf, sizeof(respbuf), &rc_out);
+			} else if (cl == 9 && !strncmp(cmd, "set_radio", 9)) {
+				int stbc=0, ldpc=0, sgi=0, bw=20, mcs=1, vhtm=0, vhtn=1;
+				qs_get_int(qstr, "stbc",      &stbc);
+				qs_get_int(qstr, "ldpc",      &ldpc);
+				qs_get_int(qstr, "short_gi",  &sgi);
+				qs_get_int(qstr, "bandwidth", &bw);
+				qs_get_int(qstr, "mcs_index", &mcs);
+				qs_get_int(qstr, "vht_mode",  &vhtm);
+				qs_get_int(qstr, "vht_nss",   &vhtn);
+				WfbCmdSetRadioReq req = {
+					.req_id    = wfb_cmd_next_req_id(),
+					.cmd_id    = WFB_CMD_SET_RADIO,
+					.stbc      = (uint8_t)stbc,
+					.ldpc      = (uint8_t)(ldpc != 0),
+					.short_gi  = (uint8_t)(sgi  != 0),
+					.bandwidth = (uint8_t)bw,
+					.mcs_index = (uint8_t)mcs,
+					.vht_mode  = (uint8_t)(vhtm != 0),
+					.vht_nss   = (uint8_t)vhtn,
+				};
+				rlen = wfb_cmd_round_trip(t->control_port, &req, sizeof(req),
+				                          respbuf, sizeof(respbuf), &rc_out);
+			} else if ((cl == 7 && !strncmp(cmd, "get_fec",   7)) ||
+			           (cl == 9 && !strncmp(cmd, "get_radio", 9))) {
+				uint8_t cmd_id = (cl == 7) ? WFB_CMD_GET_FEC : WFB_CMD_GET_RADIO;
+				WfbCmdGetReq req = {
+					.req_id = wfb_cmd_next_req_id(),
+					.cmd_id = cmd_id,
+				};
+				rlen = wfb_cmd_round_trip(t->control_port, &req, sizeof(req),
+				                          respbuf, sizeof(respbuf), &rc_out);
+			} else {
+				api_send(cli->fd, 400, "text/plain",
+				         "cmd must be set_fec|set_radio|get_fec|get_radio\n", -1);
+				return;
+			}
+
+			if (rlen < 0) {
+				api_send(cli->fd, 502, "application/json",
+				         "{\"ok\":false,\"error\":\"sendto failed\"}", -1);
+				return;
+			}
+			if (rlen == 0) {
+				api_send(cli->fd, 504, "application/json",
+				         "{\"ok\":false,\"error\":\"timeout\"}", -1);
+				return;
+			}
+			/* JSON-emit the response. Body interpretation depends on cmd. */
+			char body2[256];
+			int p = snprintf(body2, sizeof(body2),
+			                 "{\"ok\":%s,\"rc\":%u",
+			                 rc_out == 0 ? "true" : "false", rc_out);
+			if (rc_out == 0) {
+				if (cl == 7 && !strncmp(cmd, "get_fec", 7) &&
+				    rlen >= (int)sizeof(WfbCmdGetFecResp)) {
+					WfbCmdGetFecResp gf;
+					memcpy(&gf, respbuf, sizeof(gf));
+					p += snprintf(body2 + p, sizeof(body2) - p,
+					              ",\"k\":%u,\"n\":%u,\"fec_timeout_ms\":%u",
+					              gf.k, gf.n, ntohs(gf.fec_timeout_ms));
+				} else if (cl == 9 && !strncmp(cmd, "get_radio", 9) &&
+				           rlen >= (int)sizeof(WfbCmdGetRadioResp)) {
+					WfbCmdGetRadioResp gr;
+					memcpy(&gr, respbuf, sizeof(gr));
+					p += snprintf(body2 + p, sizeof(body2) - p,
+					              ",\"stbc\":%u,\"ldpc\":%u,\"short_gi\":%u,"
+					              "\"bandwidth\":%u,\"mcs_index\":%u,"
+					              "\"vht_mode\":%u,\"vht_nss\":%u",
+					              gr.stbc, gr.ldpc, gr.short_gi,
+					              gr.bandwidth, gr.mcs_index,
+					              gr.vht_mode, gr.vht_nss);
+				}
+			}
+			snprintf(body2 + p, sizeof(body2) - p, "}");
+			api_send(cli->fd, 200, "application/json", body2, -1);
 			return;
 		}
 		api_send(cli->fd, 404, "text/plain", "unknown action\n", -1);
