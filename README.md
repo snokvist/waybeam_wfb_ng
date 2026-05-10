@@ -1,208 +1,222 @@
-# waybeam\_wfb\_ng
+# waybeam_wfb_ng
 
-Zero-copy video streaming infrastructure and adaptive FEC control for
-WiFi broadcast ([wfb-ng](https://github.com/svpcom/wfb-ng)) on
-SigmaStar Infinity6E SoCs.
+Adaptive FEC + MCS controller, WCMD command channel, CSA orchestration,
+and zero-copy SHM video path for [wfb-ng](https://github.com/svpcom/wfb-ng)
+broadcast.  Two daemons:
 
-## Architecture
+- **`vehicle/link_controller`** — runs on the SigmaStar Infinity6E vehicle.
+  Subscribes to the venc RTP sidecar, sizes FEC k/n, picks MCS, applies
+  WCMD frames coming up the uplink, runs CSA on demand.  Exposes a
+  status WebUI on port 8765.
+- **`ground/gs_supervisor`** — runs on the GS host (x86 or aarch64).
+  Forks/manages `wfb_rx` + `wfb_tx`, exposes a REST API + WebUI for
+  lifecycle control, channel scan, CSA orchestration, and WCMD emit
+  toward the vehicle.  Listens on port 9080.
 
-```
- waybeam_venc          /dev/shm/venc_wfb          wfb_tx (patched)
- ┌──────────┐         ┌─────────────────┐        ┌──────────────┐
- │ H.265    ├────────►│ Lock-free SPSC  ├───────►│ FEC encode + │──► wlan0
- │ encoder  │         │ ring (512 slots)│        │ WiFi inject  │
- │ + RTP    │         └─────────────────┘        └──────┬───────┘
- └────┬─────┘                                           │
-      │ sidecar (UDP)                          UDP control port
-      ▼                                                 ▲
- ┌────────────────────────────────────────────┐         │
- │ fec_controller                             │         │
- │  SUBSCRIBE ──► venc sidecar (port 6666)    │         │
- │  FRAME     ◄── per-frame metadata (52/64B) │         │
- │  FPSEstimator + HeadroomTracker            │         │
- │  FECController (k/n computation)           ├─────────┘
- │  WfbTxControl  ──► "set_fec k n"           │
- └────────────────────────────────────────────┘
-```
-
-**Video path** uses shared memory (zero kernel copies).
-**Control path** uses UDP — no custom wfb\_tx patches needed for FEC updates.
-
-## Components
-
-### Shared memory ring (`poc/`)
-
-Zero-copy RTP packet transfer from encoder to wfb\_tx via POSIX shared
-memory, eliminating UDP sendmsg/recvmsg overhead on the video path.
-
-- `SHM_HOWTO.md` — setup guide, ring parameters, troubleshooting
-- `shm-input.patch` — wfb\_tx patch adding `-H` flag for SHM input
-- `build_wfb_tx.sh` — cross-compilation build script for Infinity6E
-
-### RTP timing sidecar (`poc/`)
-
-Out-of-band UDP channel for per-frame timing diagnostics.
-
-- `SIDECAR_INFO.md` — wire protocol, message types, overhead
-- `rtp_timing_probe.c` — host-native reference probe for frame correlation
-
-### Adaptive FEC controller (`fec_controller/`)
-
-Dynamically adjusts wfb-ng FEC k/n based on real-time video frame
-statistics received via the sidecar protocol.
-
-#### How it works
-
-1. Subscribes to the venc sidecar (sends `SUBSCRIBE` every 2s)
-2. Receives `FRAME` messages (52B base / 64B with encoder trailer)
-3. Derives fps from `frame_ready_us` intervals (EWMA)
-4. Tracks frame size variance via `HeadroomTracker` (2.5s rolling window)
-5. Computes optimal k from `avg_frame_size * headroom / MTU`
-6. Interpolates redundancy from curve: 50% at k=1 down to 25% at k=48
-7. Sends `set_fec k n` to wfb\_tx via UDP control port
-8. Gates updates with hysteresis (k must change by >= 2) and rate limiting (0.5s min)
-
-#### Key design decisions
-
-- **One frame ~ one FEC block**: k is sized so a full frame fits in one
-  block, avoiding latency from partial last blocks stalling on the next
-  frame's packets.
-- **Headroom is learned**: The max/avg frame size ratio adapts within
-  2.5s, clamped to [1.05, 1.40] with a 1.05x safety margin.
-- **Small frames get more redundancy**: At k=1, 50% redundancy is cheap
-  in absolute bytes. At k=48, 25% is sufficient because Reed-Solomon has
-  more symbols to work with.
-- **fec\_timeout at half frame period**: Flushes underflowed blocks
-  mid-gap between frames rather than colliding with the next burst.
-
-#### Reference table
+## System diagram
 
 ```
-MTU=1446, headroom=1.15
-
-FrameSize    k    n   n-k  Redundancy  Efficiency
-      500    1    2     1     50%         50%
-     1446    2    4     2     47%         50%
-     3000    3    6     3     43%         50%
-     5000    4    7     3     40%         57%
-     8000    7   11     4     35%         64%
-    12000   10   15     5     32%         67%
-    20000   16   23     7     30%         70%
-    30000   24   34    10     29%         71%
-    44000   35   48    13     27%         73%
-    60000   48   64    16     25%         75%
+ GROUND STATION (x86 host or aarch64)
+ ═══════════════════════════════════════
+ ┌──────────────────────────────────────────────────────┐
+ │ gs_supervisor                              :9080 ◄── operator
+ │   ├─ forks N×wfb_rx (video downlink)                 │
+ │   ├─ forks 1×wfb_tx (uplink for WCMD + CSA)          │
+ │   ├─ /api/v1/cmd          → 3-burst WCMD over uplink │
+ │   ├─ /api/v1/system/csa   → 5-frame burst + iw hop   │
+ │   ├─ /api/v1/system/scan  → channel sweep            │
+ │   └─ embedded WebUI       → tunnels / GS / Vehicle   │
+ └────┬──────────────────────────────────────┬──────────┘
+      │ wfb_rx                                │ wfb_tx
+      │ (decoded video to                     │ (WCMD + CSA frames)
+      │  127.0.0.1:5600)                      │
+      ▼                                       ▼
+                            [ over the air ]
+                                   ▲
+                                   │
+ VEHICLE (SigmaStar Infinity6E, armv7l, OpenIPC Linux)
+ ════════════════════════════════════════════════════════
+ ┌────────────┐   SHM ring   ┌─────────────────────┐
+ │ waybeam_   ├─────────────►│ wfb_tx (patched -H) │
+ │ venc       │   zero-copy  │ FEC encode + inject │
+ │ + RTP      │              └─────────────────────┘
+ │ + sidecar  │
+ └────┬───────┘
+      │ UDP sidecar (rtp_sidecar.h: per-frame size,fps,bitrate,…)
+      ▼
+ ┌──────────────────────────────────────────────────────┐
+ │ link_controller                            :8765 ◄── operator
+ │   ├─ FEC subsystem      (EWMA + bounded headroom)    │
+ │   ├─ MCS subsystem      (rx_ant scoring + selector)  │
+ │   ├─ WCMD dispatcher    (key→HTTP/wfb_cmd/iw)        │
+ │   ├─ CSA receiver lib   (csa.h: csa_feed/csa_tick)   │
+ │   └─ wfb_cmd writer     (set_fec, set_radio)         │
+ └──────────────────────────────────────────────────────┘
 ```
 
-#### Module structure
+## Repository layout
 
 ```
-fec_controller/
-  __init__.py        Public API exports
-  __main__.py        python -m fec_controller
-  protocol.py        Sidecar wire protocol (matches rtp_sidecar.h)
-  config.py          ControllerConfig dataclass (all tunables)
-  headroom.py        HeadroomTracker (learned I/P variance)
-  controller.py      FECController core (EWMA, k/n, gating)
-  wfb_control.py     WfbTxControl (UDP "set_fec k n" sender)
-  service.py         Async UDP service + FPSEstimator
-  cli.py             CLI entry point (run / simulate / table)
-  simulation.py      Synthetic stream generator (uses real protocol)
+ground/                  GS-side daemon
+  gs_supervisor.c          (3651 LOC)  REST API + WebUI + tunnel supervision
+  webui/gs.html            Tunnels / GS Control / Vehicle Control tabs
+  config/example.json      reference config + host_x86.json
+  scripts/                 wfb_rx_to_backpack.py, ground_rssi_forwarder.py
+  Makefile                 make / make cross / make webui / make deploy
+
+vehicle/                 vehicle-side daemon (single binary)
+  link_controller.c        (5365 LOC)  FEC + MCS + WCMD + CSA + WebUI
+  csa/                     CSA receiver library + agents
+  webui/index.html         status WebUI
+  init/S99wfb              OpenIPC init script
+  Makefile                 make (cross) / make host / make webui / make deploy
+
+shared/                  cross-side wire-format headers (single source of truth)
+  wcmd_proto.h             WCMD command channel (16-byte req/resp)
+  rtp_sidecar.h            venc per-frame metadata wire format
+
+wfb-ng/                  patched wfb-ng fork (build artefacts)
+  shm-input.patch          SHM input + -Y stats push
+  build-{armv7,aarch64,openwrt}.sh
+
+probes/                  host-native dev tools
+  rtp_timing_probe.c
+
+docs/                    design notes + protocol specs
+  protocols/{wcmd-proxy,shm-input,rtp-sidecar}.md
+  design/{gs-supervisor,variable-payload}.md
+
+tests/                   default = wire-format conformance (58 tests)
+  protocols/               frozen Python parsers vendored under _proto/
+
+archive/                 superseded code (kept in-tree for reference)
+  python/                  fec_controller/ + mcs_selector/ + 328 legacy tests
+  c-poc/                   standalone C variants subsumed by link_controller
+  init-old/                old GS init scripts replaced by gs_supervisor
+
+FOLLOWUPS.md             deferred polish across both daemons
+Makefile                 top-level umbrella (make all / test / clean)
 ```
 
-#### Usage
+## Quickstart
+
+### Build everything (host, no toolchain needed)
 
 ```bash
-# Run with live sidecar
-python -m fec_controller run \
-  --wfb-port 8003 \
-  --sidecar-host 10.0.0.1 \
-  --sidecar-port 6666 \
-  --stat-port 5610
-
-# Dry run (log updates, don't send to wfb_tx)
-python -m fec_controller run --wfb-port 8003 --dry-run
-
-# Run simulation (builds real sidecar FRAME packets)
-python -m fec_controller simulate --fps 120 --base-frame-size 5000
-
-# Print reference table
-python -m fec_controller table
+make
+make test           # 58 wire-format conformance tests
 ```
 
-#### Tests
+### Cross-build for the vehicle (Infinity6E, armv7l)
 
 ```bash
-python -m pytest tests/ -v
+# Repo expects the toolchain at ./toolchain/ (typically a symlink into
+# a sibling waybeam_venc checkout that vendors the OpenIPC SDK).
+make vehicle
 ```
 
-85 tests covering wire format roundtrips, byte order verification, fps
-estimation, headroom learning, redundancy interpolation, update gating,
-wfb\_tx control format, and async UDP integration. All tests use the
-real sidecar FRAME protocol — no mock formats.
-
-## What's done
-
-- [x] SHM ring zero-copy video path (venc -> wfb\_tx)
-- [x] wfb\_tx patch for `-H` shared memory input
-- [x] Cross-compilation build script for Infinity6E
-- [x] RTP timing sidecar protocol and reference probe
-- [x] Adaptive FEC controller module
-  - [x] Wire protocol matching `rtp_sidecar.h` (52B/64B FRAME, SUBSCRIBE)
-  - [x] FPS estimation from `frame_ready_us` intervals
-  - [x] Learned headroom from actual max/avg frame size ratio
-  - [x] Redundancy curve interpolation (k-dependent)
-  - [x] Update gating (hysteresis + rate limiting)
-  - [x] Async service with sidecar subscription keepalive
-  - [x] `set_fec k n` UDP control output to wfb\_tx
-  - [x] Simulation using real protocol path
-  - [x] 85 unit/integration tests
-
-### Variable NAL / payload sizing (host-only simulation)
-
-Sibling policy that chooses RTP payload size per frame to keep one
-encoded frame inside one FEC source block, subject to a link
-packets-per-second budget and a configurable `[min_payload, mtu_override]`
-range (hard-capped at 3900 B). See `docs/variable-payload.md` for the
-design note and acceptance criteria.
-
-Components (all in `fec_controller/`):
-
-- `payload_sizer.py` — pure `choose_payload_size()` function; closed-form.
-- `frame_size_percentile.py` — P99-over-window tracker feeding `S_ref`.
-- `link_budget.py` — stub `pps_budget` estimator (real deployment: fed by
-  `mod_aalink` via an extended sidecar message).
-- `encoder_sim.py` — synthetic encoder + packetiser with size/IDR/jitter profile.
-- `block_model.py` — FEC block wire-cost model using wfb-ng's per-block
-  largest-packet padding rule.
-- `payload_benchmark.py` — runs fixed-P vs variable-P over the same trace,
-  reports packet count, wire bytes, padding, one-block hit rate, and
-  policy volatility.
-
-Run the comparison:
+### Cross-build the ground supervisor for an aarch64 station
 
 ```bash
-python -m fec_controller payload-benchmark \
-  --frames 360 --fec-k 8 --base 3000 --ramp-at 1.5 --ramp-to 20000 \
-  --fixed-payload 1500 --mtu-override 3000 --pps-budget 3000
+make -C ground cross CROSS_CC=aarch64-linux-gnu-gcc \
+                     OUT_CROSS=build/gs_supervisor.aarch64
 ```
 
-Not yet wired into `FECControllerService` — it's behind the
-`ControllerConfig.enable_variable_payload` flag (default off) until the
-sim justifies migrating the policy. No venc, wfb_tx, or coordination
-repo changes in this slice.
+### Deploy
 
-## Next steps
+```bash
+# Vehicle: scp link_controller and restart wfb-ng init
+make -C vehicle deploy DEPLOY_HOST=192.168.1.13
+ssh root@192.168.1.13 '/etc/init.d/S99wfb restart'
 
-### Near-term
+# Ground: scp gs_supervisor and restart (config under ground/config/)
+make -C ground deploy DEPLOY_HOST=192.168.2.20
+```
 
-- **Integration testing on hardware** — Deploy to device and verify
-  `CMD_SET_FEC` binary commands are accepted by wfb\_tx's control socket.
+### WebUIs
 
-- **Packaging** — Add `pyproject.toml` for pip-installable package with
-  console\_scripts entry point.
+- Vehicle:  `http://<vehicle-ip>:8765`
+- Ground:   `http://<gs-ip>:9080`
 
-### Future enhancements
+## How the pieces fit together
 
-- **Packet aggregation on high-MTU links** — When the radio MTU allows
-  larger packets, aggregate multiple small RTP packets per FEC symbol to
-  reduce FEC overhead. Independent of the adaptive k/n logic.
+### Video path (vehicle → ground)
+
+`waybeam_venc` encodes H.265, writes RTP packets to a POSIX shared-memory
+ring.  Patched `wfb_tx` reads the ring with `-H local_shm` (zero-copy),
+applies FEC, and injects on the air.  Ground's `wfb_rx` decodes and
+forwards to `127.0.0.1:5600` for the player.
+
+### Control path (vehicle → vehicle, via venc sidecar)
+
+`venc` emits one UDP datagram per encoded frame (size, fps, QP, etc.)
+to a sidecar port.  `link_controller` subscribes, sizes FEC k/n via
+EWMA + bounded headroom, and writes `CMD_SET_FEC` to `wfb_tx`'s control
+port.  No round-trip; loss-rate feedback is not used (see "FEC gating
+design" below).
+
+### Control path (ground → vehicle, via uplink)
+
+Operator hits a button in the GS WebUI → `gs_supervisor` emits a 16-byte
+WCMD frame (3 redundant copies, same seq) to its uplink `wfb_tx` UDP
+input port → over the air → vehicle's `wfb_rx` → `link_controller`'s
+WCMD dispatcher demuxes (4-byte "WCMD" magic distinguishes from rx_ant
+JSON) → applies via venc HTTP / `wfb_cmd` / `iw`.  Per-key 500 ms seq
+dedup window collapses redundant copies to one apply.
+
+### Channel switch (ground orchestrates both)
+
+`POST /api/v1/system/csa` on the GS sends 5 `csa_commit` JSON frames at
+20 ms cadence to the vehicle.  Both sides hop with `iw set channel` at
+the same `T_switch`.  If no rx traffic arrives within `t_revert_ms`,
+both sides revert to the previous channel.
+
+## FEC gating design (vehicle side)
+
+Asymmetric — fast increase, slow decrease (mirror of TCP AIMD):
+
+| Direction | Hysteresis | Cooldown | Notes |
+|---|---|---|---|
+| Increase | 1 sample | 0.1 s | Under-protection is far worse than over-protection |
+| Decrease | 3 samples | 2.0 s | Avoid oscillation under bursty I/P imbalance |
+| Oscillation | — | × 3 multiplier | After >4 changes in 5 s |
+
+Sizing: `k = ceil(EWMA_size / MTU) × headroom`, with headroom learned
+from observed I/P ratio (1.05–1.40).  I-frames that exceed `k×MTU` span
+multiple FEC blocks, but the patched `wfb_tx` honours the RTP M-bit and
+closes each frame's final block on the boundary, so single-block loss
+never contaminates adjacent frames.
+
+## WCMD redundancy
+
+Every WCMD from `gs_supervisor /api/v1/cmd` goes out as 3 redundant
+copies sharing the same seq.  The vehicle keeps a 500 ms per-key dedup
+window, so a single FEC-block loss on the uplink no longer drops the
+command and duplicates don't double-apply.  The `coalesced_burst` counter
+in `/cmd/status` reports how often dedup fired.
+
+## Compatibility / wire formats
+
+`shared/wcmd_proto.h` and `shared/rtp_sidecar.h` are the single sources
+of truth for cross-daemon wire formats.  `tests/protocols/` keeps a
+vendored Python parser as a regression net — change either header,
+update the vendored copy, run `make test`.
+
+## Status
+
+| Component | State |
+|---|---|
+| `vehicle/link_controller` | **production** on Infinity6E vehicles |
+| `ground/gs_supervisor`    | **production** on x86 + aarch64 GS hosts |
+| `wfb-ng/shm-input.patch`  | **production** (vendored fork) |
+| `archive/python/`         | superseded — reference only, not deployed |
+| `archive/c-poc/`          | superseded — algorithmic reference |
+
+## Contributing
+
+- Cross-cutting cleanup: see `FOLLOWUPS.md` for deferred polish items.
+- Wire-format changes: bump the C header in `shared/`, the vendored
+  Python copy in `tests/protocols/_proto/`, and add a round-trip test.
+- New WCMD keys: extend `shared/wcmd_proto.h`, the dispatcher in
+  `vehicle/link_controller.c`, the emitter + WebUI in `ground/`.
+- License: see existing files.
