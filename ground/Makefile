@@ -15,7 +15,11 @@
 #        OUT_CROSS=build/gs_supervisor.mipsel
 
 BUILD_DIR ?= build
-SRC        = gs_supervisor.c
+SRCS       = gs_supervisor.c \
+             gs_supervisor_csa.c \
+             gs_supervisor_scan.c \
+             gs_supervisor_http.c
+HDRS       = gs_supervisor.h
 WEBUI_SRC  = webui/gs.html
 WEBUI_HDR  = webui/gs_assets.h
 OUT_HOST   = $(BUILD_DIR)/gs_supervisor.host
@@ -54,18 +58,18 @@ $(WEBUI_HDR): $(WEBUI_SRC)
 $(BUILD_DIR):
 	@mkdir -p $@
 
-$(OUT_HOST): $(SRC) $(WEBUI_HDR) | $(BUILD_DIR)
+$(OUT_HOST): $(SRCS) $(HDRS) $(WEBUI_HDR) | $(BUILD_DIR)
 	@echo "[gs_supervisor] host -> $@"
-	$(CC) $(CFLAGS_COMMON) $(SHARED_INC) -I. -Iwebui -g -o $@ $(SRC) $(LDFLAGS_COMMON)
+	$(CC) $(CFLAGS_COMMON) $(SHARED_INC) -I. -Iwebui -g -o $@ $(SRCS) $(LDFLAGS_COMMON)
 
 cross: $(OUT_CROSS)
 
-$(OUT_CROSS): $(SRC) $(WEBUI_HDR) | $(BUILD_DIR)
+$(OUT_CROSS): $(SRCS) $(HDRS) $(WEBUI_HDR) | $(BUILD_DIR)
 	@if [ -z "$(CROSS_CC)" ]; then \
 		echo "set CROSS_CC=<path-to-target-gcc>"; exit 2; \
 	fi
 	@echo "[gs_supervisor] cross ($(CROSS_CC)) -> $@"
-	$(CROSS_CC) $(CFLAGS_COMMON) $(SHARED_INC) -I. -Iwebui -o $@ $(SRC) $(LDFLAGS_COMMON)
+	$(CROSS_CC) $(CFLAGS_COMMON) $(SHARED_INC) -I. -Iwebui -o $@ $(SRCS) $(LDFLAGS_COMMON)
 
 deploy: $(OUT_CROSS)
 	scp $(OUT_CROSS) root@$(DEPLOY_HOST):$(DEPLOY_DIR)/

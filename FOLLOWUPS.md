@@ -19,7 +19,9 @@ fork-waitpid deadlines in `gs_supervisor.c`, set_radio auto-fill from
 live cache).  PR #50 dropped "Spaced WCMD bursts" (operator confirmed
 that wfb_tx `-T 1` already closes FEC blocks at 1 ms idle, so the 3
 back-to-back copies span blocks naturally) and shipped `run_system_cmd`
-fork+execvp + scan-drain re-emit.
+fork+execvp + scan-drain re-emit.  PR #51 split `gs_supervisor.c` into
+four units (`_csa.c` / `_scan.c` / `_http.c` + a slimmer main file plus
+`gs_supervisor.h`) ahead of further endpoint additions.
 
 1. **`populate*Select` diff vs full rebuild** — LOW gain · MED effort ·
    `gs.html`.  Preserves selection but blows away listeners and DOM nodes
@@ -34,13 +36,15 @@ fork+execvp + scan-drain re-emit.
    would let operators see "this session sent X MB."  Needs supervisor-side
    running sums + a UI toggle.
 4. **Async API handlers (architectural)** — HIGH gain · HIGH effort ·
-   `gs_supervisor.c`.  The big one — unblock the event loop end-to-end so
-   multiple operators hitting buttons concurrently don't stall each
-   other.  Fork-and-reply or worker pool; either way it's a rewrite of
-   the api_handle dispatch.
-5. **Split `gs_supervisor.c` (≈4000 LOC)** — MED gain · HIGH effort.
-   Carve into `gs_supervisor_csa.c` / `_scan.c` / `_http.c` before adding
-   more endpoints.  Pure maintainability play; no behaviour change.
+   `gs_supervisor_http.c`.  The big one — unblock the event loop
+   end-to-end so multiple operators hitting buttons concurrently don't
+   stall each other.  Fork-and-reply or worker pool; either way it's a
+   rewrite of the api_handle dispatch.  Now that HTTP is its own .c, the
+   refactor is contained to that unit.
+5. ~~**Split `gs_supervisor.c` (≈4000 LOC)**~~ — PR #51.  `_csa.c` /
+   `_scan.c` / `_http.c` extracted; main file slimmed from 3998 to
+   ~2170 LOC, with `gs_supervisor.h` carrying types + extern globals +
+   cross-module prototypes.
 
 ## Notes for next session
 
@@ -107,9 +111,13 @@ stay searchable.
   commands all tokenize cleanly.
 - ~~`-Wformat-truncation` on `g_scan.hts[i]` copy.~~  Replaced
   `snprintf("%s", src)` with explicit `strnlen`/`memcpy`.
-- **gs_supervisor.c is approaching 4000 lines.** Split into
-  `gs_supervisor_csa.c`, `gs_supervisor_scan.c`, `gs_supervisor_http.c`
-  before adding more endpoints.
+- ~~**gs_supervisor.c is approaching 4000 lines.**~~  PR #51 splits it
+  into `gs_supervisor.c` (entry, signal/log, JSON, config, tunnel
+  lifecycle, stats, iface cache, wfb_cmd, WCMD, system commands,
+  supervisor_tick), `gs_supervisor_csa.c`, `gs_supervisor_scan.c`, and
+  `gs_supervisor_http.c`, with `gs_supervisor.h` carrying types, extern
+  globals, and cross-module prototypes.  Main file dropped from 3998 to
+  ~2170 LOC; HTTP unit is now ~1190 LOC with all 32 routes contained.
 - ~~Per-iface txpower preset list (5/15/20/25 dBm) hardcoded twice.~~
   Lifted to `TXPOWER_PRESETS_MBM` JS constant; both rows
   (`renderQuickTxpowerRow` + `renderGsTxpowerRow`) consume it.

@@ -1,5 +1,5 @@
 /*
- * gs_supervisor — ground-side wfb supervisor (scaffolding).
+ * gs_supervisor — ground-side wfb supervisor.
  *
  * Single native binary that fork/execs N×wfb_rx and N×wfb_tx children
  * from one JSON config and exposes a REST API for lifecycle control.
@@ -9,97 +9,28 @@
  * Asymmetric to vehicle by design — the vehicle keeps link_controller
  * as the single venc-driven control loop; the ground gets dumb pipes.
  *
- * SCAFFOLDING SCOPE (this file)
- *   - Minimal hand-rolled JSON parser (jsmn-shaped, zero alloc)
- *   - Tunnel model with N interfaces per tunnel (diversity rx,
- *     mirror-mode tx) and arbitrary tunnel count
- *   - fork/exec children with composed argv; SIGCHLD-driven respawn
- *     with bounded exponential backoff if autostart is set
- *   - REST: GET /api/v1/health
- *           GET /api/v1/status
- *           GET /api/v1/tunnels
- *           GET /api/v1/tunnels/{name}
- *           GET /api/v1/tunnels/{name}/start
- *           GET /api/v1/tunnels/{name}/stop
- *           GET /api/v1/tunnels/{name}/restart
- *   - Clean shutdown on SIGTERM/SIGINT (children get SIGTERM → SIGKILL
- *     after grace, then system.down commands run)
- *
- * TODO (follow-up commits)
- *   - wfb_cmd passthrough (POST /api/v1/tunnels/{name}/control)
- *   - WCMD emit (POST /api/v1/cmd) using wcmd_proto.h
- *   - System up/down whitelisted commands (monitor-mode bring-up;
- *     exact iw/ip incantations to be added on device)
- *   - SSE event stream + per-child stdout/stderr ring buffers
- *   - Embedded WebUI (poc/webui/gs.html via xxd -i, like link_controller)
- *   - Config reload (POST /api/v1/reload — diff & re-apply)
+ * Compilation units:
+ *   gs_supervisor.c       — entry, signal/log, JSON parser, config,
+ *                           tunnel lifecycle, stats listener, iface
+ *                           cache, wfb_cmd round-trip, WCMD emit,
+ *                           system commands, supervisor_tick orchestrator
+ *   gs_supervisor_csa.c   — CSA orchestrator (g_csa, csa_tick)
+ *   gs_supervisor_scan.c  — passive channel scanner (g_scan, scan_tick)
+ *   gs_supervisor_http.c  — REST API + WebUI (api_handle and helpers)
  *
  * Style matches link_controller.c: single-thread poll() loop, libc only,
  * GET-based API. No pthreads, no external deps.
  */
 
-#define _GNU_SOURCE
-#include <arpa/inet.h>
-#include <ctype.h>
-#include <errno.h>
-#include <fcntl.h>
-#include <getopt.h>
-#include <limits.h>
-#include <net/if.h>
-#include <netinet/in.h>
-#include <poll.h>
-#include <signal.h>
-#include <stdarg.h>
-#include <stdbool.h>
-#include <stddef.h>
-#include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <strings.h>
-#include <sys/socket.h>
-#include <sys/stat.h>
-#include <sys/types.h>
-#include <sys/wait.h>
-#include <time.h>
-#include <unistd.h>
+#include "gs_supervisor.h"
 
-/* ---------- compile-time limits (small, predictable) ----------------- */
-
-#define GS_MAX_TUNNELS       8
-#define GS_MAX_IFACES        4
-#define GS_MAX_EXTRA_ARGS   16
-#define GS_MAX_SYSTEM_CMDS  32
-#define GS_NAME_MAX         32
-#define GS_PATH_MAX        256
-#define GS_ARG_MAX         128
-#define GS_ARGV_MAX         64
-#define GS_ARGV_BUF       1536
-
-#define API_MAX_CLIENTS      8
-#define API_BUF_BYTES     2048
-/* Slow-client deadline: a TCP peer that opens a connection but never
- * sends a complete header (i.e. no `\r\n\r\n` reached) gets closed after
- * this idle window.  Without it, eight half-open `nc` connections lock
- * out every other operator until the supervisor restarts. */
-#define API_CLIENT_IDLE_US  (5ULL * 1000000ULL)
-
-#define GS_DEFAULT_HTTP_PORT 9080
-#define GS_DEFAULT_CONFIG    "/etc/waybeam/gs_supervisor.json"
-
-/* respawn backoff schedule (ms). Capped — if we exhaust it we stay at the
- * last entry forever. Matches procd ratelimit semantics. */
-static const int GS_BACKOFF_MS[] = { 500, 1000, 2000, 4000, 8000, 16000, 30000 };
-#define GS_BACKOFF_LEN ((int)(sizeof(GS_BACKOFF_MS) / sizeof(GS_BACKOFF_MS[0])))
-
-/* SIGTERM-then-SIGKILL grace period when stopping a child. */
-#define GS_STOP_GRACE_MS  1500
+const int GS_BACKOFF_MS[GS_BACKOFF_LEN] = { 500, 1000, 2000, 4000, 8000, 16000, 30000 };
 
 /* ---------- tiny utils ----------------------------------------------- */
 
-static volatile sig_atomic_t g_shutdown = 0;
-static volatile sig_atomic_t g_sigchld  = 0;
-static int                   g_verbose  = 0;   /* -v: full info + inherit child stdout/stderr */
+volatile sig_atomic_t g_shutdown = 0;
+volatile sig_atomic_t g_sigchld  = 0;
+int                   g_verbose  = 0;   /* -v: full info + inherit child stdout/stderr */
 
 static void on_signal(int sig)
 {
@@ -107,16 +38,16 @@ static void on_signal(int sig)
 	else                g_shutdown = 1;
 }
 
-static uint64_t now_us(void)
+uint64_t now_us(void)
 {
 	struct timespec ts;
 	clock_gettime(CLOCK_MONOTONIC, &ts);
 	return (uint64_t)ts.tv_sec * 1000000ull + (uint64_t)ts.tv_nsec / 1000;
 }
 
-static uint64_t now_ms(void) { return now_us() / 1000; }
+uint64_t now_ms(void) { return now_us() / 1000; }
 
-static void logf_(const char *level, const char *fmt, ...)
+void logf_(const char *level, const char *fmt, ...)
 {
 	struct timespec ts;
 	clock_gettime(CLOCK_REALTIME, &ts);
@@ -132,14 +63,7 @@ static void logf_(const char *level, const char *fmt, ...)
 	fputc('\n', stderr);
 }
 
-#define LOG_INFO(...)  logf_("info",  __VA_ARGS__)
-#define LOG_WARN(...)  logf_("warn",  __VA_ARGS__)
-#define LOG_ERR(...)   logf_("err",   __VA_ARGS__)
-/* LOG_DEBUG silently dropped unless -v was passed. Use for per-event noise
- * (argv dumps, respawn attempts) that's only useful when troubleshooting. */
-#define LOG_DEBUG(...) do { if (g_verbose) logf_("debug", __VA_ARGS__); } while (0)
-
-static int write_all(int fd, const void *buf, size_t len)
+int write_all(int fd, const void *buf, size_t len)
 {
 	const char *p = buf;
 	while (len) {
@@ -164,18 +88,6 @@ static int write_all(int fd, const void *buf, size_t len)
  * Strings are NOT unescaped — we only use plain ASCII keys/values. If we
  * ever need full string handling we'll vendor jsmn properly.
  */
-
-typedef enum { JT_NONE = 0, JT_OBJ, JT_ARR, JT_STR, JT_PRIM } JTokType;
-
-typedef struct {
-	JTokType type;
-	int      start;   /* offset in source */
-	int      end;     /* one past last char */
-	int      size;    /* children for OBJ/ARR; 0 otherwise */
-	int      parent;  /* index in token array, -1 for root */
-} JTok;
-
-#define JSON_MAX_TOKS 512
 
 typedef struct {
 	const char *js;
@@ -229,7 +141,7 @@ static int json_parse_str(JParser *p)
 	return -1;
 }
 
-static int json_parse(const char *js, int len, JTok *toks, int max)
+int json_parse(const char *js, int len, JTok *toks, int max)
 {
 	JParser p = { .js = js, .len = len, .pos = 0,
 	              .toks = toks, .tok_max = max, .tok_count = 0, .super = -1 };
@@ -265,7 +177,7 @@ static int json_parse(const char *js, int len, JTok *toks, int max)
 	return p.tok_count;
 }
 
-static bool jeq(const char *js, const JTok *t, const char *s)
+bool jeq(const char *js, const JTok *t, const char *s)
 {
 	if (t->type != JT_STR) return false;
 	int slen = (int)strlen(s);
@@ -275,7 +187,7 @@ static bool jeq(const char *js, const JTok *t, const char *s)
 /* Advance past a token + all its descendants. Returns next index.
  * NOTE: token .size counts each direct child token. For OBJ that means
  * 2 × pair_count (one for the key string, one for the value). */
-static int jskip(const JTok *toks, int n, int i)
+int jskip(const JTok *toks, int n, int i)
 {
 	if (i >= n) return n;
 	if (toks[i].type == JT_OBJ) {
@@ -297,7 +209,7 @@ static int jskip(const JTok *toks, int n, int i)
 }
 
 /* Find a child of object `obj_idx` by key. Returns idx of value, or -1. */
-static int jfind(const char *js, const JTok *toks, int n, int obj_idx, const char *key)
+int jfind(const char *js, const JTok *toks, int n, int obj_idx, const char *key)
 {
 	if (obj_idx < 0 || obj_idx >= n || toks[obj_idx].type != JT_OBJ) return -1;
 	int pairs = toks[obj_idx].size / 2;
@@ -310,7 +222,7 @@ static int jfind(const char *js, const JTok *toks, int n, int obj_idx, const cha
 	return -1;
 }
 
-static int jstr(const char *js, const JTok *t, char *out, size_t cap)
+int jstr(const char *js, const JTok *t, char *out, size_t cap)
 {
 	if (!t || t->type != JT_STR) { out[0] = 0; return -1; }
 	int slen = t->end - t->start;
@@ -320,7 +232,7 @@ static int jstr(const char *js, const JTok *t, char *out, size_t cap)
 	return slen;
 }
 
-static int jint(const char *js, const JTok *t, long *out)
+int jint(const char *js, const JTok *t, long *out)
 {
 	if (!t || t->type != JT_PRIM) return -1;
 	char buf[32];
@@ -335,7 +247,7 @@ static int jint(const char *js, const JTok *t, long *out)
 	return 0;
 }
 
-static int jbool(const char *js, const JTok *t, bool *out)
+int jbool(const char *js, const JTok *t, bool *out)
 {
 	if (!t || t->type != JT_PRIM) return -1;
 	int slen = t->end - t->start;
@@ -344,177 +256,16 @@ static int jbool(const char *js, const JTok *t, bool *out)
 	return -1;
 }
 
-/* ---------- config + tunnel model ------------------------------------ */
-
-typedef enum {
-	TS_STOPPED = 0,   /* never started, or explicitly stopped via REST */
-	TS_STARTING,      /* fork/exec just issued */
-	TS_RUNNING,       /* alive */
-	TS_BACKOFF,       /* exited unexpectedly, waiting to respawn */
-	TS_FAILED,        /* exec failed or backoff exhausted in a future revision */
-} TunnelState;
-
-typedef struct {
-	char        name[GS_NAME_MAX];
-	char        role[4];               /* "rx" or "tx" */
-	char        binary[GS_PATH_MAX];   /* override executable; "" = wfb_rx / wfb_tx */
-	int         link_id;
-	int         radio_port;
-
-	int         iface_count;
-	char        ifaces[GS_MAX_IFACES][IFNAMSIZ];
-
-	/* rx-only */
-	char        udp_out_ip[GS_ARG_MAX]; /* "" = leave -c/-u to wfb_rx defaults */
-	int         udp_out_port;
-	char        stats_out[GS_ARG_MAX]; /* "ip:port" or empty */
-
-	/* tx-only */
-	int         udp_in_port;
-	int         control_port;
-	int         fec_k, fec_n;
-	int         bandwidth_mhz;
-	int         mcs_index;             /* -1 = unset */
-	int         stbc;                  /* -1 = unset */
-	int         ldpc;                  /* -1 = unset */
-
-	int         extra_arg_count;
-	char        extra_args[GS_MAX_EXTRA_ARGS][GS_ARG_MAX];
-
-	bool        autostart;
-
-	/* runtime state (mutable) */
-	TunnelState state;
-	pid_t       pid;
-	uint64_t    started_us;
-	uint64_t    exited_us;
-	int         exit_code;             /* WEXITSTATUS, or -signo if killed */
-	int         restart_count;
-	int         backoff_idx;
-	uint64_t    next_start_ms;         /* 0 = ASAP */
-	bool        autostart_on_exit;     /* cleared by explicit /stop */
-	uint64_t    stop_deadline_ms;      /* SIGTERM→SIGKILL transition */
-
-	/* rx-only stats listener.  We always bind a local UDP port and pass it
-	 * to wfb_rx -Y so the supervisor can surface rx_ant counters in the
-	 * Tunnels WebUI.  If the user configured a `stats_out` for downstream
-	 * consumers (e.g. uplink TX → vehicle), supervisor re-emits each
-	 * datagram to that target verbatim — preserving the existing pipeline.
-	 *
-	 *   wfb_rx ── -Y 127.0.0.1:<stats_local_port> ──▶ supervisor
-	 *                                                  │
-	 *                                                  ├─▶ parse → Tunnel.st_*
-	 *                                                  └─▶ stats_fwd_addr (re-emit)
-	 */
-	int                 stats_local_fd;
-	uint16_t            stats_local_port;
-	struct sockaddr_in  stats_fwd_addr;
-	int                 stats_fwd_active;
-	char                stats_local_arg[GS_ARG_MAX]; /* "127.0.0.1:port" passed to -Y */
-
-	/* parsed rx_ant / tx_stats snapshot
-	 *
-	 * rx_ant fields (rx role):     st_pkt_*, st_ant_count, st_rssi_best
-	 * tx_stats fields (tx role):   st_tx_pkts_in/out, st_tx_bytes_*,
-	 *                              st_tx_drop, st_tx_trunc, st_tx_fec_timeouts
-	 * shared fields:               st_first_us, st_last_us, st_interval_ms,
-	 *                              st_msg_count
-	 *
-	 * tx_stats also carries fec.k/fec.n/mcs/bw — those land in the
-	 * radio_cache / fec_cache fields directly so the WebUI's TX panel
-	 * doesn't need a separate get_radio / get_fec round-trip on every
-	 * change. */
-	uint64_t    st_first_us;
-	uint64_t    st_last_us;
-	uint32_t    st_interval_ms;
-	uint32_t    st_msg_count;
-
-	/* rx_ant decoder counters */
-	uint32_t    st_pkt_all;
-	uint32_t    st_pkt_lost;
-	uint32_t    st_pkt_fec;
-	uint32_t    st_pkt_outgoing;
-	uint32_t    st_pkt_dec_err;
-	uint32_t    st_pkt_bytes;
-	uint32_t    st_pkt_uniq;
-	int         st_ant_count;
-	int         st_rssi_best;          /* highest avg over antennas */
-
-	/* tx_stats encoder counters */
-	uint32_t    st_tx_pkts_in;
-	uint32_t    st_tx_pkts_out;
-	uint32_t    st_tx_bytes_in;
-	uint32_t    st_tx_bytes_out;
-	uint32_t    st_tx_drop;
-	uint32_t    st_tx_trunc;
-	uint32_t    st_tx_fec_timeouts;
-
-	/* tx-only runtime cache (echoes wfb_tx live state via wfb_cmd) */
-	int         short_gi;              /* -1 = unset */
-	int         vht_mode;
-	int         vht_nss;
-	int         fec_timeout_ms;        /* runtime, -1 = unknown */
-	int         radio_cache_have;
-	int         fec_cache_have;
-	uint64_t    radio_cache_us;
-	uint64_t    tx_init_query_after_us; /* schedule a get_radio/get_fec */
-} Tunnel;
-
-typedef struct {
-	char     key_file[GS_PATH_MAX];
-	char     http_bind[64];
-	uint16_t http_port;
-
-	int      system_up_count;
-	char     system_up[GS_MAX_SYSTEM_CMDS][GS_PATH_MAX];
-	int      system_down_count;
-	char     system_down[GS_MAX_SYSTEM_CMDS][GS_PATH_MAX];
-
-	int      tunnel_count;
-	Tunnel   tunnels[GS_MAX_TUNNELS];
-
-	bool     venc_cmd_enabled;
-	char     venc_cmd_uplink[GS_NAME_MAX];
-	int      venc_cmd_rate_limit_ms;
-} Config;
-
-/* ---------- iface radio state cache --------------------------------- *
+/* ---------- config + tunnel model -----------------------------------
  *
- * Each WLAN adapter the supervisor manages has a current-channel /
- * current-HT / current-txpower triple that we expose via /api/v1/ifaces
- * and use to pre-fill prev_chan/prev_ht for a CSA hop.  Refreshed
- * lazily by `iw dev <name> info` once every 2 s, plus on demand right
- * after we drive a channel change ourselves.
- *
- * Keyed by iface name (deduped across all tunnels).  Global rather than
- * tunnel-local because a single iface can appear in multiple tunnels
- * (diversity RX + uplink TX share an adapter in the host_x86 config).
- */
-#define GS_MAX_GLOBAL_IFACES (GS_MAX_TUNNELS * GS_MAX_IFACES)
-#define GS_IFACE_REFRESH_US  2000000ULL
+ * Tunnel, Config, IfaceState, and TunnelState live in gs_supervisor.h
+ * so the CSA / scan / HTTP modules can share them without a tangle of
+ * forward declarations. */
 
-typedef struct {
-	char     name[IFNAMSIZ];
-	int      chan;             /* -1 unknown */
-	int      freq_mhz;         /* -1 unknown */
-	char     ht[8];            /* "HT20" / "HT40+" / "HT40-" / "" */
-	int      txpower_mbm;      /* -1 unknown */
-	uint64_t last_query_us;    /* 0 = never */
-	int      last_rc;          /* iw exit status; 0 ok */
-} IfaceState;
+IfaceState g_iface_state[GS_MAX_GLOBAL_IFACES];
+int        g_iface_state_count = 0;
 
-static IfaceState g_iface_state[GS_MAX_GLOBAL_IFACES];
-static int        g_iface_state_count = 0;
-
-/* Forward decls — definitions are grouped with the iface_is_monitor /
- * wait_iface_state helpers further down. */
-static IfaceState *iface_state_find(const char *name);
-static IfaceState *iface_state_intern(const char *name);
-static int  iface_state_query(IfaceState *st);
-static void iface_state_init(const Config *c);
-static void iface_state_refresh_one(uint64_t now_us_arg);
-
-static const char *tunnel_state_name(TunnelState s)
+const char *tunnel_state_name(TunnelState s)
 {
 	switch (s) {
 	case TS_STOPPED:  return "stopped";
@@ -528,7 +279,7 @@ static const char *tunnel_state_name(TunnelState s)
 
 /* ---------- config loader -------------------------------------------- */
 
-static int cfg_parse_tunnel(const char *js, JTok *toks, int n, int t_idx, Tunnel *t)
+int cfg_parse_tunnel(const char *js, JTok *toks, int n, int t_idx, Tunnel *t)
 {
 	memset(t, 0, sizeof(*t));
 	t->mcs_index = -1; t->stbc = -1; t->ldpc = -1;
@@ -654,7 +405,7 @@ static int cfg_parse_tunnel(const char *js, JTok *toks, int n, int t_idx, Tunnel
 	return 0;
 }
 
-static int cfg_load(const char *path, Config *c)
+int cfg_load(const char *path, Config *c)
 {
 	memset(c, 0, sizeof(*c));
 	snprintf(c->http_bind, sizeof(c->http_bind), "0.0.0.0");
@@ -768,14 +519,7 @@ static int cfg_load(const char *path, Config *c)
 
 /* ---------- argv composition ----------------------------------------- */
 
-typedef struct {
-	char  buf[GS_ARGV_BUF];
-	size_t pos;
-	char *argv[GS_ARGV_MAX];
-	int   argc;
-} ArgvBuilder;
-
-static int ab_push(ArgvBuilder *ab, const char *fmt, ...)
+int ab_push(ArgvBuilder *ab, const char *fmt, ...)
 {
 	if (ab->argc >= GS_ARGV_MAX - 1) return -1;
 	if (ab->pos >= sizeof(ab->buf)) return -1;
@@ -789,7 +533,7 @@ static int ab_push(ArgvBuilder *ab, const char *fmt, ...)
 	return 0;
 }
 
-static int build_argv_rx(const Tunnel *t, const char *key_file, ArgvBuilder *ab)
+int build_argv_rx(const Tunnel *t, const char *key_file, ArgvBuilder *ab)
 {
 	if (ab_push(ab, "%s", t->binary[0] ? t->binary : "wfb_rx") < 0) return -1;
 	if (key_file && key_file[0] && (ab_push(ab, "-K") < 0 || ab_push(ab, "%s", key_file) < 0))
@@ -816,7 +560,7 @@ static int build_argv_rx(const Tunnel *t, const char *key_file, ArgvBuilder *ab)
 	return 0;
 }
 
-static int build_argv_tx(const Tunnel *t, const char *key_file, ArgvBuilder *ab)
+int build_argv_tx(const Tunnel *t, const char *key_file, ArgvBuilder *ab)
 {
 	if (ab_push(ab, "%s", t->binary[0] ? t->binary : "wfb_tx") < 0) return -1;
 	if (key_file && key_file[0] && (ab_push(ab, "-K") < 0 || ab_push(ab, "%s", key_file) < 0))
@@ -860,13 +604,13 @@ static int build_argv_tx(const Tunnel *t, const char *key_file, ArgvBuilder *ab)
 
 /* forward declarations: stats helpers live in the iface-validation block
  * further down to keep them grouped with the rest of the runtime/IPC code. */
-static int  stats_listener_open(Tunnel *t);
-static void stats_listener_close(Tunnel *t);
-static void stats_drain(Tunnel *t);
-static int  wfb_cmd_refresh_radio(Tunnel *t);
-static int  wfb_cmd_refresh_fec(Tunnel *t);
+int stats_listener_open(Tunnel *t);
+void stats_listener_close(Tunnel *t);
+void stats_drain(Tunnel *t);
+int wfb_cmd_refresh_radio(Tunnel *t);
+int wfb_cmd_refresh_fec(Tunnel *t);
 
-static int tunnel_spawn(Tunnel *t, const char *key_file)
+int tunnel_spawn(Tunnel *t, const char *key_file)
 {
 	/* Lazy-open the per-tunnel stats listener.  rx tunnels emit rx_ant,
 	 * tx tunnels emit tx_stats — same -Y wire format, parsed by the same
@@ -967,7 +711,7 @@ static int tunnel_spawn(Tunnel *t, const char *key_file)
 	return 0;
 }
 
-static void tunnel_request_stop(Tunnel *t)
+void tunnel_request_stop(Tunnel *t)
 {
 	if (t->pid <= 0) {
 		t->state = TS_STOPPED;
@@ -983,7 +727,7 @@ static void tunnel_request_stop(Tunnel *t)
 		LOG_INFO("tunnel '%s' stopping (SIGTERM pid=%d)", t->name, t->pid);
 }
 
-static void tunnel_on_exit(Tunnel *t, int wstatus)
+void tunnel_on_exit(Tunnel *t, int wstatus)
 {
 	t->exited_us = now_us();
 	if (WIFEXITED(wstatus))         t->exit_code = WEXITSTATUS(wstatus);
@@ -1006,7 +750,7 @@ static void tunnel_on_exit(Tunnel *t, int wstatus)
 	t->state = TS_BACKOFF;
 }
 
-static void supervisor_reap(Config *c)
+void supervisor_reap(Config *c)
 {
 	for (;;) {
 		int wstatus = 0;
@@ -1024,55 +768,10 @@ static void supervisor_reap(Config *c)
 	}
 }
 
-/* ---------- CSA orchestrator (channel switch announcement) ----------- *
+/* ---------- bounded fork helpers ------------------------------------ *
  *
- * One-shot synchronized channel hop coordinated with vehicle's csa_feed
- * state machine in vehicle/csa/csa.c. Wire format is documented in
- * vehicle/csa/PROTOCOL.md (newline-terminated JSON `csa_commit` frames).
- *
- * Flow:
- *   1. POST /api/v1/system/csa records sess++/T_switch and queues N=5
- *      csa_commit frames at 20 ms cadence into the uplink wfb_tx UDP
- *      input port (same hop that WCMDs use).
- *   2. supervisor_tick drains the queue and, at T_switch, fork+execs
- *      `iw dev <iface> set channel <chan> <ht>` on the GS-side iface.
- *   3. On revert deadline T_switch+t_revert_ms: if no rx_ant pkts
- *      arrived since T_switch on any rx tunnel, fork+exec a revert iw.
- *      Mirrors vehicle csa_tick's verify→revert behavior.
- *
- * One CSA in flight at a time; a new POST while phase!=IDLE returns 409.
- */
-
-typedef enum {
-	CSA_IDLE = 0,
-	CSA_BURST,    /* sending csa_commit frames */
-	CSA_ARMED,    /* burst done, waiting for T_switch */
-	CSA_VERIFY,   /* iw set ran, watching for traffic */
-} CsaPhase;
-
-#define GS_CSA_MAX_IFACES 4
-
-static struct {
-	CsaPhase phase;
-	uint32_t sess;
-	uint64_t t_switch_us;
-	uint64_t t_revert_us;
-	uint64_t next_frame_us;
-	int      frames_sent;
-	int      frames_total;
-	int      target_chan;
-	char     target_ht[8];
-	int      prev_chan;
-	char     prev_ht[8];
-	char     ifaces[GS_CSA_MAX_IFACES][IFNAMSIZ]; /* GS-side ifaces to switch (comma-sep input) */
-	int      iface_count;
-	uint64_t baseline_pkt_us;   /* time we snapshotted st_pkt_all */
-	uint32_t baseline_pkt_all;  /* pkt counter at T_switch (per first rx) */
-	int      baseline_rx_idx;
-	bool     no_revert;
-} g_csa = { .phase = CSA_IDLE, .sess = 0 };
-
-static uint32_t g_csa_seq_in_burst = 0;
+ * Used by both api_handle paths (iw set channel, system commands) and
+ * the CSA / scan tick handlers in gs_supervisor_csa.c / _scan.c. */
 
 /* Bounded waitpid: like waitpid(pid, NULL, 0) but returns by deadline_ms.
  * If the child doesn't exit before the deadline, sends SIGKILL and waits
@@ -1087,7 +786,7 @@ static uint32_t g_csa_seq_in_burst = 0;
  *   -2   deadline expired (SIGKILL sent; child reaped)
  *   -3   waitpid error (errno preserved)
  */
-static int waitpid_deadline(pid_t pid, int deadline_ms)
+int waitpid_deadline(pid_t pid, int deadline_ms)
 {
 	uint64_t end = now_ms() + (uint64_t)deadline_ms;
 	const struct timespec sleep_5ms = { .tv_sec = 0, .tv_nsec = 5 * 1000 * 1000 };
@@ -1109,14 +808,8 @@ static int waitpid_deadline(pid_t pid, int deadline_ms)
 	}
 }
 
-/* Default per-call deadline for the iw / ip-link forks driven by api
- * handlers.  iw set channel / set txpower normally returns in 30–80 ms
- * on RTL88x2; 1 s gives a wedged driver enough time to recover before
- * we SIGKILL and report a 502 to the operator. */
-#define GS_FORK_DEADLINE_MS 1000
-
 /* fork+exec `iw dev <iface> set channel <chan> <ht>`. */
-static int run_iw_set_channel(const char *iface, int chan, const char *ht)
+int run_iw_set_channel(const char *iface, int chan, const char *ht)
 {
 	if (!iface || !iface[0]) return -1;
 	char cs[16];
@@ -1136,158 +829,10 @@ static int run_iw_set_channel(const char *iface, int chan, const char *ht)
 	return rc;
 }
 
-/* Persistent UDP socket for csa_send_commit_frame().  Opened lazily on
- * first send; closed only at process exit (kernel cleanup).  Avoids the
- * old socket()/close() per-frame that burned 5 syscalls × 2 × per CSA
- * burst (10 ifd churns in 100 ms when CSA fires). */
-static int g_csa_send_fd = -1;
-
-/* Send one csa_commit JSON frame to the uplink wfb_tx UDP input port.
- * dt_to_switch_ms is filled in fresh at send time so all frames in the
- * burst converge on the same absolute T_switch on the receiver. */
-static int csa_send_commit_frame(const Config *c)
-{
-	const Tunnel *up = NULL;
-	for (int i = 0; i < c->tunnel_count; i++) {
-		if (!strcmp(c->tunnels[i].name, c->venc_cmd_uplink) &&
-		    !strcmp(c->tunnels[i].role, "tx")) {
-			up = &c->tunnels[i];
-			break;
-		}
-	}
-	if (!up || up->udp_in_port <= 0) return -1;
-
-	uint64_t now = now_us();
-	int dt_ms = (g_csa.t_switch_us > now)
-	    ? (int)((g_csa.t_switch_us - now) / 1000ULL) : 0;
-	int t_revert_ms = (int)((g_csa.t_revert_us - g_csa.t_switch_us) / 1000ULL);
-
-	char buf[320];
-	int n = snprintf(buf, sizeof(buf),
-		"{\"type\":\"csa_commit\",\"ver\":1,\"sess\":%u,\"seq\":%u,"
-		"\"src\":\"ground\",\"target_chan\":%d,\"target_ht\":\"%s\","
-		"\"dt_to_switch_ms\":%d,\"t_revert_ms\":%d,"
-		"\"prev_chan\":%d,\"prev_ht\":\"%s\"}\n",
-		g_csa.sess, g_csa_seq_in_burst++,
-		g_csa.target_chan, g_csa.target_ht,
-		dt_ms, t_revert_ms,
-		g_csa.prev_chan, g_csa.prev_ht);
-	if (n < 0 || (size_t)n >= sizeof(buf)) return -1;
-
-	if (g_csa_send_fd < 0) {
-		g_csa_send_fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
-		if (g_csa_send_fd < 0) return errno;
-	}
-	struct sockaddr_in dst = {
-		.sin_family = AF_INET,
-		.sin_port   = htons((uint16_t)up->udp_in_port),
-	};
-	dst.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-	ssize_t w = sendto(g_csa_send_fd, buf, (size_t)n, 0,
-	                   (struct sockaddr *)&dst, sizeof(dst));
-	return (w == (ssize_t)n) ? 0 : errno;
-}
-
-/* Pick the first rx tunnel — used to track post-switch traffic for
- * revert detection. Returns -1 if no rx tunnel exists. */
-static int csa_pick_rx_tunnel_idx(const Config *c)
-{
-	for (int i = 0; i < c->tunnel_count; i++)
-		if (!strcmp(c->tunnels[i].role, "rx")) return i;
-	return -1;
-}
-
-/* ---------- Scanner --------------------------------------------------- *
- *
- * Cycles the GS-side iface(s) through a channel/HT list, dwelling on each
- * combo for `dwell_ms`. After each dwell, the rx tunnel's pkt_all counter
- * is compared against the per-step baseline; an increase means traffic
- * was decoded on that channel — which is enough to declare we found the
- * vehicle. Useful when the operator doesn't know which channel the
- * vehicle is on (lost contact, fresh boot, regulator switch, etc.).
- *
- * No vehicle cooperation needed — purely a passive sweep on the GS.
- *
- * One scan in flight at a time; concurrent CSA blocks scan and vice
- * versa.
- */
-
-#define SCAN_MAX_STEPS 32
-
-typedef enum {
-	SCAN_IDLE = 0,
-	SCAN_RUNNING,
-	SCAN_FOUND,
-	SCAN_STOPPED,
-} ScanPhase;
-
-static struct {
-	ScanPhase phase;
-	uint32_t  sess;
-	char      ifaces[GS_CSA_MAX_IFACES][IFNAMSIZ];
-	int       iface_count;
-	int       chans[SCAN_MAX_STEPS];
-	char      hts[SCAN_MAX_STEPS][8];
-	int       step_count;
-	int       cur_step;
-	uint64_t  step_started_us;
-	uint64_t  step_dwell_us;
-	int       baseline_rx_idx;     /* -1 if no rx tunnel */
-	bool      step_saw_traffic;    /* set by stats_drain when uniq>0 */
-	int       found_chan;
-	char      found_ht[8];
-	int       hops_done;           /* completed dwells (incl. this step) */
-} g_scan = { .phase = SCAN_IDLE, .sess = 0 };
-
-/* Hop the scan iface set to step index `i`. Skips the per-iface state
- * query (caller can do it post-scan) — every fork inside the dwell
- * window steals decode time and risks missing the vehicle's burst.
- *
- * After the hops, drains any rx-tunnel stats blobs that were already
- * queued by wfb_rx before we changed channels — those blobs reflect the
- * OLD channel's pkt.uniq and would falsely trip step_saw_traffic on the
- * very first dwell. */
-static void scan_apply_step_drained(Config *c, int i)
-{
-	if (i < 0 || i >= g_scan.step_count) return;
-	int chan = g_scan.chans[i];
-	const char *ht = g_scan.hts[i];
-	for (int k = 0; k < g_scan.iface_count; k++) {
-		int rc = run_iw_set_channel(g_scan.ifaces[k], chan, ht);
-		if (rc != 0)
-			LOG_WARN("scan: iw on %s rc=%d", g_scan.ifaces[k], rc);
-	}
-	g_scan.cur_step = i;
-	g_scan.step_saw_traffic = false;
-	if (g_scan.baseline_rx_idx >= 0) {
-		Tunnel *rx = &c->tunnels[g_scan.baseline_rx_idx];
-		if (rx->stats_local_fd >= 0) {
-			/* Drain pending datagrams off the rx_ant socket so the
-			 * fresh dwell starts with a clean baseline.  Re-emit each
-			 * datagram to stats_fwd_addr if the tunnel was configured
-			 * with `stats_out` — local consumption is intentionally
-			 * skipped during scan dwells (counters are stale during
-			 * channel hops) but downstream consumers should keep
-			 * receiving samples without a hole every dwell. */
-			char drain[4096];
-			ssize_t got;
-			while ((got = recv(rx->stats_local_fd, drain,
-			                   sizeof(drain), MSG_DONTWAIT)) > 0) {
-				if (rx->stats_fwd_active) {
-					(void)sendto(rx->stats_local_fd,
-					    drain, (size_t)got, 0,
-					    (struct sockaddr *)&rx->stats_fwd_addr,
-					    sizeof(rx->stats_fwd_addr));
-				}
-			}
-		}
-	}
-	g_scan.step_started_us = now_us();
-}
-
 /* Periodic tick: handle SIGKILL escalation + backoff respawn, plus
  * deferred TX state queries (~500 ms after spawn so wfb_tx has bound
- * its control socket). */
+ * its control socket).  CSA + scan state machines are driven from
+ * gs_supervisor_csa.c / gs_supervisor_scan.c. */
 static void supervisor_tick(Config *c)
 {
 	uint64_t t_ms = now_ms();
@@ -1327,114 +872,8 @@ static void supervisor_tick(Config *c)
 		}
 	}
 
-	/* CSA state machine: drive burst frames, fire local iw at T_switch,
-	 * watch for revert. */
-	if (g_csa.phase == CSA_BURST &&
-	    t_us >= g_csa.next_frame_us &&
-	    g_csa.frames_sent < g_csa.frames_total) {
-		int rc = csa_send_commit_frame(c);
-		if (rc != 0) {
-			LOG_WARN("csa: send frame %d/%d failed (rc=%d) — aborting",
-			         g_csa.frames_sent + 1, g_csa.frames_total, rc);
-			g_csa.phase = CSA_IDLE;
-		} else {
-			g_csa.frames_sent++;
-			g_csa.next_frame_us = t_us + 20000ULL; /* 20 ms cadence */
-			if (g_csa.frames_sent >= g_csa.frames_total) {
-				g_csa.phase = CSA_ARMED;
-				LOG_INFO("csa: burst complete (%d frames), armed for "
-				         "T_switch in %.0f ms",
-				         g_csa.frames_total,
-				         (double)(g_csa.t_switch_us - t_us) / 1000.0);
-			}
-		}
-	}
-
-	if (g_csa.phase == CSA_ARMED && t_us >= g_csa.t_switch_us) {
-		LOG_INFO("csa: T_switch — iw set channel %d %s on %d iface(s)",
-		         g_csa.target_chan, g_csa.target_ht, g_csa.iface_count);
-		/* Snapshot the rx pkt counter so VERIFY can decide whether
-		 * traffic resumed on the new channel. */
-		int idx = csa_pick_rx_tunnel_idx(c);
-		g_csa.baseline_rx_idx = idx;
-		g_csa.baseline_pkt_all = (idx >= 0) ? c->tunnels[idx].st_pkt_all : 0;
-		g_csa.baseline_pkt_us  = t_us;
-		for (int i = 0; i < g_csa.iface_count; i++) {
-			int rc = run_iw_set_channel(g_csa.ifaces[i],
-			    g_csa.target_chan, g_csa.target_ht);
-			if (rc != 0)
-				LOG_WARN("csa: iw on %s rc=%d", g_csa.ifaces[i], rc);
-			/* Refresh cache so /api/v1/ifaces reflects the hop
-			 * before the periodic round-robin gets to it. */
-			IfaceState *ist = iface_state_find(g_csa.ifaces[i]);
-			if (ist) (void)iface_state_query(ist);
-		}
-		g_csa.phase = CSA_VERIFY;
-	}
-
-	/* Scanner state machine: at each step deadline, decide whether the
-	 * dwell window saw any decryptable traffic. step_saw_traffic is
-	 * OR-set by stats_drain on every non-zero rx pkt.uniq sample — a
-	 * 100 ms interval count, not cumulative — so any "1" anywhere in the
-	 * window counts. */
-	if (g_scan.phase == SCAN_RUNNING &&
-	    t_us >= g_scan.step_started_us + g_scan.step_dwell_us) {
-		bool found = g_scan.step_saw_traffic;
-		g_scan.hops_done++;
-		LOG_INFO("scan: step %d/%d ch %d %s — %s",
-		         g_scan.cur_step + 1, g_scan.step_count,
-		         g_scan.chans[g_scan.cur_step], g_scan.hts[g_scan.cur_step],
-		         found ? "FOUND" : "no traffic");
-		if (found) {
-			g_scan.found_chan = g_scan.chans[g_scan.cur_step];
-			snprintf(g_scan.found_ht, sizeof(g_scan.found_ht), "%s",
-			         g_scan.hts[g_scan.cur_step]);
-			LOG_INFO("scan: locked on chan %d %s after %d hop(s)",
-			         g_scan.found_chan, g_scan.found_ht, g_scan.hops_done);
-			g_scan.phase = SCAN_FOUND;
-			for (int j = 0; j < g_scan.iface_count; j++) {
-				IfaceState *ist = iface_state_find(g_scan.ifaces[j]);
-				if (ist) (void)iface_state_query(ist);
-			}
-		} else {
-			int next = g_scan.cur_step + 1;
-			if (next >= g_scan.step_count) {
-				LOG_WARN("scan: no traffic across %d step(s) — stopping",
-				         g_scan.step_count);
-				g_scan.phase = SCAN_STOPPED;
-				for (int j = 0; j < g_scan.iface_count; j++) {
-					IfaceState *ist = iface_state_find(g_scan.ifaces[j]);
-					if (ist) (void)iface_state_query(ist);
-				}
-			} else {
-				scan_apply_step_drained(c, next);
-				g_scan.step_saw_traffic = false;
-			}
-		}
-	}
-
-	if (g_csa.phase == CSA_VERIFY && t_us >= g_csa.t_revert_us) {
-		bool alive = false;
-		if (g_csa.baseline_rx_idx >= 0) {
-			uint32_t now_pkt = c->tunnels[g_csa.baseline_rx_idx].st_pkt_all;
-			alive = (now_pkt != g_csa.baseline_pkt_all);
-		}
-		if (alive || g_csa.no_revert) {
-			LOG_INFO("csa: VERIFY ok (rx_alive=%d no_revert=%d) — committed",
-			         (int)alive, (int)g_csa.no_revert);
-		} else {
-			LOG_WARN("csa: no rx traffic since T_switch — reverting "
-			         "%d iface(s) to channel %d %s",
-			         g_csa.iface_count, g_csa.prev_chan, g_csa.prev_ht);
-			for (int i = 0; i < g_csa.iface_count; i++) {
-				(void)run_iw_set_channel(g_csa.ifaces[i],
-				    g_csa.prev_chan, g_csa.prev_ht);
-				IfaceState *ist = iface_state_find(g_csa.ifaces[i]);
-				if (ist) (void)iface_state_query(ist);
-			}
-		}
-		g_csa.phase = CSA_IDLE;
-	}
+	csa_tick(c, t_us);
+	scan_tick(c, t_us);
 }
 
 /* ---------- system commands ------------------------------------------ */
@@ -1454,7 +893,7 @@ static void supervisor_tick(Config *c)
  * is set to NULL on success.
  *
  * Returns argc on success, -1 on shell-metachar reject, -2 on overflow. */
-static int tokenize_argv(char *cmd, char **out_argv, int max_argv)
+int tokenize_argv(char *cmd, char **out_argv, int max_argv)
 {
 	static const char metachars[] = ";|&<>$`(){}[]*?'\"\\";
 	if (strpbrk(cmd, metachars)) return -1;
@@ -1473,7 +912,7 @@ static int tokenize_argv(char *cmd, char **out_argv, int max_argv)
  * funneled JSON-config strings through `sh -c` — convert to a tokenized
  * fork+execvp so a typo'd iface name can no longer accidentally invoke
  * shell features.  Bounded by GS_SYSTEM_CMD_DEADLINE_MS. */
-static int run_system_cmd(const char *cmd_const)
+int run_system_cmd(const char *cmd_const)
 {
 	LOG_INFO("system: %s", cmd_const);
 	char cmd[GS_PATH_MAX];
@@ -1507,7 +946,7 @@ static int run_system_cmd(const char *cmd_const)
 	return rc;
 }
 
-static void run_system_block(const char *label, char cmds[][GS_PATH_MAX], int n)
+void run_system_block(const char *label, char cmds[][GS_PATH_MAX], int n)
 {
 	if (n <= 0) return;
 	LOG_INFO("running %s commands (%d)", label, n);
@@ -1527,7 +966,7 @@ static void run_system_block(const char *label, char cmds[][GS_PATH_MAX], int n)
  */
 
 /* Parse "host:port" → sockaddr_in.  Returns 0 on success. */
-static int parse_host_port(const char *s, struct sockaddr_in *out)
+int parse_host_port(const char *s, struct sockaddr_in *out)
 {
 	if (!s || !*s) return -1;
 	const char *colon = strrchr(s, ':');
@@ -1549,7 +988,7 @@ static int parse_host_port(const char *s, struct sockaddr_in *out)
 /* Open a non-blocking UDP listener on 127.0.0.1:0 and stash the assigned
  * port in t->stats_local_port + a "127.0.0.1:port" string in
  * t->stats_local_arg (for handing to wfb_rx -Y). */
-static int stats_listener_open(Tunnel *t)
+int stats_listener_open(Tunnel *t)
 {
 	if (t->stats_local_fd >= 0) return 0;
 	int fd = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
@@ -1694,7 +1133,7 @@ static int json_slice_object(const char *js, size_t jl, const char *key,
 }
 
 /* Drain pending rx_ant datagrams off a single tunnel's stats fd. */
-static void stats_drain(Tunnel *t)
+void stats_drain(Tunnel *t)
 {
 	for (;;) {
 		char buf[4096];
@@ -1844,7 +1283,7 @@ static void stats_drain(Tunnel *t)
 	}
 }
 
-static void stats_listener_close(Tunnel *t)
+void stats_listener_close(Tunnel *t)
 {
 	if (t->stats_local_fd >= 0) {
 		close(t->stats_local_fd);
@@ -1872,7 +1311,7 @@ static void stats_listener_close(Tunnel *t)
  * string.  iface names come from the operator's root-only config so it
  * was not a privilege boundary, but the shell-free path is cleaner and
  * removes one accidental-quoting footgun. */
-static int run_capture(char *const argv[], char *out, size_t cap)
+int run_capture(char *const argv[], char *out, size_t cap)
 {
 	if (cap == 0 || !argv || !argv[0]) return -1;
 	int pipefd[2];
@@ -1936,7 +1375,7 @@ static int run_capture(char *const argv[], char *out, size_t cap)
 	return (rc < 0) ? -1 : rc;
 }
 
-static int iface_is_monitor(const char *iface)
+int iface_is_monitor(const char *iface)
 {
 	char *argv[] = { (char*)"iw", (char*)"dev",
 	                 (char*)iface, (char*)"info", NULL };
@@ -1948,7 +1387,7 @@ static int iface_is_monitor(const char *iface)
 
 /* ---------- iface state cache: helpers ------------------------------ */
 
-static IfaceState *iface_state_find(const char *name)
+IfaceState *iface_state_find(const char *name)
 {
 	for (int i = 0; i < g_iface_state_count; i++)
 		if (!strcmp(g_iface_state[i].name, name))
@@ -1956,7 +1395,7 @@ static IfaceState *iface_state_find(const char *name)
 	return NULL;
 }
 
-static IfaceState *iface_state_intern(const char *name)
+IfaceState *iface_state_intern(const char *name)
 {
 	IfaceState *st = iface_state_find(name);
 	if (st) return st;
@@ -2022,7 +1461,7 @@ static void iface_state_absorb_line(IfaceState *st, const char *line)
 /* Pull a fresh snapshot via `iw dev <name> info`.  Synchronous fork+exec;
  * blocks ~30–80 ms on RTL88x2CU/EU.  Updates st->last_query_us regardless
  * of success so we don't hammer iw on a busted iface. */
-static int iface_state_query(IfaceState *st)
+int iface_state_query(IfaceState *st)
 {
 	st->last_query_us = now_us();
 	st->chan = -1;
@@ -2052,7 +1491,7 @@ static int iface_state_query(IfaceState *st)
 /* Walk every tunnel's iface list, intern each unique name, and run an
  * initial state query so the WebUI has truth on the first refresh.
  * Called once after system.up has finished. */
-static void iface_state_init(const Config *c)
+void iface_state_init(const Config *c)
 {
 	for (int i = 0; i < c->tunnel_count; i++) {
 		for (int k = 0; k < c->tunnels[i].iface_count; k++) {
@@ -2064,7 +1503,7 @@ static void iface_state_init(const Config *c)
 
 /* Refresh one stale iface per tick (round-robin), so we don't fork iw
  * on every tick yet still keep the cache fresh. */
-static void iface_state_refresh_one(uint64_t now_us_arg)
+void iface_state_refresh_one(uint64_t now_us_arg)
 {
 	static int rr_idx = 0;
 	if (g_iface_state_count == 0) return;
@@ -2078,7 +1517,7 @@ static void iface_state_refresh_one(uint64_t now_us_arg)
 	}
 }
 
-static int iface_is_admin_up(const char *iface)
+int iface_is_admin_up(const char *iface)
 {
 	char path[128];
 	int pn = snprintf(path, sizeof(path), "/sys/class/net/%s/flags", iface);
@@ -2098,7 +1537,7 @@ static int iface_is_admin_up(const char *iface)
  * the iface becoming usable for pcap_open_live — a fixed `sleep` in the
  * config is fragile (driver/USB/load dependent).  Returns 0 if every
  * iface is ready before the deadline, -1 otherwise. */
-static int wait_iface_state(const Config *c, int timeout_ms, int interval_ms)
+int wait_iface_state(const Config *c, int timeout_ms, int interval_ms)
 {
 	uint64_t deadline = now_ms() + (uint64_t)timeout_ms;
 	int prev_bad = -1;
@@ -2178,56 +1617,11 @@ static int wait_iface_state(const Config *c, int timeout_ms, int interval_ms)
  * wfb_tx binds its control socket to 127.0.0.1 only — sendto must come
  * from a 127.x address. */
 
-/* Opcodes, fixed-length wire sizes, and sentinels in shared/wfb_control.h. */
-#include "wfb_control.h"
-
-typedef struct {
-	uint32_t req_id;
-	uint8_t  cmd_id;
-	uint8_t  k;
-	uint8_t  n;
-	uint16_t fec_timeout_ms;     /* NB */
-} __attribute__((packed)) WfbCmdSetFecReq;     /* 9 B */
-
-typedef struct {
-	uint32_t req_id;
-	uint8_t  cmd_id;
-	uint8_t  stbc;
-	uint8_t  ldpc;
-	uint8_t  short_gi;
-	uint8_t  bandwidth;
-	uint8_t  mcs_index;
-	uint8_t  vht_mode;
-	uint8_t  vht_nss;
-} __attribute__((packed)) WfbCmdSetRadioReq;   /* 12 B */
-
-typedef struct {
-	uint32_t req_id;
-	uint8_t  cmd_id;
-} __attribute__((packed)) WfbCmdGetReq;        /* 5 B */
-
-typedef struct {
-	uint32_t req_id;
-	uint32_t rc;                 /* NB; 0 = success */
-	uint8_t  k;
-	uint8_t  n;
-	uint16_t fec_timeout_ms;     /* NB */
-} __attribute__((packed)) WfbCmdGetFecResp;    /* 12 B */
-
-typedef struct {
-	uint32_t req_id;
-	uint32_t rc;                 /* NB */
-	uint8_t  stbc;
-	uint8_t  ldpc;
-	uint8_t  short_gi;
-	uint8_t  bandwidth;
-	uint8_t  mcs_index;
-	uint8_t  vht_mode;
-	uint8_t  vht_nss;
-} __attribute__((packed)) WfbCmdGetRadioResp;  /* 15 B */
+/* WfbCmd*Req / WfbCmd*Resp typedefs and shared/wfb_control.h opcodes are
+ * pulled in by gs_supervisor.h. */
 
 /* Returns next req_id (32-bit rolling). Single-threaded => static is fine. */
-static uint32_t wfb_cmd_next_req_id(void)
+uint32_t wfb_cmd_next_req_id(void)
 {
 	static uint32_t s_req_id = 0;
 	return ++s_req_id;
@@ -2241,7 +1635,7 @@ static uint32_t wfb_cmd_next_req_id(void)
  * `resp_buf` is a caller-provided buffer big enough for the largest
  * possible response (sizeof(WfbCmdGetRadioResp)).
  */
-static int wfb_cmd_round_trip(int control_port,
+int wfb_cmd_round_trip(int control_port,
                               const void *req, size_t req_len,
                               void *resp_buf, size_t resp_cap,
                               uint32_t *out_rc)
@@ -2279,7 +1673,7 @@ static int wfb_cmd_round_trip(int control_port,
 
 /* Fetch live radio params via get_radio and stash into the tunnel's
  * runtime cache.  Single-shot (~200ms timeout); caller throttles. */
-static int wfb_cmd_refresh_radio(Tunnel *t)
+int wfb_cmd_refresh_radio(Tunnel *t)
 {
 	if (t->control_port <= 0) return -1;
 	WfbCmdGetReq req = {
@@ -2305,7 +1699,7 @@ static int wfb_cmd_refresh_radio(Tunnel *t)
 	return 0;
 }
 
-static int wfb_cmd_refresh_fec(Tunnel *t)
+int wfb_cmd_refresh_fec(Tunnel *t)
 {
 	if (t->control_port <= 0) return -1;
 	WfbCmdGetReq req = {
@@ -2330,7 +1724,7 @@ static int wfb_cmd_refresh_fec(Tunnel *t)
  * for + and %xx is not needed for our integer args). On hit, returns
  * pointer into qs at start of value and *len_out is value length. NULL on
  * miss. qs is the part after '?', already de-prefixed. */
-static const char *qs_get(const char *qs, const char *key, size_t *len_out)
+const char *qs_get(const char *qs, const char *key, size_t *len_out)
 {
 	if (!qs) return NULL;
 	size_t klen = strlen(key);
@@ -2352,7 +1746,7 @@ static const char *qs_get(const char *qs, const char *key, size_t *len_out)
 	return NULL;
 }
 
-static int qs_get_int(const char *qs, const char *key, int *out)
+int qs_get_int(const char *qs, const char *key, int *out)
 {
 	size_t vl;
 	const char *v = qs_get(qs, key, &vl);
@@ -2368,72 +1762,31 @@ static int qs_get_int(const char *qs, const char *key, int *out)
 
 /* ---------- WCMD emit ------------------------------------------------ *
  *
- * 16-byte WCMD_MSG_REQ, layout per poc/wcmd_proto.h. Sent to the uplink
- * tunnel's udp_in_port (127.0.0.1) where wfb_tx forwards it over the air.
- * The vehicle's link_controller demuxes WCMD frames from rx_ant JSON via
- * the WCMD_MAGIC ("WCMD" BE) prefix and proxies to the venc HTTP API.
+ * 16-byte WCMD_MSG_REQ, layout per shared/wcmd_proto.h. Sent to the
+ * uplink tunnel's udp_in_port (127.0.0.1) where wfb_tx forwards it over
+ * the air.  The vehicle's link_controller demuxes WCMD frames from
+ * rx_ant JSON via the WCMD_MAGIC ("WCMD" BE) prefix and proxies to the
+ * venc HTTP API.
  *
- * Fire-and-forget on this side — link_controller's WcmdResp goes back via
- * the rx_ant return path, which the ground supervisor does not yet bind.
- * Response correlation is deferred to v2 per the design doc.
- */
-
-#define WCMD_MAGIC          0x57434D44u   /* "WCMD" big-endian */
-#define WCMD_VERSION        1
-#define WCMD_MSG_REQ        1
-#define WCMD_KEY_BITRATE_KBPS    1
-#define WCMD_KEY_FPS             2
-#define WCMD_KEY_PAYLOAD_BYTES   3
-#define WCMD_KEY_FORCE_IDR       4
-/* Vehicle-side wfb_tx control keys — see wcmd_proto.h. */
-#define WCMD_KEY_WFB_FEC_K       5
-#define WCMD_KEY_WFB_FEC_N       6
-#define WCMD_KEY_WFB_MCS         7
-#define WCMD_KEY_WFB_BANDWIDTH   8
-#define WCMD_KEY_WFB_LDPC        9
-#define WCMD_KEY_WFB_STBC       10
-#define WCMD_KEY_WFB_SHORT_GI   11
-/* Adaptive subsystem master switches on the vehicle's link_controller. */
-#define WCMD_KEY_FEC_ENABLED    12
-#define WCMD_KEY_MCS_ENABLED    13
-/* Vehicle WLAN adapter TX power (mBm; 100 = 1 dBm). */
-#define WCMD_KEY_WFB_TXPOWER    14
-/* venc recorder start/stop: value 1 → /api/v1/record/start, 0 → /stop. */
-#define WCMD_KEY_RECORD         15
-
-#pragma pack(push, 1)
-typedef struct {
-	uint32_t magic;
-	uint8_t  version;
-	uint8_t  msg_type;
-	uint16_t seq;          /* NB */
-	uint8_t  key;
-	uint8_t  flags;        /* must be 0 */
-	uint16_t _pad;         /* must be 0 */
-	int32_t  value;        /* NB */
-} WcmdReq;
-#pragma pack(pop)
+ * Fire-and-forget on this side — link_controller's WcmdResp goes back
+ * via the rx_ant return path, which the ground supervisor does not yet
+ * bind.  Response correlation is deferred to v2 per the design doc.
+ *
+ * WCMD_* defines, WcmdReq layout, and WCMD_BURST_FRAMES live in
+ * gs_supervisor.h. */
 
 /* Per-key rate-limit state (single-process). Index = key id (1-based). */
-#define WCMD_KEY_MAX 16
-static uint64_t g_wcmd_last_send_ms[WCMD_KEY_MAX + 1] = { 0 };
-static uint16_t g_wcmd_seq = 0;
+uint64_t g_wcmd_last_send_ms[WCMD_KEY_MAX + 1] = { 0 };
+uint16_t g_wcmd_seq = 0;
 
 /* Emit-side observability — surfaced in /api/v1/status so the WebUI can
  * show burst-dedup health without polling the vehicle directly. */
-static uint64_t g_wcmd_emit_total      = 0; /* logical WCMDs emitted (all keys) */
-static uint64_t g_wcmd_emit_frames     = 0; /* wire frames sent (bursts × copies actually sent) */
-static uint64_t g_wcmd_emit_rate_limit = 0; /* /api/v1/cmd rejections by per-key window */
-static uint64_t g_wcmd_emit_failed     = 0; /* sendto failed entirely (no copy on the wire) */
+uint64_t g_wcmd_emit_total      = 0; /* logical WCMDs emitted (all keys) */
+uint64_t g_wcmd_emit_frames     = 0; /* wire frames sent (bursts × copies actually sent) */
+uint64_t g_wcmd_emit_rate_limit = 0; /* /api/v1/cmd rejections by per-key window */
+uint64_t g_wcmd_emit_failed     = 0; /* sendto failed entirely (no copy on the wire) */
 
-/* Number of redundant copies emitted per logical WCMD.  Each copy carries
- * the same seq so the vehicle's seq-dedup window collapses them back to
- * one apply.  Loss of a single FEC block on the uplink can drop one copy
- * without losing the command.  Three is the minimum useful redundancy
- * and keeps the wire cost negligible (3 × 16 B = 48 B per command). */
-#define WCMD_BURST_FRAMES 3
-
-static int wcmd_key_from_str(const char *s, size_t n)
+int wcmd_key_from_str(const char *s, size_t n)
 {
 	if (n == 12 && !strncmp(s, "bitrate_kbps",  12)) return WCMD_KEY_BITRATE_KBPS;
 	if (n ==  3 && !strncmp(s, "fps",            3)) return WCMD_KEY_FPS;
@@ -2453,7 +1806,7 @@ static int wcmd_key_from_str(const char *s, size_t n)
 	return -1;
 }
 
-static const char *wcmd_key_name(int key)
+const char *wcmd_key_name(int key)
 {
 	switch (key) {
 	case WCMD_KEY_BITRATE_KBPS:  return "bitrate_kbps";
@@ -2487,7 +1840,7 @@ static const char *wcmd_key_name(int key)
  * frames across FEC blocks here — back-to-back lands in one block, so
  * full-block loss still drops the command.  See gs.html roadmap for the
  * supervisor_tick-driven spaced-burst follow-up. */
-static int wcmd_emit(const Config *c, int key, int32_t value, uint16_t *seq_out)
+int wcmd_emit(const Config *c, int key, int32_t value, uint16_t *seq_out)
 {
 	if (!c->venc_cmd_enabled) return -1;
 	const Tunnel *up = NULL;
@@ -2538,1185 +1891,6 @@ static int wcmd_emit(const Config *c, int key, int32_t value, uint16_t *seq_out)
 	return last_err ? last_err : -1;
 }
 
-/* ---------- Embedded WebUI ------------------------------------------- *
- *
- * webui/gs.html is xxd-i embedded by Makefile.gs_supervisor's `webui`
- * target as a const byte array. Served at `/` when the request carries
- * Accept: text/html (browser path); curl with no overrides gets the
- * /api/v1/health-style help text instead. */
-#if __has_include("gs_assets.h")
-#  include "gs_assets.h"
-#else
-   static const unsigned char gs_webui_html[] =
-       "<!doctype html><h1>gs_assets.h missing — run "
-       "`make webui` from ground/.</h1>";
-   static const unsigned int  gs_webui_html_len = sizeof(gs_webui_html) - 1;
-#endif
-
-static bool request_wants_html(const char *req)
-{
-	const char *eol = strchr(req, '\n');
-	const char *headers = eol ? eol + 1 : req;
-	return strstr(headers, "Accept: text/html") != NULL ||
-	       strstr(headers, "accept: text/html") != NULL;
-}
-
-/* ---------- HTTP API ------------------------------------------------- */
-
-typedef struct {
-	int      fd;
-	uint64_t accepted_us;
-	size_t   pos;
-	char     buf[API_BUF_BYTES];
-} ApiClient;
-
-static int api_listen_open(const char *bind_ip, uint16_t port)
-{
-	int fd = socket(AF_INET, SOCK_STREAM, 0);
-	if (fd < 0) return -1;
-	int one = 1;
-	setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
-	struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons(port) };
-	if (!bind_ip || !*bind_ip) a.sin_addr.s_addr = htonl(INADDR_ANY);
-	else if (inet_pton(AF_INET, bind_ip, &a.sin_addr) != 1) {
-		close(fd); return -1;
-	}
-	if (bind(fd, (struct sockaddr *)&a, sizeof(a)) < 0) { close(fd); return -1; }
-	if (listen(fd, 4) < 0) { close(fd); return -1; }
-	int fl = fcntl(fd, F_GETFL, 0);
-	if (fl >= 0) fcntl(fd, F_SETFL, fl | O_NONBLOCK);
-	return fd;
-}
-
-static void api_send(int fd, int code, const char *ctype, const char *body, int body_len)
-{
-	if (body_len < 0) body_len = (int)strlen(body);
-	const char *reason = (code == 200) ? "OK" :
-	                     (code == 400) ? "Bad Request" :
-	                     (code == 404) ? "Not Found" :
-	                     (code == 405) ? "Method Not Allowed" :
-	                                     "Error";
-	char hdr[256];
-	int hl = snprintf(hdr, sizeof(hdr),
-		"HTTP/1.0 %d %s\r\n"
-		"Content-Type: %s\r\n"
-		"Content-Length: %d\r\n"
-		"Cache-Control: no-store\r\n"
-		"Connection: close\r\n\r\n",
-		code, reason, ctype, body_len);
-	if (hl > 0 && write_all(fd, hdr, (size_t)hl) == 0)
-		(void)write_all(fd, body, (size_t)body_len);
-}
-
-/* Send an arbitrary byte blob (e.g. embedded HTML). */
-static void api_send_blob(int fd, const char *ctype,
-                          const unsigned char *body, unsigned int len)
-{
-	char hdr[256];
-	int hl = snprintf(hdr, sizeof(hdr),
-		"HTTP/1.0 200 OK\r\n"
-		"Content-Type: %s\r\n"
-		"Content-Length: %u\r\n"
-		"Cache-Control: no-store\r\n"
-		"Connection: close\r\n\r\n",
-		ctype, len);
-	if (hl > 0 && write_all(fd, hdr, (size_t)hl) == 0)
-		(void)write_all(fd, body, (size_t)len);
-}
-
-static int json_emit_tunnel(char *buf, size_t cap, const Tunnel *t, bool full)
-{
-	int p = 0;
-	#define APP(...) do { int _w = snprintf(buf+p, cap-p, __VA_ARGS__); \
-	                      if (_w < 0 || (size_t)_w >= cap-(size_t)p) return -1; \
-	                      p += _w; } while (0)
-	APP("{\"name\":\"%s\",\"role\":\"%s\",\"state\":\"%s\","
-	    "\"pid\":%d,\"restarts\":%d,\"link_id\":%d,\"radio_port\":%d",
-	    t->name, t->role, tunnel_state_name(t->state),
-	    (int)t->pid, t->restart_count, t->link_id, t->radio_port);
-	APP(",\"interfaces\":[");
-	for (int i = 0; i < t->iface_count; i++)
-		APP("%s\"%s\"", i ? "," : "", t->ifaces[i]);
-	APP("]");
-	if (t->started_us)
-		APP(",\"uptime_s\":%.1f",
-		    t->pid > 0 ? (double)(now_us() - t->started_us) / 1e6 : 0.0);
-	if (t->exit_code || t->exited_us)
-		APP(",\"last_exit\":%d", t->exit_code);
-	if (full) {
-		if (t->binary[0]) APP(",\"binary\":\"%s\"", t->binary);
-		if (!strcmp(t->role, "rx")) {
-			if (t->udp_out_ip[0])
-				APP(",\"udp_out\":\"%s:%d\"", t->udp_out_ip, t->udp_out_port);
-			if (t->stats_out[0]) APP(",\"stats_out\":\"%s\"", t->stats_out);
-		} else {
-			APP(",\"udp_in_port\":%d,\"control_port\":%d,"
-			    "\"fec\":{\"k\":%d,\"n\":%d,\"timeout_ms\":%d,\"have\":%s},"
-			    "\"radio\":{\"bw\":%d,\"mcs\":%d,\"stbc\":%d,\"ldpc\":%d,"
-			    "\"short_gi\":%d,\"vht_mode\":%d,\"vht_nss\":%d,\"have\":%s}",
-			    t->udp_in_port, t->control_port,
-			    t->fec_k, t->fec_n, t->fec_timeout_ms,
-			    t->fec_cache_have ? "true" : "false",
-			    t->bandwidth_mhz, t->mcs_index, t->stbc, t->ldpc,
-			    t->short_gi, t->vht_mode, t->vht_nss,
-			    t->radio_cache_have ? "true" : "false");
-		}
-		APP(",\"autostart\":%s", t->autostart ? "true" : "false");
-	}
-	/* Always include stats for both roles — even if empty, the WebUI
-	 * uses the presence of `msg_count` to decide whether to render the
-	 * stats panel.  age_ms tells the UI how stale the snapshot is. */
-	{
-		uint64_t age_ms = 0;
-		if (t->st_last_us) {
-			uint64_t now_u = now_us();
-			age_ms = (now_u > t->st_last_us) ? (now_u - t->st_last_us) / 1000 : 0;
-		}
-		APP(",\"stats\":{"
-		    "\"msg_count\":%u,\"interval_ms\":%u",
-		    t->st_msg_count, t->st_interval_ms);
-		if (!strcmp(t->role, "rx")) {
-			APP(",\"pkt_all\":%u,\"pkt_lost\":%u,\"pkt_fec_recovered\":%u,"
-			    "\"pkt_outgoing\":%u,\"pkt_dec_err\":%u,\"pkt_uniq\":%u,"
-			    "\"outgoing_bytes\":%u,\"ant_count\":%d",
-			    t->st_pkt_all, t->st_pkt_lost, t->st_pkt_fec,
-			    t->st_pkt_outgoing, t->st_pkt_dec_err, t->st_pkt_uniq,
-			    t->st_pkt_bytes, t->st_ant_count);
-			if (t->st_rssi_best != INT_MIN) APP(",\"rssi_best\":%d", t->st_rssi_best);
-		} else {
-			APP(",\"pkts_in\":%u,\"pkts_out\":%u,"
-			    "\"bytes_in\":%u,\"bytes_out\":%u,"
-			    "\"pkts_drop\":%u,\"pkts_trunc\":%u,\"fec_timeouts\":%u",
-			    t->st_tx_pkts_in, t->st_tx_pkts_out,
-			    t->st_tx_bytes_in, t->st_tx_bytes_out,
-			    t->st_tx_drop, t->st_tx_trunc, t->st_tx_fec_timeouts);
-		}
-		APP(",\"age_ms\":%llu", (unsigned long long)age_ms);
-		if (t->stats_local_port)
-			APP(",\"listen_port\":%u", (unsigned)t->stats_local_port);
-		APP("}");
-	}
-	APP("}");
-	return p;
-	#undef APP
-}
-
-static int json_emit_status(char *buf, size_t cap, const Config *c, uint64_t up_us)
-{
-	int p = 0;
-	#define APP(...) do { int _w = snprintf(buf+p, cap-p, __VA_ARGS__); \
-	                      if (_w < 0 || (size_t)_w >= cap-(size_t)p) return -1; \
-	                      p += _w; } while (0)
-	APP("{\"uptime_s\":%.1f,\"wcmd\":{"
-	    "\"emit_total\":%llu,\"emit_frames\":%llu,"
-	    "\"rate_limited\":%llu,\"emit_failed\":%llu,"
-	    "\"burst_frames\":%d},\"tunnels\":[",
-	    (double)up_us / 1e6,
-	    (unsigned long long)g_wcmd_emit_total,
-	    (unsigned long long)g_wcmd_emit_frames,
-	    (unsigned long long)g_wcmd_emit_rate_limit,
-	    (unsigned long long)g_wcmd_emit_failed,
-	    WCMD_BURST_FRAMES);
-	for (int i = 0; i < c->tunnel_count; i++) {
-		if (i) APP(",");
-		int n = json_emit_tunnel(buf + p, cap - p, &c->tunnels[i], false);
-		if (n < 0) return -1;
-		p += n;
-	}
-	APP("]}");
-	return p;
-	#undef APP
-}
-
-static Tunnel *cfg_find_tunnel(Config *c, const char *name)
-{
-	for (int i = 0; i < c->tunnel_count; i++)
-		if (!strcmp(c->tunnels[i].name, name)) return &c->tunnels[i];
-	return NULL;
-}
-
-/* Routes:
- *   GET /api/v1/health
- *   GET /api/v1/status
- *   GET /api/v1/tunnels
- *   GET /api/v1/tunnels/{name}
- *   GET /api/v1/tunnels/{name}/start
- *   GET /api/v1/tunnels/{name}/stop
- *   GET /api/v1/tunnels/{name}/restart
- *   GET /api/v1/tunnels/{name}/control?cmd=set_fec&k=1&n=2[&fec_timeout_ms=50]
- *   GET /api/v1/tunnels/{name}/control?cmd=set_radio&stbc=&ldpc=&short_gi=&bandwidth=&mcs_index=&vht_mode=&vht_nss=
- *   GET /api/v1/tunnels/{name}/control?cmd=get_fec
- *   GET /api/v1/tunnels/{name}/control?cmd=get_radio
- */
-static void api_handle(ApiClient *cli, Config *c, uint64_t startup_us)
-{
-	cli->buf[cli->pos < API_BUF_BYTES ? cli->pos : API_BUF_BYTES - 1] = 0;
-
-	if (strncmp(cli->buf, "GET ", 4) != 0) {
-		api_send(cli->fd, 405, "text/plain", "expected GET\n", -1);
-		return;
-	}
-	bool wants_html = request_wants_html(cli->buf);
-	char *path = cli->buf + 4;
-	char *sp = strchr(path, ' ');
-	if (!sp) { api_send(cli->fd, 400, "text/plain", "bad request\n", -1); return; }
-	*sp = 0;
-	char *qs = strchr(path, '?');
-	const char *qstr = NULL;
-	if (qs) { *qs = 0; qstr = qs + 1; }
-
-	char body[8192];
-	int n;
-
-	if (!strcmp(path, "/")) {
-		if (wants_html) {
-			api_send_blob(cli->fd, "text/html; charset=utf-8",
-			              gs_webui_html, gs_webui_html_len);
-		} else {
-			api_send(cli->fd, 200, "text/plain",
-			    "gs_supervisor — see /api/v1/health|status|tunnels|cmd. "
-			    "Open this URL in a browser for the WebUI.\n", -1);
-		}
-		return;
-	}
-	if (!strcmp(path, "/api/v1/health")) {
-		api_send(cli->fd, 200, "text/plain", "ok\n", -1);
-		return;
-	}
-	if (!strcmp(path, "/api/v1/ifaces")) {
-		/* Per-iface current chan/ht/txpower snapshot.  Cached value is
-		 * up to GS_IFACE_REFRESH_US (2 s) old by default; we report
-		 * `age_ms` so the UI can grey out stale rows. */
-		uint64_t now = now_us();
-		int p = 0;
-		p += snprintf(body + p, sizeof(body) - p, "[");
-		for (int i = 0; i < g_iface_state_count; i++) {
-			const IfaceState *st = &g_iface_state[i];
-			double age_ms = st->last_query_us
-			    ? (double)(now - st->last_query_us) / 1000.0 : -1.0;
-			if (i) p += snprintf(body + p, sizeof(body) - p, ",");
-			p += snprintf(body + p, sizeof(body) - p,
-			    "{\"name\":\"%s\",\"chan\":%d,\"freq_mhz\":%d,"
-			    "\"ht\":\"%s\",\"txpower_mbm\":%d,"
-			    "\"age_ms\":%.0f,\"iw_rc\":%d}",
-			    st->name, st->chan, st->freq_mhz, st->ht,
-			    st->txpower_mbm, age_ms, st->last_rc);
-		}
-		p += snprintf(body + p, sizeof(body) - p, "]");
-		api_send(cli->fd, 200, "application/json", body, p);
-		return;
-	}
-	if (!strcmp(path, "/api/v1/status")) {
-		n = json_emit_status(body, sizeof(body), c, now_us() - startup_us);
-		if (n < 0) { api_send(cli->fd, 500, "text/plain", "overflow\n", -1); return; }
-		api_send(cli->fd, 200, "application/json", body, n);
-		return;
-	}
-	if (!strcmp(path, "/api/v1/tunnels")) {
-		int p = 0;
-		p += snprintf(body + p, sizeof(body) - p, "[");
-		for (int i = 0; i < c->tunnel_count; i++) {
-			if (i) p += snprintf(body + p, sizeof(body) - p, ",");
-			int w = json_emit_tunnel(body + p, sizeof(body) - p,
-			                         &c->tunnels[i], true);
-			if (w < 0) { api_send(cli->fd, 500, "text/plain", "overflow\n", -1); return; }
-			p += w;
-		}
-		p += snprintf(body + p, sizeof(body) - p, "]");
-		api_send(cli->fd, 200, "application/json", body, p);
-		return;
-	}
-	if (!strcmp(path, "/api/v1/system/reinit")) {
-		/* Last-resort recovery: stop every tunnel, run system.down, then
-		 * system.up + wait_iface_state, then respawn autostart tunnels.
-		 * This unsticks adapters that are stuck in a bad post-monitor
-		 * state (txpower=-100, NO-CARRIER while in monitor mode, etc.) —
-		 * the symptoms we saw when WCMD packets stopped getting on-air. */
-		LOG_WARN("REST /system/reinit: tearing down all tunnels");
-		for (int i = 0; i < c->tunnel_count; i++) {
-			Tunnel *t = &c->tunnels[i];
-			if (t->pid > 0) {
-				t->autostart_on_exit = false;
-				if (kill(t->pid, SIGTERM) == 0)
-					t->stop_deadline_ms = now_ms() + GS_STOP_GRACE_MS;
-			}
-		}
-		uint64_t deadline = now_ms() + GS_STOP_GRACE_MS + 500;
-		while (now_ms() < deadline) {
-			bool any = false;
-			for (int i = 0; i < c->tunnel_count; i++)
-				if (c->tunnels[i].pid > 0) any = true;
-			if (!any) break;
-			supervisor_reap(c);
-			struct timespec ts = { .tv_sec = 0, .tv_nsec = 50 * 1000 * 1000 };
-			nanosleep(&ts, NULL);
-		}
-		for (int i = 0; i < c->tunnel_count; i++) {
-			if (c->tunnels[i].pid > 0) {
-				kill(c->tunnels[i].pid, SIGKILL);
-				waitpid(c->tunnels[i].pid, NULL, 0);
-				c->tunnels[i].pid = -1;
-			}
-		}
-		/* Stats listeners stay open across reinit — wfb_rx/wfb_tx will
-		 * be respawned with the same -Y target. */
-		LOG_INFO("REST /system/reinit: running system.down");
-		run_system_block("system.down", c->system_down, c->system_down_count);
-		LOG_INFO("REST /system/reinit: running system.up");
-		run_system_block("system.up",   c->system_up,   c->system_up_count);
-		int wait_rc = wait_iface_state(c, 5000, 100);
-		if (wait_rc != 0) {
-			api_send(cli->fd, 503, "application/json",
-			         "{\"ok\":false,\"error\":\"iface readiness timeout — check supervisor log\"}", -1);
-			return;
-		}
-		int spawned = 0;
-		for (int i = 0; i < c->tunnel_count; i++) {
-			Tunnel *t = &c->tunnels[i];
-			if (t->autostart) {
-				t->backoff_idx = 0;
-				t->next_start_ms = 0;
-				if (tunnel_spawn(t, c->key_file) == 0) spawned++;
-			}
-		}
-		char body[160];
-		int p = snprintf(body, sizeof(body),
-		                 "{\"ok\":true,\"reinit\":true,\"tunnels_spawned\":%d}",
-		                 spawned);
-		api_send(cli->fd, 200, "application/json", body, p);
-		return;
-	}
-	if (!strcmp(path, "/api/v1/cmd")) {
-		size_t kl;
-		const char *kstr = qs_get(qstr, "key", &kl);
-		if (!kstr) {
-			api_send(cli->fd, 400, "text/plain", "missing ?key=\n", -1);
-			return;
-		}
-		int key = wcmd_key_from_str(kstr, kl);
-		if (key < 0) {
-			api_send(cli->fd, 400, "text/plain",
-			         "key must be bitrate_kbps|fps|payload_bytes|force_idr|"
-			         "wfb_fec_k|wfb_fec_n|wfb_mcs|wfb_bandwidth|"
-			         "wfb_ldpc|wfb_stbc|wfb_short_gi|"
-			         "fec_enabled|mcs_enabled|wfb_txpower\n", -1);
-			return;
-		}
-		int32_t value = 0;
-		int v;
-		if (qs_get_int(qstr, "value", &v) == 0) value = (int32_t)v;
-		else if (key != WCMD_KEY_FORCE_IDR) {
-			api_send(cli->fd, 400, "text/plain",
-			         "this key requires ?value=\n", -1);
-			return;
-		}
-		/* Rate limit per key. */
-		if (c->venc_cmd_rate_limit_ms > 0 && key >= 1 && key <= WCMD_KEY_MAX) {
-			uint64_t t_ms = now_ms();
-			uint64_t since = t_ms - g_wcmd_last_send_ms[key];
-			if (g_wcmd_last_send_ms[key] != 0 &&
-			    (int)since < c->venc_cmd_rate_limit_ms) {
-				g_wcmd_emit_rate_limit++;
-				char body[128];
-				int p = snprintf(body, sizeof(body),
-				                 "{\"ok\":false,\"error\":\"rate_limited\","
-				                 "\"key\":\"%s\",\"retry_after_ms\":%d}",
-				                 wcmd_key_name(key),
-				                 c->venc_cmd_rate_limit_ms - (int)since);
-				api_send(cli->fd, 429, "application/json", body, p);
-				return;
-			}
-		}
-		uint16_t seq = 0;
-		int rc = wcmd_emit(c, key, value, &seq);
-		if (rc == -1) {
-			api_send(cli->fd, 503, "application/json",
-			         "{\"ok\":false,\"error\":\"venc_cmd disabled or uplink missing\"}",
-			         -1);
-			return;
-		}
-		if (rc != 0) {
-			char body[128];
-			int p = snprintf(body, sizeof(body),
-			                 "{\"ok\":false,\"error\":\"sendto: %s\"}",
-			                 strerror(rc));
-			api_send(cli->fd, 502, "application/json", body, p);
-			return;
-		}
-		g_wcmd_last_send_ms[key] = now_ms();
-		char body[128];
-		int p;
-		if (key == WCMD_KEY_FORCE_IDR) {
-			p = snprintf(body, sizeof(body),
-			             "{\"ok\":true,\"seq\":%u,\"key\":\"%s\"}",
-			             (unsigned)seq, wcmd_key_name(key));
-		} else {
-			p = snprintf(body, sizeof(body),
-			             "{\"ok\":true,\"seq\":%u,\"key\":\"%s\",\"value\":%d}",
-			             (unsigned)seq, wcmd_key_name(key), (int)value);
-		}
-		api_send(cli->fd, 200, "application/json", body, p);
-		return;
-	}
-	if (!strcmp(path, "/api/v1/system/scan")) {
-		/* Required: iface (comma-sep), chans (comma-sep). Optional: ht /
-		 * hts (single HT for all steps, or comma-sep per step), dwell_ms
-		 * (default 600). Refuses if a CSA hop or another scan is in flight. */
-		if (g_csa.phase != CSA_IDLE) {
-			api_send(cli->fd, 409, "application/json",
-			    "{\"ok\":false,\"error\":\"csa active\"}", -1);
-			return;
-		}
-		if (g_scan.phase == SCAN_RUNNING) {
-			api_send(cli->fd, 409, "application/json",
-			    "{\"ok\":false,\"error\":\"scan already running\"}", -1);
-			return;
-		}
-		size_t il, cl, hl_ht, hl_hts;
-		const char *istr = qs_get(qstr, "iface", &il);
-		const char *cstr = qs_get(qstr, "chans", &cl);
-		const char *htstr = qs_get(qstr, "ht", &hl_ht);
-		const char *htsstr = qs_get(qstr, "hts", &hl_hts);
-		if (!istr || il == 0 || !cstr || cl == 0) {
-			api_send(cli->fd, 400, "application/json",
-			    "{\"ok\":false,\"error\":\"need iface=&chans=\"}", -1);
-			return;
-		}
-		/* parse iface list */
-		char ifaces[GS_CSA_MAX_IFACES][IFNAMSIZ];
-		int  iface_count = 0;
-		const char *p = istr, *e = istr + il;
-		while (p < e && iface_count < GS_CSA_MAX_IFACES) {
-			const char *q = p;
-			while (q < e && *q != ',') q++;
-			size_t L = (size_t)(q - p);
-			if (L == 0 || L >= IFNAMSIZ) {
-				api_send(cli->fd, 400, "application/json",
-				    "{\"ok\":false,\"error\":\"bad iface in list\"}", -1);
-				return;
-			}
-			memcpy(ifaces[iface_count], p, L);
-			ifaces[iface_count][L] = 0;
-			iface_count++;
-			p = q + 1;
-		}
-		/* If we hit the iface cap mid-list, p still has data left.  Reject
-		 * loudly rather than silently dropping the operator's tail input. */
-		if (p < e) {
-			char b[96];
-			int bp = snprintf(b, sizeof(b),
-			    "{\"ok\":false,\"error\":\"too many ifaces (max %d)\"}",
-			    GS_CSA_MAX_IFACES);
-			api_send(cli->fd, 400, "application/json", b, bp);
-			return;
-		}
-		if (iface_count == 0) {
-			api_send(cli->fd, 400, "application/json",
-			    "{\"ok\":false,\"error\":\"no iface\"}", -1);
-			return;
-		}
-		for (int j = 0; j < iface_count; j++) {
-			bool known = false;
-			for (int i = 0; i < c->tunnel_count && !known; i++)
-				for (int k = 0; k < c->tunnels[i].iface_count; k++)
-					if (!strcmp(c->tunnels[i].ifaces[k], ifaces[j])) {
-						known = true; break;
-					}
-			if (!known) {
-				char b[96];
-				int bp = snprintf(b, sizeof(b),
-				    "{\"ok\":false,\"error\":\"iface '%s' not in any tunnel\"}",
-				    ifaces[j]);
-				api_send(cli->fd, 404, "application/json", b, bp);
-				return;
-			}
-		}
-		/* parse chan list */
-		int  chans[SCAN_MAX_STEPS];
-		int  chan_count = 0;
-		p = cstr; e = cstr + cl;
-		while (p < e && chan_count < SCAN_MAX_STEPS) {
-			char buf[8]; int bn = 0;
-			while (p < e && *p != ',' && bn < (int)sizeof(buf) - 1) buf[bn++] = *p++;
-			buf[bn] = 0;
-			if (bn == 0) {
-				api_send(cli->fd, 400, "application/json",
-				    "{\"ok\":false,\"error\":\"empty chan in list\"}", -1);
-				return;
-			}
-			char *endp = NULL;
-			long ch = strtol(buf, &endp, 10);
-			if (endp == buf || ch < 1 || ch > 200) {
-				api_send(cli->fd, 400, "application/json",
-				    "{\"ok\":false,\"error\":\"chan out of range (1..200)\"}", -1);
-				return;
-			}
-			chans[chan_count++] = (int)ch;
-			if (p < e) p++;
-		}
-		if (p < e) {
-			char b[96];
-			int bp = snprintf(b, sizeof(b),
-			    "{\"ok\":false,\"error\":\"too many chans (max %d)\"}",
-			    SCAN_MAX_STEPS);
-			api_send(cli->fd, 400, "application/json", b, bp);
-			return;
-		}
-		if (chan_count == 0) {
-			api_send(cli->fd, 400, "application/json",
-			    "{\"ok\":false,\"error\":\"no chans\"}", -1);
-			return;
-		}
-		/* parse hts: prefer 'hts=' (per-step) over 'ht=' (single).
-		 * If neither given, default everything to HT20. */
-		char hts[SCAN_MAX_STEPS][8];
-		for (int i = 0; i < chan_count; i++) snprintf(hts[i], 8, "HT20");
-		if (htsstr && hl_hts > 0) {
-			int hi = 0;
-			p = htsstr; e = htsstr + hl_hts;
-			while (p < e && hi < SCAN_MAX_STEPS) {
-				const char *q = p;
-				while (q < e && *q != ',') q++;
-				size_t L = (size_t)(q - p);
-				if (L == 0 || L >= 8) {
-					api_send(cli->fd, 400, "application/json",
-					    "{\"ok\":false,\"error\":\"bad ht\"}", -1);
-					return;
-				}
-				memcpy(hts[hi], p, L); hts[hi][L] = 0;
-				hi++;
-				p = q + 1;
-			}
-			if (hi == 1 && chan_count > 1) {
-				/* repeat first across all */
-				for (int i = 1; i < chan_count; i++)
-					snprintf(hts[i], 8, "%s", hts[0]);
-			} else if (hi != chan_count) {
-				api_send(cli->fd, 400, "application/json",
-				    "{\"ok\":false,\"error\":\"hts count != chans count\"}", -1);
-				return;
-			}
-		} else if (htstr && hl_ht > 0 && hl_ht < 8) {
-			char one[8];
-			memcpy(one, htstr, hl_ht); one[hl_ht] = 0;
-			for (int i = 0; i < chan_count; i++)
-				snprintf(hts[i], 8, "%s", one);
-		}
-		for (int i = 0; i < chan_count; i++) {
-			if (strcmp(hts[i], "HT20") &&
-			    strcmp(hts[i], "HT40+") &&
-			    strcmp(hts[i], "HT40-")) {
-				api_send(cli->fd, 400, "application/json",
-				    "{\"ok\":false,\"error\":\"ht must be HT20|HT40+|HT40-\"}", -1);
-				return;
-			}
-		}
-		int dwell_ms = 600;
-		(void)qs_get_int(qstr, "dwell_ms", &dwell_ms);
-		if (dwell_ms < 100)  dwell_ms = 100;
-		if (dwell_ms > 10000) dwell_ms = 10000;
-
-		/* Arm scan state. */
-		memset(&g_scan, 0, sizeof(g_scan));
-		g_scan.sess++;
-		for (int j = 0; j < iface_count; j++)
-			snprintf(g_scan.ifaces[j], sizeof(g_scan.ifaces[j]),
-			    "%s", ifaces[j]);
-		g_scan.iface_count = iface_count;
-		for (int i = 0; i < chan_count; i++) {
-			g_scan.chans[i] = chans[i];
-			/* hts[i] is parsed/validated to ≤7 + NUL above (see L<8
-			 * guard).  Use explicit length copy so gcc-13's stricter
-			 * -Wformat-truncation doesn't trip on snprintf("%s", src)
-			 * when src and dst are both char[8]. */
-			size_t hl = strnlen(hts[i], sizeof(hts[i]) - 1);
-			memcpy(g_scan.hts[i], hts[i], hl);
-			g_scan.hts[i][hl] = '\0';
-		}
-		g_scan.step_count = chan_count;
-		g_scan.step_dwell_us = (uint64_t)dwell_ms * 1000ULL;
-		g_scan.baseline_rx_idx = csa_pick_rx_tunnel_idx(c);
-		g_scan.step_saw_traffic = false;
-		g_scan.found_chan = -1;
-		g_scan.phase = SCAN_RUNNING;
-		scan_apply_step_drained(c, 0);
-		LOG_INFO("scan: armed sess=%u %d iface(s) %d step(s) dwell=%d ms",
-		         g_scan.sess, iface_count, chan_count, dwell_ms);
-
-		char buf[400];
-		int bp = snprintf(buf, sizeof(buf),
-		    "{\"ok\":true,\"sess\":%u,\"step_count\":%d,\"dwell_ms\":%d,"
-		    "\"ifaces\":[",
-		    g_scan.sess, chan_count, dwell_ms);
-		for (int j = 0; j < iface_count; j++)
-			bp += snprintf(buf + bp, sizeof(buf) - bp, "%s\"%s\"",
-			    j ? "," : "", ifaces[j]);
-		bp += snprintf(buf + bp, sizeof(buf) - bp, "]}");
-		api_send(cli->fd, 200, "application/json", buf, bp);
-		return;
-	}
-	if (!strcmp(path, "/api/v1/system/scan/cancel")) {
-		if (g_scan.phase != SCAN_RUNNING) {
-			api_send(cli->fd, 200, "application/json",
-			    "{\"ok\":true,\"already_idle\":true}", -1);
-			return;
-		}
-		LOG_INFO("scan: cancel requested at step %d/%d",
-		         g_scan.cur_step + 1, g_scan.step_count);
-		g_scan.phase = SCAN_STOPPED;
-		api_send(cli->fd, 200, "application/json",
-		    "{\"ok\":true,\"cancelled\":true}", -1);
-		return;
-	}
-	if (!strcmp(path, "/api/v1/scan")) {
-		uint64_t t_us = now_us();
-		double dwell_left_ms = (g_scan.phase == SCAN_RUNNING)
-		    ? (double)((int64_t)(g_scan.step_started_us + g_scan.step_dwell_us)
-		               - (int64_t)t_us) / 1000.0
-		    : 0.0;
-		int cur_chan = (g_scan.cur_step < g_scan.step_count)
-		    ? g_scan.chans[g_scan.cur_step] : -1;
-		const char *cur_ht = (g_scan.cur_step < g_scan.step_count)
-		    ? g_scan.hts[g_scan.cur_step] : "";
-		/* Sized for worst case: 4 ifaces (≈19 chars each) + 32 chans
-		 * (4 chars each) + JSON envelope ≈ 360 B; 768 leaves headroom. */
-		char body2[768];
-		int p = snprintf(body2, sizeof(body2),
-		    "{\"phase\":%d,\"sess\":%u,\"cur_step\":%d,\"step_count\":%d,"
-		    "\"hops_done\":%d,\"dwell_left_ms\":%.0f,"
-		    "\"cur_chan\":%d,\"cur_ht\":\"%s\","
-		    "\"found_chan\":%d,\"found_ht\":\"%s\","
-		    "\"ifaces\":[",
-		    (int)g_scan.phase, g_scan.sess, g_scan.cur_step, g_scan.step_count,
-		    g_scan.hops_done, dwell_left_ms,
-		    cur_chan, cur_ht,
-		    g_scan.found_chan, g_scan.found_ht);
-		for (int j = 0; j < g_scan.iface_count; j++)
-			p += snprintf(body2 + p, sizeof(body2) - p, "%s\"%s\"",
-			    j ? "," : "", g_scan.ifaces[j]);
-		p += snprintf(body2 + p, sizeof(body2) - p, "],\"chans\":[");
-		for (int i = 0; i < g_scan.step_count; i++)
-			p += snprintf(body2 + p, sizeof(body2) - p, "%s%d",
-			    i ? "," : "", g_scan.chans[i]);
-		p += snprintf(body2 + p, sizeof(body2) - p, "]}");
-		api_send(cli->fd, 200, "application/json", body2, p);
-		return;
-	}
-	if (!strcmp(path, "/api/v1/system/csa")) {
-		/* Synchronized channel hop. Required: chan, ht, iface. Optional:
-		 * lead_ms (default 500), t_revert_ms (default 3000),
-		 * prev_chan/prev_ht (defaults: assume current channel from the
-		 * iface's last known state — operator override accepted),
-		 * no_revert (1 disables auto-revert; default 0).
-		 *
-		 * Schedule: now → BURST (5 frames @ 20 ms) → ARMED → at T_switch
-		 * fork iw set channel → VERIFY for t_revert_ms → revert if no
-		 * traffic.  Vehicle's csa_tick mirrors the same revert deadline. */
-		if (g_csa.phase != CSA_IDLE) {
-			char body[160];
-			int p = snprintf(body, sizeof(body),
-			    "{\"ok\":false,\"error\":\"csa already active\","
-			    "\"phase\":%d,\"sess\":%u}",
-			    (int)g_csa.phase, g_csa.sess);
-			api_send(cli->fd, 409, "application/json", body, p);
-			return;
-		}
-		/* Refuse while a scan is dwelling — both subsystems drive iw on
-		 * the same iface; interleaving would mis-time hops.  Operator
-		 * cancels via /api/v1/system/scan/cancel first.  Mirrored on the
-		 * scan handler so the lock is symmetric. */
-		if (g_scan.phase == SCAN_RUNNING) {
-			char body[160];
-			int p = snprintf(body, sizeof(body),
-			    "{\"ok\":false,\"error\":\"scan running — cancel first\","
-			    "\"scan_sess\":%u}",
-			    g_scan.sess);
-			api_send(cli->fd, 409, "application/json", body, p);
-			return;
-		}
-		size_t il, hl_ht;
-		const char *istr = qs_get(qstr, "iface", &il);
-		const char *htstr = qs_get(qstr, "ht", &hl_ht);
-		int chan = -1;
-		if (qs_get_int(qstr, "chan", &chan) != 0 || chan < 1 || chan > 200) {
-			api_send(cli->fd, 400, "text/plain",
-			    "missing/bad ?chan= (1..200)\n", -1);
-			return;
-		}
-		if (!istr || il == 0 ||
-		    !htstr || hl_ht == 0 || hl_ht >= 8) {
-			api_send(cli->fd, 400, "text/plain",
-			    "missing ?iface=name1,name2,…&ht=HT20|HT40+|HT40-\n", -1);
-			return;
-		}
-		/* Accept comma-separated iface list so a diversity-RX setup
-		 * (multiple GS adapters per video tunnel) can hop atomically. */
-		char ifaces[GS_CSA_MAX_IFACES][IFNAMSIZ];
-		int  iface_count = 0;
-		const char *p = istr, *end = istr + il;
-		while (p < end && iface_count < GS_CSA_MAX_IFACES) {
-			const char *q = p;
-			while (q < end && *q != ',') q++;
-			size_t len = (size_t)(q - p);
-			if (len == 0 || len >= IFNAMSIZ) {
-				api_send(cli->fd, 400, "text/plain",
-				    "bad iface in list\n", -1); return;
-			}
-			memcpy(ifaces[iface_count], p, len);
-			ifaces[iface_count][len] = 0;
-			iface_count++;
-			p = q + 1;
-		}
-		if (p < end) {
-			char body[96];
-			int bp = snprintf(body, sizeof(body),
-			    "too many ifaces (max %d)\n", GS_CSA_MAX_IFACES);
-			api_send(cli->fd, 400, "text/plain", body, bp);
-			return;
-		}
-		if (iface_count == 0) {
-			api_send(cli->fd, 400, "text/plain", "no iface\n", -1);
-			return;
-		}
-		for (int j = 0; j < iface_count; j++) {
-			bool known = false;
-			for (int i = 0; i < c->tunnel_count && !known; i++) {
-				for (int k = 0; k < c->tunnels[i].iface_count; k++) {
-					if (!strcmp(c->tunnels[i].ifaces[k], ifaces[j])) {
-						known = true; break;
-					}
-				}
-			}
-			if (!known) {
-				char body[96];
-				int bp = snprintf(body, sizeof(body),
-				    "iface '%s' is not in any tunnel\n", ifaces[j]);
-				api_send(cli->fd, 404, "text/plain", body, bp);
-				return;
-			}
-		}
-		char ht[8];
-		memcpy(ht, htstr, hl_ht); ht[hl_ht] = 0;
-		if (strcmp(ht, "HT20") && strcmp(ht, "HT40+") && strcmp(ht, "HT40-")) {
-			api_send(cli->fd, 400, "text/plain",
-			    "ht must be HT20|HT40+|HT40-\n", -1);
-			return;
-		}
-		int lead_ms = 500;
-		int t_revert_ms = 3000;
-		(void)qs_get_int(qstr, "lead_ms", &lead_ms);
-		(void)qs_get_int(qstr, "t_revert_ms", &t_revert_ms);
-		if (lead_ms < 100)  lead_ms = 100;
-		if (lead_ms > 5000) lead_ms = 5000;
-		if (t_revert_ms < 500)   t_revert_ms = 500;
-		if (t_revert_ms > 30000) t_revert_ms = 30000;
-		int prev_chan = chan;  /* fallback if operator omits */
-		(void)qs_get_int(qstr, "prev_chan", &prev_chan);
-		size_t pl = 0;
-		const char *pstr = qs_get(qstr, "prev_ht", &pl);
-		char prev_ht[8] = "HT20";
-		if (pstr && pl > 0 && pl < 8) {
-			memcpy(prev_ht, pstr, pl); prev_ht[pl] = 0;
-		}
-		int no_revert = 0;
-		(void)qs_get_int(qstr, "no_revert", &no_revert);
-
-		const Tunnel *up = NULL;
-		for (int i = 0; i < c->tunnel_count; i++) {
-			if (!strcmp(c->tunnels[i].name, c->venc_cmd_uplink) &&
-			    !strcmp(c->tunnels[i].role, "tx")) {
-				up = &c->tunnels[i]; break;
-			}
-		}
-		if (!up || up->udp_in_port <= 0) {
-			api_send(cli->fd, 503, "application/json",
-			    "{\"ok\":false,\"error\":\"uplink tunnel missing\"}", -1);
-			return;
-		}
-
-		/* Arm.  Frame burst is driven by supervisor_tick at 20 ms cadence,
-		 * starting from the next tick. */
-		uint64_t t_us = now_us();
-		g_csa.sess += 1;
-		g_csa.t_switch_us  = t_us + (uint64_t)lead_ms * 1000ULL;
-		g_csa.t_revert_us  = g_csa.t_switch_us +
-		                     (uint64_t)t_revert_ms * 1000ULL;
-		g_csa.next_frame_us = t_us;
-		g_csa.frames_sent  = 0;
-		g_csa.frames_total = 5;
-		g_csa.target_chan  = chan;
-		snprintf(g_csa.target_ht, sizeof(g_csa.target_ht), "%s", ht);
-		g_csa.prev_chan    = prev_chan;
-		snprintf(g_csa.prev_ht,   sizeof(g_csa.prev_ht),   "%s", prev_ht);
-		g_csa.iface_count = iface_count;
-		for (int j = 0; j < iface_count; j++)
-			snprintf(g_csa.ifaces[j], sizeof(g_csa.ifaces[j]),
-			    "%s", ifaces[j]);
-		g_csa.no_revert    = (no_revert != 0);
-		g_csa_seq_in_burst = 0;
-		g_csa.phase = CSA_BURST;
-		LOG_INFO("csa: armed sess=%u ifaces=%d %d→%d (%s→%s) "
-		         "lead=%d ms t_revert=%d ms",
-		         g_csa.sess, g_csa.iface_count,
-		         g_csa.prev_chan, g_csa.target_chan,
-		         g_csa.prev_ht, g_csa.target_ht,
-		         lead_ms, t_revert_ms);
-
-		char body[400];
-		int bp = snprintf(body, sizeof(body),
-		    "{\"ok\":true,\"sess\":%u,\"chan\":%d,\"ht\":\"%s\","
-		    "\"ifaces\":[",
-		    g_csa.sess, chan, ht);
-		for (int j = 0; j < iface_count; j++)
-			bp += snprintf(body + bp, sizeof(body) - bp,
-			    "%s\"%s\"", j ? "," : "", ifaces[j]);
-		bp += snprintf(body + bp, sizeof(body) - bp,
-		    "],\"lead_ms\":%d,\"t_revert_ms\":%d,"
-		    "\"prev_chan\":%d,\"prev_ht\":\"%s\",\"no_revert\":%s}",
-		    lead_ms, t_revert_ms, prev_chan, prev_ht,
-		    no_revert ? "true" : "false");
-		api_send(cli->fd, 200, "application/json", body, bp);
-		return;
-	}
-	if (!strcmp(path, "/api/v1/csa")) {
-		uint64_t t_us = now_us();
-		double t_to_switch_ms = (g_csa.phase == CSA_BURST ||
-		                         g_csa.phase == CSA_ARMED)
-		    ? (double)((int64_t)g_csa.t_switch_us - (int64_t)t_us) / 1000.0
-		    : 0.0;
-		double t_to_revert_ms = (g_csa.phase == CSA_VERIFY)
-		    ? (double)((int64_t)g_csa.t_revert_us - (int64_t)t_us) / 1000.0
-		    : 0.0;
-		char body[400];
-		int bp = snprintf(body, sizeof(body),
-		    "{\"phase\":%d,\"sess\":%u,\"frames_sent\":%d,"
-		    "\"frames_total\":%d,\"target_chan\":%d,\"target_ht\":\"%s\","
-		    "\"prev_chan\":%d,\"prev_ht\":\"%s\",\"ifaces\":[",
-		    (int)g_csa.phase, g_csa.sess, g_csa.frames_sent,
-		    g_csa.frames_total, g_csa.target_chan, g_csa.target_ht,
-		    g_csa.prev_chan, g_csa.prev_ht);
-		for (int j = 0; j < g_csa.iface_count; j++)
-			bp += snprintf(body + bp, sizeof(body) - bp,
-			    "%s\"%s\"", j ? "," : "", g_csa.ifaces[j]);
-		bp += snprintf(body + bp, sizeof(body) - bp,
-		    "],\"t_to_switch_ms\":%.1f,\"t_to_revert_ms\":%.1f,"
-		    "\"no_revert\":%s}",
-		    t_to_switch_ms, t_to_revert_ms,
-		    g_csa.no_revert ? "true" : "false");
-		api_send(cli->fd, 200, "application/json", body, bp);
-		return;
-	}
-	if (!strcmp(path, "/api/v1/system/txpower")) {
-		/* Per-iface `iw set txpower fixed <mBm>` on the GS host. We accept
-		 * any iface that appears in some tunnel's iface list — anything
-		 * else is a typo. The dispatch is synchronous (~30–80 ms on
-		 * RTL88x2CU/EU); keep `mbm` in 50..3000 to match the WCMD clamp.
-		 *
-		 * Useful when the operator notices an adapter dropped to txpower=
-		 * -100 dBm after a monitor-mode flip and wants to restore it
-		 * without reinit, or when probing range vs throughput. */
-		size_t il, ml;
-		const char *istr = qs_get(qstr, "iface", &il);
-		const char *mstr = qs_get(qstr, "mbm",   &ml);
-		if (!istr || !mstr) {
-			api_send(cli->fd, 400, "text/plain",
-			         "missing ?iface=<name>&mbm=<50..3000>\n", -1);
-			return;
-		}
-		char iface[IFNAMSIZ];
-		if (il == 0 || il >= sizeof(iface)) {
-			api_send(cli->fd, 400, "text/plain", "bad iface\n", -1); return;
-		}
-		memcpy(iface, istr, il); iface[il] = 0;
-		bool known = false;
-		for (int i = 0; i < c->tunnel_count && !known; i++) {
-			for (int k = 0; k < c->tunnels[i].iface_count; k++) {
-				if (!strcmp(c->tunnels[i].ifaces[k], iface)) {
-					known = true; break;
-				}
-			}
-		}
-		if (!known) {
-			api_send(cli->fd, 404, "text/plain",
-			         "iface is not in any tunnel\n", -1);
-			return;
-		}
-		int mbm;
-		if (qs_get_int(qstr, "mbm", &mbm) != 0) {
-			api_send(cli->fd, 400, "text/plain", "mbm not numeric\n", -1);
-			return;
-		}
-		if (mbm < 50 || mbm > 3000) {
-			api_send(cli->fd, 400, "text/plain",
-			         "mbm out of range (50..3000)\n", -1);
-			return;
-		}
-		char mbm_s[16];
-		snprintf(mbm_s, sizeof(mbm_s), "%d", mbm);
-		LOG_INFO("REST /system/txpower: iw dev %s set txpower fixed %s",
-		         iface, mbm_s);
-		pid_t pid = fork();
-		int rc = -1;
-		if (pid == 0) {
-			execl("/usr/sbin/iw", "iw", "dev", iface, "set", "txpower",
-			      "fixed", mbm_s, (char*)NULL);
-			execlp("iw", "iw", "dev", iface, "set", "txpower",
-			       "fixed", mbm_s, (char*)NULL);
-			_exit(127);
-		}
-		if (pid > 0) {
-			rc = waitpid_deadline(pid, GS_FORK_DEADLINE_MS);
-			if (rc == -2) LOG_WARN("REST /system/txpower: iw dev %s "
-			                       "deadline %d ms — SIGKILL'd",
-			                       iface, GS_FORK_DEADLINE_MS);
-		}
-		IfaceState *ist = iface_state_find(iface);
-		if (ist) (void)iface_state_query(ist);
-		char body[160];
-		int p = snprintf(body, sizeof(body),
-		                 "{\"ok\":%s,\"iface\":\"%s\",\"mbm\":%d,\"iw_rc\":%d}",
-		                 rc == 0 ? "true" : "false", iface, mbm, rc);
-		api_send(cli->fd, rc == 0 ? 200 : 502, "application/json", body, p);
-		return;
-	}
-	if (!strncmp(path, "/api/v1/tunnels/", 16)) {
-		char name[GS_NAME_MAX];
-		const char *rest = path + 16;
-		const char *slash = strchr(rest, '/');
-		size_t nlen = slash ? (size_t)(slash - rest) : strlen(rest);
-		if (nlen == 0 || nlen >= sizeof(name)) {
-			api_send(cli->fd, 400, "text/plain", "bad name\n", -1); return;
-		}
-		memcpy(name, rest, nlen); name[nlen] = 0;
-		Tunnel *t = cfg_find_tunnel(c, name);
-		if (!t) { api_send(cli->fd, 404, "text/plain", "no such tunnel\n", -1); return; }
-		const char *action = slash ? slash + 1 : "";
-		if (!*action) {
-			n = json_emit_tunnel(body, sizeof(body), t, true);
-			if (n < 0) { api_send(cli->fd, 500, "text/plain", "overflow\n", -1); return; }
-			api_send(cli->fd, 200, "application/json", body, n);
-			return;
-		}
-		if (!strcmp(action, "start")) {
-			if (t->pid > 0) {
-				api_send(cli->fd, 200, "application/json",
-				         "{\"ok\":true,\"already\":true}", -1);
-				return;
-			}
-			t->backoff_idx = 0;
-			t->next_start_ms = 0;
-			tunnel_spawn(t, c->key_file);
-			api_send(cli->fd, 200, "application/json", "{\"ok\":true}", -1);
-			return;
-		}
-		if (!strcmp(action, "stop")) {
-			tunnel_request_stop(t);
-			api_send(cli->fd, 200, "application/json", "{\"ok\":true}", -1);
-			return;
-		}
-		if (!strcmp(action, "restart")) {
-			tunnel_request_stop(t);
-			t->autostart_on_exit = true;
-			t->backoff_idx = 0;
-			/* If the child was already gone (TS_BACKOFF or TS_STOPPED
-			 * after tunnel_request_stop's early-return), queue an
-			 * immediate respawn instead of leaving it parked. */
-			if (t->pid <= 0) {
-				t->state = TS_BACKOFF;
-				t->next_start_ms = now_ms();
-			}
-			api_send(cli->fd, 200, "application/json", "{\"ok\":true}", -1);
-			return;
-		}
-		if (!strcmp(action, "control")) {
-			if (strcmp(t->role, "tx") != 0) {
-				api_send(cli->fd, 400, "text/plain",
-				         "control only valid on tx tunnels\n", -1);
-				return;
-			}
-			if (t->control_port <= 0) {
-				api_send(cli->fd, 409, "text/plain",
-				         "tunnel has no control_port set; add -C in config\n", -1);
-				return;
-			}
-			size_t cl;
-			const char *cmd = qs_get(qstr, "cmd", &cl);
-			if (!cmd) {
-				api_send(cli->fd, 400, "text/plain", "missing ?cmd=\n", -1);
-				return;
-			}
-			char respbuf[64];
-			uint32_t rc_out = 0xFFFFFFFFu;
-			int rlen = 0;
-
-			if (cl == 7 && !strncmp(cmd, "set_fec", 7)) {
-				int k = -1, nn = -1, to = WFB_FEC_TIMEOUT_KEEP;
-				if (qs_get_int(qstr, "k", &k) < 0 ||
-				    qs_get_int(qstr, "n", &nn) < 0 ||
-				    k < 0 || k > 255 || nn < 0 || nn > 255) {
-					api_send(cli->fd, 400, "text/plain",
-					         "set_fec needs k,n in [0,255]\n", -1);
-					return;
-				}
-				int to_arg;
-				if (qs_get_int(qstr, "fec_timeout_ms", &to_arg) == 0) {
-					if (to_arg < 0 || to_arg > 0xFFFE) {
-						api_send(cli->fd, 400, "text/plain",
-						         "fec_timeout_ms out of range\n", -1);
-						return;
-					}
-					to = to_arg;
-				}
-				WfbCmdSetFecReq req = {
-					.req_id         = wfb_cmd_next_req_id(),
-					.cmd_id         = WFB_CMD_SET_FEC,
-					.k              = (uint8_t)k,
-					.n              = (uint8_t)nn,
-					.fec_timeout_ms = htons((uint16_t)to),
-				};
-				rlen = wfb_cmd_round_trip(t->control_port, &req, sizeof(req),
-				                          respbuf, sizeof(respbuf), &rc_out);
-				if (rlen > 0 && rc_out == 0) {
-					t->fec_k = k;
-					t->fec_n = nn;
-					if (to != WFB_FEC_TIMEOUT_KEEP) t->fec_timeout_ms = to;
-					t->fec_cache_have = 1;
-				}
-			} else if (cl == 9 && !strncmp(cmd, "set_radio", 9)) {
-				/* GET-merge-SET: an operator who passes only `mcs_index`
-				 * via query string should not have stbc / ldpc / sgi /
-				 * bandwidth / vht_* silently overwritten with our local
-				 * defaults.  Read live values first; mutate only the
-				 * fields the request explicitly carried.
-				 *
-				 * Falls back to the cached/configured values if GET_RADIO
-				 * fails (e.g. wfb_tx hasn't bound its control port yet
-				 * post-spawn) — better than refusing the request. */
-				int stbc, ldpc, sgi, bw, mcs, vhtm, vhtn;
-				if (wfb_cmd_refresh_radio(t) == 0) {
-					stbc = t->stbc;
-					ldpc = t->ldpc;
-					sgi  = t->short_gi;
-					bw   = t->bandwidth_mhz;
-					mcs  = t->mcs_index;
-					vhtm = t->vht_mode;
-					vhtn = t->vht_nss;
-				} else {
-					stbc = (t->stbc        >= 0) ? t->stbc        : 0;
-					ldpc = (t->ldpc        >= 0) ? t->ldpc        : 0;
-					sgi  = (t->short_gi    >= 0) ? t->short_gi    : 0;
-					bw   = (t->bandwidth_mhz > 0) ? t->bandwidth_mhz : 20;
-					mcs  = (t->mcs_index   >= 0) ? t->mcs_index   : 1;
-					vhtm = (t->vht_mode    >= 0) ? t->vht_mode    : 0;
-					vhtn = (t->vht_nss     >  0) ? t->vht_nss     : 1;
-				}
-				/* Only override fields the caller actually passed. */
-				(void)qs_get_int(qstr, "stbc",      &stbc);
-				(void)qs_get_int(qstr, "ldpc",      &ldpc);
-				(void)qs_get_int(qstr, "short_gi",  &sgi);
-				(void)qs_get_int(qstr, "bandwidth", &bw);
-				(void)qs_get_int(qstr, "mcs_index", &mcs);
-				(void)qs_get_int(qstr, "vht_mode",  &vhtm);
-				(void)qs_get_int(qstr, "vht_nss",   &vhtn);
-				WfbCmdSetRadioReq req = {
-					.req_id    = wfb_cmd_next_req_id(),
-					.cmd_id    = WFB_CMD_SET_RADIO,
-					.stbc      = (uint8_t)stbc,
-					.ldpc      = (uint8_t)(ldpc != 0),
-					.short_gi  = (uint8_t)(sgi  != 0),
-					.bandwidth = (uint8_t)bw,
-					.mcs_index = (uint8_t)mcs,
-					.vht_mode  = (uint8_t)(vhtm != 0),
-					.vht_nss   = (uint8_t)vhtn,
-				};
-				rlen = wfb_cmd_round_trip(t->control_port, &req, sizeof(req),
-				                          respbuf, sizeof(respbuf), &rc_out);
-				if (rlen > 0 && rc_out == 0) {
-					t->stbc           = stbc;
-					t->ldpc           = (ldpc != 0);
-					t->short_gi       = (sgi  != 0);
-					t->bandwidth_mhz  = bw;
-					t->mcs_index      = mcs;
-					t->vht_mode       = (vhtm != 0);
-					t->vht_nss        = vhtn;
-					t->radio_cache_have = 1;
-					t->radio_cache_us   = now_us();
-				}
-			} else if ((cl == 7 && !strncmp(cmd, "get_fec",   7)) ||
-			           (cl == 9 && !strncmp(cmd, "get_radio", 9))) {
-				uint8_t cmd_id = (cl == 7) ? WFB_CMD_GET_FEC : WFB_CMD_GET_RADIO;
-				WfbCmdGetReq req = {
-					.req_id = wfb_cmd_next_req_id(),
-					.cmd_id = cmd_id,
-				};
-				rlen = wfb_cmd_round_trip(t->control_port, &req, sizeof(req),
-				                          respbuf, sizeof(respbuf), &rc_out);
-			} else {
-				api_send(cli->fd, 400, "text/plain",
-				         "cmd must be set_fec|set_radio|get_fec|get_radio\n", -1);
-				return;
-			}
-
-			if (rlen < 0) {
-				api_send(cli->fd, 502, "application/json",
-				         "{\"ok\":false,\"error\":\"sendto failed\"}", -1);
-				return;
-			}
-			if (rlen == 0) {
-				api_send(cli->fd, 504, "application/json",
-				         "{\"ok\":false,\"error\":\"timeout\"}", -1);
-				return;
-			}
-			/* JSON-emit the response. Body interpretation depends on cmd. */
-			char body2[256];
-			int p = snprintf(body2, sizeof(body2),
-			                 "{\"ok\":%s,\"rc\":%u",
-			                 rc_out == 0 ? "true" : "false", rc_out);
-			if (rc_out == 0) {
-				if (cl == 7 && !strncmp(cmd, "get_fec", 7) &&
-				    rlen >= (int)sizeof(WfbCmdGetFecResp)) {
-					WfbCmdGetFecResp gf;
-					memcpy(&gf, respbuf, sizeof(gf));
-					p += snprintf(body2 + p, sizeof(body2) - p,
-					              ",\"k\":%u,\"n\":%u,\"fec_timeout_ms\":%u",
-					              gf.k, gf.n, ntohs(gf.fec_timeout_ms));
-					/* Refresh runtime cache on the way through. */
-					t->fec_k          = gf.k;
-					t->fec_n          = gf.n;
-					t->fec_timeout_ms = ntohs(gf.fec_timeout_ms);
-					t->fec_cache_have = 1;
-				} else if (cl == 9 && !strncmp(cmd, "get_radio", 9) &&
-				           rlen >= (int)sizeof(WfbCmdGetRadioResp)) {
-					WfbCmdGetRadioResp gr;
-					memcpy(&gr, respbuf, sizeof(gr));
-					p += snprintf(body2 + p, sizeof(body2) - p,
-					              ",\"stbc\":%u,\"ldpc\":%u,\"short_gi\":%u,"
-					              "\"bandwidth\":%u,\"mcs_index\":%u,"
-					              "\"vht_mode\":%u,\"vht_nss\":%u",
-					              gr.stbc, gr.ldpc, gr.short_gi,
-					              gr.bandwidth, gr.mcs_index,
-					              gr.vht_mode, gr.vht_nss);
-					t->stbc             = gr.stbc;
-					t->ldpc             = gr.ldpc;
-					t->short_gi         = gr.short_gi;
-					t->bandwidth_mhz    = gr.bandwidth;
-					t->mcs_index        = gr.mcs_index;
-					t->vht_mode         = gr.vht_mode;
-					t->vht_nss          = gr.vht_nss;
-					t->radio_cache_have = 1;
-					t->radio_cache_us   = now_us();
-				}
-			}
-			snprintf(body2 + p, sizeof(body2) - p, "}");
-			api_send(cli->fd, 200, "application/json", body2, -1);
-			return;
-		}
-		api_send(cli->fd, 404, "text/plain", "unknown action\n", -1);
-		return;
-	}
-
-	api_send(cli->fd, 404, "text/plain", "not found\n", -1);
-}
 
 /* ---------- main loop ------------------------------------------------ */
 
