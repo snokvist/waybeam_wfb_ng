@@ -145,8 +145,8 @@ select{cursor:pointer;-webkit-appearance:none;appearance:none;background-image:u
 
 <div class="tabs">
   <div class="tab active" data-tab="tunnels">Tunnels</div>
-  <div class="tab" data-tab="control">Control</div>
-  <div class="tab" data-tab="cmd">Cmd</div>
+  <div class="tab" data-tab="control">GS Control</div>
+  <div class="tab" data-tab="cmd">Vehicle Control</div>
 </div>
 
 <div class="toast-container" id="toasts"></div>
@@ -158,94 +158,154 @@ select{cursor:pointer;-webkit-appearance:none;appearance:none;background-image:u
 
 <!-- Control (wfb_cmd passthrough) -->
 <div class="tab-content" id="tab-control">
+  <!-- Channel scan (passive, no vehicle cooperation) -->
   <div class="section">
-    <div class="section-header">
-      <h3>wfb_cmd target</h3>
-      <span class="help">Selects which tx tunnel's control_port the requests go to.</span>
-    </div>
+    <div class="section-header"><h3>Channel scan</h3>
+      <span class="help">Cycle the GS adapter(s) through a channel list, dwelling on each combo. Stops on the first one where wfb_rx successfully decrypts a packet — the vehicle is on that channel. Vehicle does not need to cooperate.</span></div>
     <div class="section-body">
       <div class="field">
-        <div class="field-label">Tunnel
-          <span class="help">Only tx tunnels with control_port set are valid targets.</span>
-        </div>
+        <div class="field-label">ifaces <span class="help">copies the same selection used in CSA</span></div>
+        <select id="scan-iface" multiple size="3" style="width:100%"></select>
+      </div>
+      <div class="field">
+        <div class="field-label">chans <span class="help">comma-separated channel list</span></div>
+        <input type="text" id="scan-chans" value="36,40,44,48,52,56,60,64,149,153,157,161,165">
+      </div>
+      <div class="field">
+        <div class="field-label">ht</div>
+        <select id="scan-ht">
+          <option value="HT20" selected>HT20 (all)</option>
+          <option value="HT40+">HT40+ (all)</option>
+          <option value="HT40-">HT40- (all)</option>
+        </select>
+      </div>
+      <div class="field">
+        <div class="field-label">dwell_ms <span class="help">600–1000 ms is typical for RTL88x2</span></div>
+        <input type="number" id="scan-dwell" value="800" min="200" max="10000">
+      </div>
+      <div class="field" style="grid-template-columns:auto auto 1fr auto;gap:.5rem">
+        <button class="btn btn-fire" onclick="scanFire()">Start scan</button>
+        <button class="btn-mini btn-stop" onclick="scanCancel()">Cancel</button>
+        <span></span>
+        <span></span>
+      </div>
+      <div class="reply" id="reply-scan"></div>
+      <div class="muted" id="scan-state" style="margin-top:.4rem">scan idle</div>
+    </div>
+  </div>
+
+  <!-- GS adapter txpower (per-iface iw set txpower fixed) -->
+  <div class="section">
+    <div class="section-header"><h3>GS adapter txpower</h3>
+      <span class="help">Per-iface <code>iw set txpower fixed &lt;mBm&gt;</code> on this host. 100 mBm = 1 dBm. Useful when an adapter dropped to txpower=-100 after a monitor-mode flip.</span></div>
+    <div class="section-body" id="gs-txpower-row" style="display:flex;gap:.5rem;flex-wrap:wrap">
+      <span class="muted">Loading ifaces…</span>
+    </div>
+    <div class="reply" id="reply-gs-txpower"></div>
+  </div>
+
+  <!-- Local wfb_tx control: target + FEC + Radio combined into one card -->
+  <div class="section">
+    <div class="section-header"><h3>Local wfb_tx (uplink) — fec / radio</h3>
+      <span class="help">Direct wfb_cmd into the GS-side tx tunnel's control_port. Affects this ground-side TX only; vehicle RX adapts to whatever it sees.</span></div>
+    <div class="section-body">
+      <div class="field">
+        <div class="field-label">Tunnel <span class="help">Only tx tunnels with control_port set are valid targets.</span></div>
         <select id="ctrl-tunnel"></select>
         <span></span>
       </div>
-    </div>
-  </div>
 
-  <div class="section">
-    <div class="section-header"><h3>FEC (set_fec / get_fec)</h3>
-      <span class="help">k/n &amp; per-block fec_timeout.</span></div>
-    <div class="section-body">
-      <div class="field">
-        <div class="field-label">k <span class="help">data shards per FEC block</span></div>
+      <h4 style="margin:.6rem 0 .2rem 0">FEC (set_fec / get_fec)</h4>
+      <div class="field" style="grid-template-columns:auto 5rem auto 5rem auto 8rem auto auto;gap:.4rem;align-items:center;flex-wrap:wrap">
+        <span class="muted">k</span>
         <input type="number" id="fec-k" min="1" max="255" value="1">
-        <span></span>
-      </div>
-      <div class="field">
-        <div class="field-label">n <span class="help">total shards (k + parity)</span></div>
+        <span class="muted">n</span>
         <input type="number" id="fec-n" min="1" max="255" value="2">
-        <span></span>
-      </div>
-      <div class="field">
-        <div class="field-label">fec_timeout_ms <span class="help">empty = leave running value</span></div>
+        <span class="muted">timeout_ms <span class="help">(keep)</span></span>
         <input type="number" id="fec-to" min="0" max="65534" placeholder="(keep)">
-        <span></span>
-      </div>
-      <div class="field" style="grid-template-columns:1fr auto auto;gap:.5rem">
-        <span></span>
-        <button class="btn btn-fire" onclick="ctrlGetFec()">Get</button>
-        <button class="btn btn-apply" onclick="ctrlSetFec()">Set</button>
+        <button class="btn-mini btn-fire" onclick="ctrlGetFec()">Get</button>
+        <button class="btn-mini btn-apply" onclick="ctrlSetFec()">Set</button>
       </div>
       <div class="reply" id="reply-fec"></div>
-    </div>
-  </div>
 
-  <div class="section">
-    <div class="section-header"><h3>Radio (set_radio / get_radio)</h3>
-      <span class="help">Note: changes affect this ground-side TX only; vehicle RX adapts to whatever it sees.</span></div>
-    <div class="section-body">
-      <div class="field">
-        <div class="field-label">stbc</div>
-        <input type="number" id="r-stbc" min="0" max="3" value="0"><span></span>
-      </div>
-      <div class="field">
-        <div class="field-label">ldpc</div>
-        <input type="number" id="r-ldpc" min="0" max="1" value="0"><span></span>
-      </div>
-      <div class="field">
-        <div class="field-label">short_gi</div>
-        <input type="number" id="r-sgi" min="0" max="1" value="0"><span></span>
-      </div>
-      <div class="field">
-        <div class="field-label">bandwidth (MHz)</div>
-        <input type="number" id="r-bw" min="5" max="80" value="20"><span></span>
-      </div>
-      <div class="field">
-        <div class="field-label">mcs_index</div>
-        <input type="number" id="r-mcs" min="0" max="31" value="1"><span></span>
-      </div>
-      <div class="field">
-        <div class="field-label">vht_mode</div>
-        <input type="number" id="r-vhtm" min="0" max="1" value="0"><span></span>
-      </div>
-      <div class="field">
-        <div class="field-label">vht_nss</div>
-        <input type="number" id="r-vhtn" min="1" max="4" value="1"><span></span>
-      </div>
-      <div class="field" style="grid-template-columns:1fr auto auto;gap:.5rem">
+      <h4 style="margin:.8rem 0 .2rem 0">Radio (set_radio / get_radio)</h4>
+      <div class="field" style="grid-template-columns:repeat(7,auto);gap:.4rem;align-items:center;flex-wrap:wrap">
+        <span class="muted">stbc</span>     <input type="number" id="r-stbc" min="0" max="3" value="0" style="width:4rem">
+        <span class="muted">ldpc</span>     <input type="number" id="r-ldpc" min="0" max="1" value="0" style="width:4rem">
+        <span class="muted">sgi</span>      <input type="number" id="r-sgi"  min="0" max="1" value="0" style="width:4rem">
         <span></span>
-        <button class="btn btn-fire" onclick="ctrlGetRadio()">Get</button>
-        <button class="btn btn-apply" onclick="ctrlSetRadio()">Set</button>
+      </div>
+      <div class="field" style="grid-template-columns:repeat(7,auto);gap:.4rem;align-items:center;flex-wrap:wrap;margin-top:.3rem">
+        <span class="muted">bw MHz</span>   <input type="number" id="r-bw"   min="5" max="80" value="20" style="width:5rem">
+        <span class="muted">mcs</span>      <input type="number" id="r-mcs"  min="0" max="31" value="1"  style="width:4rem">
+        <span></span>
+      </div>
+      <div class="field" style="grid-template-columns:repeat(7,auto);gap:.4rem;align-items:center;flex-wrap:wrap;margin-top:.3rem">
+        <span class="muted">vht_mode</span> <input type="number" id="r-vhtm" min="0" max="1" value="0" style="width:4rem">
+        <span class="muted">vht_nss</span>  <input type="number" id="r-vhtn" min="1" max="4" value="1" style="width:4rem">
+        <span></span>
+        <span></span>
+        <span></span>
+        <button class="btn-mini btn-fire"  onclick="ctrlGetRadio()">Get</button>
+        <button class="btn-mini btn-apply" onclick="ctrlSetRadio()">Set</button>
       </div>
       <div class="reply" id="reply-radio"></div>
     </div>
   </div>
 </div>
 
-<!-- Cmd (WCMD: venc proxy + vehicle wfb_tx control) -->
+<!-- Vehicle Control (WCMD: venc proxy + vehicle wfb_tx control + CSA) -->
 <div class="tab-content" id="tab-cmd">
+  <!-- Synchronized channel hop (CSA) — moved here because both ends must agree -->
+  <div class="section">
+    <div class="section-header"><h3>Synchronized channel hop (CSA)</h3>
+      <span class="help">Sends 5 <code>csa_commit</code> JSON frames to the vehicle over the uplink, then runs <code>iw set channel</code> locally at T_switch. Vehicle's csa_tick mirrors the same timing. Auto-revert if no rx traffic within t_revert_ms.</span></div>
+    <div class="section-body">
+      <div class="field">
+        <div class="field-label">ifaces <span class="help">GS-side adapter(s) to switch — pick one or more (Ctrl+click for multi)</span></div>
+        <select id="csa-iface" multiple size="3" style="width:100%"></select>
+      </div>
+      <div class="field">
+        <div class="field-label">target chan</div>
+        <input type="number" id="csa-chan" value="161" min="1" max="200">
+      </div>
+      <div class="field">
+        <div class="field-label">target ht</div>
+        <select id="csa-ht">
+          <option value="HT20">HT20</option>
+          <option value="HT40+">HT40+</option>
+          <option value="HT40-">HT40-</option>
+        </select>
+      </div>
+      <div class="field">
+        <div class="field-label">prev chan / ht <span class="help">used for auto-revert</span></div>
+        <div style="display:flex;gap:.4rem">
+          <input type="number" id="csa-prev-chan" value="161" min="1" max="200" style="width:6rem">
+          <select id="csa-prev-ht">
+            <option value="HT20">HT20</option>
+            <option value="HT40+">HT40+</option>
+            <option value="HT40-">HT40-</option>
+          </select>
+        </div>
+      </div>
+      <div class="field">
+        <div class="field-label">lead_ms</div>
+        <input type="number" id="csa-lead" value="500" min="100" max="5000">
+      </div>
+      <div class="field">
+        <div class="field-label">t_revert_ms</div>
+        <input type="number" id="csa-revert" value="3000" min="500" max="30000">
+      </div>
+      <div class="field" style="grid-template-columns:auto 1fr auto;gap:.5rem">
+        <label style="display:flex;align-items:center;gap:.3rem"><input type="checkbox" id="csa-no-revert"> no_revert</label>
+        <span></span>
+        <button class="btn btn-fire" onclick="csaFire()">Hop</button>
+      </div>
+      <div class="reply" id="reply-csa"></div>
+      <div class="muted" id="csa-state" style="margin-top:.4rem">phase: idle</div>
+    </div>
+  </div>
+
   <div class="section">
     <div class="section-header"><h3>WCMD over uplink</h3>
       <span class="help">Fire-and-forget. Vehicle's link_controller proxies venc keys to HTTP and wfb_* keys to wfb_cmd.</span></div>
@@ -333,99 +393,6 @@ select{cursor:pointer;-webkit-appearance:none;appearance:none;background-image:u
       <button class="btn-mini btn-start" onclick="cmdQuick('wfb_txpower',1500)">txp 15 dBm</button>
       <button class="btn-mini btn-start" onclick="cmdQuick('wfb_txpower',2000)">txp 20 dBm</button>
       <button class="btn-mini btn-start" onclick="cmdQuick('wfb_txpower',2500)">txp 25 dBm</button>
-    </div>
-  </div>
-
-  <div class="section">
-    <div class="section-header"><h3>GS adapter txpower</h3>
-      <span class="help">Per-iface <code>iw set txpower fixed &lt;mBm&gt;</code> on this host. 100 mBm = 1 dBm. Useful when an adapter dropped to txpower=-100 after a monitor-mode flip.</span></div>
-    <div class="section-body" id="gs-txpower-row" style="display:flex;gap:.5rem;flex-wrap:wrap">
-      <span class="muted">Loading ifaces…</span>
-    </div>
-    <div class="reply" id="reply-gs-txpower"></div>
-  </div>
-
-  <div class="section">
-    <div class="section-header"><h3>Channel scan</h3>
-      <span class="help">Cycle the GS adapter(s) through a channel list, dwelling on each combo. Stops on the first one where wfb_rx successfully decrypts a packet — the vehicle is on that channel. Vehicle does not need to cooperate.</span></div>
-    <div class="section-body">
-      <div class="field">
-        <div class="field-label">ifaces <span class="help">copies the same selection used in CSA</span></div>
-        <select id="scan-iface" multiple size="3" style="width:100%"></select>
-      </div>
-      <div class="field">
-        <div class="field-label">chans <span class="help">comma-separated channel list</span></div>
-        <input type="text" id="scan-chans" value="36,40,44,48,52,56,60,64,149,153,157,161,165">
-      </div>
-      <div class="field">
-        <div class="field-label">ht</div>
-        <select id="scan-ht">
-          <option value="HT20" selected>HT20 (all)</option>
-          <option value="HT40+">HT40+ (all)</option>
-          <option value="HT40-">HT40- (all)</option>
-        </select>
-      </div>
-      <div class="field">
-        <div class="field-label">dwell_ms <span class="help">600–1000 ms is typical for RTL88x2</span></div>
-        <input type="number" id="scan-dwell" value="800" min="200" max="10000">
-      </div>
-      <div class="field" style="grid-template-columns:auto auto 1fr auto;gap:.5rem">
-        <button class="btn btn-fire" onclick="scanFire()">Start scan</button>
-        <button class="btn-mini btn-stop" onclick="scanCancel()">Cancel</button>
-        <span></span>
-        <span></span>
-      </div>
-      <div class="reply" id="reply-scan"></div>
-      <div class="muted" id="scan-state" style="margin-top:.4rem">scan idle</div>
-    </div>
-  </div>
-
-  <div class="section">
-    <div class="section-header"><h3>Synchronized channel hop (CSA)</h3>
-      <span class="help">Sends 5 <code>csa_commit</code> JSON frames to the vehicle over the uplink, then runs <code>iw set channel</code> locally at T_switch. Vehicle's csa_tick mirrors the same timing. Auto-revert if no rx traffic within t_revert_ms.</span></div>
-    <div class="section-body">
-      <div class="field">
-        <div class="field-label">ifaces <span class="help">GS-side adapter(s) to switch — pick one or more (Ctrl+click for multi)</span></div>
-        <select id="csa-iface" multiple size="3" style="width:100%"></select>
-      </div>
-      <div class="field">
-        <div class="field-label">target chan</div>
-        <input type="number" id="csa-chan" value="161" min="1" max="200">
-      </div>
-      <div class="field">
-        <div class="field-label">target ht</div>
-        <select id="csa-ht">
-          <option value="HT20">HT20</option>
-          <option value="HT40+">HT40+</option>
-          <option value="HT40-">HT40-</option>
-        </select>
-      </div>
-      <div class="field">
-        <div class="field-label">prev chan / ht <span class="help">used for auto-revert</span></div>
-        <div style="display:flex;gap:.4rem">
-          <input type="number" id="csa-prev-chan" value="161" min="1" max="200" style="width:6rem">
-          <select id="csa-prev-ht">
-            <option value="HT20">HT20</option>
-            <option value="HT40+">HT40+</option>
-            <option value="HT40-">HT40-</option>
-          </select>
-        </div>
-      </div>
-      <div class="field">
-        <div class="field-label">lead_ms</div>
-        <input type="number" id="csa-lead" value="500" min="100" max="5000">
-      </div>
-      <div class="field">
-        <div class="field-label">t_revert_ms</div>
-        <input type="number" id="csa-revert" value="3000" min="500" max="30000">
-      </div>
-      <div class="field" style="grid-template-columns:auto 1fr auto;gap:.5rem">
-        <label style="display:flex;align-items:center;gap:.3rem"><input type="checkbox" id="csa-no-revert"> no_revert</label>
-        <span></span>
-        <button class="btn btn-fire" onclick="csaFire()">Hop</button>
-      </div>
-      <div class="reply" id="reply-csa"></div>
-      <div class="muted" id="csa-state" style="margin-top:.4rem">phase: idle</div>
     </div>
   </div>
 </div>
