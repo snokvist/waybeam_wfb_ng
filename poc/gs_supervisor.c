@@ -78,6 +78,11 @@
 
 #define API_MAX_CLIENTS      8
 #define API_BUF_BYTES     2048
+/* Slow-client deadline: a TCP peer that opens a connection but never
+ * sends a complete header (i.e. no `\r\n\r\n` reached) gets closed after
+ * this idle window.  Without it, eight half-open `nc` connections lock
+ * out every other operator until the supervisor restarts. */
+#define API_CLIENT_IDLE_US  (5ULL * 1000000ULL)
 
 #define GS_DEFAULT_HTTP_PORT 9080
 #define GS_DEFAULT_CONFIG    "/etc/waybeam/gs_supervisor.json"
@@ -1740,15 +1745,64 @@ static void stats_listener_close(Tunnel *t)
  */
 #define IFF_UP_BIT 0x1u
 
+/* fork+exec a command, capture up to cap-1 bytes of stdout, NUL-terminate.
+ * Returns child exit status (0 on success), -1 on fork/pipe failure.
+ *
+ * Used to invoke `iw` without going through a shell — earlier versions
+ * used popen()/system() which interpolated iface names into a /bin/sh -c
+ * string.  iface names come from the operator's root-only config so it
+ * was not a privilege boundary, but the shell-free path is cleaner and
+ * removes one accidental-quoting footgun. */
+static int run_capture(char *const argv[], char *out, size_t cap)
+{
+	if (cap == 0 || !argv || !argv[0]) return -1;
+	int pipefd[2];
+	if (pipe(pipefd) < 0) return -1;
+	pid_t pid = fork();
+	if (pid < 0) {
+		close(pipefd[0]); close(pipefd[1]);
+		return -1;
+	}
+	if (pid == 0) {
+		close(pipefd[0]);
+		if (pipefd[1] != STDOUT_FILENO) {
+			dup2(pipefd[1], STDOUT_FILENO);
+			close(pipefd[1]);
+		}
+		int devnull = open("/dev/null", O_WRONLY);
+		if (devnull >= 0) {
+			dup2(devnull, STDERR_FILENO);
+			close(devnull);
+		}
+		execvp(argv[0], argv);
+		_exit(127);
+	}
+	close(pipefd[1]);
+	size_t pos = 0;
+	while (pos + 1 < cap) {
+		ssize_t r = read(pipefd[0], out + pos, cap - 1 - pos);
+		if (r < 0) {
+			if (errno == EINTR) continue;
+			break;
+		}
+		if (r == 0) break;
+		pos += (size_t)r;
+	}
+	out[pos] = 0;
+	close(pipefd[0]);
+	int st;
+	if (waitpid(pid, &st, 0) < 0) return -1;
+	return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+}
+
 static int iface_is_monitor(const char *iface)
 {
-	char cmd[256];
-	int n = snprintf(cmd, sizeof(cmd),
-	                 "iw dev %s info 2>/dev/null | grep -qE 'type monitor'",
-	                 iface);
-	if (n < 0 || n >= (int)sizeof(cmd)) return -1;
-	int rc = system(cmd);
-	return (rc == 0) ? 0 : -1;
+	char *argv[] = { (char*)"iw", (char*)"dev",
+	                 (char*)iface, (char*)"info", NULL };
+	char out[1024];
+	int rc = run_capture(argv, out, sizeof(out));
+	if (rc != 0) return -1;
+	return strstr(out, "type monitor") ? 0 : -1;
 }
 
 /* ---------- iface state cache: helpers ------------------------------ */
@@ -1835,17 +1889,23 @@ static int iface_state_query(IfaceState *st)
 	st->ht[0] = 0;
 	st->txpower_mbm = -1;
 
-	char cmd[128];
-	int n = snprintf(cmd, sizeof(cmd), "iw dev %s info 2>/dev/null", st->name);
-	if (n < 0 || n >= (int)sizeof(cmd)) { st->last_rc = -1; return -1; }
-	FILE *f = popen(cmd, "r");
-	if (!f) { st->last_rc = -1; return -1; }
-	char line[256];
-	while (fgets(line, sizeof(line), f))
-		iface_state_absorb_line(st, line);
-	int rc = pclose(f);
-	st->last_rc = WIFEXITED(rc) ? WEXITSTATUS(rc) : -1;
-	return st->last_rc == 0 ? 0 : -1;
+	char *argv[] = { (char*)"iw", (char*)"dev",
+	                 st->name, (char*)"info", NULL };
+	char out[1024];
+	int rc = run_capture(argv, out, sizeof(out));
+	st->last_rc = rc;
+	if (rc != 0) return -1;
+	/* Walk lines without strtok() so a missing trailing newline still
+	 * absorbs the final line. */
+	char *p = out;
+	while (*p) {
+		char *eol = strchr(p, '\n');
+		if (eol) *eol = 0;
+		iface_state_absorb_line(st, p);
+		if (!eol) break;
+		p = eol + 1;
+	}
+	return 0;
 }
 
 /* Walk every tunnel's iface list, intern each unique name, and run an
@@ -2201,6 +2261,8 @@ static int qs_get_int(const char *qs, const char *key, int *out)
 #define WCMD_KEY_MCS_ENABLED    13
 /* Vehicle WLAN adapter TX power (mBm; 100 = 1 dBm). */
 #define WCMD_KEY_WFB_TXPOWER    14
+/* venc recorder start/stop: value 1 → /api/v1/record/start, 0 → /stop. */
+#define WCMD_KEY_RECORD         15
 
 #pragma pack(push, 1)
 typedef struct {
@@ -2220,6 +2282,13 @@ typedef struct {
 static uint64_t g_wcmd_last_send_ms[WCMD_KEY_MAX + 1] = { 0 };
 static uint16_t g_wcmd_seq = 0;
 
+/* Number of redundant copies emitted per logical WCMD.  Each copy carries
+ * the same seq so the vehicle's seq-dedup window collapses them back to
+ * one apply.  Loss of a single FEC block on the uplink can drop one copy
+ * without losing the command.  Three is the minimum useful redundancy
+ * and keeps the wire cost negligible (3 × 16 B = 48 B per command). */
+#define WCMD_BURST_FRAMES 3
+
 static int wcmd_key_from_str(const char *s, size_t n)
 {
 	if (n == 12 && !strncmp(s, "bitrate_kbps",  12)) return WCMD_KEY_BITRATE_KBPS;
@@ -2236,6 +2305,7 @@ static int wcmd_key_from_str(const char *s, size_t n)
 	if (n == 11 && !strncmp(s, "fec_enabled", 11))   return WCMD_KEY_FEC_ENABLED;
 	if (n == 11 && !strncmp(s, "mcs_enabled", 11))   return WCMD_KEY_MCS_ENABLED;
 	if (n == 11 && !strncmp(s, "wfb_txpower", 11))   return WCMD_KEY_WFB_TXPOWER;
+	if (n ==  6 && !strncmp(s, "record",       6))   return WCMD_KEY_RECORD;
 	return -1;
 }
 
@@ -2256,12 +2326,23 @@ static const char *wcmd_key_name(int key)
 	case WCMD_KEY_FEC_ENABLED:   return "fec_enabled";
 	case WCMD_KEY_MCS_ENABLED:   return "mcs_enabled";
 	case WCMD_KEY_WFB_TXPOWER:   return "wfb_txpower";
+	case WCMD_KEY_RECORD:        return "record";
 	}
 	return "?";
 }
 
-/* Send a WCMD_MSG_REQ packet. Returns 0 on success, errno code (positive)
- * on send failure, -1 if the uplink tunnel is missing/disabled. */
+/* Send a WCMD_MSG_REQ packet as a redundancy burst.  WCMD_BURST_FRAMES
+ * copies of the same datagram (identical seq) go through one socket
+ * back-to-back; the vehicle's seq-dedup window collapses them to a
+ * single apply.  Returns 0 if at least one copy made it onto the wire,
+ * an errno code (positive) if every send failed, or -1 if the uplink
+ * tunnel is missing/disabled.
+ *
+ * Cost: 48 bytes on the air per command.  Benefit: single-FEC-block
+ * loss on the uplink no longer drops the WCMD.  We don't space the
+ * frames across FEC blocks here — back-to-back lands in one block, so
+ * full-block loss still drops the command.  See gs.html roadmap for the
+ * supervisor_tick-driven spaced-burst follow-up. */
 static int wcmd_emit(const Config *c, int key, int32_t value, uint16_t *seq_out)
 {
 	if (!c->venc_cmd_enabled) return -1;
@@ -2296,11 +2377,16 @@ static int wcmd_emit(const Config *c, int key, int32_t value, uint16_t *seq_out)
 		._pad     = 0,
 		.value    = (int32_t)htonl((uint32_t)value),
 	};
-	ssize_t w = sendto(s, &req, sizeof(req), 0,
-	                   (struct sockaddr *)&dst, sizeof(dst));
-	int err = (w == sizeof(req)) ? 0 : errno;
+	int sent = 0, last_err = 0;
+	for (int i = 0; i < WCMD_BURST_FRAMES; i++) {
+		ssize_t w = sendto(s, &req, sizeof(req), 0,
+		                   (struct sockaddr *)&dst, sizeof(dst));
+		if (w == sizeof(req)) sent++;
+		else                  last_err = errno;
+	}
 	close(s);
-	return err;
+	if (sent > 0) return 0;
+	return last_err ? last_err : -1;
 }
 
 /* ---------- Embedded WebUI ------------------------------------------- *
@@ -2755,6 +2841,16 @@ static void api_handle(ApiClient *cli, Config *c, uint64_t startup_us)
 			iface_count++;
 			p = q + 1;
 		}
+		/* If we hit the iface cap mid-list, p still has data left.  Reject
+		 * loudly rather than silently dropping the operator's tail input. */
+		if (p < e) {
+			char b[96];
+			int bp = snprintf(b, sizeof(b),
+			    "{\"ok\":false,\"error\":\"too many ifaces (max %d)\"}",
+			    GS_CSA_MAX_IFACES);
+			api_send(cli->fd, 400, "application/json", b, bp);
+			return;
+		}
 		if (iface_count == 0) {
 			api_send(cli->fd, 400, "application/json",
 			    "{\"ok\":false,\"error\":\"no iface\"}", -1);
@@ -2798,6 +2894,14 @@ static void api_handle(ApiClient *cli, Config *c, uint64_t startup_us)
 			}
 			chans[chan_count++] = (int)ch;
 			if (p < e) p++;
+		}
+		if (p < e) {
+			char b[96];
+			int bp = snprintf(b, sizeof(b),
+			    "{\"ok\":false,\"error\":\"too many chans (max %d)\"}",
+			    SCAN_MAX_STEPS);
+			api_send(cli->fd, 400, "application/json", b, bp);
+			return;
 		}
 		if (chan_count == 0) {
 			api_send(cli->fd, 400, "application/json",
@@ -2950,6 +3054,19 @@ static void api_handle(ApiClient *cli, Config *c, uint64_t startup_us)
 			api_send(cli->fd, 409, "application/json", body, p);
 			return;
 		}
+		/* Refuse while a scan is dwelling — both subsystems drive iw on
+		 * the same iface; interleaving would mis-time hops.  Operator
+		 * cancels via /api/v1/system/scan/cancel first.  Mirrored on the
+		 * scan handler so the lock is symmetric. */
+		if (g_scan.phase == SCAN_RUNNING) {
+			char body[160];
+			int p = snprintf(body, sizeof(body),
+			    "{\"ok\":false,\"error\":\"scan running — cancel first\","
+			    "\"scan_sess\":%u}",
+			    g_scan.sess);
+			api_send(cli->fd, 409, "application/json", body, p);
+			return;
+		}
 		size_t il, hl_ht;
 		const char *istr = qs_get(qstr, "iface", &il);
 		const char *htstr = qs_get(qstr, "ht", &hl_ht);
@@ -2982,6 +3099,13 @@ static void api_handle(ApiClient *cli, Config *c, uint64_t startup_us)
 			ifaces[iface_count][len] = 0;
 			iface_count++;
 			p = q + 1;
+		}
+		if (p < end) {
+			char body[96];
+			int bp = snprintf(body, sizeof(body),
+			    "too many ifaces (max %d)\n", GS_CSA_MAX_IFACES);
+			api_send(cli->fd, 400, "text/plain", body, bp);
+			return;
 		}
 		if (iface_count == 0) {
 			api_send(cli->fd, 400, "text/plain", "no iface\n", -1);
@@ -3284,14 +3408,41 @@ static void api_handle(ApiClient *cli, Config *c, uint64_t startup_us)
 					t->fec_cache_have = 1;
 				}
 			} else if (cl == 9 && !strncmp(cmd, "set_radio", 9)) {
-				int stbc=0, ldpc=0, sgi=0, bw=20, mcs=1, vhtm=0, vhtn=1;
-				qs_get_int(qstr, "stbc",      &stbc);
-				qs_get_int(qstr, "ldpc",      &ldpc);
-				qs_get_int(qstr, "short_gi",  &sgi);
-				qs_get_int(qstr, "bandwidth", &bw);
-				qs_get_int(qstr, "mcs_index", &mcs);
-				qs_get_int(qstr, "vht_mode",  &vhtm);
-				qs_get_int(qstr, "vht_nss",   &vhtn);
+				/* GET-merge-SET: an operator who passes only `mcs_index`
+				 * via query string should not have stbc / ldpc / sgi /
+				 * bandwidth / vht_* silently overwritten with our local
+				 * defaults.  Read live values first; mutate only the
+				 * fields the request explicitly carried.
+				 *
+				 * Falls back to the cached/configured values if GET_RADIO
+				 * fails (e.g. wfb_tx hasn't bound its control port yet
+				 * post-spawn) — better than refusing the request. */
+				int stbc, ldpc, sgi, bw, mcs, vhtm, vhtn;
+				if (wfb_cmd_refresh_radio(t) == 0) {
+					stbc = t->stbc;
+					ldpc = t->ldpc;
+					sgi  = t->short_gi;
+					bw   = t->bandwidth_mhz;
+					mcs  = t->mcs_index;
+					vhtm = t->vht_mode;
+					vhtn = t->vht_nss;
+				} else {
+					stbc = (t->stbc        >= 0) ? t->stbc        : 0;
+					ldpc = (t->ldpc        >= 0) ? t->ldpc        : 0;
+					sgi  = (t->short_gi    >= 0) ? t->short_gi    : 0;
+					bw   = (t->bandwidth_mhz > 0) ? t->bandwidth_mhz : 20;
+					mcs  = (t->mcs_index   >= 0) ? t->mcs_index   : 1;
+					vhtm = (t->vht_mode    >= 0) ? t->vht_mode    : 0;
+					vhtn = (t->vht_nss     >  0) ? t->vht_nss     : 1;
+				}
+				/* Only override fields the caller actually passed. */
+				(void)qs_get_int(qstr, "stbc",      &stbc);
+				(void)qs_get_int(qstr, "ldpc",      &ldpc);
+				(void)qs_get_int(qstr, "short_gi",  &sgi);
+				(void)qs_get_int(qstr, "bandwidth", &bw);
+				(void)qs_get_int(qstr, "mcs_index", &mcs);
+				(void)qs_get_int(qstr, "vht_mode",  &vhtm);
+				(void)qs_get_int(qstr, "vht_nss",   &vhtn);
 				WfbCmdSetRadioReq req = {
 					.req_id    = wfb_cmd_next_req_id(),
 					.cmd_id    = WFB_CMD_SET_RADIO,
@@ -3572,6 +3723,22 @@ int main(int argc, char **argv)
 
 		if (g_sigchld) { g_sigchld = 0; supervisor_reap(&cfg); }
 		supervisor_tick(&cfg);
+
+		/* Reap idle clients that opened a TCP connection but never sent
+		 * a complete header.  Without this, every API_MAX_CLIENTS slot
+		 * could be squatted indefinitely by `nc 192.168.x.x 9080` and
+		 * accept() would silently drop new connections. */
+		{
+			uint64_t now_u = now_us();
+			for (int i = 0; i < API_MAX_CLIENTS; i++) {
+				if (clients[i].fd < 0) continue;
+				if (now_u - clients[i].accepted_us > API_CLIENT_IDLE_US) {
+					LOG_DEBUG("api client slot %d idle, closing", i);
+					close(clients[i].fd);
+					clients[i].fd = -1;
+				}
+			}
+		}
 
 		if (r < 0) {
 			if (poll_err == EINTR) continue;

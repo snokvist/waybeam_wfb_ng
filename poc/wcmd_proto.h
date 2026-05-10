@@ -91,6 +91,15 @@
  */
 #define WCMD_KEY_WFB_TXPOWER    14   /* iw set txpower fixed <mBm> */
 
+/*
+ * venc recorder start/stop.  Single key with binary value: 1 → HTTP GET
+ * /api/v1/record/start, 0 → /api/v1/record/stop.  Uses the same fire-
+ * and-forget path as the other venc HTTP keys; venc replies 200 with
+ * `{"ok":true}` on success.  The vehicle's seq-dedup window prevents a
+ * triple-burst from triggering three start/stop cycles.
+ */
+#define WCMD_KEY_RECORD         15   /* /api/v1/record/{start,stop} */
+
 /* Status codes returned in CMD_RESP */
 #define WCMD_STATUS_OK           0
 #define WCMD_STATUS_DISABLED     1   /* cmd subsystem off (cmd.enabled=false) */

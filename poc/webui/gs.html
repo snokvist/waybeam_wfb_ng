@@ -332,6 +332,7 @@ select{cursor:pointer;-webkit-appearance:none;appearance:none;background-image:u
             <option value="fps">fps</option>
             <option value="payload_bytes">payload_bytes</option>
             <option value="force_idr">force_idr</option>
+            <option value="record">record (1=start, 0=stop)</option>
           </optgroup>
           <optgroup label="vehicle wfb_tx (video link)">
             <option value="wfb_fec_k">wfb_fec_k</option>
@@ -366,6 +367,8 @@ select{cursor:pointer;-webkit-appearance:none;appearance:none;background-image:u
     <div class="section-header"><h3>Quick fires — venc</h3><span class="help">Common one-shots over the uplink to the encoder.</span></div>
     <div class="section-body" style="display:flex;gap:.5rem;flex-wrap:wrap">
       <button class="btn-mini btn-restart" onclick="cmdQuick('force_idr')">force_idr</button>
+      <button class="btn-mini btn-start" onclick="cmdQuick('record',1)">record start</button>
+      <button class="btn-mini btn-stop"  onclick="cmdQuick('record',0)">record stop</button>
       <button class="btn-mini btn-start" onclick="cmdQuick('bitrate_kbps',2000)">bitrate 2 Mbps</button>
       <button class="btn-mini btn-start" onclick="cmdQuick('bitrate_kbps',4000)">bitrate 4 Mbps</button>
       <button class="btn-mini btn-start" onclick="cmdQuick('bitrate_kbps',8000)">bitrate 8 Mbps</button>
@@ -412,6 +415,25 @@ select{cursor:pointer;-webkit-appearance:none;appearance:none;background-image:u
 <script>
 const $=s=>document.querySelector(s);
 const $$=s=>document.querySelectorAll(s);
+
+/* Escape a value for safe interpolation into HTML element content or
+ * attribute strings. Tunnel/iface names come from the supervisor's
+ * config (root-edited), so the blast radius is small, but we still
+ * round-trip everything through this so a config typo can't break
+ * page rendering or smuggle </script> into innerHTML. */
+function esc(v){
+  return String(v==null?'':v)
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+    .replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+}
+/* Encode a value for use as a JS string literal inside an HTML attribute
+ * (e.g. onclick="foo('${jsAttr(name)}')"). JSON.stringify gives a
+ * well-quoted JS literal; HTML-escape the result so attribute parsing
+ * stays correct. Strip the surrounding quotes so the caller picks the
+ * matching quote style. */
+function jsAttr(v){
+  return esc(JSON.stringify(String(v==null?'':v)).slice(1,-1));
+}
 
 function fmtUptime(s){
   s=Math.floor(s||0);
@@ -467,6 +489,9 @@ function ifaceLookup(name){
   return (lastIfaces||[]).find(i=>i.name===name);
 }
 function ifaceLabel(name){
+  /* Returned as plain text; written into an <option> via .textContent
+   * (see populate{Csa,Scan}IfaceSelect) so HTML escaping is automatic.
+   * No esc() needed here. */
   const s=ifaceLookup(name);
   if(!s||s.chan<=0) return name+' [?]';
   const dbm=(s.txpower_mbm>=0)?` ${(s.txpower_mbm/100).toFixed(0)} dBm`:'';
@@ -493,10 +518,10 @@ function renderGsTxpowerRow(ts){
     const cur=s && s.txpower_mbm>=0 ? `${(s.txpower_mbm/100).toFixed(0)} dBm` : '?';
     const ch=s && s.chan>0 ? `ch ${s.chan} ${s.ht||''}` : 'ch ?';
     h+=`<div style="display:flex;align-items:center;gap:.4rem;flex-wrap:wrap">`;
-    h+=`<code>${i}</code><span class="muted">${ch} · current ${cur}</span>`;
+    h+=`<code>${esc(i)}</code><span class="muted">${esc(ch)} · current ${esc(cur)}</span>`;
     presets.forEach(m=>{
       const dbm=(m/100).toFixed(0);
-      h+=`<button class="btn-mini btn-start" onclick="gsTxpower('${i}',${m})">${dbm} dBm</button>`;
+      h+=`<button class="btn-mini btn-start" onclick="gsTxpower('${jsAttr(i)}',${m})">${dbm} dBm</button>`;
     });
     h+=`</div>`;
   });
@@ -615,8 +640,8 @@ async function refreshScanState(){
       el.textContent=`scanning sess=${j.sess} step ${j.cur_step+1}/${j.step_count} `+
         `→ ch ${j.cur_chan} ${j.cur_ht} (dwell ${j.dwell_left_ms.toFixed(0)} ms)`;
     } else if(j.phase===2){
-      el.innerHTML=`<b>found</b> traffic on chan <b>${j.found_chan} ${j.found_ht}</b> `+
-        `after ${j.hops_done} hop(s) — adapters now on this channel`;
+      el.innerHTML=`<b>found</b> traffic on chan <b>${esc(j.found_chan)} ${esc(j.found_ht)}</b> `+
+        `after ${esc(j.hops_done)} hop(s) — adapters now on this channel`;
     } else {
       el.textContent=`scan stopped after ${j.hops_done} hop(s) — no traffic found`;
     }
@@ -704,12 +729,6 @@ function setConn(ok){
 function fmtUnset(v, label){
   return v===undefined||v===null||v<0 ? `<span class="muted">${label||'unset'}</span>` : v;
 }
-function fmtBytes(n){
-  if(!n) return '0 B';
-  const u=['B','kB','MB','GB']; let i=0; let v=n;
-  while(v>=1024 && i<u.length-1){ v/=1024; i++; }
-  return v.toFixed(v<10?2:v<100?1:0)+' '+u[i];
-}
 function fmtRate(bytes, ms){
   if(!bytes||!ms) return '-';
   const bps = (bytes*8)*(1000/ms);
@@ -722,11 +741,14 @@ function renderTunnels(ts){
   const g=$('#tunnel-grid');
   if(!ts || !ts.length){ g.innerHTML='<div class="empty">no tunnels configured</div>'; return; }
   g.innerHTML=ts.map(t=>{
-    const ifs=(t.interfaces||[]).join(', ');
+    const ifs=esc((t.interfaces||[]).join(', '));
+    const tname=esc(t.name);
+    const trole=esc(t.role);
+    const tstate=esc(t.state);
     let detail, statsBlock='';
     if(t.role==='rx'){
-      detail = `<dt>udp_out</dt><dd>${t.udp_out||'<span class="muted">(default 127.0.0.1:5600)</span>'}</dd>
-         <dt>stats_out</dt><dd>${t.stats_out||'<span class="muted">-</span>'}</dd>`;
+      detail = `<dt>udp_out</dt><dd>${t.udp_out?esc(t.udp_out):'<span class="muted">(default 127.0.0.1:5600)</span>'}</dd>
+         <dt>stats_out</dt><dd>${t.stats_out?esc(t.stats_out):'<span class="muted">-</span>'}</dd>`;
       const s=t.stats||{};
       const live = s.msg_count>0;
       const stale = !live || (s.age_ms!==undefined && s.age_ms>3000);
@@ -741,7 +763,7 @@ function renderTunnels(ts){
         </div>
         <dl class="tunnel-kv stats-grid">
           <dt>pkts</dt><dd>${s.pkt_all||0} <span class="muted">(uniq ${s.pkt_uniq||0})</span></dd>
-          <dt>outgoing</dt><dd>${s.pkt_outgoing||0} · ${fmtBytes(s.outgoing_bytes||0)} · ${fmtRate(s.outgoing_bytes||0, s.interval_ms||0)}</dd>
+          <dt>outgoing</dt><dd>${s.pkt_outgoing||0} pkts · ${fmtRate(s.outgoing_bytes||0, s.interval_ms||0)}</dd>
           <dt>lost</dt><dd>${s.pkt_lost||0} (${lossPct.toFixed(2)}%)</dd>
           <dt>fec rec</dt><dd>${s.pkt_fec_recovered||0}</dd>
           <dt>dec_err</dt><dd>${s.pkt_dec_err||0}</dd>
@@ -770,8 +792,8 @@ function renderTunnels(ts){
           <span class="muted">${dotLbl}</span>
         </div>
         <dl class="tunnel-kv stats-grid">
-          <dt>in</dt><dd>${s.pkts_in||0} pkts · ${fmtBytes(s.bytes_in||0)} · ${fmtRate(s.bytes_in||0, s.interval_ms||0)}</dd>
-          <dt>on-air</dt><dd>${s.pkts_out||0} pkts · ${fmtBytes(s.bytes_out||0)} · ${fmtRate(s.bytes_out||0, s.interval_ms||0)}</dd>
+          <dt>in</dt><dd>${s.pkts_in||0} pkts · ${fmtRate(s.bytes_in||0, s.interval_ms||0)}</dd>
+          <dt>on-air</dt><dd>${s.pkts_out||0} pkts · ${fmtRate(s.bytes_out||0, s.interval_ms||0)}</dd>
           <dt>drop</dt><dd>${s.pkts_drop||0} (${dropPct.toFixed(2)}%)${s.pkts_trunc?` · trunc ${s.pkts_trunc}`:''}</dd>
           <dt>fec t/o</dt><dd>${s.fec_timeouts||0}</dd>
         </dl>
@@ -779,9 +801,9 @@ function renderTunnels(ts){
     }
     return `<div class="tunnel">
       <div class="tunnel-head">
-        <div class="tunnel-name">${t.name}</div>
-        <span class="role-badge role-${t.role}">${t.role}</span>
-        <span class="state-badge state-${t.state}">${t.state}</span>
+        <div class="tunnel-name">${tname}</div>
+        <span class="role-badge role-${trole}">${trole}</span>
+        <span class="state-badge state-${tstate}">${tstate}</span>
       </div>
       <div class="tunnel-body">
         <dl class="tunnel-kv">
@@ -790,13 +812,13 @@ function renderTunnels(ts){
           <dt>link_id</dt><dd>${t.link_id} / radio_port ${t.radio_port}</dd>
           <dt>ifaces</dt><dd>${ifs}</dd>
           ${detail}
-          ${t.last_exit!==undefined?`<dt>last_exit</dt><dd>${t.last_exit}</dd>`:''}
+          ${t.last_exit!==undefined?`<dt>last_exit</dt><dd>${esc(t.last_exit)}</dd>`:''}
         </dl>
         ${statsBlock}
         <div class="tunnel-actions">
-          <button class="btn-mini btn-start" ${t.state==='running'?'disabled':''} onclick="tunnelAction('${t.name}','start')">Start</button>
-          <button class="btn-mini btn-stop" ${t.state==='running'||t.state==='backoff'?'':'disabled'} onclick="tunnelAction('${t.name}','stop')">Stop</button>
-          <button class="btn-mini btn-restart" onclick="tunnelAction('${t.name}','restart')">Restart</button>
+          <button class="btn-mini btn-start" ${t.state==='running'?'disabled':''} onclick="tunnelAction('${jsAttr(t.name)}','start')">Start</button>
+          <button class="btn-mini btn-stop" ${t.state==='running'||t.state==='backoff'?'':'disabled'} onclick="tunnelAction('${jsAttr(t.name)}','stop')">Stop</button>
+          <button class="btn-mini btn-restart" onclick="tunnelAction('${jsAttr(t.name)}','restart')">Restart</button>
         </div>
       </div>
     </div>`;
@@ -808,7 +830,7 @@ function populateCtrlTunnels(ts){
   const cur=sel.value;
   const txs=(ts||[]).filter(t=>t.role==='tx' && t.control_port>0);
   sel.innerHTML=txs.length
-    ? txs.map(t=>`<option value="${t.name}">${t.name} (control_port ${t.control_port})</option>`).join('')
+    ? txs.map(t=>`<option value="${esc(t.name)}">${esc(t.name)} (control_port ${esc(t.control_port)})</option>`).join('')
     : `<option value="">no tx tunnels with control_port</option>`;
   if(txs.find(t=>t.name===cur)) sel.value=cur;
 }
@@ -888,7 +910,7 @@ async function systemReinit(){
     if(j.ok===false) throw new Error(j.error||'reinit failed');
     toast(`reinit ok — ${j.tunnels_spawned||0} tunnel(s) respawned`, 'ok');
   }catch(e){
-    toast('reinit failed: '+e.message, 'bad');
+    toast('reinit failed: '+e.message, 'err');
   }
   setTimeout(refresh, 800);
 }

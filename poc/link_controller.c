@@ -1447,7 +1447,16 @@ static int wfb_run_iw_txpower(const char *iface, int mbm)
 	return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
 }
 
-#define WCMD_NUM_KEYS 14   /* highest defined WCMD_KEY_* value */
+#define WCMD_NUM_KEYS 15   /* highest defined WCMD_KEY_* value */
+
+/* Burst-dedup window: GS may send 3 redundant copies of the same WCMD
+ * with the same seq to ride out single-FEC-block losses on the uplink.
+ * If we see the same (key, seq) again inside this window, we count it
+ * as a duplicate of an already-applied request and return OK without
+ * re-dispatching to the venc HTTP API or wfb_cmd.  500 ms comfortably
+ * covers a burst spaced across multiple FEC blocks; a hostile flood of
+ * the same seq just gets coalesced. */
+#define WCMD_BURST_DEDUP_US (500ULL * 1000ULL)
 
 typedef struct {
 	uint64_t recv_total;        /* every WCMD_REQ that passed magic/version */
@@ -1459,8 +1468,16 @@ typedef struct {
 	uint64_t rejected_range;
 	uint64_t rejected_rate;
 	uint64_t rejected_peer;
+	uint64_t coalesced_burst;   /* duplicates of the same seq inside window */
 	uint64_t http_errors;
 	uint64_t last_apply_us[WCMD_NUM_KEYS + 1]; /* indexed by key (1-based) */
+	/* Per-key burst-dedup: last_seq[key] holds the seq we last APPLIED;
+	 * last_seq_us[key] gates the WCMD_BURST_DEDUP_US window.  Initialised
+	 * to 0 in the parent zero-init; on first arrival we still want to
+	 * apply, so the dedup short-circuit only triggers when last_seq_us[k]
+	 * is non-zero AND the seq matches the last applied. */
+	uint16_t last_seq[WCMD_NUM_KEYS + 1];
+	uint64_t last_seq_us[WCMD_NUM_KEYS + 1];
 	uint64_t last_recv_us;
 	uint8_t  last_status;       /* WCMD_STATUS_* of most recent request */
 	uint8_t  last_key;
@@ -1489,6 +1506,15 @@ static int wcmd_build_path(uint8_t key, int32_t value, char *path, size_t path_s
 		break;
 	case WCMD_KEY_FORCE_IDR:
 		n = snprintf(path, path_sz, "/request/idr");
+		break;
+	case WCMD_KEY_RECORD:
+		/* Binary toggle: 1 starts a recording, 0 stops the active one.
+		 * Both endpoints are GETs and reply with `{"ok":true}` even when
+		 * the underlying state is already start/stop, so the burst-dedup
+		 * on this side is the main reason a 3-frame burst doesn't yield
+		 * three start/stop cycles. */
+		n = snprintf(path, path_sz,
+		             value ? "/api/v1/record/start" : "/api/v1/record/stop");
 		break;
 	default:
 		return -1;
@@ -1547,6 +1573,7 @@ static int wcmd_clamp_value(const Config *cfg, uint8_t key, int32_t *value)
 	case WCMD_KEY_WFB_SHORT_GI:
 	case WCMD_KEY_FEC_ENABLED:
 	case WCMD_KEY_MCS_ENABLED:
+	case WCMD_KEY_RECORD:
 		lo = 0; hi = 1;
 		break;
 	case WCMD_KEY_WFB_TXPOWER:
@@ -1564,6 +1591,17 @@ static int wcmd_clamp_value(const Config *cfg, uint8_t key, int32_t *value)
 	if (*value < lo) { *value = lo; return 1; }
 	if (*value > hi) { *value = hi; return 1; }
 	return (*value == orig) ? 0 : 1;
+}
+
+/* Stamp the per-key apply timestamp + seq on a successful dispatch.
+ * Centralised so every accept site updates both halves of the burst-
+ * dedup state — easy to forget if scattered. */
+static inline void wcmd_mark_applied(WcmdState *st, uint8_t key,
+                                     uint16_t seq, uint64_t now)
+{
+	st->last_apply_us[key] = now;
+	st->last_seq[key]      = seq;
+	st->last_seq_us[key]   = now;
 }
 
 /* Process one WCMD_REQ datagram (already validated for length and
@@ -1625,6 +1663,27 @@ static int wcmd_dispatch(Config *cfg, const WcmdReq *req,
 		return 0;
 	}
 
+	/* Burst-dedup short-circuit: GS sends 3 redundant copies of every
+	 * single-shot WCMD with the same seq so that a single FEC-block loss
+	 * on the uplink can't drop the whole command.  If we've already
+	 * applied this exact (key, seq) inside WCMD_BURST_DEDUP_US, return
+	 * OK without re-dispatching — the original apply is the source of
+	 * truth and the duplicates are pure redundancy.
+	 *
+	 * Done BEFORE the rate-limit check so a legitimate burst doesn't
+	 * count against the operator's per-key floor. */
+	uint16_t req_seq = ntohs(req->seq);
+	if (st->last_seq_us[key] != 0 &&
+	    st->last_seq[key] == req_seq &&
+	    now - st->last_seq_us[key] < WCMD_BURST_DEDUP_US) {
+		resp->status      = WCMD_STATUS_OK;
+		resp->http_status = htons((uint16_t)st->last_http_status);
+		resp->applied_value = htonl((uint32_t)st->last_value);
+		st->coalesced_burst++;
+		st->last_status = resp->status;
+		return 0;
+	}
+
 	int32_t value = (int32_t)ntohl((uint32_t)req->value);
 	int clamp_rc  = wcmd_clamp_value(cfg, key, &value);
 	if (clamp_rc < 0) {
@@ -1658,7 +1717,7 @@ static int wcmd_dispatch(Config *cfg, const WcmdReq *req,
 		resp->status = WCMD_STATUS_OK;
 		resp->http_status   = htons(0);
 		resp->applied_value = htonl((uint32_t)(new_state ? 1 : 0));
-		st->last_apply_us[key] = now;
+		wcmd_mark_applied(st, key, req_seq, now);
 		st->accepted++;
 		st->last_status = resp->status;
 		st->last_value  = new_state ? 1 : 0;
@@ -1686,7 +1745,7 @@ static int wcmd_dispatch(Config *cfg, const WcmdReq *req,
 			resp->status = WCMD_STATUS_OK;
 			resp->http_status   = htons(0);
 			resp->applied_value = htonl((uint32_t)value);
-			st->last_apply_us[key] = now;
+			wcmd_mark_applied(st, key, req_seq, now);
 			st->accepted++;
 			st->last_status = resp->status;
 			st->last_value  = value;
@@ -1695,8 +1754,13 @@ static int wcmd_dispatch(Config *cfg, const WcmdReq *req,
 		}
 		int rc = wfb_run_iw_txpower(iface, (int)value);
 		if (rc != 0) {
+			/* Negative rc is our "fork/exec/waitpid failed" sentinel —
+			 * don't sign-extend it into the wire u16. Receiver would
+			 * see http_status=0xFFFF and decode it as 65535. Emit 0
+			 * and let status=HTTP_ERROR carry the meaning. */
+			uint16_t hs = (rc > 0 && rc <= 0xFFFF) ? (uint16_t)rc : 0;
 			resp->status = WCMD_STATUS_HTTP_ERROR;
-			resp->http_status = htons((uint16_t)rc);
+			resp->http_status = htons(hs);
 			st->http_errors++;
 			st->last_status = resp->status;
 			st->last_http_status = rc;
@@ -1705,7 +1769,7 @@ static int wcmd_dispatch(Config *cfg, const WcmdReq *req,
 		resp->status        = WCMD_STATUS_OK;
 		resp->http_status   = htons(0);
 		resp->applied_value = htonl((uint32_t)value);
-		st->last_apply_us[key] = now;
+		wcmd_mark_applied(st, key, req_seq, now);
 		st->accepted++;
 		st->last_status      = resp->status;
 		st->last_value       = value;
@@ -1726,7 +1790,7 @@ static int wcmd_dispatch(Config *cfg, const WcmdReq *req,
 			resp->status = WCMD_STATUS_OK;
 			resp->http_status   = htons(0);
 			resp->applied_value = htonl((uint32_t)value);
-			st->last_apply_us[key] = now;
+			wcmd_mark_applied(st, key, req_seq, now);
 			st->accepted++;
 			st->last_status = resp->status;
 			st->last_value  = value;
@@ -1782,7 +1846,7 @@ static int wcmd_dispatch(Config *cfg, const WcmdReq *req,
 		resp->status        = WCMD_STATUS_OK;
 		resp->http_status   = htons(0);
 		resp->applied_value = htonl((uint32_t)value);
-		st->last_apply_us[key] = now;
+		wcmd_mark_applied(st, key, req_seq, now);
 		st->accepted++;
 		st->last_status      = resp->status;
 		st->last_value       = value;
@@ -1803,7 +1867,7 @@ static int wcmd_dispatch(Config *cfg, const WcmdReq *req,
 		resp->status = WCMD_STATUS_OK;
 		resp->http_status   = htons(200);
 		resp->applied_value = htonl((uint32_t)value);
-		st->last_apply_us[key] = now;
+		wcmd_mark_applied(st, key, req_seq, now);
 		st->accepted++;
 		st->last_status = resp->status;
 		st->last_value  = value;
@@ -1841,7 +1905,7 @@ static int wcmd_dispatch(Config *cfg, const WcmdReq *req,
 	resp->status        = WCMD_STATUS_OK;
 	resp->http_status   = htons((uint16_t)(http_status > 0 ? http_status : 200));
 	resp->applied_value = htonl((uint32_t)value);
-	st->last_apply_us[key] = now;
+	wcmd_mark_applied(st, key, req_seq, now);
 	st->accepted++;
 	st->last_status      = resp->status;
 	st->last_value       = value;
@@ -2555,7 +2619,7 @@ static const TunableDesc TUNABLES[] = {
 	{"cmd.enabled",          SUB_COMMON, TF_BOOL, OFF_CMD(enabled),          0, 0,      "enable venc command proxy on rx_ant socket"},
 	{"cmd.loopback_only",    SUB_COMMON, TF_BOOL, OFF_CMD(loopback_only),    0, 0,      "reject WCMD requests not from 127.0.0.1"},
 	{"cmd.rate_limit_ms",    SUB_COMMON, TF_INT,  OFF_CMD(rate_limit_ms),    0, 60000,  "min ms between same-key applies (0 disables)"},
-	{"cmd.allow_keys_mask",  SUB_COMMON, TF_INT,  OFF_CMD(allow_keys_mask),  0, 0xFFFF, "bitmask of WCMD_KEY_* allowed (1=br,2=fps,4=pl,8=idr,16=fec_k,32=fec_n,64=mcs,128=bw,256=ldpc,512=stbc,1024=sgi,2048=fec_en,4096=mcs_en,8192=txpower)"},
+	{"cmd.allow_keys_mask",  SUB_COMMON, TF_INT,  OFF_CMD(allow_keys_mask),  0, 0xFFFF, "bitmask of WCMD_KEY_* allowed (1=br,2=fps,4=pl,8=idr,16=fec_k,32=fec_n,64=mcs,128=bw,256=ldpc,512=stbc,1024=sgi,2048=fec_en,4096=mcs_en,8192=txpower,16384=record)"},
 	{"cmd.bitrate_min_kbps", SUB_COMMON, TF_INT,  OFF_CMD(bitrate_min_kbps), 1, 200000, "min accepted bitrate kbps (fallback when fec disabled)"},
 	{"cmd.bitrate_max_kbps", SUB_COMMON, TF_INT,  OFF_CMD(bitrate_max_kbps), 1, 200000, "max accepted bitrate kbps (fallback when fec disabled)"},
 	{"cmd.fps_min",          SUB_COMMON, TF_INT,  OFF_CMD(fps_min),          1, 240,    "min accepted fps"},
@@ -3106,7 +3170,7 @@ static int cmd_status_to_json(const ApiSnapshot *s, char *buf, size_t cap)
 			"\"wfb_mcs\":%.3f,\"wfb_bandwidth\":%.3f,"
 			"\"wfb_ldpc\":%.3f,\"wfb_stbc\":%.3f,\"wfb_short_gi\":%.3f,"
 			"\"fec_enabled\":%.3f,\"mcs_enabled\":%.3f,"
-			"\"wfb_txpower\":%.3f"
+			"\"wfb_txpower\":%.3f,\"record\":%.3f"
 		"}}",
 		log_rel_s(),
 		(w ? "true" : "false"),
@@ -3142,7 +3206,8 @@ static int cmd_status_to_json(const ApiSnapshot *s, char *buf, size_t cap)
 		last_apply_age[WCMD_KEY_WFB_SHORT_GI],
 		last_apply_age[WCMD_KEY_FEC_ENABLED],
 		last_apply_age[WCMD_KEY_MCS_ENABLED],
-		last_apply_age[WCMD_KEY_WFB_TXPOWER]);
+		last_apply_age[WCMD_KEY_WFB_TXPOWER],
+		last_apply_age[WCMD_KEY_RECORD]);
 	if (n < 0 || (size_t)n >= cap) return -1;
 	return n;
 }
@@ -3907,7 +3972,7 @@ static void config_defaults(Config *c)
 	c->cmd.enabled         = true;
 	c->cmd.loopback_only   = false;
 	c->cmd.rate_limit_ms   = 100;
-	c->cmd.allow_keys_mask = 0x3FFF;     /* keys 1..14 enabled */
+	c->cmd.allow_keys_mask = 0x7FFF;     /* keys 1..15 enabled */
 	c->cmd.bitrate_min_kbps = 100;
 	c->cmd.bitrate_max_kbps = 25000;
 	c->cmd.fps_min          = 1;
