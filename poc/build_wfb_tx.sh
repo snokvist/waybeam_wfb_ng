@@ -38,6 +38,10 @@ BUILD_DIR="$SCRIPT_DIR/build"
 # dynamic-linked wfb_tx finds it on-device. libsodium 1.0.19+ bumps to
 # libsodium.so.26 and breaks runtime. Bump only when OpenIPC bumps.
 LIBSODIUM_VER="1.0.18"
+# libpcap version: must produce SONAME libpcap.so.1 to match OpenIPC's
+# /usr/lib/libpcap.so.1.10.5 SONAME libpcap.so.1.  1.10.x is fine; bump
+# only when OpenIPC bumps.
+LIBPCAP_VER="1.10.5"
 DEPLOY_HOST="${DEPLOY_HOST:-192.168.1.10}"
 DEPLOY_DIR="${DEPLOY_DIR:-/usr/bin}"
 
@@ -114,6 +118,61 @@ if [ ! -f "$SODIUM_PREFIX/lib/libsodium.so" ]; then
     echo "libsodium installed to $SODIUM_PREFIX"
 else
     echo "=== libsodium already built ==="
+fi
+
+# ── Step 1b: Cross-compile libpcap (for the cross wfb_rx build) ──────
+#
+# libpcap-dev is not in the SigmaStar toolchain sysroot.  We cross-build
+# libpcap as a static archive and link wfb_rx against it; on-device the
+# binary uses /usr/lib/libpcap.so.1 from the OpenIPC rootfs at runtime
+# (the static archive is just a shim providing headers + stubs that the
+# dynamic loader resolves against the rootfs SONAME).
+#
+# Actually the cleaner approach: build libpcap shared so the binary
+# dynamically resolves against the on-device libpcap.so.1.  The toolchain
+# doesn't ship libpcap headers, so we install a fresh build into our own
+# prefix and link against -lpcap from there (header path) but expect the
+# device's libpcap.so.1 at runtime — which works because the SONAMEs match.
+
+PCAP_DIR="$BUILD_DIR/libpcap-${LIBPCAP_VER}"
+PCAP_PREFIX="$BUILD_DIR/pcap-install"
+
+if [ ! -f "$PCAP_PREFIX/lib/libpcap.so" ]; then
+    echo "=== Building libpcap ${LIBPCAP_VER} (cross) ==="
+    if [ ! -d "$PCAP_DIR" ]; then
+        cd "$BUILD_DIR"
+        TARBALL="libpcap-${LIBPCAP_VER}.tar.gz"
+        if [ ! -f "$TARBALL" ]; then
+            echo "Downloading libpcap..."
+            curl -fsSL -o "$TARBALL" \
+                "https://www.tcpdump.org/release/${TARBALL}"
+        fi
+        tar xzf "$TARBALL"
+    fi
+    cd "$PCAP_DIR"
+    # libpcap auto-detects build artifacts.  Disable optional features so
+    # we don't drag in dbus/usb/bluetooth headers we don't have for the
+    # SigmaStar sysroot.
+    CC="$CROSS_CC" AR="$CROSS_AR" RANLIB="$CROSS_RANLIB" STRIP="$CROSS_STRIP" \
+        ./configure --host="$CROSS_PREFIX" \
+                    --prefix="$PCAP_PREFIX" \
+                    --disable-shared \
+                    --enable-static \
+                    --without-libnl \
+                    --disable-bluetooth \
+                    --disable-dbus \
+                    --disable-rdma \
+                    --disable-usb \
+                    --disable-canusb \
+                    --with-pcap=linux \
+                    --enable-remote=no \
+                    >/dev/null
+    make -s -j$(nproc)
+    make -s install
+    cd "$SCRIPT_DIR"
+    echo "libpcap installed to $PCAP_PREFIX"
+else
+    echo "=== libpcap already built ==="
 fi
 
 # ── Step 2: Clone wfb-ng ─────────────────────────────────────────────
@@ -227,6 +286,25 @@ $CROSS_CC -o wfb_tx_cmd src/tx_cmd.o $WFB_LDFLAGS
 $CROSS_STRIP wfb_tx_cmd
 cp wfb_tx_cmd "$BUILD_DIR/wfb_tx_cmd"
 
+# ── Cross wfb_rx (armhf) ────────────────────────────────────────────
+# Uses the locally cross-built libpcap (static linkage of pcap is fine —
+# we still rely on libsodium/libstdc++ from the device rootfs).
+echo "  Building wfb_rx (cross armhf)..."
+RX_CFLAGS="$SIZE_CFLAGS -Wall -fno-strict-aliasing"
+RX_CFLAGS="$RX_CFLAGS -I$SODIUM_PREFIX/include -I$VENC_ROOT/include"
+RX_CFLAGS="$RX_CFLAGS -I$PCAP_PREFIX/include"
+RX_CFLAGS="$RX_CFLAGS -DZFEX_UNROLL_ADDMUL_SIMD=8 -DZFEX_INLINE_ADDMUL -DZFEX_INLINE_ADDMUL_SIMD"
+RX_CFLAGS="$RX_CFLAGS -DWFB_VERSION=\"shm-patched-cross\""
+RX_LDFLAGS="-L$SODIUM_PREFIX/lib -L$PCAP_PREFIX/lib $SIZE_LDFLAGS -lrt -lsodium -lpcap"
+
+$CROSS_CXX $RX_CFLAGS -std=gnu++11 -c -o src/rx.o src/rx.cpp
+$CROSS_CC  $RX_CFLAGS -std=gnu99 -c -o src/radiotap.o src/radiotap.c
+$CROSS_CXX -o wfb_rx \
+    src/rx.o src/zfex.o src/wifibroadcast.o src/radiotap.o \
+    $RX_LDFLAGS
+$CROSS_STRIP wfb_rx
+cp wfb_rx "$BUILD_DIR/wfb_rx"
+
 # ── Native wfb_rx (x86_64) for the ground station laptop ────────────
 # wfb_rx needs real libpcap (not the stub used by the cross build of
 # wfb_tx) so we compile it natively with the host toolchain and system
@@ -296,7 +374,8 @@ $CROSS_STRIP "$BUILD_DIR/shm_consumer_test"
 echo ""
 echo "=== Build complete ==="
 echo ""
-ls -lh "$BUILD_DIR/wfb_tx" "$BUILD_DIR/wfb_keygen" "$BUILD_DIR/wfb_tx_cmd" \
+ls -lh "$BUILD_DIR/wfb_tx" "$BUILD_DIR/wfb_rx" \
+       "$BUILD_DIR/wfb_keygen" "$BUILD_DIR/wfb_tx_cmd" \
        "$BUILD_DIR/wfb_rx_native" "$BUILD_DIR/wfb_tx_native" \
        "$BUILD_DIR/shm_ring_stats" "$BUILD_DIR/shm_consumer_test"
 echo ""
@@ -307,6 +386,7 @@ if [ "$DO_DEPLOY" = "1" ]; then
     echo "=== Deploying to root@${DEPLOY_HOST}:${DEPLOY_DIR} ==="
     scp -O \
         "$BUILD_DIR/wfb_tx" \
+        "$BUILD_DIR/wfb_rx" \
         "$BUILD_DIR/wfb_keygen" \
         "$BUILD_DIR/wfb_tx_cmd" \
         "$BUILD_DIR/shm_ring_stats" \

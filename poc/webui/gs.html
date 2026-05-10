@@ -269,6 +269,10 @@ select{cursor:pointer;-webkit-appearance:none;appearance:none;background-image:u
             <option value="wfb_stbc">wfb_stbc</option>
             <option value="wfb_short_gi">wfb_short_gi</option>
           </optgroup>
+          <optgroup label="vehicle adaptive switches">
+            <option value="fec_enabled">fec_enabled</option>
+            <option value="mcs_enabled">mcs_enabled</option>
+          </optgroup>
         </select>
         <span></span>
       </div>
@@ -298,8 +302,19 @@ select{cursor:pointer;-webkit-appearance:none;appearance:none;background-image:u
   </div>
 
   <div class="section">
+    <div class="section-header"><h3>Quick fires — adaptive switches</h3>
+      <span class="help">Pin the vehicle's FEC and/or MCS so manual wfb_* changes below stick. Re-enable to resume adaptation.</span></div>
+    <div class="section-body" style="display:flex;gap:.5rem;flex-wrap:wrap">
+      <button class="btn-mini btn-stop" onclick="cmdQuick('fec_enabled',0)">fec auto OFF</button>
+      <button class="btn-mini btn-start" onclick="cmdQuick('fec_enabled',1)">fec auto ON</button>
+      <button class="btn-mini btn-stop" onclick="cmdQuick('mcs_enabled',0)">mcs auto OFF</button>
+      <button class="btn-mini btn-start" onclick="cmdQuick('mcs_enabled',1)">mcs auto ON</button>
+    </div>
+  </div>
+
+  <div class="section">
     <div class="section-header"><h3>Quick fires — vehicle wfb_tx</h3>
-      <span class="help">Vehicle's adaptive FEC and MCS will overwrite these on the next tick. Disable fec.enabled / mcs.enabled on the vehicle for manual control to stick.</span></div>
+      <span class="help">Vehicle's adaptive FEC and MCS will overwrite these on the next tick unless you turn the auto switches off above.</span></div>
     <div class="section-body" style="display:flex;gap:.5rem;flex-wrap:wrap">
       <button class="btn-mini btn-start" onclick="cmdQuick('wfb_mcs',1)">mcs 1</button>
       <button class="btn-mini btn-start" onclick="cmdQuick('wfb_mcs',2)">mcs 2</button>

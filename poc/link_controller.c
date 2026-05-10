@@ -1414,7 +1414,7 @@ static int wfb_get_fec(const Config *cfg, int *k_out, int *n_out, int *to_out);
 static int wfb_get_radio(const Config *cfg, RadioBody *out);
 static int wfb_set_radio(const Config *cfg, const RadioBody *params);
 
-#define WCMD_NUM_KEYS 11   /* highest defined WCMD_KEY_* value */
+#define WCMD_NUM_KEYS 13   /* highest defined WCMD_KEY_* value */
 
 typedef struct {
 	uint64_t recv_total;        /* every WCMD_REQ that passed magic/version */
@@ -1512,6 +1512,8 @@ static int wcmd_clamp_value(const Config *cfg, uint8_t key, int32_t *value)
 	case WCMD_KEY_WFB_LDPC:
 	case WCMD_KEY_WFB_STBC:
 	case WCMD_KEY_WFB_SHORT_GI:
+	case WCMD_KEY_FEC_ENABLED:
+	case WCMD_KEY_MCS_ENABLED:
 		lo = 0; hi = 1;
 		break;
 	default:
@@ -1531,7 +1533,10 @@ static int wcmd_clamp_value(const Config *cfg, uint8_t key, int32_t *value)
  * magic/version). Always populates *resp; the caller sends it on the
  * rx_ant socket. Returns 0 on success, <0 only if dispatch was a no-op
  * (e.g. unknown key — caller may want to log differently). */
-static int wcmd_dispatch(const Config *cfg, const WcmdReq *req,
+/* cfg is non-const because the FEC_ENABLED / MCS_ENABLED keys flip the
+ * adaptive subsystem master switches at runtime — every other key path
+ * treats the struct as read-only. */
+static int wcmd_dispatch(Config *cfg, const WcmdReq *req,
                          const struct sockaddr_in *peer,
                          WcmdState *st, uint64_t now,
                          WcmdResp *resp)
@@ -1605,12 +1610,33 @@ static int wcmd_dispatch(const Config *cfg, const WcmdReq *req,
 		}
 	}
 
+	/* Adaptive subsystem toggles — flip the master switch in cfg.  No
+	 * external I/O; the change takes effect on the FEC/MCS subsystem's
+	 * next tick.  Useful when the operator wants to pin a manual
+	 * wfb_fec_k / wfb_mcs without restarting link_controller. */
+	if (key == WCMD_KEY_FEC_ENABLED || key == WCMD_KEY_MCS_ENABLED) {
+		bool new_state = (value != 0);
+		if (key == WCMD_KEY_FEC_ENABLED) cfg->fec.enabled = new_state;
+		else                              cfg->mcs.enabled = new_state;
+		resp->status = WCMD_STATUS_OK;
+		resp->http_status   = htons(0);
+		resp->applied_value = htonl((uint32_t)(new_state ? 1 : 0));
+		st->last_apply_us[key] = now;
+		st->accepted++;
+		st->last_status = resp->status;
+		st->last_value  = new_state ? 1 : 0;
+		st->last_http_status = 0;
+		(void)clamp_rc;
+		return 0;
+	}
+
 	/* wfb_tx control keys go to a local wfb_cmd round-trip rather than
 	 * the venc HTTP surface.  Read current radio/fec state, mutate just
 	 * the requested field, write back via SET_RADIO / SET_FEC.  Caveat:
 	 * link_controller's adaptive FEC and MCS subsystems will overwrite
-	 * these on their next tick — set fec.enabled=0 / mcs.enabled=0
-	 * locally for manual control to stick. */
+	 * these on their next tick — toggle WCMD_KEY_FEC_ENABLED=0 /
+	 * WCMD_KEY_MCS_ENABLED=0 first if you want manual control to
+	 * stick. */
 	if (key >= WCMD_KEY_WFB_FEC_K && key <= WCMD_KEY_WFB_SHORT_GI) {
 		if (cfg->dry_run) {
 			resp->status = WCMD_STATUS_OK;
@@ -1805,17 +1831,13 @@ static int wfb_get_fec(const Config *cfg, int *k_out, int *n_out, int *to_out)
 	CmdResp resp = {0};
 	ssize_t n = recv(fd, &resp, sizeof(resp), 0);
 	close(fd);
-	/* Accept either the 12-byte response (k+n+fec_timeout_ms) or the
-	 * older 10-byte form (k+n only).  Vehicles in the field run older
-	 * wfb_tx builds that don't echo fec_timeout. */
-	if (n < (ssize_t)(sizeof(uint32_t) * 2 + 2)) return -1;
+	if (n < (ssize_t)(sizeof(uint32_t) * 2 + 4)) return -1;
 	if (ntohl(resp.req_id) != req_id) return -1;
 	if (ntohl(resp.rc) != 0) return -1;
 
 	if (k_out)  *k_out  = resp.u.get_fec.k;
 	if (n_out)  *n_out  = resp.u.get_fec.n;
-	if (to_out) *to_out = (n >= (ssize_t)(sizeof(uint32_t) * 2 + 4))
-	                        ? ntohs(resp.u.get_fec.fec_timeout_ms) : 0;
+	if (to_out) *to_out = ntohs(resp.u.get_fec.fec_timeout_ms);
 	return 0;
 }
 
@@ -2449,7 +2471,7 @@ static const TunableDesc TUNABLES[] = {
 	{"cmd.enabled",          SUB_COMMON, TF_BOOL, OFF_CMD(enabled),          0, 0,      "enable venc command proxy on rx_ant socket"},
 	{"cmd.loopback_only",    SUB_COMMON, TF_BOOL, OFF_CMD(loopback_only),    0, 0,      "reject WCMD requests not from 127.0.0.1"},
 	{"cmd.rate_limit_ms",    SUB_COMMON, TF_INT,  OFF_CMD(rate_limit_ms),    0, 60000,  "min ms between same-key applies (0 disables)"},
-	{"cmd.allow_keys_mask",  SUB_COMMON, TF_INT,  OFF_CMD(allow_keys_mask),  0, 0xFFFF, "bitmask of WCMD_KEY_* allowed (1=br,2=fps,4=pl,8=idr,16=fec_k,32=fec_n,64=mcs,128=bw,256=ldpc,512=stbc,1024=sgi)"},
+	{"cmd.allow_keys_mask",  SUB_COMMON, TF_INT,  OFF_CMD(allow_keys_mask),  0, 0xFFFF, "bitmask of WCMD_KEY_* allowed (1=br,2=fps,4=pl,8=idr,16=fec_k,32=fec_n,64=mcs,128=bw,256=ldpc,512=stbc,1024=sgi,2048=fec_en,4096=mcs_en)"},
 	{"cmd.bitrate_min_kbps", SUB_COMMON, TF_INT,  OFF_CMD(bitrate_min_kbps), 1, 200000, "min accepted bitrate kbps (fallback when fec disabled)"},
 	{"cmd.bitrate_max_kbps", SUB_COMMON, TF_INT,  OFF_CMD(bitrate_max_kbps), 1, 200000, "max accepted bitrate kbps (fallback when fec disabled)"},
 	{"cmd.fps_min",          SUB_COMMON, TF_INT,  OFF_CMD(fps_min),          1, 240,    "min accepted fps"},
@@ -2996,7 +3018,8 @@ static int cmd_status_to_json(const ApiSnapshot *s, char *buf, size_t cap)
 			"\"payload\":%.3f,\"force_idr\":%.3f,"
 			"\"wfb_fec_k\":%.3f,\"wfb_fec_n\":%.3f,"
 			"\"wfb_mcs\":%.3f,\"wfb_bandwidth\":%.3f,"
-			"\"wfb_ldpc\":%.3f,\"wfb_stbc\":%.3f,\"wfb_short_gi\":%.3f"
+			"\"wfb_ldpc\":%.3f,\"wfb_stbc\":%.3f,\"wfb_short_gi\":%.3f,"
+			"\"fec_enabled\":%.3f,\"mcs_enabled\":%.3f"
 		"}}",
 		log_rel_s(),
 		(w ? "true" : "false"),
@@ -3029,7 +3052,9 @@ static int cmd_status_to_json(const ApiSnapshot *s, char *buf, size_t cap)
 		last_apply_age[WCMD_KEY_WFB_BANDWIDTH],
 		last_apply_age[WCMD_KEY_WFB_LDPC],
 		last_apply_age[WCMD_KEY_WFB_STBC],
-		last_apply_age[WCMD_KEY_WFB_SHORT_GI]);
+		last_apply_age[WCMD_KEY_WFB_SHORT_GI],
+		last_apply_age[WCMD_KEY_FEC_ENABLED],
+		last_apply_age[WCMD_KEY_MCS_ENABLED]);
 	if (n < 0 || (size_t)n >= cap) return -1;
 	return n;
 }
@@ -3794,7 +3819,7 @@ static void config_defaults(Config *c)
 	c->cmd.enabled         = true;
 	c->cmd.loopback_only   = false;
 	c->cmd.rate_limit_ms   = 100;
-	c->cmd.allow_keys_mask = 0x07FF;     /* keys 1..11 enabled */
+	c->cmd.allow_keys_mask = 0x1FFF;     /* keys 1..13 enabled */
 	c->cmd.bitrate_min_kbps = 100;
 	c->cmd.bitrate_max_kbps = 25000;
 	c->cmd.fps_min          = 1;

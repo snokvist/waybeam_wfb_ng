@@ -70,6 +70,15 @@
 #define WCMD_KEY_WFB_STBC       10   /* radio stbc */
 #define WCMD_KEY_WFB_SHORT_GI   11   /* radio short_gi (0/1) */
 
+/*
+ * Adaptive subsystem master switches.  Toggle the FEC controller and the
+ * MCS selector at runtime so an operator can pin a manual FEC k/n or MCS
+ * via the keys above without restarting link_controller.  Re-enabling
+ * resumes adaptation from the current state.
+ */
+#define WCMD_KEY_FEC_ENABLED    12   /* link_controller fec.enabled (0/1) */
+#define WCMD_KEY_MCS_ENABLED    13   /* link_controller mcs.enabled (0/1) */
+
 /* Status codes returned in CMD_RESP */
 #define WCMD_STATUS_OK           0
 #define WCMD_STATUS_DISABLED     1   /* cmd subsystem off (cmd.enabled=false) */

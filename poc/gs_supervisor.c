@@ -1698,6 +1698,9 @@ static int qs_get_int(const char *qs, const char *key, int *out)
 #define WCMD_KEY_WFB_LDPC        9
 #define WCMD_KEY_WFB_STBC       10
 #define WCMD_KEY_WFB_SHORT_GI   11
+/* Adaptive subsystem master switches on the vehicle's link_controller. */
+#define WCMD_KEY_FEC_ENABLED    12
+#define WCMD_KEY_MCS_ENABLED    13
 
 #pragma pack(push, 1)
 typedef struct {
@@ -1730,6 +1733,8 @@ static int wcmd_key_from_str(const char *s, size_t n)
 	if (n ==  8 && !strncmp(s, "wfb_ldpc",       8)) return WCMD_KEY_WFB_LDPC;
 	if (n ==  8 && !strncmp(s, "wfb_stbc",       8)) return WCMD_KEY_WFB_STBC;
 	if (n == 12 && !strncmp(s, "wfb_short_gi", 12))  return WCMD_KEY_WFB_SHORT_GI;
+	if (n == 11 && !strncmp(s, "fec_enabled", 11))   return WCMD_KEY_FEC_ENABLED;
+	if (n == 11 && !strncmp(s, "mcs_enabled", 11))   return WCMD_KEY_MCS_ENABLED;
 	return -1;
 }
 
@@ -1747,6 +1752,8 @@ static const char *wcmd_key_name(int key)
 	case WCMD_KEY_WFB_LDPC:      return "wfb_ldpc";
 	case WCMD_KEY_WFB_STBC:      return "wfb_stbc";
 	case WCMD_KEY_WFB_SHORT_GI:  return "wfb_short_gi";
+	case WCMD_KEY_FEC_ENABLED:   return "fec_enabled";
+	case WCMD_KEY_MCS_ENABLED:   return "mcs_enabled";
 	}
 	return "?";
 }
@@ -2122,7 +2129,8 @@ static void api_handle(ApiClient *cli, Config *c, uint64_t startup_us)
 			api_send(cli->fd, 400, "text/plain",
 			         "key must be bitrate_kbps|fps|payload_bytes|force_idr|"
 			         "wfb_fec_k|wfb_fec_n|wfb_mcs|wfb_bandwidth|"
-			         "wfb_ldpc|wfb_stbc|wfb_short_gi\n", -1);
+			         "wfb_ldpc|wfb_stbc|wfb_short_gi|"
+			         "fec_enabled|mcs_enabled\n", -1);
 			return;
 		}
 		int32_t value = 0;
