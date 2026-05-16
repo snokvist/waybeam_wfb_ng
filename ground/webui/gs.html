@@ -29,6 +29,9 @@ code,pre,.mono{font-family:'JetBrains Mono',monospace;font-size:.85em}
 .tbar-sep{width:1px;height:20px;background:var(--border)}
 .tbar-item{display:flex;align-items:center;gap:.4rem;font-size:.8rem;color:var(--text-dim);white-space:nowrap}
 .tbar-item b{color:var(--text);font-weight:600}
+.tbar-item.chip{padding:2px 8px;border:1px solid var(--border);border-radius:4px;font-family:'JetBrains Mono',monospace;font-size:.72rem;cursor:help}
+.tbar-item.chip.warn{border-color:var(--warn);color:var(--warn)}
+.tbar-item.chip.bad{border-color:var(--bad);color:var(--bad)}
 .tbar-dot{width:7px;height:7px;border-radius:50%;flex-shrink:0}
 .tbar-dot.on{background:var(--live);box-shadow:0 0 8px rgba(34,197,94,.5);animation:pulse-dot 2s ease infinite}
 .tbar-dot.off{background:var(--text-dim);opacity:.4}
@@ -40,8 +43,15 @@ code,pre,.mono{font-family:'JetBrains Mono',monospace;font-size:.85em}
 .tbar-btn:hover{border-color:var(--text-dim);color:var(--text)}
 
 /* Tabs */
-.tabs{display:flex;background:var(--bg2);border-bottom:1px solid var(--border);padding:0 1.2rem;gap:0}
-.tab{padding:.7rem 1.2rem;cursor:pointer;color:var(--text-dim);font-weight:500;font-size:.85rem;border-bottom:2px solid transparent;transition:all .15s;user-select:none}
+/* overflow-x:auto on narrow viewports lets the tab row scroll. We
+ * leave the native scrollbar visible (thin) so the operator gets a
+ * visual cue that more tabs exist off-screen — hiding it caused
+ * "Encoder" to silently vanish at phone widths. */
+.tabs{display:flex;background:var(--bg2);border-bottom:1px solid var(--border);padding:0 1.2rem;gap:0;overflow-x:auto;scrollbar-width:thin}
+.tabs::-webkit-scrollbar{height:3px}
+.tabs::-webkit-scrollbar-thumb{background:var(--border-hi);border-radius:2px}
+.tabs::-webkit-scrollbar-track{background:transparent}
+.tab{padding:.7rem 1.2rem;cursor:pointer;color:var(--text-dim);font-weight:500;font-size:.85rem;border-bottom:2px solid transparent;transition:all .15s;user-select:none;white-space:nowrap}
 .tab:hover{color:var(--text)}
 .tab.active{color:var(--accent);border-bottom-color:var(--accent)}
 .tab-content{display:none;padding:1.2rem;max-width:1100px;margin:0 auto}
@@ -87,6 +97,14 @@ code,pre,.mono{font-family:'JetBrains Mono',monospace;font-size:.85em}
 .section-header h3{font-size:.85rem;font-weight:600;color:var(--text-bright);flex:1}
 .section-header .help{font-size:.7rem;color:var(--text-dim)}
 .section-body{padding:.8rem 1rem}
+
+/* Two-column layout for Link tab (GS-side ↔ Vehicle-side mirror). Stacks
+ * vertically below 900 px so each card keeps its labels readable. */
+.split{display:grid;grid-template-columns:repeat(auto-fit,minmax(360px,1fr));gap:.8rem;margin-bottom:.8rem}
+.split .section{margin-bottom:0}
+.side-label{display:inline-block;font-size:.62rem;padding:1px 6px;border-radius:3px;font-family:'JetBrains Mono',monospace;letter-spacing:.04em;text-transform:uppercase;font-weight:700;margin-left:.5rem}
+.side-label.gs{color:var(--blue);background:var(--blue-bg);border:1px solid var(--blue)}
+.side-label.veh{color:var(--accent);background:var(--accent-glow);border:1px solid var(--accent)}
 
 /* Controls form */
 .field{display:grid;grid-template-columns:160px 1fr auto;align-items:center;padding:.4rem 0;gap:.8rem;border-bottom:1px solid var(--border)}
@@ -140,14 +158,36 @@ select{cursor:pointer;-webkit-appearance:none;appearance:none;background-image:u
 
 /* Subsection heading inside a card. */
 .subhead{margin:.8rem 0 .2rem 0;font-size:.78rem;font-weight:600;
-         color:var(--text-bright);font-family:'JetBrains Mono',monospace}
+         color:var(--text-bright);font-family:'JetBrains Mono',monospace;
+         display:flex;align-items:center;gap:.4rem}
+.subhead .h{font-size:.7rem;font-weight:400;color:var(--text-dim);
+            font-family:'DM Sans',sans-serif}
 
 /* Left-aligned action-button row. */
 .action-row{display:flex;gap:.5rem;justify-content:flex-start;
             align-items:center;flex-wrap:wrap;padding:.5rem 0 .2rem 0}
 
-/* Result/last-reply pane */
-.reply{background:var(--bg);border:1px solid var(--border);border-radius:4px;padding:.5rem .8rem;margin-top:.5rem;font-family:'JetBrains Mono',monospace;font-size:.75rem;color:var(--text);white-space:pre-wrap;word-break:break-all;min-height:1.4em}
+/* Quick-fire button cluster (multiple sub-rows of presets) */
+.quick-row{display:flex;gap:.4rem;flex-wrap:wrap;align-items:center;
+           padding:.35rem 0;border-bottom:1px dashed var(--border)}
+.quick-row:last-child{border-bottom:none}
+.quick-row .qlabel{font-size:.72rem;color:var(--text-dim);
+                   font-family:'JetBrains Mono',monospace;
+                   min-width:88px;letter-spacing:.04em;text-transform:uppercase}
+
+/* Adaptive-switch toggles — pinned at top of Link tab so it's obvious
+ * they gate whether the wfb_* knobs below actually stick. */
+.adaptive-strip{display:flex;gap:.6rem;flex-wrap:wrap;padding:.6rem 1rem;
+                background:var(--bg2);border:1px solid var(--border);
+                border-radius:6px;margin-bottom:.8rem;align-items:center}
+.adaptive-strip .label{font-size:.78rem;color:var(--text);
+                       font-family:'JetBrains Mono',monospace;font-weight:600}
+.adaptive-strip .hint{font-size:.7rem;color:var(--text-dim);flex:1;min-width:200px}
+
+/* Result/last-reply pane — auto-hides when empty so each section doesn't
+ * carry a ~30 px gap before the operator has fired anything. */
+.reply{background:var(--bg);border:1px solid var(--border);border-radius:4px;padding:.5rem .8rem;margin-top:.5rem;font-family:'JetBrains Mono',monospace;font-size:.75rem;color:var(--text);white-space:pre-wrap;word-break:break-all}
+.reply:empty{display:none}
 .reply.ok{border-left:3px solid var(--live)}
 .reply.err{border-left:3px solid var(--bad)}
 
@@ -166,6 +206,7 @@ select{cursor:pointer;-webkit-appearance:none;appearance:none;background-image:u
 
 .muted{color:var(--text-dim)}
 .empty{color:var(--text-dim);text-align:center;padding:2rem;font-size:.85rem;border:1px dashed var(--border);border-radius:6px}
+.hidden{display:none !important}
 </style>
 </head>
 <body>
@@ -175,6 +216,7 @@ select{cursor:pointer;-webkit-appearance:none;appearance:none;background-image:u
   <div class="tbar-sep"></div>
   <div class="tbar-item">uptime <b id="tbar-up">-</b></div>
   <div class="tbar-item">tunnels <b id="tbar-tunnels">-</b></div>
+  <div class="tbar-item chip" id="tbar-wcmd" title="WCMD emit counters">wcmd <b id="tbar-wcmd-summary">—</b></div>
   <div class="tbar-item"><div class="tbar-dot off" id="tbar-conn"></div><span id="tbar-conn-label">connecting</span></div>
   <div class="tbar-right">
     <button class="tbar-btn" onclick="systemReinit()" title="Tear down all tunnels, run system.down + system.up, respawn — last-resort recovery for adapters stuck in a bad state (e.g. txpower=-100 dBm after monitor mode flip).">Reinit</button>
@@ -184,118 +226,30 @@ select{cursor:pointer;-webkit-appearance:none;appearance:none;background-image:u
 
 <div class="tabs">
   <div class="tab active" data-tab="tunnels">Tunnels</div>
-  <div class="tab" data-tab="control">GS Control</div>
-  <div class="tab" data-tab="cmd">Vehicle Control</div>
+  <div class="tab" data-tab="channel">Channel</div>
+  <div class="tab" data-tab="link">Link</div>
+  <div class="tab" data-tab="encoder">Encoder</div>
 </div>
 
 <div class="toast-container" id="toasts"></div>
 
-<!-- Tunnels -->
+<!-- ──────────────────────── TUNNELS ──────────────────────── -->
 <div class="tab-content active" id="tab-tunnels">
   <div id="tunnel-grid" class="tunnel-grid"></div>
 </div>
 
-<!-- Control (wfb_cmd passthrough) -->
-<div class="tab-content" id="tab-control">
-  <!-- Channel scan (passive, no vehicle cooperation) -->
+<!-- ──────────────────────── CHANNEL ──────────────────────── -->
+<!-- All "where am I broadcasting" controls: passive scan (find vehicle),
+     synchronized hop (CSA), and per-iface txpower. They share the
+     GS-adapter iface picker, so they belong on one tab. -->
+<div class="tab-content" id="tab-channel">
+
+  <!-- Synchronized channel hop (CSA) — the primary "change channel" tool
+       when the link is already up. Moved to the top because it's the
+       most-used workflow: scan only runs when the vehicle's channel is
+       unknown. -->
   <div class="section">
-    <div class="section-header"><h3>Channel scan</h3>
-      <span class="help">Cycle the GS adapter(s) through a channel list, dwelling on each combo. Stops on the first one where wfb_rx successfully decrypts a packet — the vehicle is on that channel. Vehicle does not need to cooperate.</span></div>
-    <div class="section-body">
-      <div class="field">
-        <div class="field-label">ifaces <span class="help">tap to toggle — copies the same selection used in CSA</span></div>
-        <div id="scan-iface" class="iface-checks"></div>
-      </div>
-      <div class="field">
-        <div class="field-label">chans <span class="help">comma-separated channel list</span></div>
-        <input type="text" id="scan-chans" value="36,40,44,48,52,56,60,64,149,153,157,161,165">
-      </div>
-      <div class="field">
-        <div class="field-label">ht</div>
-        <select id="scan-ht">
-          <option value="HT20" selected>HT20 (all)</option>
-          <option value="HT40+">HT40+ (all)</option>
-          <option value="HT40-">HT40- (all)</option>
-        </select>
-      </div>
-      <div class="field">
-        <div class="field-label">dwell_ms <span class="help">600–1000 ms is typical for RTL88x2</span></div>
-        <input type="number" id="scan-dwell" value="800" min="200" max="10000">
-      </div>
-      <div class="action-row">
-        <button class="btn btn-fire" onclick="scanFire()">Start scan</button>
-        <button class="btn btn-stop" onclick="scanCancel()">Cancel</button>
-      </div>
-      <div class="reply" id="reply-scan"></div>
-      <div class="muted" id="scan-state" style="margin-top:.4rem">scan idle</div>
-    </div>
-  </div>
-
-  <!-- GS adapter txpower (per-iface iw set txpower fixed) -->
-  <div class="section">
-    <div class="section-header"><h3>GS adapter txpower</h3>
-      <span class="help">Per-iface <code>iw set txpower fixed &lt;mBm&gt;</code> on this host. 100 mBm = 1 dBm. Useful when an adapter dropped to txpower=-100 after a monitor-mode flip.</span></div>
-    <div class="section-body" id="gs-txpower-row" style="display:flex;gap:.5rem;flex-wrap:wrap">
-      <span class="muted">Loading ifaces…</span>
-    </div>
-    <div class="reply" id="reply-gs-txpower"></div>
-  </div>
-
-  <!-- Local wfb_tx control: target + FEC + Radio combined into one card.
-       All input rows share a single 2-column grid (label : input) so the
-       inputs line up vertically; action buttons are left-aligned in their
-       own row beneath each subsection. -->
-  <div class="section">
-    <div class="section-header"><h3>Local wfb_tx (uplink) — fec / radio</h3>
-      <span class="help">Direct wfb_cmd into the GS-side tx tunnel's control_port. Affects this ground-side TX only; vehicle RX adapts to whatever it sees.</span></div>
-    <div class="section-body">
-      <div class="field">
-        <div class="field-label">Tunnel <span class="help">Only tx tunnels with control_port set are valid targets.</span></div>
-        <select id="ctrl-tunnel"></select>
-        <span></span>
-      </div>
-
-      <h4 class="subhead">FEC (set_fec / get_fec)</h4>
-      <div class="kv-grid">
-        <label for="fec-k">k <span class="help">data shards per FEC block</span></label>
-        <input type="number" id="fec-k" min="1" max="255" value="1">
-
-        <label for="fec-n">n <span class="help">total shards (k + parity)</span></label>
-        <input type="number" id="fec-n" min="1" max="255" value="2">
-
-        <label for="fec-to">timeout_ms <span class="help">empty = leave running value</span></label>
-        <input type="number" id="fec-to" min="0" max="65534" placeholder="(keep)">
-      </div>
-      <div class="action-row">
-        <button class="btn btn-fire"  onclick="ctrlGetFec()">Get FEC</button>
-        <button class="btn btn-apply" onclick="ctrlSetFec()">Set FEC</button>
-      </div>
-      <div class="reply" id="reply-fec"></div>
-
-      <h4 class="subhead">Radio (set_radio / get_radio)</h4>
-      <div class="kv-grid">
-        <label for="r-stbc">stbc</label>      <input type="number" id="r-stbc" min="0" max="3" value="0">
-        <label for="r-ldpc">ldpc</label>      <input type="number" id="r-ldpc" min="0" max="1" value="0">
-        <label for="r-sgi">short_gi</label>   <input type="number" id="r-sgi"  min="0" max="1" value="0">
-        <label for="r-bw">bandwidth (MHz)</label> <input type="number" id="r-bw" min="5" max="80" value="20">
-        <label for="r-mcs">mcs_index</label>  <input type="number" id="r-mcs"  min="0" max="31" value="1">
-        <label for="r-vhtm">vht_mode</label>  <input type="number" id="r-vhtm" min="0" max="1" value="0">
-        <label for="r-vhtn">vht_nss</label>   <input type="number" id="r-vhtn" min="1" max="4" value="1">
-      </div>
-      <div class="action-row">
-        <button class="btn btn-fire"  onclick="ctrlGetRadio()">Get Radio</button>
-        <button class="btn btn-apply" onclick="ctrlSetRadio()">Set Radio</button>
-      </div>
-      <div class="reply" id="reply-radio"></div>
-    </div>
-  </div>
-</div>
-
-<!-- Vehicle Control (WCMD: venc proxy + vehicle wfb_tx control + CSA) -->
-<div class="tab-content" id="tab-cmd">
-  <!-- Synchronized channel hop (CSA) — moved here because both ends must agree -->
-  <div class="section">
-    <div class="section-header"><h3>Synchronized channel hop (CSA)</h3>
+    <div class="section-header"><h3>Synchronized hop (CSA)</h3>
       <span class="help">Sends 5 <code>csa_commit</code> JSON frames to the vehicle over the uplink, then runs <code>iw set channel</code> locally at T_switch. Vehicle's csa_tick mirrors the same timing. Auto-revert if no rx traffic within t_revert_ms.</span></div>
     <div class="section-body">
       <div class="field">
@@ -343,9 +297,214 @@ select{cursor:pointer;-webkit-appearance:none;appearance:none;background-image:u
     </div>
   </div>
 
+  <!-- Passive channel scan — only when the vehicle's chan is unknown. -->
   <div class="section">
-    <div class="section-header"><h3>WCMD over uplink</h3>
-      <span class="help">Fire-and-forget. Vehicle's link_controller proxies venc keys to HTTP and wfb_* keys to wfb_cmd.</span></div>
+    <div class="section-header"><h3>Find vehicle (passive scan)</h3>
+      <span class="help">Cycle the GS adapter(s) through a channel list, dwelling on each combo. Stops on the first one where wfb_rx successfully decrypts a packet — the vehicle is on that channel. Vehicle does not need to cooperate.</span></div>
+    <div class="section-body">
+      <div class="field">
+        <div class="field-label">ifaces <span class="help">independent from CSA picker — scan can target a subset</span></div>
+        <div id="scan-iface" class="iface-checks"></div>
+      </div>
+      <div class="field">
+        <div class="field-label">chans <span class="help">comma-separated channel list</span></div>
+        <input type="text" id="scan-chans" value="36,40,44,48,52,56,60,64,149,153,157,161,165">
+      </div>
+      <div class="field">
+        <div class="field-label">ht</div>
+        <select id="scan-ht">
+          <option value="HT20" selected>HT20 (all)</option>
+          <option value="HT40+">HT40+ (all)</option>
+          <option value="HT40-">HT40- (all)</option>
+        </select>
+      </div>
+      <div class="field">
+        <div class="field-label">dwell_ms <span class="help">600–1000 ms is typical for RTL88x2</span></div>
+        <input type="number" id="scan-dwell" value="800" min="200" max="10000">
+      </div>
+      <div class="action-row">
+        <button class="btn btn-fire" onclick="scanFire()">Start scan</button>
+        <button class="btn btn-stop" onclick="scanCancel()">Cancel</button>
+      </div>
+      <div class="reply" id="reply-scan"></div>
+      <div class="muted" id="scan-state" style="margin-top:.4rem">scan idle</div>
+    </div>
+  </div>
+
+  <!-- Per-iface GS txpower — small last-resort knob for adapters stuck
+       at txpower=-100 after monitor-mode flips. Lives on this tab
+       because it's per-GS-adapter, like scan/CSA. -->
+  <div class="section">
+    <div class="section-header"><h3>GS adapter txpower</h3>
+      <span class="help">Per-iface <code>iw set txpower fixed &lt;mBm&gt;</code> on this host. 100 mBm = 1 dBm. Useful when an adapter dropped to txpower=-100 after a monitor-mode flip.</span></div>
+    <div class="section-body" id="gs-txpower-row" style="display:flex;gap:.5rem;flex-wrap:wrap">
+      <span class="muted">Loading ifaces…</span>
+    </div>
+    <div class="reply" id="reply-gs-txpower"></div>
+  </div>
+</div>
+
+<!-- ──────────────────────── LINK ──────────────────────── -->
+<!-- Everything that shapes the radio link: adaptive on/off switches at
+     the top (they gate whether the manual knobs below stick), then a
+     side-by-side mirror of the two link endpoints — GS uplink wfb_tx
+     (direct wfb_cmd) on the left, vehicle video wfb_tx (via WCMD) on
+     the right. Quick-fire vehicle wfb_tx presets close out the tab. -->
+<div class="tab-content" id="tab-link">
+
+  <!-- Adaptive switches — pinned at top so the operator sees at a glance
+       whether the vehicle is auto-managing FEC/MCS. Manual wfb_* knobs
+       below get overwritten on the next adaptive tick unless these are
+       off. -->
+  <div class="adaptive-strip">
+    <span class="label">Vehicle adaptive</span>
+    <span class="hint">FEC sizes k/n from EWMA; MCS bucket picks rate from headroom. Turn off to pin manual values from the cards below.</span>
+    <button class="btn-mini btn-start" onclick="cmdQuick('fec_enabled',1)">fec auto ON</button>
+    <button class="btn-mini btn-stop"  onclick="cmdQuick('fec_enabled',0)">fec auto OFF</button>
+    <button class="btn-mini btn-start" onclick="cmdQuick('mcs_enabled',1)">mcs auto ON</button>
+    <button class="btn-mini btn-stop"  onclick="cmdQuick('mcs_enabled',0)">mcs auto OFF</button>
+  </div>
+
+  <div class="split">
+    <!-- GS uplink (direct wfb_cmd to the GS-side tx tunnel) -->
+    <div class="section">
+      <div class="section-header"><h3>Uplink wfb_tx<span class="side-label gs">GS</span></h3>
+        <span class="help">Direct wfb_cmd into this host's tx tunnel control_port. Affects the GS→vehicle uplink only.</span></div>
+      <div class="section-body">
+        <div class="field">
+          <div class="field-label">Tunnel <span class="help">Only tx tunnels with control_port set are valid targets.</span></div>
+          <select id="ctrl-tunnel"></select>
+          <span></span>
+        </div>
+
+        <h4 class="subhead">FEC <span class="h">k/n + timeout</span></h4>
+        <div class="kv-grid">
+          <label for="fec-k">k <span class="help">data shards per FEC block</span></label>
+          <input type="number" id="fec-k" min="1" max="255" value="1">
+
+          <label for="fec-n">n <span class="help">total shards (k + parity)</span></label>
+          <input type="number" id="fec-n" min="1" max="255" value="2">
+
+          <label for="fec-to">timeout_ms <span class="help">empty = leave running value</span></label>
+          <input type="number" id="fec-to" min="0" max="65534" placeholder="(keep)">
+        </div>
+        <div class="action-row">
+          <button class="btn btn-fire"  onclick="ctrlGetFec()">Get FEC</button>
+          <button class="btn btn-apply" onclick="ctrlSetFec()">Set FEC</button>
+        </div>
+        <div class="reply" id="reply-fec"></div>
+
+        <h4 class="subhead">Radio <span class="h">bw / mcs / stbc / ldpc / sgi / vht</span></h4>
+        <div class="kv-grid">
+          <label for="r-stbc">stbc</label>      <input type="number" id="r-stbc" min="0" max="3" value="0">
+          <label for="r-ldpc">ldpc</label>      <input type="number" id="r-ldpc" min="0" max="1" value="0">
+          <label for="r-sgi">short_gi</label>   <input type="number" id="r-sgi"  min="0" max="1" value="0">
+          <label for="r-bw">bandwidth (MHz)</label> <input type="number" id="r-bw" min="5" max="80" value="20">
+          <label for="r-mcs">mcs_index</label>  <input type="number" id="r-mcs"  min="0" max="31" value="1">
+          <label for="r-vhtm">vht_mode</label>  <input type="number" id="r-vhtm" min="0" max="1" value="0">
+          <label for="r-vhtn">vht_nss</label>   <input type="number" id="r-vhtn" min="1" max="4" value="1">
+        </div>
+        <div class="action-row">
+          <button class="btn btn-fire"  onclick="ctrlGetRadio()">Get Radio</button>
+          <button class="btn btn-apply" onclick="ctrlSetRadio()">Set Radio</button>
+        </div>
+        <div class="reply" id="reply-radio"></div>
+      </div>
+    </div>
+
+    <!-- Vehicle video wfb_tx (via WCMD over uplink) -->
+    <div class="section">
+      <div class="section-header"><h3>Video wfb_tx<span class="side-label veh">VEH</span></h3>
+        <span class="help">WCMD over uplink → vehicle link_controller → vehicle wfb_cmd. Adaptive will overwrite these on the next tick unless the toggles above are off.</span></div>
+      <div class="section-body">
+        <h4 class="subhead">FEC <span class="h">manual k/n</span></h4>
+        <div class="quick-row">
+          <span class="qlabel">k</span>
+          <button class="btn-mini btn-start" onclick="cmdQuick('wfb_fec_k',4)">4</button>
+          <button class="btn-mini btn-start" onclick="cmdQuick('wfb_fec_k',6)">6</button>
+          <button class="btn-mini btn-start" onclick="cmdQuick('wfb_fec_k',8)">8</button>
+          <button class="btn-mini btn-start" onclick="cmdQuick('wfb_fec_k',12)">12</button>
+        </div>
+        <div class="quick-row">
+          <span class="qlabel">n</span>
+          <button class="btn-mini btn-start" onclick="cmdQuick('wfb_fec_n',6)">6</button>
+          <button class="btn-mini btn-start" onclick="cmdQuick('wfb_fec_n',8)">8</button>
+          <button class="btn-mini btn-start" onclick="cmdQuick('wfb_fec_n',12)">12</button>
+          <button class="btn-mini btn-start" onclick="cmdQuick('wfb_fec_n',16)">16</button>
+        </div>
+
+        <h4 class="subhead">Radio <span class="h">mcs / bandwidth / ldpc / sgi</span></h4>
+        <div class="quick-row">
+          <span class="qlabel">mcs</span>
+          <button class="btn-mini btn-start" onclick="cmdQuick('wfb_mcs',1)">1</button>
+          <button class="btn-mini btn-start" onclick="cmdQuick('wfb_mcs',2)">2</button>
+          <button class="btn-mini btn-start" onclick="cmdQuick('wfb_mcs',3)">3</button>
+          <button class="btn-mini btn-start" onclick="cmdQuick('wfb_mcs',4)">4</button>
+          <button class="btn-mini btn-start" onclick="cmdQuick('wfb_mcs',5)">5</button>
+        </div>
+        <div class="quick-row">
+          <span class="qlabel">bw</span>
+          <button class="btn-mini btn-start" onclick="cmdQuick('wfb_bandwidth',20)">20</button>
+          <button class="btn-mini btn-start" onclick="cmdQuick('wfb_bandwidth',40)">40</button>
+        </div>
+        <div class="quick-row">
+          <span class="qlabel">ldpc</span>
+          <button class="btn-mini btn-stop"  onclick="cmdQuick('wfb_ldpc',0)">off</button>
+          <button class="btn-mini btn-start" onclick="cmdQuick('wfb_ldpc',1)">on</button>
+        </div>
+        <div class="quick-row">
+          <span class="qlabel">short_gi</span>
+          <button class="btn-mini btn-stop"  onclick="cmdQuick('wfb_short_gi',0)">off</button>
+          <button class="btn-mini btn-start" onclick="cmdQuick('wfb_short_gi',1)">on</button>
+        </div>
+        <div class="quick-row">
+          <span class="qlabel">stbc</span>
+          <button class="btn-mini btn-stop"  onclick="cmdQuick('wfb_stbc',0)">0</button>
+          <button class="btn-mini btn-start" onclick="cmdQuick('wfb_stbc',1)">1</button>
+        </div>
+
+        <h4 class="subhead">TX power <span class="h">vehicle adapter</span></h4>
+        <div class="quick-row" id="quick-txpower-row">
+          <span class="qlabel">dBm</span>
+        </div>
+        <div class="reply" id="reply-cmd-link"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ──────────────────────── ENCODER ──────────────────────── -->
+<!-- Everything that lives in the venc HTTP API on the vehicle, plus the
+     generic WCMD escape hatch for anything not covered by the cards. -->
+<div class="tab-content" id="tab-encoder">
+
+  <!-- Quick fires first — these cover 95 % of operator interaction. -->
+  <div class="section">
+    <div class="section-header"><h3>Encoder quick fires</h3>
+      <span class="help">One-shot WCMDs to the venc HTTP API. force_idr, recording, bitrate, fps.</span></div>
+    <div class="section-body">
+      <div class="quick-row">
+        <span class="qlabel">capture</span>
+        <button class="btn-mini btn-restart" onclick="cmdQuick('force_idr')">force_idr</button>
+        <button class="btn-mini btn-start"   onclick="cmdQuick('record',1)">record start</button>
+        <button class="btn-mini btn-stop"    onclick="cmdQuick('record',0)">record stop</button>
+      </div>
+      <div class="quick-row">
+        <span class="qlabel">bitrate</span>
+        <span id="bitrate-presets-row" style="display:contents"></span>
+      </div>
+      <div class="quick-row">
+        <span class="qlabel">fps</span>
+        <span id="fps-presets-row" style="display:contents"></span>
+      </div>
+      <div class="reply" id="reply-quick"></div>
+    </div>
+  </div>
+
+  <!-- Generic WCMD form — escape hatch for any key not covered above. -->
+  <div class="section">
+    <div class="section-header"><h3>Generic WCMD</h3>
+      <span class="help">Any WCMD key. Fire-and-forget; vehicle's link_controller proxies venc keys to HTTP and wfb_* keys to wfb_cmd.</span></div>
     <div class="section-body">
       <div class="field">
         <div class="field-label">key
@@ -375,7 +534,7 @@ select{cursor:pointer;-webkit-appearance:none;appearance:none;background-image:u
         </select>
         <span></span>
       </div>
-      <div class="field">
+      <div class="field" id="cmd-value-row">
         <div class="field-label">value <span class="help">int32; ignored for force_idr; 0/1 for ldpc/stbc/short_gi</span></div>
         <input type="number" id="cmd-value" placeholder="e.g. 4000">
         <span></span>
@@ -384,61 +543,6 @@ select{cursor:pointer;-webkit-appearance:none;appearance:none;background-image:u
         <button class="btn btn-fire" onclick="cmdFire()">Send</button>
       </div>
       <div class="reply" id="reply-cmd"></div>
-      <div class="tunnel-kv" style="margin-top:.5rem">
-        <dt title="Logical WCMDs emitted (one per /api/v1/cmd success)">commands</dt>
-        <dd id="wcmd-emit-total">—</dd>
-        <dt title="Wire frames sent (= commands × burst copies actually placed on the wire)">wire frames</dt>
-        <dd id="wcmd-emit-frames">—</dd>
-        <dt title="Per-key rate-limit rejections (HTTP 429) since boot">rate-limited</dt>
-        <dd id="wcmd-rate-limited">—</dd>
-        <dt title="Bursts where every copy failed sendto() (sock down, ENOBUFS, …)">emit failed</dt>
-        <dd id="wcmd-emit-failed">—</dd>
-      </div>
-    </div>
-  </div>
-
-  <div class="section">
-    <div class="section-header"><h3>Quick fires — venc</h3><span class="help">Common one-shots over the uplink to the encoder.</span></div>
-    <div class="section-body" style="display:flex;gap:.5rem;flex-wrap:wrap">
-      <button class="btn-mini btn-restart" onclick="cmdQuick('force_idr')">force_idr</button>
-      <button class="btn-mini btn-start" onclick="cmdQuick('record',1)">record start</button>
-      <button class="btn-mini btn-stop"  onclick="cmdQuick('record',0)">record stop</button>
-      <button class="btn-mini btn-start" onclick="cmdQuick('bitrate_kbps',2000)">bitrate 2 Mbps</button>
-      <button class="btn-mini btn-start" onclick="cmdQuick('bitrate_kbps',4000)">bitrate 4 Mbps</button>
-      <button class="btn-mini btn-start" onclick="cmdQuick('bitrate_kbps',8000)">bitrate 8 Mbps</button>
-      <button class="btn-mini btn-start" onclick="cmdQuick('fps',60)">fps 60</button>
-      <button class="btn-mini btn-start" onclick="cmdQuick('fps',120)">fps 120</button>
-    </div>
-  </div>
-
-  <div class="section">
-    <div class="section-header"><h3>Quick fires — adaptive switches</h3>
-      <span class="help">Pin the vehicle's FEC and/or MCS so manual wfb_* changes below stick. Re-enable to resume adaptation.</span></div>
-    <div class="section-body" style="display:flex;gap:.5rem;flex-wrap:wrap">
-      <button class="btn-mini btn-stop" onclick="cmdQuick('fec_enabled',0)">fec auto OFF</button>
-      <button class="btn-mini btn-start" onclick="cmdQuick('fec_enabled',1)">fec auto ON</button>
-      <button class="btn-mini btn-stop" onclick="cmdQuick('mcs_enabled',0)">mcs auto OFF</button>
-      <button class="btn-mini btn-start" onclick="cmdQuick('mcs_enabled',1)">mcs auto ON</button>
-    </div>
-  </div>
-
-  <div class="section">
-    <div class="section-header"><h3>Quick fires — vehicle wfb_tx</h3>
-      <span class="help">Vehicle's adaptive FEC and MCS will overwrite these on the next tick unless you turn the auto switches off above.</span></div>
-    <div class="section-body" style="display:flex;gap:.5rem;flex-wrap:wrap">
-      <button class="btn-mini btn-start" onclick="cmdQuick('wfb_mcs',1)">mcs 1</button>
-      <button class="btn-mini btn-start" onclick="cmdQuick('wfb_mcs',2)">mcs 2</button>
-      <button class="btn-mini btn-start" onclick="cmdQuick('wfb_mcs',3)">mcs 3</button>
-      <button class="btn-mini btn-start" onclick="cmdQuick('wfb_mcs',4)">mcs 4</button>
-      <button class="btn-mini btn-start" onclick="cmdQuick('wfb_bandwidth',20)">bw 20</button>
-      <button class="btn-mini btn-start" onclick="cmdQuick('wfb_bandwidth',40)">bw 40</button>
-      <button class="btn-mini btn-start" onclick="cmdQuick('wfb_fec_k',8)">fec k=8</button>
-      <button class="btn-mini btn-start" onclick="cmdQuick('wfb_fec_n',12)">fec n=12</button>
-      <button class="btn-mini btn-stop" onclick="cmdQuick('wfb_ldpc',0)">ldpc 0</button>
-      <button class="btn-mini btn-start" onclick="cmdQuick('wfb_ldpc',1)">ldpc 1</button>
-      <button class="btn-mini btn-stop" onclick="cmdQuick('wfb_short_gi',0)">sgi 0</button>
-      <button class="btn-mini btn-start" onclick="cmdQuick('wfb_short_gi',1)">sgi 1</button>
-      <span id="quick-txpower-row" style="display:contents"></span>
     </div>
   </div>
 </div>
@@ -447,19 +551,45 @@ select{cursor:pointer;-webkit-appearance:none;appearance:none;background-image:u
 const $=s=>document.querySelector(s);
 const $$=s=>document.querySelectorAll(s);
 
-/* Per-iface txpower presets in mBm (1 dBm = 100 mBm). Single source of
- * truth for both the vehicle quick-fire row and the per-iface GS row. */
-const TXPOWER_PRESETS_MBM=[500,1500,2000,2500];
+/* ────────────────────────────────────────────────────────────────────
+ * Preset arrays — single source of truth for quick-fire button rows.
+ * Adding a new preset is a one-line change here; the row re-renders on
+ * load via renderPresetRows().
+ *
+ * TXPOWER is in mBm (1 dBm = 100 mBm).
+ * BITRATE is in kbps, sent as-is to venc bitrate_kbps.
+ * FPS is the encoder framerate target. */
+const TXPOWER_PRESETS_MBM = [500, 1500, 2000, 2500];
+const BITRATE_PRESETS_KBPS = [2000, 4000, 6000, 8000, 12000];
+const FPS_PRESETS = [30, 60, 90, 120];
 
-/* Build the static "quick-fire vehicle txpower" buttons once on load
- * from TXPOWER_PRESETS_MBM. */
-function renderQuickTxpowerRow(){
-  const host=$('#quick-txpower-row');
-  if(!host) return;
-  host.innerHTML=TXPOWER_PRESETS_MBM.map(m=>{
-    const dbm=(m/100).toFixed(0);
-    return `<button class="btn-mini btn-start" onclick="cmdQuick('wfb_txpower',${m})">txp ${dbm} dBm</button>`;
-  }).join('');
+function renderPresetRows(){
+  const txp = $('#quick-txpower-row');
+  if (txp) {
+    /* keep the leading "dBm" label, replace presets after it */
+    txp.querySelectorAll('button').forEach(b=>b.remove());
+    TXPOWER_PRESETS_MBM.forEach(m=>{
+      const dbm=(m/100).toFixed(0);
+      const b=document.createElement('button');
+      b.className='btn-mini btn-start';
+      b.textContent=`${dbm} dBm`;
+      b.onclick=()=>cmdQuick('wfb_txpower',m);
+      txp.appendChild(b);
+    });
+  }
+  const br = $('#bitrate-presets-row');
+  if (br) {
+    br.innerHTML = BITRATE_PRESETS_KBPS.map(k=>{
+      const lbl = k>=1000 ? `${(k/1000).toFixed(k%1000?1:0)} Mbps` : `${k} kbps`;
+      return `<button class="btn-mini btn-start" onclick="cmdQuick('bitrate_kbps',${k})">${lbl}</button>`;
+    }).join('');
+  }
+  const fp = $('#fps-presets-row');
+  if (fp) {
+    fp.innerHTML = FPS_PRESETS.map(f=>
+      `<button class="btn-mini btn-start" onclick="cmdQuick('fps',${f})">${f}</button>`
+    ).join('');
+  }
 }
 
 /* Escape a value for safe interpolation into HTML element content or
@@ -529,14 +659,7 @@ async function refresh(){
     const j=await r.json();
     $('#tbar-up').textContent=fmtUptime(j.uptime_s);
     $('#tbar-tunnels').textContent=(j.tunnels||[]).length;
-    if(j.wcmd){
-      const w=j.wcmd;
-      const set=(id,v)=>{const e=$(id);if(e)e.textContent=String(v);};
-      set('#wcmd-emit-total',`${w.emit_total||0}`);
-      set('#wcmd-emit-frames',`${w.emit_frames||0} (${w.burst_frames||3}×)`);
-      set('#wcmd-rate-limited',`${w.rate_limited||0}`);
-      set('#wcmd-emit-failed',`${w.emit_failed||0}`);
-    }
+    renderWcmdChip(j.wcmd);
     setConn(true);
     // pull /tunnels for full detail
     const r2=await fetchT('/api/v1/tunnels');
@@ -559,6 +682,29 @@ async function refresh(){
   }catch(e){
     setConn(false);
   }
+}
+
+/* WCMD chip in the telemetry bar — the four counters that used to live
+ * inside the generic WCMD card. Rendered as one compact summary
+ * "<commands>×<burst> · <failed>"; full breakdown lives in the chip's
+ * title= tooltip so the bar stays scannable. */
+function renderWcmdChip(w){
+  const chip=$('#tbar-wcmd');
+  const sum=$('#tbar-wcmd-summary');
+  if(!chip || !sum) return;
+  if(!w){ sum.textContent='—'; chip.title='WCMD emit counters'; chip.classList.remove('warn','bad'); return; }
+  const burst = w.burst_frames || 3;
+  const total = w.emit_total || 0;
+  const failed = w.emit_failed || 0;
+  const rated = w.rate_limited || 0;
+  sum.textContent = `${total}×${burst}` + (failed?` · ${failed} fail`:'');
+  chip.classList.toggle('bad',  failed>0);
+  chip.classList.toggle('warn', failed===0 && rated>0);
+  chip.title =
+    `commands     ${total}\n`+
+    `wire frames  ${w.emit_frames||0} (${burst}×)\n`+
+    `rate-limited ${rated}\n`+
+    `emit failed  ${failed}`;
 }
 
 let lastIfaces=[];
@@ -920,10 +1066,18 @@ function renderTunnels(ts){
   }).join('');
 }
 
-/* Last tunnel name we successfully auto-filled the set_radio form
- * from.  Reset on operator-initiated select change so the new tunnel
- * gets one auto-fill pass, then is left alone. */
+/* Per-side latches recording which tunnel we've already auto-filled.
+ * Radio and FEC are tracked separately because their wfb_cmd caches
+ * land independently (and either one can fail to populate at startup
+ * if wfb_tx isn't ready in time — see gs_supervisor.c:871, which
+ * retries radio but not fec). A single shared latch waiting for BOTH
+ * caused the already-filled side to be re-written on every poll,
+ * wiping operator edits in the still-unfilled window.
+ *
+ * Reset on operator-initiated select change so the new tunnel gets
+ * one auto-fill pass per side, then is left alone. */
 let lastRadioFilled='';
+let lastFecFilled='';
 
 function populateCtrlTunnels(ts){
   const sel=$('#ctrl-tunnel');
@@ -936,39 +1090,49 @@ function populateCtrlTunnels(ts){
   if(sel.dataset.firstLoad!=='no'){
     sel.dataset.firstLoad='no';
     sel.addEventListener('change', ()=>{
-      // Operator picked a different tunnel — drop the no-overwrite guard
-      // and refill immediately from the new tunnel's live cache.
-      lastRadioFilled='';
-      populateRadioFormFromTunnel(sel.value);
+      // Operator picked a different tunnel — drop both no-overwrite
+      // guards and refill immediately from the new tunnel's live cache.
+      lastRadioFilled=''; lastFecFilled='';
+      populateLinkFormsFromTunnel(sel.value);
     });
   }
-  // Auto-fill if we haven't successfully filled this tunnel yet.  If the
-  // cache had have:false at first refresh, this retries until the
-  // wfb_cmd_refresh_radio tick lands; once filled, lastRadioFilled is
-  // set and we stop touching the form so operator edits stick.
-  if(sel.value && lastRadioFilled !== sel.value){
-    populateRadioFormFromTunnel(sel.value);
+  // Auto-fill any side we haven't yet successfully filled for this
+  // tunnel. populateLinkFormsFromTunnel is cheap when both latches
+  // already match (it just checks and returns).
+  if(sel.value && (lastRadioFilled !== sel.value || lastFecFilled !== sel.value)){
+    populateLinkFormsFromTunnel(sel.value);
   }
 }
 
-/* Pre-populate the set_radio form from the tx tunnel's live wfb_cmd
- * cache so the operator doesn't have to read t.radio off the dashboard
- * and re-type it.  Skips when have:false so the form isn't filled with
- * -1 sentinels before the first wfb_cmd round-trip lands. */
-function populateRadioFormFromTunnel(name){
+/* Pre-populate the set_radio AND set_fec forms from the tx tunnel's
+ * live wfb_cmd cache so the operator doesn't have to read t.radio /
+ * t.fec off the dashboard and re-type. Skips each side when have:false
+ * so the form isn't filled with -1 sentinels before the first wfb_cmd
+ * round-trip lands. Each side latches independently — once a side has
+ * been filled for this tunnel, subsequent polls leave it alone so
+ * operator edits stick even if the other side is still catching up. */
+function populateLinkFormsFromTunnel(name){
   if(!name) return;
   const t=(lastTunnels||[]).find(x=>x.name===name);
-  if(!t || !t.radio || t.radio.have===false) return;
-  const r=t.radio;
+  if(!t) return;
   const setV=(id,v)=>{ if(v!==undefined && v!==null && v>=0){ const el=$(id); if(el) el.value=v; } };
-  setV('#r-stbc', r.stbc);
-  setV('#r-ldpc', r.ldpc);
-  setV('#r-sgi',  r.short_gi);
-  setV('#r-bw',   r.bw);
-  setV('#r-mcs',  r.mcs);
-  setV('#r-vhtm', r.vht_mode);
-  setV('#r-vhtn', r.vht_nss);
-  lastRadioFilled=name;
+  if(t.radio && t.radio.have && lastRadioFilled !== name){
+    const r=t.radio;
+    setV('#r-stbc', r.stbc);
+    setV('#r-ldpc', r.ldpc);
+    setV('#r-sgi',  r.short_gi);
+    setV('#r-bw',   r.bw);
+    setV('#r-mcs',  r.mcs);
+    setV('#r-vhtm', r.vht_mode);
+    setV('#r-vhtn', r.vht_nss);
+    lastRadioFilled=name;
+  }
+  if(t.fec && t.fec.have && lastFecFilled !== name){
+    setV('#fec-k', t.fec.k);
+    setV('#fec-n', t.fec.n);
+    /* fec-to is left alone — empty means "keep running value" */
+    lastFecFilled=name;
+  }
 }
 
 async function tunnelAction(name, action){
@@ -983,6 +1147,7 @@ async function tunnelAction(name, action){
 
 function setReply(id, j, ok){
   const el=$(id);
+  if(!el) return;
   el.className='reply '+(ok?'ok':'err');
   el.textContent=JSON.stringify(j,null,2);
 }
@@ -1024,15 +1189,26 @@ async function cmdFire(){
   }catch(e){ setReply('#reply-cmd', {ok:false,error:String(e)}, false); }
 }
 
+/* Quick-fire button handler. Pick a reply pane that's actually visible
+ * in whatever tab we're in so the JSON response shows up next to the
+ * button the operator just clicked (used to always land in #reply-cmd
+ * on the old "Vehicle Control" tab, even when fired from the Link tab). */
 async function cmdQuick(key, value){
   let qs=`key=${encodeURIComponent(key)}`;
   if(value!==undefined) qs+=`&value=${value}`;
+  const replyId = pickReplyPane(key);
   try{
     const r=await fetchT(`/api/v1/cmd?${qs}`);
     const j=await r.json();
-    setReply('#reply-cmd', j, j.ok);
+    setReply(replyId, j, j.ok);
     toast(`${key}${value!==undefined?'='+value:''}: ${j.ok?'sent':j.error}`, j.ok?'ok':'err');
   }catch(e){ toast(`cmd failed: ${e.message||e}`,'err'); }
+}
+
+function pickReplyPane(key){
+  /* wfb_* + adaptive switches → Link tab; venc keys → Encoder tab. */
+  if (key.startsWith('wfb_') || key==='fec_enabled' || key==='mcs_enabled') return '#reply-cmd-link';
+  return '#reply-quick';
 }
 
 function manualRefresh(){ refresh(); }
@@ -1051,6 +1227,19 @@ async function systemReinit(){
   setTimeout(refresh, 800);
 }
 
+/* Generic WCMD: hide the value input when force_idr is selected so it's
+ * visually obvious that whatever's in the box won't be sent. Also clear
+ * the input on the way in so a later key-change doesn't reveal a stale
+ * value the operator typed before switching to force_idr. */
+function updateCmdValueRow(){
+  const key=$('#cmd-key').value;
+  const row=$('#cmd-value-row');
+  if(!row) return;
+  const hide=(key==='force_idr');
+  row.classList.toggle('hidden', hide);
+  if(hide){ const v=$('#cmd-value'); if(v) v.value=''; }
+}
+
 $$('.tab').forEach(t=>{
   t.addEventListener('click', ()=>{
     $$('.tab').forEach(x=>x.classList.remove('active'));
@@ -1060,7 +1249,12 @@ $$('.tab').forEach(t=>{
   });
 });
 
-renderQuickTxpowerRow();
+document.addEventListener('DOMContentLoaded', ()=>{
+  const cmdKey=$('#cmd-key');
+  if(cmdKey){ cmdKey.addEventListener('change', updateCmdValueRow); updateCmdValueRow(); }
+});
+
+renderPresetRows();
 refresh();
 setInterval(refresh, 1000);
 </script>
