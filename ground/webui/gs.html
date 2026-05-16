@@ -690,8 +690,14 @@ function renderSysChip(state){
   chip.title = tip;
   const up   = $('#tbar-sys-up');
   const down = $('#tbar-sys-down');
+  /* Up: only useful when we're NOT currently up.
+   * Down: useful any time the operator wants a definitive teardown.
+   *   Enabled even from up_failed so the operator can force a clean
+   *   system.down (idempotent if the rollback already ran it). Only
+   *   disabled when state is already 'down' — pressing Down then
+   *   would be a no-op. */
   if(up)   up.disabled   = (state === 'up');
-  if(down) down.disabled = (state !== 'up');
+  if(down) down.disabled = (state === 'down');
 }
 
 let lastTunnels=[];

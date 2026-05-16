@@ -310,13 +310,19 @@ void api_handle(ApiClient *cli, Config *c, uint64_t startup_us)
 		if (supervisor_bring_up(c) != 0) {
 			api_send(cli->fd, 503, "application/json",
 			         "{\"ok\":false,\"error\":\"iface readiness timeout — "
-			         "check supervisor log; system rolled back to down\"}", -1);
+			         "see supervisor log; state is up_failed\","
+			         "\"system_state\":\"up_failed\"}", -1);
 			return;
 		}
 		int spawned = 0;
 		for (int i = 0; i < c->tunnel_count; i++) {
 			Tunnel *t = &c->tunnels[i];
-			if (t->autostart) {
+			/* pid <= 0 guard: tunnel_spawn doesn't check, so a manually
+			 * started tunnel (POST /tunnels/<name>/start while system
+			 * was down) would otherwise get re-forked here, orphaning
+			 * the original child. The state machine doesn't formally
+			 * enforce "no tunnels while not up", so be defensive. */
+			if (t->autostart && t->pid <= 0) {
 				t->backoff_idx = 0;
 				t->next_start_ms = 0;
 				if (tunnel_spawn(t, c->key_file) == 0) spawned++;
@@ -344,14 +350,19 @@ void api_handle(ApiClient *cli, Config *c, uint64_t startup_us)
 		if (supervisor_bring_up(c) != 0) {
 			api_send(cli->fd, 503, "application/json",
 			         "{\"ok\":false,\"error\":\"iface readiness timeout — "
-			         "check supervisor log; system rolled back to down\","
+			         "see supervisor log; state is up_failed\","
 			         "\"system_state\":\"up_failed\"}", -1);
 			return;
 		}
 		int spawned = 0;
 		for (int i = 0; i < c->tunnel_count; i++) {
 			Tunnel *t = &c->tunnels[i];
-			if (t->autostart) {
+			/* pid <= 0 guard: tunnel_spawn doesn't check, so a manually
+			 * started tunnel (POST /tunnels/<name>/start while system
+			 * was down) would otherwise get re-forked here, orphaning
+			 * the original child. The state machine doesn't formally
+			 * enforce "no tunnels while not up", so be defensive. */
+			if (t->autostart && t->pid <= 0) {
 				t->backoff_idx = 0;
 				t->next_start_ms = 0;
 				if (tunnel_spawn(t, c->key_file) == 0) spawned++;
