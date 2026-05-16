@@ -43,8 +43,14 @@ code,pre,.mono{font-family:'JetBrains Mono',monospace;font-size:.85em}
 .tbar-btn:hover{border-color:var(--text-dim);color:var(--text)}
 
 /* Tabs */
-.tabs{display:flex;background:var(--bg2);border-bottom:1px solid var(--border);padding:0 1.2rem;gap:0;overflow-x:auto;scrollbar-width:none}
-.tabs::-webkit-scrollbar{display:none}
+/* overflow-x:auto on narrow viewports lets the tab row scroll. We
+ * leave the native scrollbar visible (thin) so the operator gets a
+ * visual cue that more tabs exist off-screen — hiding it caused
+ * "Encoder" to silently vanish at phone widths. */
+.tabs{display:flex;background:var(--bg2);border-bottom:1px solid var(--border);padding:0 1.2rem;gap:0;overflow-x:auto;scrollbar-width:thin}
+.tabs::-webkit-scrollbar{height:3px}
+.tabs::-webkit-scrollbar-thumb{background:var(--border-hi);border-radius:2px}
+.tabs::-webkit-scrollbar-track{background:transparent}
 .tab{padding:.7rem 1.2rem;cursor:pointer;color:var(--text-dim);font-weight:500;font-size:.85rem;border-bottom:2px solid transparent;transition:all .15s;user-select:none;white-space:nowrap}
 .tab:hover{color:var(--text)}
 .tab.active{color:var(--accent);border-bottom-color:var(--accent)}
@@ -1060,10 +1066,18 @@ function renderTunnels(ts){
   }).join('');
 }
 
-/* Last tunnel name we successfully auto-filled the set_radio form
- * from.  Reset on operator-initiated select change so the new tunnel
- * gets one auto-fill pass, then is left alone. */
-let lastFormFilled='';
+/* Per-side latches recording which tunnel we've already auto-filled.
+ * Radio and FEC are tracked separately because their wfb_cmd caches
+ * land independently (and either one can fail to populate at startup
+ * if wfb_tx isn't ready in time — see gs_supervisor.c:871, which
+ * retries radio but not fec). A single shared latch waiting for BOTH
+ * caused the already-filled side to be re-written on every poll,
+ * wiping operator edits in the still-unfilled window.
+ *
+ * Reset on operator-initiated select change so the new tunnel gets
+ * one auto-fill pass per side, then is left alone. */
+let lastRadioFilled='';
+let lastFecFilled='';
 
 function populateCtrlTunnels(ts){
   const sel=$('#ctrl-tunnel');
@@ -1076,17 +1090,16 @@ function populateCtrlTunnels(ts){
   if(sel.dataset.firstLoad!=='no'){
     sel.dataset.firstLoad='no';
     sel.addEventListener('change', ()=>{
-      // Operator picked a different tunnel — drop the no-overwrite guard
-      // and refill immediately from the new tunnel's live cache.
-      lastFormFilled='';
+      // Operator picked a different tunnel — drop both no-overwrite
+      // guards and refill immediately from the new tunnel's live cache.
+      lastRadioFilled=''; lastFecFilled='';
       populateLinkFormsFromTunnel(sel.value);
     });
   }
-  // Auto-fill if we haven't successfully filled this tunnel yet.  If the
-  // cache had have:false at first refresh, this retries until the
-  // wfb_cmd_refresh_{radio,fec} ticks land; once filled, lastFormFilled
-  // is set and we stop touching the form so operator edits stick.
-  if(sel.value && lastFormFilled !== sel.value){
+  // Auto-fill any side we haven't yet successfully filled for this
+  // tunnel. populateLinkFormsFromTunnel is cheap when both latches
+  // already match (it just checks and returns).
+  if(sel.value && (lastRadioFilled !== sel.value || lastFecFilled !== sel.value)){
     populateLinkFormsFromTunnel(sel.value);
   }
 }
@@ -1095,14 +1108,15 @@ function populateCtrlTunnels(ts){
  * live wfb_cmd cache so the operator doesn't have to read t.radio /
  * t.fec off the dashboard and re-type. Skips each side when have:false
  * so the form isn't filled with -1 sentinels before the first wfb_cmd
- * round-trip lands. */
+ * round-trip lands. Each side latches independently — once a side has
+ * been filled for this tunnel, subsequent polls leave it alone so
+ * operator edits stick even if the other side is still catching up. */
 function populateLinkFormsFromTunnel(name){
   if(!name) return;
   const t=(lastTunnels||[]).find(x=>x.name===name);
   if(!t) return;
   const setV=(id,v)=>{ if(v!==undefined && v!==null && v>=0){ const el=$(id); if(el) el.value=v; } };
-  let filled=false;
-  if(t.radio && t.radio.have){
+  if(t.radio && t.radio.have && lastRadioFilled !== name){
     const r=t.radio;
     setV('#r-stbc', r.stbc);
     setV('#r-ldpc', r.ldpc);
@@ -1111,18 +1125,13 @@ function populateLinkFormsFromTunnel(name){
     setV('#r-mcs',  r.mcs);
     setV('#r-vhtm', r.vht_mode);
     setV('#r-vhtn', r.vht_nss);
-    filled=true;
+    lastRadioFilled=name;
   }
-  if(t.fec && t.fec.have){
+  if(t.fec && t.fec.have && lastFecFilled !== name){
     setV('#fec-k', t.fec.k);
     setV('#fec-n', t.fec.n);
     /* fec-to is left alone — empty means "keep running value" */
-    filled=true;
-  }
-  /* Only stop retrying once at least one side has succeeded; otherwise
-   * the next tick will get a chance to fill whichever is still missing. */
-  if(filled && t.radio && t.radio.have && t.fec && t.fec.have){
-    lastFormFilled=name;
+    lastFecFilled=name;
   }
 }
 
@@ -1219,12 +1228,16 @@ async function systemReinit(){
 }
 
 /* Generic WCMD: hide the value input when force_idr is selected so it's
- * visually obvious that whatever's in the box won't be sent. */
+ * visually obvious that whatever's in the box won't be sent. Also clear
+ * the input on the way in so a later key-change doesn't reveal a stale
+ * value the operator typed before switching to force_idr. */
 function updateCmdValueRow(){
   const key=$('#cmd-key').value;
   const row=$('#cmd-value-row');
   if(!row) return;
-  row.classList.toggle('hidden', key==='force_idr');
+  const hide=(key==='force_idr');
+  row.classList.toggle('hidden', hide);
+  if(hide){ const v=$('#cmd-value'); if(v) v.value=''; }
 }
 
 $$('.tab').forEach(t=>{
