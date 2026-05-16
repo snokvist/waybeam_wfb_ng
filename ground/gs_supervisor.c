@@ -1971,31 +1971,11 @@ int wcmd_emit(const Config *c, int key, int32_t value, uint16_t *seq_out)
 
 static void shutdown_all(Config *c)
 {
-	for (int i = 0; i < c->tunnel_count; i++) {
-		Tunnel *t = &c->tunnels[i];
-		if (t->pid > 0) {
-			kill(t->pid, SIGTERM);
-			t->stop_deadline_ms = now_ms() + GS_STOP_GRACE_MS;
-			t->autostart_on_exit = false;
-		}
-	}
-	uint64_t deadline = now_ms() + GS_STOP_GRACE_MS + 500;
-	while (now_ms() < deadline) {
-		bool any = false;
-		for (int i = 0; i < c->tunnel_count; i++)
-			if (c->tunnels[i].pid > 0) any = true;
-		if (!any) break;
-		supervisor_reap(c);
-		struct timespec ts = { .tv_sec = 0, .tv_nsec = 50 * 1000 * 1000 };
-		nanosleep(&ts, NULL);
-	}
-	for (int i = 0; i < c->tunnel_count; i++) {
-		if (c->tunnels[i].pid > 0) {
-			kill(c->tunnels[i].pid, SIGKILL);
-			waitpid(c->tunnels[i].pid, NULL, 0);
-			c->tunnels[i].pid = -1;
-		}
-	}
+	/* Shutdown teardown is byte-equivalent to a /system/down stop —
+	 * SIGTERM, reap, SIGKILL, pid=-1. Share the helper so future
+	 * tweaks (e.g. a longer grace, a stats-listener handoff) only
+	 * have to happen in one place. */
+	supervisor_stop_all_tunnels(c);
 }
 
 static void usage(const char *argv0)

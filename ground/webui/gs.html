@@ -1267,10 +1267,13 @@ function manualRefresh(){ refresh(); }
  * (system.up + 5 s readiness wait + tunnel respawn), so bump the
  * fetch deadline well above the 1 s default; otherwise the abort
  * trips before /system/* returns and the toast claims failure even
- * though the server completed successfully.  GS_SYSTEM_CMD_DEADLINE_MS
- * (10 s/cmd) × ~18 commands worst case is unrealistic — supervisor
- * pipelines the block — so 15 s covers the common case generously. */
-const SYS_CMD_TIMEOUT_MS = 15000;
+ * though the server completed successfully.
+ *
+ * Worst-case envelope: GS_SYSTEM_CMD_DEADLINE_MS (10 s/cmd) × small
+ * number of commands + 5 s readiness window + tunnel respawn. The
+ * common case is ~6 s; 30 s leaves headroom for a single hung `iw`
+ * to complete its deadline without us aborting prematurely. */
+const SYS_CMD_TIMEOUT_MS = 30000;
 
 async function systemUp(){
   toast('system.up: bringing up…', 'warn');
@@ -1319,7 +1322,8 @@ async function systemDown(){
     const r=await fetchT('/api/v1/system/down', {timeout_ms: SYS_CMD_TIMEOUT_MS});
     const j=await r.json();
     if(j.ok===false) throw new Error(j.error||'down failed');
-    toast('system.down ok', 'ok');
+    const n = j.tunnels_stopped|0;
+    toast(`system.down ok — ${n} tunnel(s) stopped`, 'ok');
   }catch(e){
     toast('system.down failed: '+e.message, 'err');
   }

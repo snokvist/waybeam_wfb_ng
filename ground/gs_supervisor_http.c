@@ -382,11 +382,15 @@ void api_handle(ApiClient *cli, Config *c, uint64_t startup_us)
 		 * against already-down adapters is fine (nmcli/iw will just
 		 * report "already" and continue). */
 		LOG_WARN("REST /system/down: stopping tunnels and running system.down");
+		int running_before = 0;
+		for (int i = 0; i < c->tunnel_count; i++)
+			if (c->tunnels[i].pid > 0) running_before++;
 		supervisor_take_down(c);
-		char body[96];
+		char body[128];
 		int p = snprintf(body, sizeof(body),
-		                 "{\"ok\":true,\"system_state\":\"%s\"}",
-		                 system_state_name(c->system_state));
+		                 "{\"ok\":true,\"tunnels_stopped\":%d,"
+		                 "\"system_state\":\"%s\"}",
+		                 running_before, system_state_name(c->system_state));
 		api_send(cli->fd, 200, "application/json", body, p);
 		return;
 	}
