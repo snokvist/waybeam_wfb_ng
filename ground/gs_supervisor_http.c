@@ -306,7 +306,11 @@ void api_handle(ApiClient *cli, Config *c, uint64_t startup_us)
 		supervisor_stop_all_tunnels(c);
 		LOG_INFO("REST /system/reinit: running system.down + system.up");
 		run_system_block("system.down", c->system_down, c->system_down_count);
-		c->system_state = SYS_DOWN;
+		/* No need to set c->system_state = SYS_DOWN here —
+		 * supervisor_bring_up writes the state unconditionally on both
+		 * success (SYS_UP) and failure (SYS_UP_FAILED) paths. The
+		 * inline system.down above only rolls back the adapters; the
+		 * state field is owned by the bring-up call that follows. */
 		if (supervisor_bring_up(c) != 0) {
 			api_send(cli->fd, 503, "application/json",
 			         "{\"ok\":false,\"error\":\"iface readiness timeout — "
@@ -382,6 +386,11 @@ void api_handle(ApiClient *cli, Config *c, uint64_t startup_us)
 		 * against already-down adapters is fine (nmcli/iw will just
 		 * report "already" and continue). */
 		LOG_WARN("REST /system/down: stopping tunnels and running system.down");
+		/* Count tunnels that were running at request time. We capture
+		 * BEFORE supervisor_take_down because the helper clears pid
+		 * as it reaps. Note this is "tunnels we asked to stop", not
+		 * "tunnels confirmed dead" — SIGKILL is unblockable so the
+		 * two are effectively equal in practice. */
 		int running_before = 0;
 		for (int i = 0; i < c->tunnel_count; i++)
 			if (c->tunnels[i].pid > 0) running_before++;

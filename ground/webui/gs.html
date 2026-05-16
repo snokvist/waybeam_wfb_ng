@@ -1322,8 +1322,7 @@ async function systemDown(){
     const r=await fetchT('/api/v1/system/down', {timeout_ms: SYS_CMD_TIMEOUT_MS});
     const j=await r.json();
     if(j.ok===false) throw new Error(j.error||'down failed');
-    const n = j.tunnels_stopped|0;
-    toast(`system.down ok — ${n} tunnel(s) stopped`, 'ok');
+    toast(`system.down ok — ${j.tunnels_stopped||0} tunnel(s) stopped`, 'ok');
   }catch(e){
     toast('system.down failed: '+e.message, 'err');
   }
