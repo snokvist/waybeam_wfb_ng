@@ -234,6 +234,23 @@ typedef struct {
 	uint64_t    tx_init_query_after_us;
 } Tunnel;
 
+/* Tri-state for the system.up/system.down lifecycle.
+ *   SYS_DOWN      — adapters are released back to the host OS, no
+ *                   tunnels are spawned. Either never brought up yet,
+ *                   or explicitly taken down via /api/v1/system/down.
+ *   SYS_UP        — system.up succeeded and iface readiness passed.
+ *                   Tunnels are eligible for autostart / running.
+ *   SYS_UP_FAILED — system.up was run but iface readiness timed out;
+ *                   system.down was issued to roll back. Effectively
+ *                   the same as SYS_DOWN for operations, but kept
+ *                   distinct so the WebUI can warn "last bring-up
+ *                   failed — fix the config or retry". */
+typedef enum {
+	SYS_DOWN = 0,
+	SYS_UP,
+	SYS_UP_FAILED,
+} SystemState;
+
 typedef struct {
 	char     key_file[GS_PATH_MAX];
 	char     http_bind[64];
@@ -250,7 +267,27 @@ typedef struct {
 	bool     venc_cmd_enabled;
 	char     venc_cmd_uplink[GS_NAME_MAX];
 	int      venc_cmd_rate_limit_ms;
+
+	SystemState system_state;
 } Config;
+
+const char *system_state_name(SystemState s);
+
+/* Stop every tunnel and wait up to (GS_STOP_GRACE_MS + 500 ms) for the
+ * children to exit, then SIGKILL any survivors. Shared by /system/down
+ * and /system/reinit; both want a clean slate before touching the OS
+ * adapter state. */
+void supervisor_stop_all_tunnels(Config *c);
+
+/* Stateless wrappers around the boot-time bring-up logic so the same
+ * sequence runs from main() and from /api/v1/system/up. Each returns
+ * 0 on success, -1 on failure (system.up command non-zero is logged
+ * as a warning but not fatal; iface readiness timeout IS fatal).
+ * supervisor_bring_up runs system.up + readiness + iface_state_init
+ * and updates c->system_state. supervisor_take_down stops tunnels,
+ * runs system.down, and updates c->system_state. */
+int  supervisor_bring_up(Config *c);
+int  supervisor_take_down(Config *c);
 
 /* ---------- iface radio state cache --------------------------------- */
 

@@ -955,6 +955,81 @@ void run_system_block(const char *label, char cmds[][GS_PATH_MAX], int n)
 	}
 }
 
+/* ---------- system lifecycle helpers --------------------------------- *
+ *
+ * Three callers share this code: boot-time main(), /api/v1/system/up
+ * (manual retry after a failed boot), /api/v1/system/down, and
+ * /api/v1/system/reinit. The boot path used to inline the sequence
+ * and exit on iface-readiness failure; lifting it into helpers lets
+ * the supervisor stay alive (HTTP listening) when bring-up fails, so
+ * the operator can still drive a retry from the WebUI.
+ */
+
+const char *system_state_name(SystemState s)
+{
+	switch (s) {
+	case SYS_DOWN:       return "down";
+	case SYS_UP:         return "up";
+	case SYS_UP_FAILED:  return "up_failed";
+	}
+	return "?";
+}
+
+void supervisor_stop_all_tunnels(Config *c)
+{
+	for (int i = 0; i < c->tunnel_count; i++) {
+		Tunnel *t = &c->tunnels[i];
+		if (t->pid > 0) {
+			t->autostart_on_exit = false;
+			if (kill(t->pid, SIGTERM) == 0)
+				t->stop_deadline_ms = now_ms() + GS_STOP_GRACE_MS;
+		}
+	}
+	uint64_t deadline = now_ms() + GS_STOP_GRACE_MS + 500;
+	while (now_ms() < deadline) {
+		bool any = false;
+		for (int i = 0; i < c->tunnel_count; i++)
+			if (c->tunnels[i].pid > 0) any = true;
+		if (!any) break;
+		supervisor_reap(c);
+		struct timespec ts = { .tv_sec = 0, .tv_nsec = 50 * 1000 * 1000 };
+		nanosleep(&ts, NULL);
+	}
+	for (int i = 0; i < c->tunnel_count; i++) {
+		if (c->tunnels[i].pid > 0) {
+			kill(c->tunnels[i].pid, SIGKILL);
+			waitpid(c->tunnels[i].pid, NULL, 0);
+			c->tunnels[i].pid = -1;
+		}
+	}
+}
+
+int supervisor_bring_up(Config *c)
+{
+	run_system_block("system.up", c->system_up, c->system_up_count);
+	if (wait_iface_state(c, 5000, 100) != 0) {
+		LOG_WARN("system.up: iface readiness timed out — rolling back "
+		         "via system.down. HTTP stays up so /api/v1/system/up "
+		         "can retry after the operator fixes the bring-up "
+		         "sequence (typo'd iface, missing module, "
+		         "NetworkManager still holding the device, etc.)");
+		run_system_block("system.down", c->system_down, c->system_down_count);
+		c->system_state = SYS_UP_FAILED;
+		return -1;
+	}
+	iface_state_init(c);
+	c->system_state = SYS_UP;
+	return 0;
+}
+
+int supervisor_take_down(Config *c)
+{
+	supervisor_stop_all_tunnels(c);
+	run_system_block("system.down", c->system_down, c->system_down_count);
+	c->system_state = SYS_DOWN;
+	return 0;
+}
+
 /* ---------- rx stats listener + rx_ant parser ------------------------ *
  *
  * One UDP socket per rx tunnel.  wfb_rx is launched with `-Y` pointing at
@@ -1983,22 +2058,14 @@ int main(int argc, char **argv)
 		         "bring-up (monitor mode, MTU, txpower) and skipping "
 		         "managed link-layer setup");
 	}
-	run_system_block("system.up", cfg.system_up, cfg.system_up_count);
 
-	/* Drivers (notably rtl88xxau and friends) take a variable amount of
-	 * time to flip an iface UP after `iw set monitor otherbss` — fixed
-	 * sleeps in system.up are fragile.  Poll up to 5 s before giving up. */
-	if (wait_iface_state(&cfg, 5000, 100) != 0) {
-		/* Bring back what system.up touched, then exit. The operator
-		 * needs to fix the bring-up sequence (typo'd iface name, missing
-		 * sudo, kernel module not loaded, etc.) before we can serve. */
-		run_system_block("system.down", cfg.system_down, cfg.system_down_count);
-		return 1;
-	}
-
-	/* Snapshot every iface's chan/ht/txpower right after system.up so the
-	 * /api/v1/ifaces endpoint has truth on the very first poll. */
-	iface_state_init(&cfg);
+	/* Bring up adapters BUT do not exit on failure. If readiness times
+	 * out, supervisor_bring_up rolls back via system.down and sets
+	 * c->system_state = SYS_UP_FAILED; HTTP still starts so the
+	 * operator can fix the bring-up sequence and retry via
+	 * /api/v1/system/up from the WebUI. Tunnels do not autostart in
+	 * that case (would just thrash against not-monitor ifaces). */
+	bool boot_up_ok = (supervisor_bring_up(&cfg) == 0);
 
 	int api_fd = api_listen_open(cfg.http_bind, cfg.http_port);
 	if (api_fd < 0) {
@@ -2012,9 +2079,15 @@ int main(int argc, char **argv)
 
 	uint64_t startup_us = now_us();
 
-	for (int i = 0; i < cfg.tunnel_count; i++) {
-		if (cfg.tunnels[i].autostart)
-			tunnel_spawn(&cfg.tunnels[i], cfg.key_file);
+	if (boot_up_ok) {
+		for (int i = 0; i < cfg.tunnel_count; i++) {
+			if (cfg.tunnels[i].autostart)
+				tunnel_spawn(&cfg.tunnels[i], cfg.key_file);
+		}
+	} else {
+		LOG_WARN("tunnels NOT autostarted because boot bring-up failed "
+		         "— issue /api/v1/system/up from the WebUI once the "
+		         "underlying problem is fixed");
 	}
 
 	while (!g_shutdown) {
@@ -2166,7 +2239,12 @@ int main(int argc, char **argv)
 	shutdown_all(&cfg);
 	for (int i = 0; i < cfg.tunnel_count; i++)
 		stats_listener_close(&cfg.tunnels[i]);
-	run_system_block("system.down", cfg.system_down, cfg.system_down_count);
+	/* Only run system.down on exit if we currently consider the system
+	 * up — otherwise it was either already rolled back (SYS_UP_FAILED)
+	 * or never brought up by us (operator took it down manually). */
+	if (cfg.system_state == SYS_UP) {
+		run_system_block("system.down", cfg.system_down, cfg.system_down_count);
+	}
 	LOG_INFO("bye");
 	return 0;
 }

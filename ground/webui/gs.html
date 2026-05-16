@@ -41,6 +41,16 @@ code,pre,.mono{font-family:'JetBrains Mono',monospace;font-size:.85em}
 .tbar-right{margin-left:auto;display:flex;align-items:center;gap:.8rem}
 .tbar-btn{background:none;border:1px solid var(--border);color:var(--text-dim);padding:4px 10px;border-radius:4px;cursor:pointer;font-size:.75rem;font-family:'JetBrains Mono',monospace;transition:all .15s}
 .tbar-btn:hover{border-color:var(--text-dim);color:var(--text)}
+.tbar-btn:disabled{opacity:.4;cursor:not-allowed}
+.tbar-btn:disabled:hover{border-color:var(--border);color:var(--text-dim)}
+/* System-state chip — shows whether system.up/down has succeeded or
+ * is currently rolled back. Three states map to the API's
+ * SystemState enum: up (green), up_failed (red, rollback after a
+ * failed bring-up), down (muted). */
+.tbar-item.sys-chip{padding:2px 8px;border:1px solid var(--border);border-radius:4px;font-family:'JetBrains Mono',monospace;font-size:.72rem;cursor:help}
+.tbar-item.sys-chip.up{color:var(--live);border-color:var(--live);background:rgba(34,197,94,.08)}
+.tbar-item.sys-chip.bad{color:var(--bad);border-color:var(--bad);background:rgba(239,68,68,.08)}
+.tbar-item.sys-chip.muted{opacity:.5}
 
 /* Tabs */
 /* overflow-x:auto on narrow viewports lets the tab row scroll. We
@@ -216,10 +226,13 @@ select{cursor:pointer;-webkit-appearance:none;appearance:none;background-image:u
   <div class="tbar-sep"></div>
   <div class="tbar-item">uptime <b id="tbar-up">-</b></div>
   <div class="tbar-item">tunnels <b id="tbar-tunnels">-</b></div>
+  <div class="tbar-item sys-chip muted" id="tbar-sys" title="System state — adapters bring-up status. Click Up/Reinit/Down on the right to drive it.">sys —</div>
   <div class="tbar-item chip" id="tbar-wcmd" title="WCMD emit counters">wcmd <b id="tbar-wcmd-summary">—</b></div>
   <div class="tbar-item"><div class="tbar-dot off" id="tbar-conn"></div><span id="tbar-conn-label">connecting</span></div>
   <div class="tbar-right">
-    <button class="tbar-btn" onclick="systemReinit()" title="Tear down all tunnels, run system.down + system.up, respawn — last-resort recovery for adapters stuck in a bad state (e.g. txpower=-100 dBm after monitor mode flip).">Reinit</button>
+    <button class="tbar-btn" id="tbar-sys-up"     onclick="systemUp()"     title="Run system.up + wait for iface readiness + autostart tunnels. Enabled when the system is currently DOWN or recovering from a failed bring-up.">Up</button>
+    <button class="tbar-btn" id="tbar-sys-reinit" onclick="systemReinit()" title="Tear down all tunnels, run system.down + system.up, respawn — last-resort recovery for adapters stuck in a bad state (e.g. txpower=-100 dBm after monitor mode flip).">Reinit</button>
+    <button class="tbar-btn" id="tbar-sys-down"   onclick="systemDown()"   title="Stop every tunnel and run system.down. Releases adapters back to NetworkManager / host OS.">Down</button>
     <button class="tbar-btn" onclick="manualRefresh()">Refresh</button>
   </div>
 </div>
@@ -651,6 +664,36 @@ async function fetchT(url, opts){
   }
 }
 
+/* System-state chip in the telemetry bar. Also gates the Up/Down
+ * buttons: Up is enabled only when system is currently down (either
+ * never brought up or rolled back after a failed bring-up); Down is
+ * enabled only when system is up. Reinit is always enabled. */
+function renderSysChip(state){
+  const chip=$('#tbar-sys');
+  if(!chip) return;
+  chip.classList.remove('up','bad','muted');
+  let label, tip;
+  if(state === 'up'){
+    chip.classList.add('up');
+    label = 'sys: up';
+    tip   = 'system.up succeeded — adapters are in monitor and ready.';
+  }else if(state === 'up_failed'){
+    chip.classList.add('bad');
+    label = 'sys: up FAILED';
+    tip   = 'system.up was run but iface readiness timed out — system.down rolled back. Fix the bring-up sequence and click Up.';
+  }else{
+    chip.classList.add('muted');
+    label = 'sys: down';
+    tip   = 'adapters released — no tunnels are running. Click Up to bring up.';
+  }
+  chip.textContent = label;
+  chip.title = tip;
+  const up   = $('#tbar-sys-up');
+  const down = $('#tbar-sys-down');
+  if(up)   up.disabled   = (state === 'up');
+  if(down) down.disabled = (state !== 'up');
+}
+
 let lastTunnels=[];
 async function refresh(){
   try{
@@ -659,6 +702,7 @@ async function refresh(){
     const j=await r.json();
     $('#tbar-up').textContent=fmtUptime(j.uptime_s);
     $('#tbar-tunnels').textContent=(j.tunnels||[]).length;
+    renderSysChip(j.system_state);
     renderWcmdChip(j.wcmd);
     setConn(true);
     // pull /tunnels for full detail
@@ -1213,11 +1257,33 @@ function pickReplyPane(key){
 
 function manualRefresh(){ refresh(); }
 
+/* System lifecycle endpoints. Each runs synchronously on the server
+ * (system.up + 5 s readiness wait + tunnel respawn), so bump the
+ * fetch deadline well above the 1 s default; otherwise the abort
+ * trips before /system/* returns and the toast claims failure even
+ * though the server completed successfully.  GS_SYSTEM_CMD_DEADLINE_MS
+ * (10 s/cmd) × ~18 commands worst case is unrealistic — supervisor
+ * pipelines the block — so 15 s covers the common case generously. */
+const SYS_CMD_TIMEOUT_MS = 15000;
+
+async function systemUp(){
+  toast('system.up: bringing up…', 'warn');
+  try{
+    const r=await fetchT('/api/v1/system/up', {timeout_ms: SYS_CMD_TIMEOUT_MS});
+    const j=await r.json();
+    if(j.ok===false) throw new Error(j.error||'up failed');
+    toast(`system.up ok — ${j.tunnels_spawned||0} tunnel(s) spawned`, 'ok');
+  }catch(e){
+    toast('system.up failed: '+e.message, 'err');
+  }
+  setTimeout(refresh, 400);
+}
+
 async function systemReinit(){
   if(!confirm('Reinit will:\n  • stop every tunnel\n  • run system.down then system.up\n  • respawn autostart tunnels\n\nVideo stream will drop for ~6–8 s. Proceed?')) return;
   toast('reinit: tearing down…', 'warn');
   try{
-    const r=await fetchT('/api/v1/system/reinit');
+    const r=await fetchT('/api/v1/system/reinit', {timeout_ms: SYS_CMD_TIMEOUT_MS});
     const j=await r.json();
     if(j.ok===false) throw new Error(j.error||'reinit failed');
     toast(`reinit ok — ${j.tunnels_spawned||0} tunnel(s) respawned`, 'ok');
@@ -1238,6 +1304,20 @@ function updateCmdValueRow(){
   const hide=(key==='force_idr');
   row.classList.toggle('hidden', hide);
   if(hide){ const v=$('#cmd-value'); if(v) v.value=''; }
+}
+
+async function systemDown(){
+  if(!confirm('Down will:\n  • stop every tunnel\n  • run system.down (release adapters back to NetworkManager / host OS)\n\nVideo stream will drop and stay down until you click Up. Proceed?')) return;
+  toast('system.down: tearing down…', 'warn');
+  try{
+    const r=await fetchT('/api/v1/system/down', {timeout_ms: SYS_CMD_TIMEOUT_MS});
+    const j=await r.json();
+    if(j.ok===false) throw new Error(j.error||'down failed');
+    toast('system.down ok', 'ok');
+  }catch(e){
+    toast('system.down failed: '+e.message, 'err');
+  }
+  setTimeout(refresh, 400);
 }
 
 $$('.tab').forEach(t=>{

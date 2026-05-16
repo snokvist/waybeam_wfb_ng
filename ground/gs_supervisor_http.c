@@ -174,11 +174,12 @@ int json_emit_status(char *buf, size_t cap, const Config *c, uint64_t up_us)
 	#define APP(...) do { int _w = snprintf(buf+p, cap-p, __VA_ARGS__); \
 	                      if (_w < 0 || (size_t)_w >= cap-(size_t)p) return -1; \
 	                      p += _w; } while (0)
-	APP("{\"uptime_s\":%.1f,\"wcmd\":{"
+	APP("{\"uptime_s\":%.1f,\"system_state\":\"%s\",\"wcmd\":{"
 	    "\"emit_total\":%llu,\"emit_frames\":%llu,"
 	    "\"rate_limited\":%llu,\"emit_failed\":%llu,"
 	    "\"burst_frames\":%d},\"tunnels\":[",
 	    (double)up_us / 1e6,
+	    system_state_name(c->system_state),
 	    (unsigned long long)g_wcmd_emit_total,
 	    (unsigned long long)g_wcmd_emit_frames,
 	    (unsigned long long)g_wcmd_emit_rate_limit,
@@ -296,45 +297,20 @@ void api_handle(ApiClient *cli, Config *c, uint64_t startup_us)
 	if (!strcmp(path, "/api/v1/system/reinit")) {
 		/* Last-resort recovery: stop every tunnel, run system.down, then
 		 * system.up + wait_iface_state, then respawn autostart tunnels.
-		 * This unsticks adapters that are stuck in a bad post-monitor
-		 * state (txpower=-100, NO-CARRIER while in monitor mode, etc.) —
-		 * the symptoms we saw when WCMD packets stopped getting on-air. */
-		LOG_WARN("REST /system/reinit: tearing down all tunnels");
-		for (int i = 0; i < c->tunnel_count; i++) {
-			Tunnel *t = &c->tunnels[i];
-			if (t->pid > 0) {
-				t->autostart_on_exit = false;
-				if (kill(t->pid, SIGTERM) == 0)
-					t->stop_deadline_ms = now_ms() + GS_STOP_GRACE_MS;
-			}
-		}
-		uint64_t deadline = now_ms() + GS_STOP_GRACE_MS + 500;
-		while (now_ms() < deadline) {
-			bool any = false;
-			for (int i = 0; i < c->tunnel_count; i++)
-				if (c->tunnels[i].pid > 0) any = true;
-			if (!any) break;
-			supervisor_reap(c);
-			struct timespec ts = { .tv_sec = 0, .tv_nsec = 50 * 1000 * 1000 };
-			nanosleep(&ts, NULL);
-		}
-		for (int i = 0; i < c->tunnel_count; i++) {
-			if (c->tunnels[i].pid > 0) {
-				kill(c->tunnels[i].pid, SIGKILL);
-				waitpid(c->tunnels[i].pid, NULL, 0);
-				c->tunnels[i].pid = -1;
-			}
-		}
-		/* Stats listeners stay open across reinit — wfb_rx/wfb_tx will
+		 * Unsticks adapters left in a bad post-monitor state
+		 * (txpower=-100, NO-CARRIER while in monitor mode, etc.) —
+		 * the symptoms seen when WCMD packets stopped getting on-air.
+		 * Stats listeners stay open across reinit: wfb_rx/wfb_tx will
 		 * be respawned with the same -Y target. */
-		LOG_INFO("REST /system/reinit: running system.down");
+		LOG_WARN("REST /system/reinit: tearing down all tunnels");
+		supervisor_stop_all_tunnels(c);
+		LOG_INFO("REST /system/reinit: running system.down + system.up");
 		run_system_block("system.down", c->system_down, c->system_down_count);
-		LOG_INFO("REST /system/reinit: running system.up");
-		run_system_block("system.up",   c->system_up,   c->system_up_count);
-		int wait_rc = wait_iface_state(c, 5000, 100);
-		if (wait_rc != 0) {
+		c->system_state = SYS_DOWN;
+		if (supervisor_bring_up(c) != 0) {
 			api_send(cli->fd, 503, "application/json",
-			         "{\"ok\":false,\"error\":\"iface readiness timeout — check supervisor log\"}", -1);
+			         "{\"ok\":false,\"error\":\"iface readiness timeout — "
+			         "check supervisor log; system rolled back to down\"}", -1);
 			return;
 		}
 		int spawned = 0;
@@ -348,8 +324,58 @@ void api_handle(ApiClient *cli, Config *c, uint64_t startup_us)
 		}
 		char body[160];
 		int p = snprintf(body, sizeof(body),
-		                 "{\"ok\":true,\"reinit\":true,\"tunnels_spawned\":%d}",
-		                 spawned);
+		                 "{\"ok\":true,\"reinit\":true,\"tunnels_spawned\":%d,"
+		                 "\"system_state\":\"%s\"}",
+		                 spawned, system_state_name(c->system_state));
+		api_send(cli->fd, 200, "application/json", body, p);
+		return;
+	}
+	if (!strcmp(path, "/api/v1/system/up")) {
+		/* Run system.up + readiness wait, then autospawn tunnels.
+		 * Refuses if system is already up — operator should use
+		 * /system/reinit for a clean cycle. */
+		if (c->system_state == SYS_UP) {
+			api_send(cli->fd, 409, "application/json",
+			         "{\"ok\":false,\"error\":\"already up — use "
+			         "/api/v1/system/reinit to cycle\"}", -1);
+			return;
+		}
+		LOG_WARN("REST /system/up: bringing up adapters");
+		if (supervisor_bring_up(c) != 0) {
+			api_send(cli->fd, 503, "application/json",
+			         "{\"ok\":false,\"error\":\"iface readiness timeout — "
+			         "check supervisor log; system rolled back to down\","
+			         "\"system_state\":\"up_failed\"}", -1);
+			return;
+		}
+		int spawned = 0;
+		for (int i = 0; i < c->tunnel_count; i++) {
+			Tunnel *t = &c->tunnels[i];
+			if (t->autostart) {
+				t->backoff_idx = 0;
+				t->next_start_ms = 0;
+				if (tunnel_spawn(t, c->key_file) == 0) spawned++;
+			}
+		}
+		char body[160];
+		int p = snprintf(body, sizeof(body),
+		                 "{\"ok\":true,\"tunnels_spawned\":%d,"
+		                 "\"system_state\":\"%s\"}",
+		                 spawned, system_state_name(c->system_state));
+		api_send(cli->fd, 200, "application/json", body, p);
+		return;
+	}
+	if (!strcmp(path, "/api/v1/system/down")) {
+		/* Stop every tunnel, then run system.down. Always safe to call:
+		 * a no-op tunnel-stop is harmless, and running system.down
+		 * against already-down adapters is fine (nmcli/iw will just
+		 * report "already" and continue). */
+		LOG_WARN("REST /system/down: stopping tunnels and running system.down");
+		supervisor_take_down(c);
+		char body[96];
+		int p = snprintf(body, sizeof(body),
+		                 "{\"ok\":true,\"system_state\":\"%s\"}",
+		                 system_state_name(c->system_state));
 		api_send(cli->fd, 200, "application/json", body, p);
 		return;
 	}
