@@ -26,9 +26,19 @@ code,pre,.mono,.tune-row .name,.timeline,.kv dd,.card .v{font-family:'JetBrains 
 header{position:sticky;top:0;z-index:100;display:flex;align-items:center;gap:1rem;padding:0 1.2rem;height:44px;background:var(--bg2);border-bottom:1px solid var(--border);backdrop-filter:blur(12px)}
 header h1{font-family:'JetBrains Mono',monospace;font-weight:700;font-size:1rem;color:var(--text-bright);letter-spacing:-.02em;white-space:nowrap;margin:0}
 header h1 .v{color:var(--mute);font-weight:400;margin-left:.6rem;font-family:'DM Sans',sans-serif;font-size:.78rem}
-header .conn{margin-left:auto;font-size:.78rem;padding:3px 10px;border-radius:4px;background:var(--panel);border:1px solid var(--border);font-family:'JetBrains Mono',monospace}
+header .conn{font-size:.78rem;padding:3px 10px;border-radius:4px;background:var(--panel);border:1px solid var(--border);font-family:'JetBrains Mono',monospace}
 header .conn.ok{color:var(--ok);border-color:var(--ok);background:var(--ok-bg)}
 header .conn.bad{color:var(--bad);border-color:var(--bad);background:var(--bad-bg)}
+/* Auto-state chip — "fec auto · mcs auto" badge in the header so the
+ * operator can tell at a glance whether the adaptive loops are running
+ * without opening the Tune tab. Colour reflects worst-of-pair:
+ *   .ok  — both on  (the normal case)
+ *   .warn — exactly one on (split state, usually after a manual pin)
+ *   .bad — both off (everything is being driven by hand) */
+header .chip{margin-left:auto;font-size:.72rem;padding:2px 8px;border:1px solid var(--border);border-radius:4px;font-family:'JetBrains Mono',monospace;cursor:help;color:var(--mute);white-space:nowrap}
+header .chip.ok{color:var(--ok);border-color:var(--ok);background:var(--ok-bg)}
+header .chip.warn{color:var(--warn);border-color:var(--warn);background:var(--warn-bg)}
+header .chip.bad{color:var(--bad);border-color:var(--bad);background:var(--bad-bg)}
 
 /* Tabs */
 nav{display:flex;background:var(--bg2);border-bottom:1px solid var(--border);padding:0 1.2rem;gap:0}
@@ -78,6 +88,21 @@ main{padding:1.2rem;overflow:auto;height:calc(100vh - 86px);max-width:1100px;mar
 .payload-flags .flag{font-size:.6rem;padding:1px 6px;border-radius:3px;text-transform:uppercase;letter-spacing:.04em;font-weight:600;font-family:'JetBrains Mono',monospace}
 .payload-flags .flag.warn{background:var(--warn-bg);color:var(--warn);border:1px solid var(--warn)}
 .payload-flags .flag.info{background:rgba(59,130,246,.15);color:var(--fec);border:1px solid var(--fec)}
+
+/* Adaptive-switch strip — pinned at the top of the Tune tab so the
+ * three loop-enable toggles (fec / mcs / cmd) aren't lost among ~75
+ * params. Mirrors the .adaptive-strip pattern from the ground PR #52
+ * Link tab. Click a button → /set?<key>=<0|1>; the active state is
+ * read back from the response and reflected in .on/.off styling. */
+.adaptive-strip{display:flex;gap:.6rem;flex-wrap:wrap;padding:.6rem .8rem;background:var(--bg2);border:1px solid var(--border);border-radius:6px;margin-bottom:1rem;align-items:center}
+.adaptive-strip .label{font-size:.78rem;color:var(--text-bright);font-family:'JetBrains Mono',monospace;font-weight:600;text-transform:uppercase;letter-spacing:.04em}
+.adaptive-strip .group{display:flex;align-items:center;gap:.3rem}
+.adaptive-strip .group .name{font-size:.72rem;color:var(--mute);font-family:'JetBrains Mono',monospace;text-transform:uppercase;letter-spacing:.04em}
+.adaptive-strip button{background:var(--panel);color:var(--mute);border:1px solid var(--border);border-radius:3px;padding:3px 10px;font-family:'JetBrains Mono',monospace;font-size:.72rem;font-weight:700;cursor:pointer;text-transform:uppercase;letter-spacing:.04em;transition:all .15s}
+.adaptive-strip button:hover{border-color:var(--border-hi);color:var(--text)}
+.adaptive-strip button.on{background:var(--ok-bg);color:var(--ok);border-color:var(--ok)}
+.adaptive-strip button.off{background:var(--bad-bg);color:var(--bad);border-color:var(--bad)}
+.adaptive-strip .hint{font-size:.7rem;color:var(--mute);flex:1;min-width:180px;text-align:right}
 
 /* Tune tab — sections + parameter rows */
 .tune-section{margin-bottom:1.2rem}
@@ -139,6 +164,7 @@ main{padding:1.2rem;overflow:auto;height:calc(100vh - 86px);max-width:1100px;mar
 <body>
 <header>
   <h1>link_controller<span class="v">FEC + MCS adaptive controller</span></h1>
+  <span id="auto-chip" class="chip" title="Adaptive loop state. Click the buttons on the Tune tab to toggle.">auto —</span>
   <span id="conn" class="conn">connecting…</span>
 </header>
 <nav>
@@ -305,8 +331,31 @@ function fmtKv(parent, obj, fmt) {
   }
 }
 
+// Header auto-state chip — reads fec.enabled / mcs.enabled out of the
+// status poll. cmd.enabled is not surfaced in /status (would need a
+// server-side change), so the chip stays scoped to the two adaptive
+// loops; the Tune-tab strip still covers cmd.
+function renderAutoChip(s) {
+  const chip = $("#auto-chip");
+  if (!chip) return;
+  const fec = !!(s && s.fec && s.fec.enabled);
+  const mcs = !!(s && s.mcs && s.mcs.enabled);
+  chip.classList.remove("ok","warn","bad");
+  if (fec && mcs)      chip.classList.add("ok");
+  else if (fec || mcs) chip.classList.add("warn");
+  else                 chip.classList.add("bad");
+  chip.textContent =
+    "fec " + (fec ? "auto" : "OFF") +
+    " · mcs " + (mcs ? "auto" : "OFF");
+  chip.title =
+    "fec.enabled = " + (fec ? "true" : "false") + "\n" +
+    "mcs.enabled = " + (mcs ? "true" : "false") + "\n" +
+    "Toggle these on the Tune tab.";
+}
+
 function renderStatus(s) {
   $("#c-uptime").textContent = (s.uptime_s ?? 0).toFixed(1) + "s";
+  renderAutoChip(s);
 
   // FEC card — show k/n with explicit encoded bitrate + parity %.
   // Bitrate is computed here (avg_frame_size × fps × 8) instead of in
@@ -510,6 +559,12 @@ function renderAntRow(ants) {
   row.innerHTML = html;
 }
 
+// Loop-enable keys that get promoted into the .adaptive-strip and
+// hidden from their parent section in the tune grid — having them in
+// both places leaves the row's value stale after a strip toggle, which
+// is more confusing than the small loss of consistency.
+const ADAPTIVE_KEYS = ["fec.enabled", "mcs.enabled", "cmd.enabled"];
+
 // ── Tune tab — init-once form ────────────────────────────────────────
 async function renderTune() {
   const root = $("#tab-tune");
@@ -527,11 +582,15 @@ async function renderTune() {
   // schema is [{name, type, lo, hi, help}, ...]
   state.paramsSchema = schema.map(s => ({...s, value: params[s.name], subsys: subsysOf(s.name)}));
 
-  // Group by subsystem
+  // Group by subsystem (excluding the keys promoted to the strip)
   const groups = {common:[], fec:[], mcs:[]};
-  for (const f of state.paramsSchema) groups[f.subsys].push(f);
+  for (const f of state.paramsSchema) {
+    if (ADAPTIVE_KEYS.includes(f.name)) continue;
+    groups[f.subsys].push(f);
+  }
 
   root.innerHTML = "";
+  root.appendChild(buildAdaptiveStrip(params));
   for (const g of ["common","fec","mcs"]) {
     if (!groups[g].length) continue;
     const sect = document.createElement("div"); sect.className = "tune-section " + g;
@@ -542,6 +601,74 @@ async function renderTune() {
     root.appendChild(sect);
   }
   state.tuneRendered = true;
+}
+
+// Adaptive-switch strip — three pinned ON/OFF pairs at the top of the
+// Tune tab. State is read from /params on render and refreshed from
+// the /set response on every toggle (which always returns the full
+// params dict, see link_controller's set_param handler).
+function buildAdaptiveStrip(params) {
+  const wrap = document.createElement("div"); wrap.className = "adaptive-strip";
+  const label = document.createElement("span"); label.className = "label";
+  label.textContent = "Adaptive";
+  wrap.appendChild(label);
+  for (const key of ADAPTIVE_KEYS) {
+    const grp = document.createElement("span"); grp.className = "group";
+    const nameEl = document.createElement("span"); nameEl.className = "name";
+    nameEl.textContent = key.replace(/\.enabled$/, "");
+    const on = document.createElement("button");  on.textContent  = "ON";
+    const off = document.createElement("button"); off.textContent = "OFF";
+    on.dataset.key  = key; on.dataset.val  = "1";
+    off.dataset.key = key; off.dataset.val = "0";
+    on.addEventListener("click",  () => toggleAdaptive(key, 1));
+    off.addEventListener("click", () => toggleAdaptive(key, 0));
+    syncAdaptiveButtons(on, off, !!params[key]);
+    grp.append(nameEl, on, off);
+    wrap.appendChild(grp);
+  }
+  const hint = document.createElement("span"); hint.className = "hint";
+  hint.textContent = "manual tune-row changes get overwritten on the next tick when these are ON";
+  wrap.appendChild(hint);
+  return wrap;
+}
+
+function syncAdaptiveButtons(onBtn, offBtn, isOn) {
+  onBtn.classList.toggle("on",   isOn);
+  onBtn.classList.toggle("off",  false);
+  offBtn.classList.toggle("on",  false);
+  offBtn.classList.toggle("off", !isOn);
+}
+
+async function toggleAdaptive(key, val) {
+  const url = "/set?" + encodeURIComponent(key) + "=" + val;
+  try {
+    const r = await fetch(url, {cache:"no-store"});
+    const j = await r.json();
+    const ok = (j.applied || []).includes(key);
+    // Reflect whatever the server actually committed (handles clamping
+    // and the case where a future server-side guard refuses the toggle).
+    const newVal = j.params && (key in j.params) ? !!j.params[key] : !!val;
+    refreshAdaptiveStripFromParams(j.params || {[key]: newVal});
+    // Also nudge the chip — saves waiting for the next 1 s status poll.
+    if (key === "fec.enabled" || key === "mcs.enabled") {
+      renderAutoChip({fec:{enabled:!!(j.params||{})["fec.enabled"]},
+                      mcs:{enabled:!!(j.params||{})["mcs.enabled"]}});
+    }
+    if (!ok) console.warn("toggleAdaptive: server did not apply", key, j);
+  } catch (e) {
+    console.warn("toggleAdaptive failed", key, e);
+  }
+}
+
+function refreshAdaptiveStripFromParams(params) {
+  const strip = document.querySelector(".adaptive-strip");
+  if (!strip) return;
+  for (const key of ADAPTIVE_KEYS) {
+    if (!(key in params)) continue;
+    const on  = strip.querySelector('button[data-key="' + key + '"][data-val="1"]');
+    const off = strip.querySelector('button[data-key="' + key + '"][data-val="0"]');
+    if (on && off) syncAdaptiveButtons(on, off, !!params[key]);
+  }
 }
 
 function buildTuneRow(f) {
