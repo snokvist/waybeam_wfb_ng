@@ -233,6 +233,14 @@ void api_handle(ApiClient *cli, Config *c, uint64_t startup_us)
 	const char *qstr = NULL;
 	if (qs) { *qs = 0; qstr = qs + 1; }
 
+	/* venc-style alias: GET /request/idr → /api/v1/cmd?key=force_idr.
+	 * Lets clients that already speak venc's URL hit the ground supervisor
+	 * directly; the WCMD path, rate-limit, and response shape are unchanged. */
+	if (!strcmp(path, "/request/idr")) {
+		path = (char *)"/api/v1/cmd";
+		qstr = "key=force_idr";
+	}
+
 	char body[8192];
 	int n;
 
