@@ -23,6 +23,7 @@ broadcast.  Two daemons:
  │   ├─ forks N×wfb_rx (video downlink)                 │
  │   ├─ forks 1×wfb_tx (uplink for WCMD + CSA)          │
  │   ├─ /api/v1/cmd          → 3-burst WCMD over uplink │
+ │   │   └─ /request/idr     → alias for ?key=force_idr │
  │   ├─ /api/v1/system/csa   → 5-frame burst + iw hop   │
  │   ├─ /api/v1/system/scan  → channel sweep            │
  │   └─ embedded WebUI       → tunnels / GS / Vehicle   │
