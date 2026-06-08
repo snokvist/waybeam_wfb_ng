@@ -25,6 +25,10 @@ let BANDS = [];         // merged, what the plugin draws
 let CHARTS = [];
 let LABEL_MODE = false;
 let PENDING = null;     // {x0, x1} from the active selection
+// A drag below this many px is treated as a click: uPlot fires setSelect with
+// ~0 width on a plain click, so onSelect expands sub-CLICK_PX selections to a
+// small default span — single-clicking a point works, not only dragging a span.
+const CLICK_PX = 6;
 
 /* ---- overlay bands ---- */
 function bandsPlugin() {
@@ -81,16 +85,47 @@ function makeChart(el, title, series, data, scales, axes) {
     hooks: { setSelect: [onSelect] },
     series,
   };
-  return new uPlot(opts, data, el);
+  const u = new uPlot(opts, data, el);
+  // uPlot only fires setSelect for a real drag; a plain click (no movement)
+  // may fire it with ~0 width or not at all. Make a click deterministic in
+  // label mode: synthesise a zero-width selection at the click so onSelect
+  // (which expands sub-CLICK_PX selections to a default span) always runs.
+  let downX = null;
+  u.over.addEventListener("mousedown", e => { downX = e.clientX; });
+  u.over.addEventListener("mouseup", e => {
+    if (!LABEL_MODE || downX === null) return;
+    const moved = Math.abs(e.clientX - downX);
+    downX = null;
+    if (moved > CLICK_PX) return;  // real drag — setSelect already handled it
+    const lpx = e.clientX - u.over.getBoundingClientRect().left;
+    u.setSelect({ left: lpx, width: 0, top: 0, height: u.over.clientHeight }, true);
+  });
+  return u;
 }
 
 function onSelect(u) {
   if (!LABEL_MODE) return;
   const sel = u.select;
-  if (!sel || sel.width <= 0) return;
-  const a = u.posToVal(sel.left, "x");
-  const b = u.posToVal(sel.left + sel.width, "x");
+  if (!sel) return;
+  let a, b;
+  if (sel.width <= CLICK_PX) {
+    const cx = u.posToVal(sel.left + sel.width / 2, "x");
+    const xmin = u.scales.x.min, xmax = u.scales.x.max;
+    const half = Math.max(0.25, (xmax - xmin) * 0.0075);
+    a = Math.max(xmin, cx - half);
+    b = Math.min(xmax, cx + half);
+  } else {
+    a = u.posToVal(sel.left, "x");
+    b = u.posToVal(sel.left + sel.width, "x");
+  }
   PENDING = { x0: Math.min(a, b), x1: Math.max(a, b) };
+  // reflect the (possibly click-expanded) span as a visible selection box;
+  // fire=false so this doesn't re-enter onSelect. Skip when it already matches
+  // the drag the user made.
+  const lpx = u.valToPos(PENDING.x0, "x");
+  const wpx = u.valToPos(PENDING.x1, "x") - lpx;
+  if (Math.abs(wpx - sel.width) > 0.5)
+    u.setSelect({ left: lpx, width: wpx, top: 0, height: u.over.clientHeight }, false);
   const f = document.getElementById("label-form");
   document.getElementById("lf-range").textContent =
     `${PENDING.x0.toFixed(2)}s – ${PENDING.x1.toFixed(2)}s`;
@@ -114,7 +149,7 @@ async function reloadLabels() {
 
 function renderLabels() {
   const el = document.getElementById("labels-panel");
-  if (!LABELS.length) { el.innerHTML = '<p class="muted">No labels yet. Toggle label mode and drag on a chart.</p>'; return; }
+  if (!LABELS.length) { el.innerHTML = '<p class="muted">No labels yet. Toggle label mode, then click a point or drag a span on a chart.</p>'; return; }
   const rows = LABELS.map(l => `
     <tr>
       <td><span class="chip hl-${l.kind}">${l.kind}</span></td>
