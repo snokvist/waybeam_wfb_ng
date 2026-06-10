@@ -22,6 +22,12 @@ ADAPTER="${ADAPTER:-wlx40a5ef2f229b}"           # RX-only adapter
 # NOTE: absolute path -- under sudo $HOME=/root, so do NOT derive from $HOME.
 RX="${RX:-/home/snokvist/dev/waybeam-coordination/waybeam_wfb_ng/wfb-ng/build/wfb_rx_native}"
 STATS_BASE="${STATS_BASE:-5850}"                # rung r -> -Y 127.0.0.1:STATS_BASE+r
+# CRITICAL: wfb_rx defaults its decoded-payload forward to 127.0.0.1:5600 -- the
+# RTP VIDEO port. Without an explicit -u, accepted probe packets get injected into
+# the live H.265 decoder and flap the video (root-caused 2026-06-10). The probe
+# only needs -Y rx_ant stats; the forwarded payload is unused, so send it to a
+# dead local port (one per rung, off 5600). NEVER let this default to 5600.
+CLIENT_BASE="${CLIENT_BASE:-5751}"              # rung r -> -u CLIENT_BASE+r
 HERE="$(cd "$(dirname "$0")" && pwd)"
 
 RUNGS="$CUR_MCS $((CUR_MCS + 1))"               # match probe_drone.sh
@@ -35,8 +41,10 @@ r=0
 for M in $RUNGS; do
     P=$((LINK_ID + r))
     SP=$((STATS_BASE + r))
-    echo "[probe-gs] rung MCS=$M radio_port=$P stats=127.0.0.1:$SP"
-    "$RX" -K "$KEY" -i "$LINK_ID" -p "$P" -x -Y "127.0.0.1:$SP" -l 100 "$ADAPTER" \
+    CP=$((CLIENT_BASE + r))
+    echo "[probe-gs] rung MCS=$M radio_port=$P stats=127.0.0.1:$SP fwd=127.0.0.1:$CP"
+    "$RX" -K "$KEY" -i "$LINK_ID" -p "$P" -c 127.0.0.1 -u "$CP" \
+          -x -Y "127.0.0.1:$SP" -l 100 "$ADAPTER" \
           >"/tmp/rxgs_$P.log" 2>&1 &
     PIDS="$PIDS $!"
     rung_args="$rung_args --rung $P:$M:$SP"

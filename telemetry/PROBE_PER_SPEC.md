@@ -95,6 +95,14 @@ GS:     [wfb_rx port 0  -> video, never touched]
   MCS** so the probe isolates the MCS variable.
 - **Packet format** (per gist `feeder.c`): magic `"PRB0"` + 64-bit big-endian
   sequence number + `0xA5` fill to size.
+- **Probe RX MUST set an explicit forward port (`-u <dead port>` / `-U <sock>`).**
+  `wfb_rx` defaults its decoded-payload forward to `127.0.0.1:5600` — the **RTP
+  video port**. A probe `wfb_rx` left at the default injects accepted `PRB` packets
+  straight into the live H.265 decoder and flaps the video. The probe needs only
+  the `-Y` rx_ant stats; the decoded payload is unused, so send it to a dead local
+  port. (Root-caused 2026-06-10: this — not adapter sharing or host CPU — was the
+  Test-C "video on/off flap." `-x` flapped because plaintext probe packets were
+  *accepted* and forwarded to 5600; AEAD-on dropped them, so no flap.)
 
 ## 5. Measurement
 
@@ -193,8 +201,15 @@ PR/spec** that must move three pieces in lockstep:
   PHY) + the paced feeder, gated like `wfbmode`; the MCS sweep driven by
   `wfb_tx_cmd set_radio`.
 - **`gs_supervisor` (ground):** spawn the probe `wfb_rx_native -Y` per rung (or one
-  for the swept TX) on the RX-only adapter and run `probe_log`, teeing probe
-  records into the existing stats path (same place the `-Y` video tee goes).
+  for the swept TX) and run `probe_log`, teeing probe records into the existing
+  stats path (same place the `-Y` video tee goes). **The probe RX MUST be given an
+  explicit forward port (`-u <dead port>` / `-U <sock>`) — never the `5600` default,
+  which is the live RTP video sink (see §4).** Cleaner still: skip the second
+  `wfb_rx` entirely and demux the probe `radio_port` inside the *existing* video
+  `wfb_rx` (both diversity adapters already capture the probe frames in monitor
+  mode), which never forwards probe payloads to the decoder at all. NB: the
+  RX-only-adapter advice elsewhere was a red herring — adapter sharing was never the
+  flap cause; the forward-port collision was.
 - **`link_controller` (air unit):** consume probe PER over the existing
   back-channel for the **promote** decision (raise MCS only when `cur+1` probe PER
   is clean); **demotion stays reactive** on live video PER. Replaces the
