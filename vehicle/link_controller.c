@@ -4188,17 +4188,27 @@ static void config_defaults(Config *c)
 	c->mcs.mode              = 0;
 	c->mcs.mcs_start         = 0;     /* cold-start low, let the probe climb */
 	c->mcs.probe_clean_milli = 20;    /* <=2%  -> +2 clean -> promote        */
-	c->mcs.probe_fail_milli  = 100;   /* >=10% -> +2 fail  -> pre-empt demote*/
+	/* fail threshold 200‰ (not 100): with a 0.5 s GS window the rung
+	 * sample is ~accounted = pps/2 packets; at 100‰ a single lost packet
+	 * of 20 sat exactly on the threshold and a *marginal* (not failing)
+	 * V+2 rung caused a constant pre-empt-demote/promote bounce at the
+	 * ceiling (device-observed 2026-06-10, ~1 bounce/10 s). A real
+	 * approaching cliff reads 500-1000‰ within a window, so 200 keeps
+	 * the early-warning intact while reading "marginal" as hold. */
+	c->mcs.probe_fail_milli  = 200;   /* >=20% -> +2 fail  -> pre-empt demote*/
 	c->mcs.demote_per_milli  = 30;    /* >=3% live video PER -> reactive down*/
 	c->mcs.promote_dwell_s   = 0.5f;
 	c->mcs.probe_window_s    = 0.5f;
 	c->mcs.probe_stale_age_s = 1.0f; /* matches ~10 Hz single-stream freshness
 	                                  * (Phase 4; 1.5 was the swept prototype) */
 	/* Probe producer: live-enabled by default, but inert until S99wfb
-	 * passes --probe / --probe-feed (ports stay 0). 20 pps × 1400 B
-	 * ≈ 224 kbit/s of probe airtime at the V+2 rate — negligible. */
+	 * passes --probe / --probe-feed (ports stay 0). 40 pps × 1400 B
+	 * ≈ 450 kbit/s of probe airtime at the V+2 rate — still negligible,
+	 * and it doubles the per-window PER resolution (~20 packets per
+	 * 0.5 s GS window → 50‰ granularity; 20 pps gave 10-packet windows
+	 * where one lost packet hit the old fail threshold exactly). */
 	c->mcs.probe_enabled     = true;
-	c->mcs.probe_feed_pps    = 20;
+	c->mcs.probe_feed_pps    = 40;
 	c->mcs.probe_feed_bytes  = 1400;
 
 	/* CSA: off until --csa-iface is set. */

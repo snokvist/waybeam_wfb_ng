@@ -199,13 +199,18 @@ Probe record (vehicle demux reads `mcs`, `accounted`, `lost`; `per_milli` derive
 | Param | Prototype | Phase 4 default | Note |
 |---|---|---|---|
 | `mcs.probe_stale_age_s` | 1.5 | **1.0** | matches ~10 Hz single-stream freshness |
-| probe window (gs_supervisor) | — | **0.5 s** | ≈20 pkt/rung at 20 pps → ~5% PER granularity; 0.3 s too short (invalid PER) |
-| feeder pps | 20 | **20** (start) | C feeder could go higher; 20 was sufficient |
+| probe window (gs_supervisor) | — | **0.5 s** | window population = pps/2 packets; 0.3 s too short (invalid PER) |
+| feeder pps (`mcs.probe_feed_pps`) | 20 | **40** | bring-up finding: 20 pps → 10-pkt windows → 100‰ per lost packet, too coarse (see fail threshold) |
 | `mcs.probe_clean_milli` | 20 | 20 | ≤2% → promote |
-| `mcs.probe_fail_milli` | 100 | 100 | ≥10% → pre-empt demote |
+| `mcs.probe_fail_milli` | 100 | **200** | bring-up finding (2026-06-10): at 100, ONE lost packet of a 10-pkt window sat exactly on the threshold → constant pre-empt-demote/promote bounce at a *marginal* (not failing) ceiling rung (~1/10 s, device-observed). A real cliff reads 500–1000‰ within a window, so 200 keeps the early warning. 40 pps + 200‰ device-verified: bounce stopped (0 demotes/90 s), marginal rung reads 100‰ → hold |
 | `mcs.demote_per_milli` | 30 | 30 | ≥3% live video PER → reactive demote |
 | `mcs.promote_dwell_s` | 0.5 | 0.5 | |
 | `mcs.down_cooldown_s` | 0.2 | 0.2 | |
+
+Note: the mode=1 promote path uses `promote_dwell_s` only — the oscillation
+damper (`oscillation_*`) multiplies the *bucket-FSM* up-cooldown and does NOT
+apply. If ceiling cycling ever reappears, the knobs are `probe_fail_milli` ↑,
+`promote_dwell_s` ↑, or (code) a post-pre-empt clean-streak requirement.
 
 ---
 
