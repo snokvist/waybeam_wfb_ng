@@ -29,13 +29,25 @@ WFB_RECOVER_N=2
 SHM_RING="local_shm"
 KEY="/etc/drone.key"
 
+# Boundary-probe producer (mcs.mode=1): one extra wfb_tx at V+2, fed and
+# retuned by link_controller. Enable: fw_setenv wfbprobe 1 (plus wfbmode 1).
+# Probe stream mirrors the video PHY (-B/-S/-L), FEC 1/1, AEAD off (-x),
+# on its own link_id so it can never collide with video (207) / uplink (208).
+# See telemetry/PROBE_PER_SPEC.md.
+WFB_PROBE_LINK=50
+WFB_PROBE_PORT=50
+WFB_PROBE_CTRL=8001
+WFB_PROBE_FEED=5750
+
 PID_TX="/var/run/wfb_tx.pid"
 PID_RX="/var/run/wfb_rx.pid"
 PID_LC="/var/run/link_controller.pid"
+PID_PTX="/var/run/wfb_probe_tx.pid"
 LOG="/tmp/wfb.log"
 
 fw_get() { fw_printenv -n "$1" 2>/dev/null || echo "$2"; }
 is_enabled() { [ "$(fw_get wfbmode 0)" = "1" ]; }
+probe_enabled() { [ "$(fw_get wfbprobe 0)" = "1" ]; }
 log() { echo "[wfb] $*" | tee -a "$LOG"; }
 
 start_wfb() {
@@ -66,11 +78,32 @@ start_wfb() {
            >> "$LOG" 2>&1 &
     echo $! > "$PID_RX"
 
+    # Probe wfb_tx (boundary-probe producer; wfbprobe=1). Spawned at a
+    # best-effort V+2 MCS; link_controller retunes it on its control
+    # socket (-C) and feeds paced PRB packets to its udp input (-u).
+    # FEC 1/1 so raw loss is not masked; -x because the GS probe rx
+    # runs -x (PER measurement does not need AEAD).
+    PROBE_ARGS=""
+    if probe_enabled; then
+        PROBE_MCS=$((WFB_MCS + 2))
+        [ "$PROBE_MCS" -gt 7 ] && PROBE_MCS=7
+        wfb_tx -K "$KEY" -i $WFB_PROBE_LINK -p $WFB_PROBE_PORT \
+               -M $PROBE_MCS -B $WFB_BW -S 1 -L 1 -k 1 -n 1 \
+               -C $WFB_PROBE_CTRL -u $WFB_PROBE_FEED \
+               -l 1000 -x wlan0 \
+               >> "$LOG" 2>&1 &
+        echo $! > "$PID_PTX"
+        PROBE_ARGS="--probe 127.0.0.1:$WFB_PROBE_CTRL --probe-feed 127.0.0.1:$WFB_PROBE_FEED"
+        log "probe wfb_tx up (link=$WFB_PROBE_LINK port=$WFB_PROBE_PORT mcs=$PROBE_MCS ctrl=$WFB_PROBE_CTRL feed=$WFB_PROBE_FEED)"
+    fi
+
     # link_controller (writes safe bitrate to venc on startup, adaptive FEC,
     # WebUI on :8765 reachable via eth0). --stats binds the rx_ant socket
     # for both MCS scoring and the venc command proxy (CMD_PROXY.md).
     # --failsafe / --recover-consec absorb bursty rx_ant loss over the
     # wfb-ng uplink — see WFB_FAILSAFE_S / WFB_RECOVER_N above.
+    # $PROBE_ARGS is intentionally unquoted (two flags when wfbprobe=1,
+    # empty otherwise).
     link_controller \
         --wfb 127.0.0.1:$WFB_CTRL \
         --venc 127.0.0.1:80 \
@@ -80,15 +113,16 @@ start_wfb() {
         --recover-consec $WFB_RECOVER_N \
         --wfb-iface wlan0 \
         --csa-iface wlan0 \
+        $PROBE_ARGS \
         >> "$LOG" 2>&1 &
     echo $! > "$PID_LC"
 
-    log "started (tx=$(cat $PID_TX) rx=$(cat $PID_RX) lc=$(cat $PID_LC))"
+    log "started (tx=$(cat $PID_TX) rx=$(cat $PID_RX) lc=$(cat $PID_LC)$(probe_enabled && echo " ptx=$(cat $PID_PTX)"))"
 }
 
 stop_wfb() {
     log "stopping"
-    for f in "$PID_LC" "$PID_RX" "$PID_TX"; do
+    for f in "$PID_LC" "$PID_PTX" "$PID_RX" "$PID_TX"; do
         [ -f "$f" ] && { kill "$(cat $f)" 2>/dev/null; rm -f "$f"; }
     done
     sleep 0.5
@@ -101,11 +135,17 @@ stop_wfb() {
 }
 
 status_wfb() {
-    echo "wfbmode env: $(fw_get wfbmode 0)"
+    echo "wfbmode env: $(fw_get wfbmode 0)  wfbprobe env: $(fw_get wfbprobe 0)"
     for name in wfb_tx wfb_rx link_controller; do
         pid=$(pidof "$name" 2>/dev/null)
         echo "  $name: ${pid:-not running}"
     done
+    if [ -f "$PID_PTX" ]; then
+        ppid=$(cat "$PID_PTX")
+        kill -0 "$ppid" 2>/dev/null \
+            && echo "  probe wfb_tx: $ppid" \
+            || echo "  probe wfb_tx: stale pidfile ($ppid)"
+    fi
     echo "wlan0:"
     iw dev wlan0 info 2>/dev/null | grep -E "type|channel|txpower" | sed 's/^/  /'
 }

@@ -48,6 +48,21 @@
       "autostart": true
     },
     {
+      "_comment": "Boundary-probe RX (PROBE_PER_SPEC.md). Matches the vehicle's probe wfb_tx (S99wfb, wfbprobe=1, link 50/port 50). probe:true makes the supervisor compute windowed per-MCS PER and forward {type:probe} records to stats_out (uplink back-channel) INSTEAD of raw rx_ant. udp_out MUST be an explicit dead port — never 5600 (RTP video); the supervisor rejects the config otherwise.",
+      "name": "probe",
+      "role": "rx",
+      "binary": "/home/snokvist/dev/waybeam-coordination/waybeam_wfb_ng/wfb-ng/build/wfb_rx_native",
+      "interfaces": ["wlx40a5ef2f229b", "wlx40a5ef2f2308"],
+      "link_id": 50,
+      "radio_port": 50,
+      "udp_out": "127.0.0.1:5751",
+      "stats_out": "127.0.0.1:6600",
+      "probe": true,
+      "probe_window_ms": 500,
+      "extra_args": ["-x", "-l", "100"],
+      "autostart": true
+    },
+    {
       "_comment": "Uplink TX. -T 1 sets fec_timeout=1ms. control_port=8000 enables wfb_cmd passthrough via /api/v1/tunnels/uplink/control.",
       "name": "uplink",
       "role": "tx",

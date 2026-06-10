@@ -150,6 +150,11 @@ int json_emit_tunnel(char *buf, size_t cap, const Tunnel *t, bool full)
 			    t->st_pkt_outgoing, t->st_pkt_dec_err, t->st_pkt_uniq,
 			    t->st_pkt_bytes, t->st_ant_count);
 			if (t->st_rssi_best != INT_MIN) APP(",\"rssi_best\":%d", t->st_rssi_best);
+			if (t->probe)
+				APP(",\"probe\":{\"window_ms\":%d,"
+				    "\"emitted\":%u,\"stale_dropped\":%u}",
+				    t->probe_window_ms,
+				    t->probe_emit_count, t->probe_drop_count);
 		} else {
 			APP(",\"pkts_in\":%u,\"pkts_out\":%u,"
 			    "\"bytes_in\":%u,\"bytes_out\":%u,"

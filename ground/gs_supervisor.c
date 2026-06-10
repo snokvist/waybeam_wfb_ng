@@ -357,6 +357,18 @@ int cfg_parse_tunnel(const char *js, JTok *toks, int n, int t_idx, Tunnel *t)
 			if (jstr(js, &toks[v], t->stats_out, sizeof(t->stats_out)) < 0)
 				return -1;
 		}
+
+		/* Boundary-probe PER producer (see PROBE_PER_SPEC.md). */
+		if ((v = jfind(js, toks, n, t_idx, "probe")) >= 0) {
+			if (jbool(js, &toks[v], &bv) < 0) return -1;
+			t->probe = bv;
+		}
+		t->probe_window_ms = 500;
+		if ((v = jfind(js, toks, n, t_idx, "probe_window_ms")) >= 0) {
+			if (jint(js, &toks[v], &lv) < 0) return -1;
+			if (lv < 100 || lv > 10000) return -1;
+			t->probe_window_ms = (int)lv;
+		}
 	} else {
 		if ((v = jfind(js, toks, n, t_idx, "udp_in_port")) < 0) return -1;
 		if (jint(js, &toks[v], &lv) < 0) return -1;
@@ -512,8 +524,36 @@ int cfg_load(const char *path, Config *c)
 		ci = jskip(toks, n, ci);
 	}
 	c->tunnel_count = kids;
-
 	free(buf);
+
+	/* Forward-port safety (the 2026-06-10 "video flap" class): wfb_rx
+	 * defaults its decoded-payload forward to 127.0.0.1:5600 — the RTP
+	 * video port. A probe tunnel forwarding there injects probe payloads
+	 * straight into the H.265 decoder. Reject that outright, and warn on
+	 * any two rx tunnels sharing an effective forward port (an omitted
+	 * udp_out counts as 5600). */
+	for (int k = 0; k < kids; k++) {
+		Tunnel *t = &c->tunnels[k];
+		if (strcmp(t->role, "rx") != 0) continue;
+		int eff = t->udp_out_ip[0] ? t->udp_out_port : 5600;
+		if (t->probe && (!t->udp_out_ip[0] || eff == 5600)) {
+			LOG_ERR("config: probe tunnel '%s' must set an explicit "
+			        "udp_out on a dead port (never 5600 = RTP video)",
+			        t->name);
+			return -1;
+		}
+		for (int j = 0; j < k; j++) {
+			Tunnel *o = &c->tunnels[j];
+			if (strcmp(o->role, "rx") != 0) continue;
+			int oeff = o->udp_out_ip[0] ? o->udp_out_port : 5600;
+			if (oeff == eff)
+				LOG_WARN("config: rx tunnels '%s' and '%s' both "
+				         "forward to udp:%d (omitted udp_out = "
+				         "5600) — decoded payloads will interleave",
+				         o->name, t->name, eff);
+		}
+	}
+
 	return 0;
 }
 
@@ -1207,6 +1247,82 @@ static int json_slice_object(const char *js, size_t jl, const char *key,
 	return -1;
 }
 
+/* ---------- boundary-probe PER producer ------------------------------ *
+ *
+ * For a tunnel with "probe": true, stats_drain() accumulates each rx_ant
+ * record's pkt counters into a bucket keyed by the *received* MCS (from
+ * the ant[] block) and flushes one compact {"type":"probe"} record per
+ * non-empty bucket per window to the tunnel's stats_out. Bucketing by
+ * received MCS means a window straddling a vehicle-side probe retune
+ * emits one clean record per MCS — pre-retune traffic can never land in
+ * the new rung. Port of telemetry/probe/probe_log.py --by-mcs (the
+ * device-validated prototype); schema frozen in
+ * tests/protocols/test_probe_protocol.py. */
+
+static void probe_buckets_reset(Tunnel *t, uint64_t now)
+{
+	memset(t->probe_bucket, 0, sizeof(t->probe_bucket));
+	for (int i = 0; i < 16; i++) t->probe_bucket[i].rssi = INT_MIN;
+	t->probe_win_start_us = now;
+}
+
+static void probe_window_flush(Tunnel *t, uint64_t now)
+{
+	double win_s = (double)(now - t->probe_win_start_us) / 1e6;
+	struct timespec rt;
+	clock_gettime(CLOCK_REALTIME, &rt);
+	unsigned long long ts_ms = (unsigned long long)rt.tv_sec * 1000ULL +
+	                           (unsigned long long)rt.tv_nsec / 1000000ULL;
+	for (int m = 0; m < 16; m++) {
+		uint32_t u = t->probe_bucket[m].uniq;
+		uint32_t l = t->probe_bucket[m].lost;
+		uint32_t acc = u + l;
+		if (acc == 0) continue;
+		char rssi_s[16] = "null";
+		if (t->probe_bucket[m].rssi != INT_MIN)
+			snprintf(rssi_s, sizeof(rssi_s), "%d",
+			         t->probe_bucket[m].rssi);
+		char rec[256];
+		int len = snprintf(rec, sizeof(rec),
+		    "{\"type\":\"probe\",\"ts_ms\":%llu,\"radio_port\":%d,"
+		    "\"mcs\":%d,\"per\":%.4f,\"recv\":%u,\"lost\":%u,"
+		    "\"accounted\":%u,\"rssi\":%s,\"window_s\":%.3f}\n",
+		    ts_ms, t->radio_port, m,
+		    (double)l / (double)acc, u, l, acc, rssi_s, win_s);
+		if (len > 0 && len < (int)sizeof(rec) && t->stats_fwd_active)
+			(void)sendto(t->stats_local_fd, rec, (size_t)len, 0,
+			             (struct sockaddr *)&t->stats_fwd_addr,
+			             sizeof(t->stats_fwd_addr));
+		t->probe_emit_count++;
+	}
+	probe_buckets_reset(t, now);
+}
+
+static void probe_accumulate(Tunnel *t, uint32_t uniq, uint32_t lost,
+                             int mcs, int rssi, uint64_t now)
+{
+	uint64_t win_us = (uint64_t)t->probe_window_ms * 1000ULL;
+	if (t->probe_win_start_us == 0)
+		probe_buckets_reset(t, now);
+	/* Stale partial window (probe traffic gap): the counts would span
+	 * far more than the nominal window — discard rather than emit a
+	 * record whose arrival time overstates its freshness. */
+	if (now - t->probe_win_start_us > 4 * win_us) {
+		probe_buckets_reset(t, now);
+		t->probe_drop_count++;
+	}
+	if (mcs >= 0 && mcs < 16) {
+		t->probe_bucket[mcs].uniq += uniq;
+		t->probe_bucket[mcs].lost += lost;
+		if (rssi != INT_MIN &&
+		    (t->probe_bucket[mcs].rssi == INT_MIN ||
+		     rssi > t->probe_bucket[mcs].rssi))
+			t->probe_bucket[mcs].rssi = rssi;
+	}
+	if (now - t->probe_win_start_us >= win_us)
+		probe_window_flush(t, now);
+}
+
 /* Drain pending rx_ant datagrams off a single tunnel's stats fd. */
 void stats_drain(Tunnel *t)
 {
@@ -1223,8 +1339,12 @@ void stats_drain(Tunnel *t)
 		buf[got] = 0;
 
 		/* Re-emit to user's stats_out before parsing — keeps latency
-		 * for the downstream consumer minimal. */
-		if (t->stats_fwd_active) {
+		 * for the downstream consumer minimal. Probe tunnels do NOT
+		 * re-emit raw rx_ant: forwarded up the uplink it would be
+		 * ingested by the vehicle's link_controller as *video* score
+		 * (probe loss → spurious reactive demotes). They forward the
+		 * computed {"type":"probe"} records instead (below). */
+		if (t->stats_fwd_active && !t->probe) {
 			(void)sendto(t->stats_local_fd, buf, (size_t)got, 0,
 			             (struct sockaddr *)&t->stats_fwd_addr,
 			             sizeof(t->stats_fwd_addr));
@@ -1242,18 +1362,23 @@ void stats_drain(Tunnel *t)
 		if (!is_rx_ant && !is_tx_stats) continue;
 
 		if (is_rx_ant) {
+			/* Record-local counters for the probe PER accumulator
+			 * (st_pkt_* keep "latest seen" semantics for the UI). */
+			uint32_t rec_uniq = 0, rec_lost = 0;
+			int      rec_mcs  = -1;
 			const char *pkt = NULL;
 			size_t pkl = 0;
 			if (json_slice_object(buf, (size_t)got, "pkt", &pkt, &pkl) == 0) {
 				uint32_t u;
 				if (json_pick_u32(pkt, pkl, "all",            &u) == 0) t->st_pkt_all      = u;
-				if (json_pick_u32(pkt, pkl, "lost",           &u) == 0) t->st_pkt_lost     = u;
+				if (json_pick_u32(pkt, pkl, "lost",           &u) == 0) { t->st_pkt_lost = u; rec_lost = u; }
 				if (json_pick_u32(pkt, pkl, "fec_recovered",  &u) == 0) t->st_pkt_fec      = u;
 				if (json_pick_u32(pkt, pkl, "outgoing",       &u) == 0) t->st_pkt_outgoing = u;
 				if (json_pick_u32(pkt, pkl, "dec_err",        &u) == 0) t->st_pkt_dec_err  = u;
 				if (json_pick_u32(pkt, pkl, "outgoing_bytes", &u) == 0) t->st_pkt_bytes    = u;
 				if (json_pick_u32(pkt, pkl, "uniq",           &u) == 0) {
 					t->st_pkt_uniq = u;
+					rec_uniq = u;
 					/* Scanner: any non-zero `uniq` sample during the
 					 * current step's dwell counts as "we found the
 					 * vehicle on this channel". `pkt.uniq` is the
@@ -1302,6 +1427,12 @@ void stats_drain(Tunnel *t)
 									if (avg > best_rssi) best_rssi = avg;
 								}
 							}
+							/* Received MCS of this ant entry (-Y keys
+							 * entries by freq:mcs:bw). Last one wins —
+							 * mirrors probe_log.py. */
+							int32_t am;
+							if (json_pick_i32(o, ol, "mcs", &am) == 0)
+								rec_mcs = am;
 							ant_count++;
 						}
 					}
@@ -1309,6 +1440,11 @@ void stats_drain(Tunnel *t)
 			}
 			t->st_ant_count = ant_count;
 			if (best_rssi != INT_MIN) t->st_rssi_best = best_rssi;
+
+			/* Boundary-probe PER accumulation + window flush. */
+			if (t->probe)
+				probe_accumulate(t, rec_uniq, rec_lost, rec_mcs,
+				                 best_rssi, now_us());
 		}
 
 		if (is_tx_stats) {

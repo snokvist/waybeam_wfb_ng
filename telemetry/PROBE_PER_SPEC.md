@@ -251,6 +251,33 @@ Device soak (Star6E imx335 @192.168.1.13, GS = x86 + 2× RTL88x2, fixed distance
 Note `probe_stale_age_s` default is 1.5 (tuned for slower data); fast parallel probing
 wants ~1.0. Phase 4 should set the production default to match the probe cadence.
 
+## 8c. Phase 4 — PRODUCTIONIZED (2026-06-10)
+
+The prototype rig (`probe/*.sh` + `probe_log.py` + `probe_bridge.py`) is folded
+into the production daemons. Full spec + implementation notes:
+`specs/2026-06-10-boundary-probe-phase4/requirements.md`.
+
+Production shape (single V+2 stream — the law reads only `rung[current+2]`, and
+one TX retuned over time keeps `freq:mcs:bw` bucketing valid, so the N-parallel
+prototype collapses to **1 probe TX + 1 probe RX, no sweep**):
+
+- **Vehicle:** `S99wfb` (gated by `fw_setenv wfbprobe 1`) spawns one probe
+  `wfb_tx` (link 50/port 50, mirrors video PHY, FEC 1/1, `-x`, `-C 8001`,
+  `-u 5750`). `link_controller --probe 127.0.0.1:8001 --probe-feed
+  127.0.0.1:5750` feeds it paced PRB packets (20 pps, main-loop tick) and
+  retunes it to `min(current+2, 7)` on every commit (reconciler + commit-gate;
+  `mcs.probe_enabled` / `mcs.probe_feed_pps` / `mcs.probe_feed_bytes` tunables;
+  `probe_stale_age_s` default now **1.0**).
+- **Ground:** `host_x86.json` adds a `"probe": true` rx tunnel (udp_out 5751 —
+  dead port, enforced at config load). `gs_supervisor` computes the windowed
+  per-received-MCS PER in C (port of `probe_log.py --by-mcs`, 0.5 s window) and
+  forwards only `{"type":"probe"}` records to `stats_out` 6600 — raw probe
+  rx_ant is suppressed (it would pollute the vehicle's video scorer).
+- **Schema:** frozen in `tests/protocols/test_probe_protocol.py`.
+
+The prototype scripts stay for bench experiments (multi-rung sweeps, ladder
+characterization) but are no longer the deployment path.
+
 ## 9. Risks / open questions (validate before trusting)
 
 - **Reciprocity** — only an issue if someone shortcuts to uplink-only probing for

@@ -166,6 +166,13 @@ typedef struct {
 	char        udp_out_ip[GS_ARG_MAX];
 	int         udp_out_port;
 	char        stats_out[GS_ARG_MAX];
+	/* rx-only: boundary-probe PER producer ("probe": true).
+	 * The tunnel's raw rx_ant is NOT re-emitted to stats_out (it would
+	 * pollute the vehicle's video scorer); instead stats_drain()
+	 * computes windowed per-received-MCS PER and sends compact
+	 * {"type":"probe",...} records there. See PROBE_PER_SPEC.md. */
+	bool        probe;
+	int         probe_window_ms;           /* PER window (default 500) */
 
 	/* tx-only */
 	int         udp_in_port;
@@ -199,6 +206,17 @@ typedef struct {
 	struct sockaddr_in  stats_fwd_addr;
 	int                 stats_fwd_active;
 	char                stats_local_arg[GS_ARG_MAX];
+
+	/* probe PER accumulator (rx + probe only). One bucket per received
+	 * MCS so a window straddling a vehicle-side retune emits one clean
+	 * record per MCS instead of mislabelling the whole window. */
+	uint64_t    probe_win_start_us;
+	struct {
+		uint32_t uniq, lost;
+		int      rssi;                 /* best avg dBm; INT_MIN = unset */
+	} probe_bucket[16];
+	uint32_t    probe_emit_count;
+	uint32_t    probe_drop_count;          /* stale windows discarded */
 
 	/* parsed rx_ant / tx_stats snapshot */
 	uint64_t    st_first_us;

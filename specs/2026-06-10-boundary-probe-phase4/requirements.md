@@ -1,6 +1,6 @@
 # Boundary-Probe MCS Control — Phase 4 (Productionize) — Requirements
 
-Status: DRAFT for review
+Status: IMPLEMENTED 2026-06-10 (host-verified; device bring-up pending — §8)
 Date: 2026-06-10
 Branch: `feature/mcs-boundary-probe` (PR #58)
 Depends on: Phase 1+2 (`link_controller` boundary-probe law, merged in this PR);
@@ -251,3 +251,58 @@ Backward compatibility: every piece is gated (`wfbprobe`, tunnel `autostart`,
 - Multi-port `wfb_rx` patch (not needed for a single stream).
 - `mcs.mode=1` as the default + legacy bucket FSM removal (post-soak, separate change).
 - Phase 3 RSSI fade-rate/staleness augment.
+- **Probe downlink as a data side-channel** (maintainer idea, 2026-06-10): the PRB
+  payload is pure padding today — the probe stream is a free ~28 kB/s vehicle→GS
+  channel that already exists end-to-end (feeder → probe wfb_tx → probe wfb_rx →
+  gs_supervisor). If the GS ever needs vehicle-originated data outside the video
+  path (e.g. link_controller state snapshots, debug telemetry), it can ride inside
+  the PRB packets after the 13-byte header with zero extra airtime. Caveats: AEAD
+  is off (-x) so the channel is unauthenticated/plaintext, and it lives at V+2 so
+  it degrades exactly when the link does — diagnostics-grade only, never control.
+
+---
+
+## 10. Implementation notes (2026-06-10, deviations from the draft — all tightening)
+
+1. **§3.1 "feeder thread" → main-loop deadline tick.** `link_controller` is by
+   design a single-threaded poll() loop; the feeder is a paced deadline tick in
+   that loop (50 ms at 20 pps joins the poll-deadline computation), and the
+   retune reconciler runs at loop-top. Satisfies §5.8 with zero locking.
+2. **Retune is a reconciler, not a commit hook.** Desired probe MCS
+   (`min(current+2, 7)`) plus the mirrored video PHY body is compared against
+   the last acked body every loop iteration; any drift (MCS commit from ANY
+   path — probe law, failsafe, realign, WCMD — or a PHY change like a WCMD
+   bandwidth write) triggers one SET_RADIO. 1 s backoff while the probe wfb_tx
+   is unreachable, so a missing probe can never stall the loop.
+3. **§5.1 got a hard commit gate, not just the freshness check.**
+   `ProbeState.gate_us` is stamped whenever the committed video MCS changes;
+   `selector_update_probe()` refuses any rung record with `last_us < gate_us`.
+   Host-verified: after a reactive demote, fresh-looking pre-demote rungs
+   (well inside `probe_stale_age_s`) cannot re-promote. Combined with the GS
+   bucketing by *received* MCS, a stale-high re-promote is impossible by
+   construction.
+4. **Probe tunnel must NOT raw-forward rx_ant (flap-class bug found in the
+   draft).** §3.3 as drafted ("emit into the existing stats_drain → stats_out
+   path") would have re-emitted the probe tunnel's raw rx_ant verbatim to 6600 —
+   the vehicle ingests rx_ant as *video* score, so probe MCS-7 loss would have
+   caused spurious reactive demotes. `"probe": true` suppresses the raw re-emit
+   and forwards only the computed `{"type":"probe"}` records.
+5. **GS guard (§3.3) semantics:** a probe tunnel without an explicit `udp_out`,
+   or with `udp_out` port 5600, is REJECTED at config load; any two rx tunnels
+   sharing an effective forward port (omitted = 5600) get a WARN.
+6. **Producer never emits `accounted == 0`** — total-loss windows surface as
+   staleness on the vehicle (hold), exactly matching the soak-observed MCS-7
+   cliff behaviour. Stale partial windows (probe gap > 4 windows) are discarded,
+   not emitted with overstated freshness.
+7. **Schema frozen** in `tests/protocols/test_probe_protocol.py` +
+   `_proto/probe_protocol.py` (18 tests): required keys `mcs`/`accounted`/`lost`,
+   compact `"type":"probe"` demux token, per-mille round-half-up derivation,
+   `accounted==0 → -1` invalid.
+8. **Observability:** vehicle `/status` `mcs.probe` gains `configured`,
+   `enabled`, `feed_seq`, `tuned_mcs`, `retune_fails`; GS tunnel status gains
+   `probe:{window_ms, emitted, stale_dropped}`.
+9. **Host-verified end-to-end** (fake wfb_tx control endpoints + fake wfb_rx):
+   cold-start commit → retune to V+2; clean rung → promote + immediate
+   re-retune; lossy video → reactive demote + down-retune; stale-rung hold
+   (gate); retune history exactly one SET_RADIO per commit. GS: 20/2 window →
+   `per:0.1000`, `window_s:0.501`, raw rx_ant fully suppressed.

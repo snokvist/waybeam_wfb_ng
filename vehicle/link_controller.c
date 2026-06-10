@@ -378,6 +378,11 @@ typedef struct {
 		float    promote_dwell_s;   /* min dwell before a probe promote     */
 		float    probe_window_s;    /* nominal probe PER window (info)      */
 		float    probe_stale_age_s; /* ignore probe rungs older than this   */
+		/* Probe producer (Phase 4). Master live-switch + feeder pacing;
+		 * the endpoints themselves are startup-only (--probe/--probe-feed). */
+		bool     probe_enabled;     /* live on/off for feeder + retune      */
+		int      probe_feed_pps;    /* paced PRB packets per second         */
+		int      probe_feed_bytes;  /* PRB packet size (mirror video MTU-ish)*/
 	} mcs;
 
 	/* ── CSA subsystem (Channel Switch Announcement receiver) ──
@@ -452,6 +457,15 @@ typedef struct {
 	/* ── Common ── */
 	char     wfb_host[64];           /* shared wfb_tx control endpoint */
 	uint16_t wfb_port;
+	/* Probe wfb_tx endpoints (boundary-probe producer, mcs.mode=1).
+	 * The probe wfb_tx is spawned by S99wfb (parallel to the video
+	 * wfb_tx); we retune its MCS to current+2 via its own control
+	 * socket and feed it paced PRB packets on its udp input. Both
+	 * stay disabled until --probe / --probe-feed are given (port 0). */
+	char     probe_host[64];         /* probe wfb_tx control endpoint  */
+	uint16_t probe_port;
+	char     probe_feed_host[64];    /* probe wfb_tx udp_in (feeder)   */
+	uint16_t probe_feed_port;
 	int      api_port;               /* HTTP API on 127.0.0.1:N (0 disables) */
 	int      iface_mtu;              /* startup-only: ip link set dev <iface> mtu N
 	                                  * across {csa.iface, cmd.wfb_iface}. 0 = off.
@@ -2049,10 +2063,13 @@ static int wfb_get_radio(const Config *cfg, RadioBody *out)
 	return 0;
 }
 
-static int wfb_set_radio(const Config *cfg, const RadioBody *params)
+/* SET_RADIO against an explicit control endpoint. Used for both the video
+ * wfb_tx (cfg->wfb_*) and the probe wfb_tx (cfg->probe_*). */
+static int wfb_set_radio_at(const char *host, uint16_t port,
+                            const RadioBody *params)
 {
 	struct sockaddr_in dst;
-	if (resolve_ipv4(cfg->wfb_host, cfg->wfb_port, &dst) != 0) return -1;
+	if (resolve_ipv4(host, port, &dst) != 0) return -1;
 	int fd = socket(AF_INET, SOCK_DGRAM, 0);
 	if (fd < 0) return -1;
 
@@ -2082,6 +2099,11 @@ static int wfb_set_radio(const Config *cfg, const RadioBody *params)
 	if (ntohl(resp.req_id) != req_id) return -1;
 	if (ntohl(resp.rc) != 0) return -1;
 	return 0;
+}
+
+static int wfb_set_radio(const Config *cfg, const RadioBody *params)
+{
+	return wfb_set_radio_at(cfg->wfb_host, cfg->wfb_port, params);
 }
 
 /* ── MCS-down ordered-commit machinery ─────────────────────────────────
@@ -2416,6 +2438,14 @@ typedef struct {
 	uint64_t  last_any_us;   /* local rx time of any probe record  */
 	uint32_t  total_records;
 	uint32_t  parse_errors;
+	/* Commit gate (§5.1 retune-ordering invariant): stamped whenever the
+	 * committed video MCS changes. The control law refuses to act on any
+	 * rung record that arrived before the gate, so a pre-commit reading
+	 * (e.g. the clean rung[6] that justified a promote we then reverted)
+	 * can never re-promote after a demote. Belt-and-suspenders on top of
+	 * the GS bucketing by *received* MCS — pre-retune probe traffic lands
+	 * in the old rung, never the new V+2. */
+	uint64_t  gate_us;
 } ProbeState;
 
 static inline void probe_state_init(ProbeState *p) { memset(p, 0, sizeof(*p)); }
@@ -2641,12 +2671,16 @@ static SelectDecision selector_update_probe(Selector *s, const Config *cfg,
 		return SD_NONE;  /* at floor or cooling down */
 	}
 
-	/* 2. PROBE-DRIVEN promote / pre-emptive demote at the V+2 boundary. */
+	/* 2. PROBE-DRIVEN promote / pre-emptive demote at the V+2 boundary.
+	 *    Records must be (a) fresh per probe_stale_age_s AND (b) newer than
+	 *    the commit gate — a reading taken before the last MCS commit is
+	 *    never acted on (§5.1 retune-ordering invariant). */
 	int v2 = s->current_mcs + 2;
 	if (v2 >= 0 && v2 < PROBE_MCS_MAX) {
 		const ProbeRung *pr = &probe->rung[v2];
 		float age = pr->valid ? (float)(now - pr->last_us) / 1e6f : 1e9f;
 		if (pr->valid && pr->per_milli >= 0 &&
+		    pr->last_us >= probe->gate_us &&
 		    age <= cfg->mcs.probe_stale_age_s) {
 			if (pr->per_milli <= cfg->mcs.probe_clean_milli) {
 				/* +2 clean -> +1 guaranteed viable (monotonic) -> promote. */
@@ -2763,6 +2797,9 @@ static const TunableDesc TUNABLES[] = {
 	{"mcs.promote_dwell_s",               SUB_MCS, TF_FLOAT, OFF_MCS(promote_dwell_s),               0.0, 60.0,  "probe: min dwell before a promote"},
 	{"mcs.probe_window_s",                SUB_MCS, TF_FLOAT, OFF_MCS(probe_window_s),                0.05, 10.0, "probe: nominal PER window (informational)"},
 	{"mcs.probe_stale_age_s",             SUB_MCS, TF_FLOAT, OFF_MCS(probe_stale_age_s),             0.1, 30.0,  "probe: ignore V+2 rungs older than this"},
+	{"mcs.probe_enabled",                 SUB_MCS, TF_BOOL,  OFF_MCS(probe_enabled),                 0, 0,       "probe: live on/off for the feeder + retune producer"},
+	{"mcs.probe_feed_pps",                SUB_MCS, TF_INT,   OFF_MCS(probe_feed_pps),                1, 200,     "probe: paced PRB feed rate (pkts/s)"},
+	{"mcs.probe_feed_bytes",              SUB_MCS, TF_INT,   OFF_MCS(probe_feed_bytes),              64, 1472,   "probe: PRB packet size (bytes)"},
 
 	/* ── cmd (venc command proxy on the rx_ant socket) ── */
 	{"cmd.enabled",          SUB_COMMON, TF_BOOL, OFF_CMD(enabled),          0, 0,      "enable venc command proxy on rx_ant socket"},
@@ -2995,6 +3032,11 @@ typedef struct {
 	const WcmdState *wcmd;
 	/* Boundary-probe PER snapshot (read-only; Phase 1 observability). */
 	const ProbeState *probe;
+	/* Probe producer state (Phase 4: feeder + retune reconciler). */
+	bool     probe_configured;     /* --probe endpoint present */
+	uint32_t probe_feed_seq;
+	int      probe_tuned_mcs;
+	uint32_t probe_retune_fails;
 } ApiSnapshot;
 
 static int append_score_json(char *buf, size_t cap, size_t pos,
@@ -3175,7 +3217,9 @@ static int append_mcs_json(char *buf, size_t cap, size_t pos,
 		"\"bitrate_lead_s\":%.3f,"
 		"\"pending_drop\":{\"active\":%s,\"target_mcs\":%d,\"ms_remaining\":%d},"
 		"\"probe\":{\"records\":%u,\"parse_errors\":%u,\"age_s\":%.3f,"
-		"\"v2_mcs\":%d,\"v2_per_milli\":%d,\"v2_accounted\":%ld,\"v2_age_s\":%.3f}}",
+		"\"v2_mcs\":%d,\"v2_per_milli\":%d,\"v2_accounted\":%ld,\"v2_age_s\":%.3f,"
+		"\"configured\":%s,\"enabled\":%s,\"feed_seq\":%u,"
+		"\"tuned_mcs\":%d,\"retune_fails\":%u}}",
 		s->cfg->mcs.enabled ? "true" : "false",
 		s->sel->current_bucket, s->sel->current_mcs,
 		s->sel->in_failsafe ? "true" : "false", s->sel->recovery_streak,
@@ -3190,7 +3234,10 @@ static int append_mcs_json(char *buf, size_t cap, size_t pos,
 		s->probe ? s->probe->parse_errors : 0u,
 		probe_age_s,
 		v2, pr ? pr->per_milli : -1,
-		pr ? pr->accounted : -1L, v2_age_s);
+		pr ? pr->accounted : -1L, v2_age_s,
+		s->probe_configured ? "true" : "false",
+		s->cfg->mcs.probe_enabled ? "true" : "false",
+		s->probe_feed_seq, s->probe_tuned_mcs, s->probe_retune_fails);
 	if (n < 0 || (size_t)n >= cap - pos) return -1;
 	return n;
 }
@@ -3956,6 +4003,9 @@ static void usage(const char *prog)
 		"  --osc-threshold N        changes/window before backoff (default 4)\n"
 		"  --osc-backoff F          up-cooldown multiplier when oscillating (default 3.0)\n"
 		"  --start-low              force range[0] mcs at startup (default off)\n"
+		"  --probe HOST:PORT        probe wfb_tx control endpoint (boundary-probe\n"
+		"                           producer, mcs.mode=1; default off)\n"
+		"  --probe-feed HOST:PORT   probe wfb_tx udp input for the paced PRB feeder\n"
 		"\n"
 		"CSA receiver (off unless --csa-iface set; reuses --stats listener):\n"
 		"  --csa-iface NAME         enable CSA receiver on iface (e.g. wlan0)\n"
@@ -4048,6 +4098,9 @@ static void config_defaults(Config *c)
 {
 	/* Common */
 	strcpy(c->wfb_host, "127.0.0.1"); c->wfb_port = 8000;
+	/* Probe wfb_tx endpoints: off (port 0) until --probe / --probe-feed. */
+	strcpy(c->probe_host, "127.0.0.1");      c->probe_port = 0;
+	strcpy(c->probe_feed_host, "127.0.0.1"); c->probe_feed_port = 0;
 	c->api_port = 8765;
 	c->dry_run = false;
 	c->verbose = 0;
@@ -4139,7 +4192,14 @@ static void config_defaults(Config *c)
 	c->mcs.demote_per_milli  = 30;    /* >=3% live video PER -> reactive down*/
 	c->mcs.promote_dwell_s   = 0.5f;
 	c->mcs.probe_window_s    = 0.5f;
-	c->mcs.probe_stale_age_s = 1.5f;
+	c->mcs.probe_stale_age_s = 1.0f; /* matches ~10 Hz single-stream freshness
+	                                  * (Phase 4; 1.5 was the swept prototype) */
+	/* Probe producer: live-enabled by default, but inert until S99wfb
+	 * passes --probe / --probe-feed (ports stay 0). 20 pps × 1400 B
+	 * ≈ 224 kbit/s of probe airtime at the V+2 rate — negligible. */
+	c->mcs.probe_enabled     = true;
+	c->mcs.probe_feed_pps    = 20;
+	c->mcs.probe_feed_bytes  = 1400;
 
 	/* CSA: off until --csa-iface is set. */
 	c->csa.enabled = false;
@@ -4210,7 +4270,7 @@ int main(int argc, char **argv)
 		OPT_UP_CONSEC, OPT_DOWN_CONSEC, OPT_UP_COOLDOWN, OPT_DOWN_COOLDOWN,
 		OPT_FAILSAFE, OPT_RECOVER_CONSEC,
 		OPT_OSC_WINDOW, OPT_OSC_THRESHOLD, OPT_OSC_BACKOFF,
-		OPT_START_LOW,
+		OPT_START_LOW, OPT_PROBE, OPT_PROBE_FEED,
 		/* csa */
 		OPT_CSA_IFACE, OPT_CSA_ALLOWLIST, OPT_CSA_BANDWIDTH,
 		OPT_CSA_COOLDOWN, OPT_CSA_NO_REVERT,
@@ -4271,6 +4331,8 @@ int main(int argc, char **argv)
 		{"osc-threshold",  required_argument, 0, OPT_OSC_THRESHOLD},
 		{"osc-backoff",    required_argument, 0, OPT_OSC_BACKOFF},
 		{"start-low",      no_argument,       0, OPT_START_LOW},
+		{"probe",          required_argument, 0, OPT_PROBE},
+		{"probe-feed",     required_argument, 0, OPT_PROBE_FEED},
 		{"csa-iface",      required_argument, 0, OPT_CSA_IFACE},
 		{"csa-allowlist",  required_argument, 0, OPT_CSA_ALLOWLIST},
 		{"csa-bandwidth",  required_argument, 0, OPT_CSA_BANDWIDTH},
@@ -4414,6 +4476,19 @@ int main(int argc, char **argv)
 		case OPT_OSC_THRESHOLD:  cfg.mcs.oscillation_threshold  = atoi(optarg); break;
 		case OPT_OSC_BACKOFF:    cfg.mcs.oscillation_backoff    = (float)atof(optarg); break;
 		case OPT_START_LOW:      cfg.mcs.start_low = true; break;
+		case OPT_PROBE:
+			if (parse_hostport(optarg, cfg.probe_host,
+			                   sizeof(cfg.probe_host), &cfg.probe_port) != 0) {
+				fprintf(stderr, "invalid --probe\n"); return 1;
+			}
+			break;
+		case OPT_PROBE_FEED:
+			if (parse_hostport(optarg, cfg.probe_feed_host,
+			                   sizeof(cfg.probe_feed_host),
+			                   &cfg.probe_feed_port) != 0) {
+				fprintf(stderr, "invalid --probe-feed\n"); return 1;
+			}
+			break;
 		case OPT_CSA_IFACE:
 			snprintf(cfg.csa.iface, sizeof(cfg.csa.iface), "%s", optarg);
 			cfg.csa.enabled = true;
@@ -4491,6 +4566,11 @@ int main(int argc, char **argv)
 	    cfg.wfb_host, cfg.wfb_port, cfg.api_port, cfg.dry_run ? 1 : 0,
 	    cfg.fec.enabled ? "on" : "off",
 	    cfg.mcs.enabled ? "on" : "off");
+	if (cfg.probe_port != 0)
+		LOG_MCS("probe producer: ctrl=%s:%u feed=%s:%u pps=%d bytes=%d (active when mcs.mode=1)",
+		    cfg.probe_host, (unsigned)cfg.probe_port,
+		    cfg.probe_feed_host, (unsigned)cfg.probe_feed_port,
+		    cfg.mcs.probe_feed_pps, cfg.mcs.probe_feed_bytes);
 
 	/* Apply --iface-mtu to each unique iface in {csa.iface, cmd.wfb_iface}
 	 * before any subsystem opens its sockets. Skipped under --dry-run so a
@@ -4729,6 +4809,20 @@ int main(int argc, char **argv)
 	scorer_reset(&scorer);
 	ProbeState probe;
 	probe_state_init(&probe);
+	/* Probe producer (mode=1): paced PRB feeder + V+2 retune reconciler.
+	 * Inert until --probe / --probe-feed configure the endpoints. Both
+	 * run as deadline ticks in the single poll() loop — no thread. */
+	int       probe_feed_fd      = -1;
+	uint32_t  probe_feed_seq     = 0;
+	uint64_t  next_probe_feed_us = 0;
+	int       probe_tuned_mcs    = -1;   /* last MCS acked by probe wfb_tx */
+	RadioBody probe_sent_body;           /* last body acked by probe wfb_tx */
+	bool      probe_sent_valid   = false;
+	uint64_t  probe_retry_us     = 0;    /* retune failure backoff          */
+	uint32_t  probe_retune_fails = 0;
+	int       probe_sf_state     = 0;    /* retune failing (log-once latch) */
+	int       probe_gate_mcs     = -2;   /* commit-change detector          */
+	memset(&probe_sent_body, 0, sizeof(probe_sent_body));
 	float    last_eff_rssi    = 0.0f;
 	float    last_smooth_rssi = 0.0f;
 	float    last_lost_ratio  = 0.0f;
@@ -4858,6 +4952,106 @@ int main(int argc, char **argv)
 				 * don't tight-loop SET_RADIO. */
 				pending_drop.deadline_us = now + 100000ULL;
 			}
+		}
+
+		/* --- Probe producer tick (boundary-probe mode=1) ---
+		 *
+		 * (a) Commit gate: stamp probe.gate_us whenever the committed
+		 *     video MCS moves, so the control law never acts on a probe
+		 *     record measured before the commit (§5.1 retune-ordering
+		 *     invariant). Detected here (not in selector_commit_mcs) so
+		 *     EVERY commit path is covered: probe law, failsafe,
+		 *     realign, WCMD operator writes.
+		 * (b) Retune reconciler: keep the probe wfb_tx at
+		 *     min(current_mcs + 2, 7), mirroring the video PHY
+		 *     (bw/stbc/ldpc/sgi/vht). Reconciles on any drift — MCS
+		 *     commits AND video PHY changes (e.g. a WCMD bandwidth
+		 *     write) — with a 1 s backoff while the probe wfb_tx is
+		 *     unreachable so a missing probe can't stall the loop.
+		 * (c) Paced PRB feeder at mcs.probe_feed_pps to the probe
+		 *     wfb_tx udp input. Best-effort connected-UDP sends;
+		 *     errors (probe down) are silently dropped. */
+		bool probe_on = cfg.mcs.enabled && cfg.mcs.mode == 1 &&
+		                cfg.mcs.probe_enabled && !cfg.dry_run;
+		if (sel.current_mcs != probe_gate_mcs) {
+			probe.gate_us = now;
+			probe_gate_mcs = sel.current_mcs;
+		}
+		if (probe_on && cfg.probe_port != 0 && sel.current_mcs >= 0 &&
+		    now >= probe_retry_us) {
+			int desired = sel.current_mcs + 2;
+			if (desired > 7) desired = 7;   /* 1SS headroom clamp (§5.2) */
+			RadioBody want;
+			if (radio_body_valid) {
+				want = radio_body;
+			} else {
+				/* Video PHY not synced yet — canonical defaults
+				 * (B20 S1 L1, long GI, HT). */
+				memset(&want, 0, sizeof(want));
+				want.stbc = 1; want.ldpc = 1; want.short_gi = 0;
+				want.bandwidth = 20; want.vht_mode = 0; want.vht_nss = 1;
+			}
+			want.mcs_index = (uint8_t)desired;
+			if (!probe_sent_valid ||
+			    memcmp(&want, &probe_sent_body, sizeof(want)) != 0) {
+				if (wfb_set_radio_at(cfg.probe_host, cfg.probe_port,
+				                     &want) == 0) {
+					probe_sent_body  = want;
+					probe_sent_valid = true;
+					probe_tuned_mcs  = desired;
+					if (probe_sf_state) {
+						LOG_MCS("probe: retune recovered (mcs=%d)",
+						    desired);
+						probe_sf_state = 0;
+					}
+					LOG_MCS("probe: retuned probe wfb_tx to mcs=%d (video=%d)",
+					    desired, sel.current_mcs);
+				} else {
+					probe_retune_fails++;
+					if (!probe_sf_state) {
+						LOG_MCS("probe: SET_RADIO %s:%u failed — retrying every 1s",
+						    cfg.probe_host, (unsigned)cfg.probe_port);
+						probe_sf_state = 1;
+					}
+					probe_retry_us = now + 1000000ULL;
+				}
+			}
+		}
+		if (probe_on && cfg.probe_feed_port != 0 &&
+		    cfg.mcs.probe_feed_pps > 0 && now >= next_probe_feed_us) {
+			if (probe_feed_fd < 0) {
+				struct sockaddr_in fa;
+				if (resolve_ipv4(cfg.probe_feed_host,
+				                 cfg.probe_feed_port, &fa) == 0) {
+					probe_feed_fd = socket(AF_INET,
+					    SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+					if (probe_feed_fd >= 0 &&
+					    connect(probe_feed_fd, (struct sockaddr*)&fa,
+					            sizeof(fa)) != 0) {
+						close(probe_feed_fd);
+						probe_feed_fd = -1;
+					}
+				}
+			}
+			if (probe_feed_fd >= 0) {
+				/* "PRB" + 10-digit seq + 'x' padding — same shape as
+				 * the validated shell-feeder prototype. */
+				char pkt[1472];
+				int len = cfg.mcs.probe_feed_bytes;
+				if (len < 64) len = 64;
+				if (len > (int)sizeof(pkt)) len = (int)sizeof(pkt);
+				int hdr = snprintf(pkt, sizeof(pkt), "PRB%010u",
+				                   probe_feed_seq);
+				memset(pkt + hdr, 'x', (size_t)len - (size_t)hdr);
+				(void)send(probe_feed_fd, pkt, (size_t)len, 0);
+				probe_feed_seq++;
+			}
+			uint64_t iv = 1000000ULL /
+			    (uint64_t)cfg.mcs.probe_feed_pps;
+			/* Fixed-cadence schedule; resync (not burst) after a stall. */
+			next_probe_feed_us = (next_probe_feed_us == 0 ||
+			                      next_probe_feed_us + iv < now)
+			    ? now + iv : next_probe_feed_us + iv;
 		}
 
 		/* --- FEC sidecar SUBSCRIBE keepalive ---
@@ -5074,6 +5268,9 @@ int main(int argc, char **argv)
 			deadline = pending_drop.deadline_us;
 		if (csa_next_us > 0 && csa_next_us < deadline)
 			deadline = csa_next_us;
+		if (probe_on && cfg.probe_feed_port != 0 &&
+		    next_probe_feed_us > 0 && next_probe_feed_us < deadline)
+			deadline = next_probe_feed_us;
 		int timeout_ms = 100;
 		if (deadline > now) {
 			uint64_t ahead_ms = (deadline - now) / 1000ULL;
@@ -5139,6 +5336,10 @@ int main(int argc, char **argv)
 				    : 0,
 				.wcmd = &wcmd_state,
 				.probe = &probe,
+				.probe_configured = cfg.probe_port != 0,
+				.probe_feed_seq = probe_feed_seq,
+				.probe_tuned_mcs = probe_tuned_mcs,
+				.probe_retune_fails = probe_retune_fails,
 			};
 			memcpy(snap.ant_avg, last_ant_avg, sizeof(snap.ant_avg));
 			for (int i = 0; i < API_MAX_CLIENTS; i++) {
@@ -5614,6 +5815,7 @@ int main(int argc, char **argv)
 	if (sidecar_fd >= 0) close(sidecar_fd);
 	if (wfb_stats_fd >= 0) close(wfb_stats_fd);
 	if (rx_ant_fd >= 0) close(rx_ant_fd);
+	if (probe_feed_fd >= 0) close(probe_feed_fd);
 	if (api_fd >= 0) close(api_fd);
 	g_api_clients = NULL;
 	for (int i = 0; i < API_MAX_CLIENTS; i++)
