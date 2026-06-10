@@ -5,13 +5,25 @@ Design spec for per-MCS link adaptation on the wfb_ng FPV link. This is the
 (`README.md`): Tier-1 carries the firehose and makes the real-time MCS call;
 Tier-2 Gemma explains the rare escalation.
 
-# ⇩ CURRENT DESIGN — Boundary-probe control law (2026-06-08 pivot)
+# ⇩ SHIPPED — Unified law: PER probe + RSSI guard-rails (2026-06-10)
+
+**The boundary-probe law below is now THE control law** — the legacy
+`bucket_from_rssi()` 3-bucket FSM, its `mcs_bucket_{0,1,2}` tunables, and the
+`mcs.mode` knob were removed from `link_controller` on 2026-06-10. The RSSI
+signal survives as two guard-rail demote rules folded into the same law
+(floor at `rssi_floor_dbm`, fade at `rssi_fade_db_per_s` armed below
+`rssi_fade_arm_dbm`) plus a promote guard — this subsumes the "RSSI fade-rate
+augment" sketched as Phase 3 below. The probe producer is now MANDATORY when
+MCS adaptation is enabled (`--probe`; S99wfb `wfbprobe=1`); `wfbprobe=0` runs
+FEC-only. Spec: `specs/2026-06-10-unified-mcs-rssi-law/requirements.md`.
+
+# ⇩ Boundary-probe control law (2026-06-08 pivot)
 
 **This section is the live design and supersedes the model-centric framing in
 the rest of the file** (kept below as background). The control loop is a
 **relative boundary-probe ladder with a reactive-PER demote backstop, no ML in
 the loop.** It replaces the shipped `bucket_from_rssi()` 3-bucket FSM and its
-user-set `mcs_bucket_{0,1,2}` tunables — those go away. The probe locates the
+user-set `mcs_bucket_{0,1,2}` tunables — those went away (see above). The probe locates the
 cliff directly, so the whole 0–5 video range is driven accurately with minimal
 control logic and **no further data collection is needed to ship it**.
 

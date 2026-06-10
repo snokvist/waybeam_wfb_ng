@@ -227,15 +227,18 @@ within ~3 s. The `commit_count` and `ordered drop` lines in the log
 show this clearly.
 
 **Recommended starting point** for typical FPV uplinks (set via
-`--failsafe` / `--recover-consec` at launch, or live via `/set`):
+`--failsafe` at launch, or live via `/set`):
 
 ```
-mcs.failsafe_timeout_s             = 2.0    (was 0.5)
-mcs.failsafe_recovery_consecutive  = 2      (was 3)
+mcs.failsafe_timeout_s = 2.0    (was 0.5)
 ```
 
-The bundled `poc/init/S99wfb` template wires these as
-`WFB_FAILSAFE_S=2.0` / `WFB_RECOVER_N=2` env vars. If your uplink is
+(Recovery is immediate on the next rx_ant datagram under the unified
+PER-probe law — the legacy `failsafe_recovery_consecutive` /
+`--recover-consec` unfreeze counter was removed 2026-06-10.)
+
+The bundled `vehicle/init/S99wfb` template wires this as the
+`WFB_FAILSAFE_S=2.0` env var. If your uplink is
 even lossier (counted in `wfb.log`: `grep -c 'no rx_ant' /tmp/wfb.log`
 shows the trip rate), raise `WFB_FAILSAFE_S` further or tighten the
 wfb-ng parity ratio of the rx_ant return path.

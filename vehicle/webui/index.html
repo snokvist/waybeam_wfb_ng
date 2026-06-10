@@ -186,8 +186,8 @@ main{padding:1.2rem;overflow:auto;height:calc(100vh - 86px);max-width:1100px;mar
     <div class="cards">
       <div class="card"><h3>Uptime</h3><div class="v" id="c-uptime">—</div></div>
       <div class="card"><h3>FEC k / n</h3><div class="v" id="c-fec">—</div><div class="sub" id="c-fec-sub">—</div></div>
-      <div class="card"><h3>MCS bucket</h3><div class="v" id="c-mcs">—</div><div class="sub" id="c-mcs-sub">—</div></div>
-      <div class="card"><h3>Effective RSSI</h3><div class="v" id="c-rssi">—</div><div class="sub" id="c-rssi-sub">—</div></div>
+      <div class="card"><h3>MCS · V+2 probe</h3><div class="v" id="c-mcs">—</div><div class="sub" id="c-mcs-sub">—</div></div>
+      <div class="card"><h3>RSSI</h3><div class="v" id="c-rssi">—</div><div class="sub" id="c-rssi-sub">—</div></div>
       <div class="card"><h3>Loss</h3><div class="v" id="c-loss">—</div><div class="sub" id="c-loss-sub">—</div></div>
       <div class="card"><h3>Diversity</h3><div class="v" id="c-div">—</div><div class="sub" id="c-div-sub">—</div></div>
       <div class="card"><h3>Headroom</h3><div class="v" id="c-headroom">—</div><div class="sub" id="c-headroom-sub">—</div></div>
@@ -395,27 +395,42 @@ function renderStatus(s) {
     $("#c-fec-sub").textContent = "(waiting for first commit)";
   }
 
-  // MCS card
+  // MCS · V+2 probe card — current committed MCS plus the probe rung the
+  // law gates on (per-mille PER + freshness).
   const mcs = s.mcs || {};
-  if (mcs.current_bucket >= 0) {
-    $("#c-mcs").textContent = "B" + mcs.current_bucket + " · MCS " + mcs.current_mcs;
+  const pb = mcs.probe || {};
+  if (mcs.current_mcs >= 0) {
+    const probeStr = (pb.tuned_mcs >= 0) ? " → P" + pb.tuned_mcs : "";
+    $("#c-mcs").textContent = "MCS " + mcs.current_mcs + probeStr;
     $("#c-mcs").className = mcs.in_failsafe ? "v bad" : "v ok";
-    $("#c-mcs-sub").textContent = mcs.in_failsafe
-      ? ("FAILSAFE  recov " + mcs.recovery_streak)
-      : ("commits " + mcs.commit_count + (mcs.changes_in_window > 1 ? "  osc " + mcs.changes_in_window : ""));
+    if (mcs.in_failsafe) {
+      $("#c-mcs-sub").textContent = "FAILSAFE (no rx_ant)";
+    } else {
+      const perStr = (pb.v2_per_milli >= 0)
+        ? "V+2 " + pb.v2_per_milli + "‰ · " + (pb.v2_age_s >= 0 ? pb.v2_age_s.toFixed(1) + "s" : "—")
+        : "V+2 no data";
+      $("#c-mcs-sub").textContent = perStr + " · commits " + mcs.commit_count;
+    }
   } else {
     $("#c-mcs").textContent = "—";
     $("#c-mcs").className = "v";
     $("#c-mcs-sub").textContent = "(no rx_ant yet)";
   }
 
-  // RSSI
+  // RSSI — smoothed dBm + slope; guard badge when a floor/fade rule is
+  // suppressing promotes (or actively demoting).
   const score = s.score || {};
-  if ("effective_rssi" in score) {
-    const eff = score.effective_rssi;
-    $("#c-rssi").textContent = eff.toFixed(1) + " dBm";
-    $("#c-rssi").className = "v " + (eff < -75 ? "bad" : eff < -60 ? "warn" : "ok");
-    $("#c-rssi-sub").textContent = "penalty " + (score.loss_penalty_db||0).toFixed(1) + " dB";
+  const guard = mcs.rssi_guard || {};
+  if ("smoothed_rssi" in score) {
+    const sm = score.smoothed_rssi;
+    const slope = score.rssi_slope_db_s || 0;
+    const guardOn = guard.floor_active || guard.fade_active;
+    $("#c-rssi").textContent = sm.toFixed(1) + " dBm";
+    $("#c-rssi").className = "v " + (guardOn || sm < -75 ? "bad" : sm < -60 ? "warn" : "ok");
+    let sub = "slope " + (slope >= 0 ? "+" : "") + slope.toFixed(1) + " dB/s";
+    if (guard.floor_active) sub += " · FLOOR";
+    if (guard.fade_active)  sub += " · FADE";
+    $("#c-rssi-sub").textContent = sub;
   }
 
   // Loss
@@ -490,10 +505,15 @@ function renderStatus(s) {
 
   // Detail panels
   fmtKv($("#kv-sel"), {
-    bucket: mcs.current_bucket,
     mcs: mcs.current_mcs,
-    pending_bucket: mcs.pending_bucket,
-    pending_streak: mcs.pending_streak,
+    probe_tuned_mcs: pb.tuned_mcs,
+    v2_per_milli: pb.v2_per_milli,
+    v2_age_s: (pb.v2_age_s >= 0) ? pb.v2_age_s.toFixed(2) : "—",
+    probe_records: pb.records,
+    retune_fails: pb.retune_fails,
+    rssi_slope: (score.rssi_slope_db_s != null) ? score.rssi_slope_db_s.toFixed(1) : "—",
+    floor_active: !!guard.floor_active,
+    fade_active: !!guard.fade_active,
     in_failsafe: !!mcs.in_failsafe,
     commit_count: mcs.commit_count,
     changes_in_window: mcs.changes_in_window,
@@ -586,7 +606,7 @@ const TOGGLE_STRIPS = [
   {
     cls:  "adaptive-strip",
     label:"Adaptive",
-    hint: "ON = the controller writes k/n (fec) and mcs bucket on each tick; manual tune-row edits below are overwritten.",
+    hint: "ON = the controller writes k/n (fec) and the PER-probe MCS law on each tick; manual tune-row edits below are overwritten.",
     keys: ["fec.enabled", "mcs.enabled"],
   },
   {

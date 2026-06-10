@@ -266,8 +266,11 @@ Backward compatibility: every piece is gated (`wfbprobe`, tunnel `autostart`,
 - V+1 probing (the law only reads V+2 today). If Phase 3 wants V+1 confirmation, add a
   fast 2-rung micro-sweep on the same single stream.
 - Multi-port `wfb_rx` patch (not needed for a single stream).
-- `mcs.mode=1` as the default + legacy bucket FSM removal (post-soak, separate change).
-- Phase 3 RSSI fade-rate/staleness augment.
+- ~~`mcs.mode=1` as the default + legacy bucket FSM removal~~ — DONE 2026-06-10,
+  see `specs/2026-06-10-unified-mcs-rssi-law/` (mode knob removed; probe law is
+  the only law, probe producer mandatory).
+- ~~Phase 3 RSSI fade-rate/staleness augment~~ — DONE 2026-06-10 as the RSSI
+  floor/fade guard-rails in the same unified-law change.
 - **Probe downlink as a data side-channel** (maintainer idea, 2026-06-10): the PRB
   payload is pure padding today — the probe stream is a free ~28 kB/s vehicle→GS
   channel that already exists end-to-end (feeder → probe wfb_tx → probe wfb_rx →
