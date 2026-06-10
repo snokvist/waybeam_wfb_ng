@@ -66,7 +66,11 @@ cleanup() {
     # reap any stray as a backstop (the deploy-target C feeder won't need this).
     killall -q socat 2>/dev/null
 }
-trap cleanup EXIT INT TERM
+# INT/TERM must cleanup AND exit: a bare `trap cleanup TERM` reaps the children
+# but the shell then RESUMES the `while` loop (POSIX returns from the handler),
+# so the swept TX leaks back into production on the next rung. Force exit.
+trap 'cleanup; exit 0' INT TERM
+trap cleanup EXIT
 
 # Paced PRB feeder: ASCII "PRB<10-digit seq>" + padding to PKT_BYTES, at PPS
 # packets/sec, to udp 127.0.0.1:$UDP_IN. (C feeder is the deploy target; this
