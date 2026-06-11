@@ -515,6 +515,8 @@ function renderStatus(s) {
     rssi_slope: (score.rssi_slope_db_s != null) ? score.rssi_slope_db_s.toFixed(1) : "—",
     floor_active: !!guard.floor_active,
     fade_active: !!guard.fade_active,
+    flap_guard: (mcs.flap_guard && mcs.flap_guard.active)
+      ? ("rung " + mcs.flap_guard.mcs) : "off",
     in_failsafe: !!mcs.in_failsafe,
     commit_count: mcs.commit_count,
     changes_in_window: mcs.changes_in_window,

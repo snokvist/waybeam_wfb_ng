@@ -369,9 +369,16 @@ typedef struct {
 		 * that still works when probe records are stale; fade is the
 		 * pre-emptive demote on fast signal collapse, armed only below
 		 * rssi_fade_arm_dbm so fades at strong signal are ignored. */
-		float    rssi_floor_dbm;    /* demote at/below; +3dB promote guard  */
+		float    rssi_floor_dbm;    /* demote at/below                      */
 		float    rssi_fade_db_per_s;/* slope demote threshold (0 = off)     */
 		float    rssi_fade_arm_dbm; /* fade rule armed at/below this        */
+		float    rssi_floor_hyst_db;/* promote blocked <= floor + this      */
+		/* Flap damping (promote-side only — demotes are never delayed):
+		 * re-promoting into/above the rung we last demoted from within
+		 * reentry_backoff_s requires reentry_dwell_s of clean probe
+		 * instead of promote_dwell_s. */
+		float    reentry_backoff_s; /* flap-guard window (0 = off)          */
+		float    reentry_dwell_s;   /* dwell for re-entry into failed rung  */
 		/* Probe producer (Phase 4). Master live-switch + feeder pacing;
 		 * the endpoints themselves are startup-only (--probe/--probe-feed). */
 		bool     probe_enabled;     /* live on/off for feeder + retune      */
@@ -2421,6 +2428,21 @@ typedef struct {
 	 * currently suppressing promotes. Refreshed every selector_update. */
 	bool      rssi_floor_active;
 	bool      rssi_fade_active;
+	/* Fade persistence: consecutive datagrams meeting the fade condition.
+	 * The DEMOTE needs FADE_PERSIST_SAMPLES in a row (RSSI noise of ±10dB
+	 * raw produces single-sample slope spikes past the threshold with
+	 * alternating sign — a real fade holds the sign); the instantaneous
+	 * condition still vetoes promotes (cheap, retried next tick). */
+	int       fade_streak;
+	/* Flap guard ("penalty box"): the highest rung we demoted FROM in the
+	 * current failure episode. Re-promoting into/above it within
+	 * reentry_backoff_s requires reentry_dwell_s of clean probe instead
+	 * of promote_dwell_s — a rung that just failed needs longer proof.
+	 * Every further demote refreshes the window, so a flapping boundary
+	 * stretches its own period instead of oscillating at dwell rate.
+	 * Demotes are never delayed by this. */
+	int       flap_guard_mcs;
+	uint64_t  flap_guard_us;
 } Selector;
 
 /* ── Boundary-probe PER state (2026-06-08 control law) ───────────────────
@@ -2482,6 +2504,9 @@ static void selector_init(Selector *s)
 	s->commit_count = 0;
 	s->rssi_floor_active = false;
 	s->rssi_fade_active = false;
+	s->fade_streak = 0;
+	s->flap_guard_mcs = -1;
+	s->flap_guard_us = 0;
 }
 
 static void selector_expire_changes(Selector *s, const Config *cfg, uint64_t now)
@@ -2525,6 +2550,19 @@ static SelectDecision selector_commit(Selector *s, const Config *cfg,
 		s->last_change_us = now;
 		selector_record_change(s, cfg, now);
 		s->commit_count++;
+		/* Flap guard: any downward commit from a valid rung stamps the
+		 * episode. Keep the HIGHEST failed rung while the window is
+		 * live (a cascade 5->1 means "5 failed", the rungs below were
+		 * collateral — they re-climb at normal dwell, only the final
+		 * step back into 5 needs the longer proof). */
+		if (prev >= 0 && s->current_mcs < prev) {
+			uint64_t backoff_us =
+			    (uint64_t)(cfg->mcs.reentry_backoff_s * 1e6f);
+			if (s->flap_guard_mcs < prev ||
+			    now - s->flap_guard_us > backoff_us)
+				s->flap_guard_mcs = prev;
+			s->flap_guard_us = now;
+		}
 	}
 	*out_mcs = s->current_mcs;
 	return reason;
@@ -2567,12 +2605,16 @@ static SelectDecision selector_tick_no_data(Selector *s, const Config *cfg,
  *   4. probe V+2         — fail -> pre-emptive demote (restores the +2
  *                          cushion); clean -> +1 viable by monotonicity ->
  *                          promote. Promotes are BLOCKED while a floor/fade
- *                          condition holds (floor guard has +3 dB
- *                          hysteresis so promotes don't resume on the
- *                          knife-edge).
+ *                          condition holds (floor guard has
+ *                          rssi_floor_hyst_db of hysteresis so promotes
+ *                          don't resume on the knife-edge), and promotes
+ *                          back into a recently-failed rung wait
+ *                          reentry_dwell_s (flap guard).
  *   5. hold
- * All demotes step current_mcs-1 and respect down_cooldown_s. */
-#define RSSI_FLOOR_PROMOTE_HYST_DB 3.0f
+ * Demotes are FAST (down_cooldown_s, cascade allowed, never delayed by the
+ * flap guard); promotes are SLOW (probe-verified per rung, dwell, guards).
+ * All demotes step current_mcs-1. */
+#define FADE_PERSIST_SAMPLES 3
 
 static SelectDecision selector_update(Selector *s, const Config *cfg,
                                       const Score *score,
@@ -2594,11 +2636,19 @@ static SelectDecision selector_update(Selector *s, const Config *cfg,
 	bool can_demote = s->current_mcs > cfg->mcs.mcs_min &&
 	                  elapsed >= cfg->mcs.down_cooldown_s;
 
-	/* RSSI guard-rail conditions (also exported to /status). */
+	/* RSSI guard-rail conditions. fade_sample is the instantaneous
+	 * condition: it vetoes promotes immediately (cheap — promotes retry
+	 * next tick) but only DEMOTES after FADE_PERSIST_SAMPLES consecutive
+	 * hits. Rationale: ±10 dB raw RSSI flap produces single-sample slope
+	 * spikes past the threshold with alternating sign; a real fade holds
+	 * the sign, so the streak filters noise without adding meaningful
+	 * latency (3 samples = 0.3 s at 10 Hz on top of the slope filter). */
 	bool floor_hit = score->smoothed_rssi <= cfg->mcs.rssi_floor_dbm;
-	bool fade_hit  = cfg->mcs.rssi_fade_db_per_s > 0.0f &&
-	                 score->smoothed_rssi <= cfg->mcs.rssi_fade_arm_dbm &&
-	                 score->rssi_slope_db_s <= -cfg->mcs.rssi_fade_db_per_s;
+	bool fade_sample = cfg->mcs.rssi_fade_db_per_s > 0.0f &&
+	                   score->smoothed_rssi <= cfg->mcs.rssi_fade_arm_dbm &&
+	                   score->rssi_slope_db_s <= -cfg->mcs.rssi_fade_db_per_s;
+	s->fade_streak = fade_sample ? s->fade_streak + 1 : 0;
+	bool fade_hit = s->fade_streak >= FADE_PERSIST_SAMPLES;
 	s->rssi_floor_active = floor_hit;
 	s->rssi_fade_active  = fade_hit;
 
@@ -2637,13 +2687,24 @@ static SelectDecision selector_update(Selector *s, const Config *cfg,
 					                       now, SD_DOWN, out_mcs);
 			} else if (pr->per_milli <= cfg->mcs.probe_clean_milli) {
 				/* +2 clean -> +1 guaranteed viable (monotonic) -> promote,
-				 * unless an RSSI guard condition is (near-)active. */
-				bool promote_guard = fade_hit ||
+				 * unless an RSSI guard condition is (near-)active. The
+				 * guard uses the INSTANT fade sample (not the persisted
+				 * streak): vetoing a promote on a transient is cheap. */
+				bool promote_guard = fade_sample ||
 				    score->smoothed_rssi <= cfg->mcs.rssi_floor_dbm +
-				                            RSSI_FLOOR_PROMOTE_HYST_DB;
+				                            cfg->mcs.rssi_floor_hyst_db;
+				/* Flap guard: re-promoting into/above the rung that
+				 * failed this episode needs the longer re-entry dwell. */
+				float need_dwell = cfg->mcs.promote_dwell_s;
+				if (s->flap_guard_mcs >= 0 &&
+				    s->current_mcs + 1 >= s->flap_guard_mcs &&
+				    (float)(now - s->flap_guard_us) / 1e6f <
+				        cfg->mcs.reentry_backoff_s &&
+				    cfg->mcs.reentry_dwell_s > need_dwell)
+					need_dwell = cfg->mcs.reentry_dwell_s;
 				if (!promote_guard &&
 				    s->current_mcs < cfg->mcs.mcs_max &&
-				    elapsed >= cfg->mcs.promote_dwell_s)
+				    elapsed >= need_dwell)
 					return selector_commit(s, cfg, s->current_mcs + 1,
 					                       now, SD_UP, out_mcs);
 			}
@@ -2729,6 +2790,9 @@ static const TunableDesc TUNABLES[] = {
 	{"mcs.rssi_floor_dbm",                SUB_MCS, TF_FLOAT, OFF_MCS(rssi_floor_dbm),                -120.0, 0.0,"guard: demote at/below this smoothed RSSI"},
 	{"mcs.rssi_fade_db_per_s",            SUB_MCS, TF_FLOAT, OFF_MCS(rssi_fade_db_per_s),            0.0, 60.0,  "guard: demote when RSSI falls faster (0=off)"},
 	{"mcs.rssi_fade_arm_dbm",             SUB_MCS, TF_FLOAT, OFF_MCS(rssi_fade_arm_dbm),             -120.0, 0.0,"guard: fade rule armed at/below this RSSI"},
+	{"mcs.rssi_floor_hyst_db",            SUB_MCS, TF_FLOAT, OFF_MCS(rssi_floor_hyst_db),            0.0, 20.0,  "guard: promotes blocked at/below floor + this (must exceed smoothed RSSI noise)"},
+	{"mcs.reentry_backoff_s",             SUB_MCS, TF_FLOAT, OFF_MCS(reentry_backoff_s),             0.0, 120.0, "flap guard: window after a demote during which re-entry needs the longer dwell (0 = off)"},
+	{"mcs.reentry_dwell_s",               SUB_MCS, TF_FLOAT, OFF_MCS(reentry_dwell_s),               0.0, 30.0,  "flap guard: dwell for promoting back into the rung that just failed"},
 	{"mcs.probe_clean_milli",             SUB_MCS, TF_INT,   OFF_MCS(probe_clean_milli),             0, 1000,    "probe: V+2 PER <= this permille -> promote-eligible"},
 	{"mcs.probe_fail_milli",              SUB_MCS, TF_INT,   OFF_MCS(probe_fail_milli),              0, 1000,    "probe: V+2 PER >= this permille -> pre-emptive demote"},
 	{"mcs.demote_per_milli",              SUB_MCS, TF_INT,   OFF_MCS(demote_per_milli),              0, 1000,    "probe: live video PER >= this permille -> reactive demote"},
@@ -3157,6 +3221,7 @@ static int append_mcs_json(char *buf, size_t cap, size_t pos,
 		"\"mcs\":{\"enabled\":%s,\"current_mcs\":%d,"
 		"\"in_failsafe\":%s,"
 		"\"rssi_guard\":{\"floor_active\":%s,\"fade_active\":%s},"
+		"\"flap_guard\":{\"mcs\":%d,\"active\":%s},"
 		"\"commit_count\":%u,\"changes_in_window\":%d,"
 		"\"last_emit_mcs\":%d,\"rx_ant_age_s\":%.3f,"
 		"\"bitrate_lead_s\":%.3f,"
@@ -3171,6 +3236,10 @@ static int append_mcs_json(char *buf, size_t cap, size_t pos,
 		s->sel->in_failsafe ? "true" : "false",
 		s->sel->rssi_floor_active ? "true" : "false",
 		s->sel->rssi_fade_active ? "true" : "false",
+		s->sel->flap_guard_mcs,
+		(s->sel->flap_guard_mcs >= 0 && s->sel->flap_guard_us != 0 &&
+		 (double)(now - s->sel->flap_guard_us) / 1e6 <
+		     (double)s->cfg->mcs.reentry_backoff_s) ? "true" : "false",
 		s->sel->commit_count, s->sel->changes_count,
 		s->last_emit_mcs, rx_age_s,
 		(double)s->cfg->fec.bitrate_lead_s,
@@ -3951,7 +4020,9 @@ static void usage(const char *prog)
 		"                           0 disables (default 10)\n"
 		"  --rssi-fade-arm F        guard: fade rule armed at/below this dBm (default -65)\n"
 		"  (probe-law thresholds — clean/fail/demote permille, dwell, pacing —\n"
-		"   are runtime tunables: see /schema keys mcs.probe_* and mcs.*_milli)\n"
+		"   and the flap-damping knobs — mcs.rssi_floor_hyst_db,\n"
+		"   mcs.reentry_backoff_s, mcs.reentry_dwell_s — are runtime\n"
+		"   tunables: see /schema)\n"
 		"\n"
 		"CSA receiver (off unless --csa-iface set; reuses --stats listener):\n"
 		"  --csa-iface NAME         enable CSA receiver on iface (e.g. wlan0)\n"
@@ -4033,6 +4104,13 @@ static int cfg_validate_warnings(const Config *c)
 	    c->mcs.probe_fail_milli <= c->mcs.demote_per_milli) {
 		LOG_MCS("WARNING probe_fail_milli (%d) <= demote_per_milli (%d) — probe pre-empt cannot fire before the reactive rule",
 		    c->mcs.probe_fail_milli, c->mcs.demote_per_milli);
+		n++;
+	}
+	if (c->mcs.enabled && c->mcs.reentry_backoff_s > 0.0f &&
+	    c->mcs.reentry_dwell_s <= c->mcs.promote_dwell_s) {
+		LOG_MCS("WARNING reentry_dwell_s (%.1f) <= promote_dwell_s (%.1f) — flap guard adds no extra proof",
+		    (double)c->mcs.reentry_dwell_s,
+		    (double)c->mcs.promote_dwell_s);
 		n++;
 	}
 	if (c->fec.enabled && c->fec.min_k > c->fec.max_k) {
@@ -4164,6 +4242,12 @@ static void config_defaults(Config *c)
 	c->mcs.rssi_floor_dbm     = -85.0f;
 	c->mcs.rssi_fade_db_per_s = 10.0f;
 	c->mcs.rssi_fade_arm_dbm  = -65.0f;
+	/* 6 dB: must exceed the smoothed-RSSI noise amplitude (raw ±10 dB
+	 * flap -> ±4-5 dB after the 0.3 EWMA), or promotes resume on noise
+	 * peaks at the knife-edge. */
+	c->mcs.rssi_floor_hyst_db = 6.0f;
+	c->mcs.reentry_backoff_s  = 5.0f;
+	c->mcs.reentry_dwell_s    = 2.0f;
 
 	/* CSA: off until --csa-iface is set. */
 	c->csa.enabled = false;

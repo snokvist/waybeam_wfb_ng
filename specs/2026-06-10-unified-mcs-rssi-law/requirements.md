@@ -30,9 +30,23 @@ Evaluated once per video rx_ant datagram in `selector_update()`
 | 4 | Probe V+2 | fresh + post-gate rung[V+2]: PER ≥ `probe_fail_milli` (200‰) → demote; PER ≤ `probe_clean_milli` (20‰) → promote +1 after `promote_dwell_s`. **Fail branch is evaluated first** so an inverted config (clean ≥ fail, warned) can only demote/hold, never promote on a failing rung | the Phase 4 law, unchanged |
 | 5 | Hold | — | stale probe / mid-band PER |
 
-- **Promote guard**: promotes are blocked while rule 3 is active, or while
-  smoothed RSSI ≤ `rssi_floor_dbm` + 3 dB (hysteresis so promotes don't resume
-  on the knife-edge).
+- **Promote guard**: promotes are blocked while the *instantaneous* fade
+  condition holds, or while smoothed RSSI ≤ `rssi_floor_dbm` +
+  `rssi_floor_hyst_db` (default 6 dB — must exceed the smoothed-RSSI noise
+  amplitude: ±10 dB raw flap → ±4–5 dB after the 0.3 EWMA).
+- **Fade persistence**: rule 3 *demotes* only after 3 consecutive qualifying
+  samples (`FADE_PERSIST_SAMPLES`). ±10 dB raw flap produces single-sample
+  slope spikes past the threshold with alternating sign; a real fade holds
+  the sign. The instant condition still vetoes promotes (cheap).
+- **Flap guard** (penalty box): a demote stamps the highest rung failed in
+  the current episode; promoting back into/above it within
+  `reentry_backoff_s` (5 s, 0 = off) requires `reentry_dwell_s` (2.0 s) of
+  clean probe instead of `promote_dwell_s`. A cascade 5→1 means "5 failed" —
+  the collateral rungs re-climb at normal dwell, only the final step back
+  into 5 needs the longer proof. Every further demote refreshes the window,
+  so a flapping boundary stretches its own period (~0.7 s → ~2.2 s+) and
+  settles one rung down instead of oscillating. Demotes are never delayed.
+  Exposed as `mcs.flap_guard:{mcs,active}` in `/status`.
 - **RSSI slope**: per-sample derivative of the smoothed RSSI series, EWMA'd
   with fixed α=0.3 (no extra knob). **Latency honesty**: this is two cascaded
   first-order filters (rssi_ewma + slope ewma, each τ≈0.28 s at 10 Hz) — a
@@ -91,6 +105,9 @@ Behavioral side effects of the unification:
 | `mcs.rssi_floor_dbm` | −85.0 | `--rssi-floor` |
 | `mcs.rssi_fade_db_per_s` | 10.0 (0 = fade rule off) | `--rssi-fade` |
 | `mcs.rssi_fade_arm_dbm` | −65.0 | `--rssi-fade-arm` |
+| `mcs.rssi_floor_hyst_db` | 6.0 | /set only |
+| `mcs.reentry_backoff_s` | 5.0 (0 = flap guard off) | /set only |
+| `mcs.reentry_dwell_s` | 2.0 | /set only |
 
 CLI values are strict-parsed with the same ranges as the `/set` path
 ([−120,0] / [0,60] / [−120,0]); a malformed or out-of-range value is a
@@ -197,3 +214,33 @@ Verified: harness Phase F (F1 probe mirror follows WCMD bandwidth same tick;
 F2 adaptive demote commit preserves operator bw=40 — pre-fix it reverted to
 20; F3 selector adopts WCMD MCS; F4 probe retunes to adopted V+2; F5 law
 re-promotes from the adopted rung). Full harness 29/29.
+
+## 10. Flap hardening (2026-06-11, maintainer flap concern)
+
+Analysis against ±10 dB raw RSSI flap (stated field-realistic) found three
+weaknesses, all promote-side or noise-rejection — demotes remain fast:
+
+1. The old +3 dB floor hysteresis was *smaller* than the smoothed noise
+   (±4–5 dB after the 0.3 EWMA) → promotes re-enabled on noise peaks at the
+   knife-edge. → `rssi_floor_hyst_db`, default 6 dB, tunable.
+2. A single −10 dB sample step = −30 dB/s instantaneous slope → one EWMA
+   step lands ≈ −9…−13 dB/s → the fade rule could *demote on pure noise*
+   below the arm point. → 3-sample persistence for the demote; the instant
+   condition still vetoes promotes.
+3. No rung memory: a failed rung could be re-entered after 0.5 s of clean
+   probe → A→B→A flap with ~0.7 s period. → flap guard (§2): re-entry into
+   the episode's failed rung needs `reentry_dwell_s`; renewed failures
+   re-stamp the window.
+
+Verified (harness Phase H, 7 new checks, total 36/36): 6 s of ±10–12 dB
+alternating flap in the armed zone → **zero commits**, fade never armed;
+re-entry into a failed rung measured at 2.01 s vs ~0.5 s normal dwell;
+parked in the hysteresis band (−80 vs floor+6 = −79) with a clean probe →
+no promote; resumes at −70. A real −25 dB step still demotes 3 rungs in
+0.6 s — the fast-demote path is untouched by all of this.
+
+Field-calibration note: `rssi_floor_hyst_db` must exceed the *measured*
+smoothed-RSSI noise at range; if raw flap exceeds ±10 dB, raise toward
+8–10. `reentry_dwell_s` trades flap suppression against post-transient
+recovery speed (cascade recovery ≈ 0.5 s × collateral rungs + 2 s final
+step ≈ 3.5 s typical).
