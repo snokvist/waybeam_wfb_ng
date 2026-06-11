@@ -4748,6 +4748,13 @@ int main(int argc, char **argv)
 
 	Selector sel;
 	selector_init(&sel);
+	/* Boot-arm the failsafe watchdog: with the GS absent at boot nothing
+	 * ever feeds the selector, and video would sit at the static S99wfb
+	 * MCS forever instead of the most robust rung. Pretend a datagram at
+	 * boot so the watchdog forces mcs_min after failsafe_timeout_s
+	 * ("GS absent => max robustness"); the first real datagram clears
+	 * failsafe and the probe law climbs rung-by-rung as usual. */
+	sel.last_datagram_us = now_us();
 	Scorer scorer;
 	scorer_reset(&scorer);
 	ProbeState probe;
@@ -5071,6 +5078,23 @@ int main(int argc, char **argv)
 			}
 			if (sd == SD_NONE)
 				sd = selector_tick_no_data(&sel, &cfg, now, &new_mcs);
+			/* Boot-failsafe corner: the watchdog can fire before any
+			 * rx_ant datagram ever synced the radio cache (GS absent
+			 * at boot). wfb_tx is local — sync now so the mcs_min SET
+			 * below actually goes out; otherwise the commit would stay
+			 * selector-only until the first datagram's realign, which
+			 * never comes while the GS is away. */
+			if (sd != SD_NONE && !radio_body_valid && !cfg.dry_run) {
+				RadioBody fresh;
+				if (wfb_get_radio(&cfg, &fresh) == 0) {
+					radio_body = fresh;
+					radio_body_valid = true;
+					LOG_MCS("wfb_tx radio sync (watchdog): bw=%d sgi=%d stbc=%d ldpc=%d mcs=%d vht=%d nss=%d",
+					    fresh.bandwidth, fresh.short_gi, fresh.stbc,
+					    fresh.ldpc, fresh.mcs_index, fresh.vht_mode,
+					    fresh.vht_nss);
+				}
+			}
 			if (sd != SD_NONE && radio_body_valid && !cfg.dry_run) {
 				int rc = commit_mcs_change(&cfg, &pending_drop,
 				    &radio_body, new_mcs, &radio, &fec_ctrl,

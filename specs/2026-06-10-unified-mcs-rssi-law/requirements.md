@@ -43,8 +43,17 @@ Evaluated once per video rx_ant datagram in `selector_update()`
   dt handling: < 10 ms (burst-drained datagrams after an event-loop stall)
   → sample skipped entirely, baseline untouched; > 2 s → slope reset to 0
   (a fade rate measured before a blackout carries no information about now).
-- **Failsafe** (watchdog, unchanged): no rx_ant for `failsafe_timeout_s` →
-  commit `mcs_min`; clears on the next datagram.
+- **Failsafe** (watchdog): no rx_ant for `failsafe_timeout_s` → commit
+  `mcs_min`; clears on the next datagram. **Boot-armed** ("GS absent ⇒ max
+  robustness"): the watchdog reference is seeded at process start, so a
+  vehicle that boots with no GS in range drops to `mcs_min` after
+  `failsafe_timeout_s` instead of sitting at the static S99wfb MCS forever.
+  The watchdog also syncs the radio cache from the local wfb_tx if a
+  failsafe fires before any datagram ever did (otherwise the mcs_min SET
+  could not go out). Recovery from any failsafe is NOT a jump back — the
+  flag clears on the first datagram, then the law climbs +1 per
+  `promote_dwell_s`, each rung gated on a fresh post-gate clean V+2 probe
+  reading.
 
 ## 3. Probe is mandatory
 
