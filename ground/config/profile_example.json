@@ -1,0 +1,22 @@
+{
+  "_comment": "Minimal public-distribution config. The 'profile' block synthesizes the canonical 3-tunnel topology (video rx link 207, boundary-probe rx link 50, uplink tx link 208 with WCMD control on :8000) plus the adapter bring-up/down commands — link ids and ports match the vehicle's S99wfb and are not configurable here by design. For non-standard topologies, replace 'profile' with an explicit 'tunnels' array (see host_x86.json); the two forms are mutually exclusive.",
+
+  "key_file": "/etc/drone.key",
+
+  "http": { "bind": "0.0.0.0", "port": 80 },
+
+  "profile": {
+    "_comment": "ifaces = all monitor-mode adapters (RX diversity); uplink_iface (default: last entry) also carries the GS->vehicle TX. txpower_mbm is optional (100 mBm = 1 dBm; omit to leave adapter defaults). wfb_bin_dir is optional (omit to resolve wfb_rx/wfb_tx from $PATH).",
+    "ifaces": ["wlxAAAAAAAAAAA", "wlxBBBBBBBBBBB"],
+    "uplink_iface": "wlxBBBBBBBBBBB",
+    "channel": 161,
+    "ht": "HT20",
+    "txpower_mbm": 2000
+  },
+
+  "_comment_system": "Optional: an explicit 'system' block composes with the profile — its 'up' entries run after the synthesized adapter bring-up, its 'down' entries before the synthesized take-down.",
+  "system": {
+    "up":   [],
+    "down": []
+  }
+}

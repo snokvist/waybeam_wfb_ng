@@ -279,7 +279,7 @@ const char *tunnel_state_name(TunnelState s)
 
 /* ---------- config loader -------------------------------------------- */
 
-int cfg_parse_tunnel(const char *js, JTok *toks, int n, int t_idx, Tunnel *t)
+static void tunnel_init_defaults(Tunnel *t)
 {
 	memset(t, 0, sizeof(*t));
 	t->mcs_index = -1; t->stbc = -1; t->ldpc = -1;
@@ -288,6 +288,11 @@ int cfg_parse_tunnel(const char *js, JTok *toks, int n, int t_idx, Tunnel *t)
 	t->stats_local_fd = -1;
 	t->st_rssi_best = INT_MIN;
 	t->autostart = true;
+}
+
+int cfg_parse_tunnel(const char *js, JTok *toks, int n, int t_idx, Tunnel *t)
+{
+	tunnel_init_defaults(t);
 
 	int v;
 	long lv;
@@ -417,6 +422,241 @@ int cfg_parse_tunnel(const char *js, JTok *toks, int n, int t_idx, Tunnel *t)
 	return 0;
 }
 
+/* ---------- profile expansion ----------------------------------------
+ *
+ * "profile" synthesizes the canonical 3-tunnel topology — video rx
+ * (link 207), boundary-probe rx (link 50, PER producer), uplink tx
+ * (link 208, WCMD back-channel) — plus the adapter bring-up/down
+ * command blocks, from a handful of deployment facts:
+ *
+ *   "profile": {
+ *     "ifaces": ["wlxA", "wlxB"],      // monitor-mode adapters (1..4)
+ *     "uplink_iface": "wlxB",          // TX adapter (default: last)
+ *     "channel": 161,
+ *     "ht": "HT20",                    // optional (HT20/HT40+/HT40-)
+ *     "txpower_mbm": 2000,             // optional; absent = leave alone
+ *     "wfb_bin_dir": "/usr/local/bin"  // optional; absent = $PATH
+ *   }
+ *
+ * Link ids/ports must match the vehicle's S99wfb, so they are not
+ * configurable here by design; a hand-written "tunnels" array remains
+ * available as the advanced override (mutually exclusive with
+ * "profile"). Synthesis also makes the probe-forward foot-gun
+ * impossible: the probe tunnel always lands on a dead udp_out port,
+ * never 5600 (RTP video).
+ *
+ * Composition with an explicit "system" block: synthesized iface
+ * bring-up runs first, then the config's system.up entries (e.g. a
+ * walkout logger); on the way down the config's system.down entries
+ * run first, then the synthesized iface take-down. */
+
+#define PROFILE_VIDEO_LINK   207
+#define PROFILE_PROBE_LINK   50
+#define PROFILE_PROBE_PORT   50
+#define PROFILE_UPLINK_LINK  208
+#define PROFILE_STATS_FANIN  "127.0.0.1:6600"
+#define PROFILE_UPLINK_UDP_IN 6600
+#define PROFILE_UPLINK_CTRL  8000
+#define PROFILE_PROBE_SINK_IP   "127.0.0.1"  /* dead port: never 5600 */
+#define PROFILE_PROBE_SINK_PORT 5751
+
+static int profile_push_cmd(char cmds[][GS_PATH_MAX], int *count,
+                            const char *fmt, ...)
+{
+	if (*count >= GS_MAX_SYSTEM_CMDS) {
+		LOG_ERR("profile: synthesized system block exceeds %d "
+		        "commands — reduce ifaces or explicit system entries",
+		        GS_MAX_SYSTEM_CMDS);
+		return -1;
+	}
+	va_list ap;
+	va_start(ap, fmt);
+	int n = vsnprintf(cmds[*count], GS_PATH_MAX, fmt, ap);
+	va_end(ap);
+	if (n < 0 || n >= GS_PATH_MAX) return -1;
+	(*count)++;
+	return 0;
+}
+
+static void profile_set_binary(Tunnel *t, const char *bin_dir,
+                               const char *name)
+{
+	if (bin_dir[0])
+		snprintf(t->binary, sizeof(t->binary), "%s/%s", bin_dir, name);
+	/* else: empty binary → build_argv_* falls back to $PATH lookup */
+}
+
+static int cfg_expand_profile(const char *js, JTok *toks, int n,
+                              int p_idx, Config *c)
+{
+	int v;
+	long lv;
+
+	char ifaces[GS_MAX_IFACES][IFNAMSIZ];
+	int iface_count = 0;
+	v = jfind(js, toks, n, p_idx, "ifaces");
+	if (v < 0 || toks[v].type != JT_ARR ||
+	    toks[v].size < 1 || toks[v].size > GS_MAX_IFACES) {
+		LOG_ERR("profile: 'ifaces' must be an array of 1..%d names",
+		        GS_MAX_IFACES);
+		return -1;
+	}
+	int ci = v + 1;
+	for (int k = 0; k < toks[v].size; k++) {
+		if (jstr(js, &toks[ci], ifaces[k], IFNAMSIZ) < 0) return -1;
+		ci = jskip(toks, n, ci);
+		iface_count++;
+	}
+
+	char uplink[IFNAMSIZ];
+	snprintf(uplink, sizeof(uplink), "%s", ifaces[iface_count - 1]);
+	if ((v = jfind(js, toks, n, p_idx, "uplink_iface")) >= 0) {
+		if (jstr(js, &toks[v], uplink, sizeof(uplink)) < 0) return -1;
+		bool member = false;
+		for (int k = 0; k < iface_count; k++)
+			if (!strcmp(uplink, ifaces[k])) member = true;
+		if (!member) {
+			LOG_ERR("profile: uplink_iface '%s' not in ifaces[]",
+			        uplink);
+			return -1;
+		}
+	}
+
+	if ((v = jfind(js, toks, n, p_idx, "channel")) < 0 ||
+	    jint(js, &toks[v], &lv) < 0 || lv < 1 || lv > 200) {
+		LOG_ERR("profile: 'channel' (1..200) is required");
+		return -1;
+	}
+	int channel = (int)lv;
+
+	char ht[8] = "HT20";
+	if ((v = jfind(js, toks, n, p_idx, "ht")) >= 0) {
+		if (jstr(js, &toks[v], ht, sizeof(ht)) < 0) return -1;
+		if (strcmp(ht, "HT20") && strcmp(ht, "HT40+") &&
+		    strcmp(ht, "HT40-")) {
+			LOG_ERR("profile: ht must be HT20/HT40+/HT40-");
+			return -1;
+		}
+	}
+
+	long txpower_mbm = 0;
+	if ((v = jfind(js, toks, n, p_idx, "txpower_mbm")) >= 0) {
+		if (jint(js, &toks[v], &txpower_mbm) < 0 ||
+		    txpower_mbm < 0 || txpower_mbm > 4000) {
+			LOG_ERR("profile: txpower_mbm out of range [0, 4000]");
+			return -1;
+		}
+	}
+
+	char bin_dir[GS_PATH_MAX] = "";
+	if ((v = jfind(js, toks, n, p_idx, "wfb_bin_dir")) >= 0) {
+		if (jstr(js, &toks[v], bin_dir, sizeof(bin_dir)) < 0) return -1;
+	}
+
+	/* system.up: iface bring-up first, explicit entries after. The
+	 * sleeps match the reference config — monitor-mode flips race
+	 * driver state without them. */
+	char up[GS_MAX_SYSTEM_CMDS][GS_PATH_MAX];
+	int up_count = 0;
+	for (int k = 0; k < iface_count; k++) {
+		const char *ifc = ifaces[k];
+		if (profile_push_cmd(up, &up_count, "ip link set %s down", ifc) < 0 ||
+		    profile_push_cmd(up, &up_count, "iw dev %s set monitor otherbss", ifc) < 0 ||
+		    profile_push_cmd(up, &up_count, "sleep 0.5") < 0 ||
+		    profile_push_cmd(up, &up_count, "ip link set %s up", ifc) < 0 ||
+		    profile_push_cmd(up, &up_count, "sleep 0.5") < 0 ||
+		    profile_push_cmd(up, &up_count, "iw dev %s set channel %d %s", ifc, channel, ht) < 0)
+			return -1;
+		if (txpower_mbm > 0 &&
+		    (profile_push_cmd(up, &up_count, "sleep 0.5") < 0 ||
+		     profile_push_cmd(up, &up_count, "iw dev %s set txpower fixed %ld", ifc, txpower_mbm) < 0))
+			return -1;
+	}
+	for (int k = 0; k < c->system_up_count; k++)
+		if (profile_push_cmd(up, &up_count, "%s", c->system_up[k]) < 0)
+			return -1;
+	memcpy(c->system_up, up, sizeof(up));
+	c->system_up_count = up_count;
+
+	/* system.down: explicit entries first, iface take-down after. */
+	for (int k = 0; k < iface_count; k++)
+		if (profile_push_cmd(c->system_down, &c->system_down_count,
+		                     "ip link set %s down", ifaces[k]) < 0)
+			return -1;
+
+	/* The three canonical tunnels. */
+	Tunnel *t = &c->tunnels[0];
+	tunnel_init_defaults(t);
+	snprintf(t->name, sizeof(t->name), "video");
+	snprintf(t->role, sizeof(t->role), "rx");
+	profile_set_binary(t, bin_dir, "wfb_rx");
+	t->link_id = PROFILE_VIDEO_LINK;
+	t->radio_port = 0;
+	t->iface_count = iface_count;
+	for (int k = 0; k < iface_count; k++)
+		memcpy(t->ifaces[k], ifaces[k], IFNAMSIZ);
+	/* udp_out omitted → wfb_rx default 127.0.0.1:5600 (RTP video) */
+	snprintf(t->stats_out, sizeof(t->stats_out), PROFILE_STATS_FANIN);
+	t->probe_window_ms = 500;
+	t->extra_arg_count = 3;
+	snprintf(t->extra_args[0], GS_ARG_MAX, "-x");
+	snprintf(t->extra_args[1], GS_ARG_MAX, "-l");
+	snprintf(t->extra_args[2], GS_ARG_MAX, "100");
+
+	t = &c->tunnels[1];
+	tunnel_init_defaults(t);
+	snprintf(t->name, sizeof(t->name), "probe");
+	snprintf(t->role, sizeof(t->role), "rx");
+	profile_set_binary(t, bin_dir, "wfb_rx");
+	t->link_id = PROFILE_PROBE_LINK;
+	t->radio_port = PROFILE_PROBE_PORT;
+	t->iface_count = iface_count;
+	for (int k = 0; k < iface_count; k++)
+		memcpy(t->ifaces[k], ifaces[k], IFNAMSIZ);
+	snprintf(t->udp_out_ip, sizeof(t->udp_out_ip), PROFILE_PROBE_SINK_IP);
+	t->udp_out_port = PROFILE_PROBE_SINK_PORT;
+	snprintf(t->stats_out, sizeof(t->stats_out), PROFILE_STATS_FANIN);
+	t->probe = true;
+	t->probe_window_ms = 500;
+	t->extra_arg_count = 3;
+	snprintf(t->extra_args[0], GS_ARG_MAX, "-x");
+	snprintf(t->extra_args[1], GS_ARG_MAX, "-l");
+	snprintf(t->extra_args[2], GS_ARG_MAX, "100");
+
+	t = &c->tunnels[2];
+	tunnel_init_defaults(t);
+	snprintf(t->name, sizeof(t->name), "uplink");
+	snprintf(t->role, sizeof(t->role), "tx");
+	profile_set_binary(t, bin_dir, "wfb_tx");
+	t->link_id = PROFILE_UPLINK_LINK;
+	t->radio_port = 0;
+	t->iface_count = 1;
+	snprintf(t->ifaces[0], IFNAMSIZ, "%s", uplink);
+	t->udp_in_port = PROFILE_UPLINK_UDP_IN;
+	t->control_port = PROFILE_UPLINK_CTRL;
+	t->fec_k = 1;
+	t->fec_n = 2;
+	/* -T 1: close FEC blocks at 1 ms idle so the 3 redundant WCMD
+	 * copies span blocks (see CLAUDE.md "WCMD redundancy"). */
+	t->extra_arg_count = 2;
+	snprintf(t->extra_args[0], GS_ARG_MAX, "-T");
+	snprintf(t->extra_args[1], GS_ARG_MAX, "1");
+
+	c->tunnel_count = 3;
+
+	/* WCMD emit path defaults on unless the config said otherwise. */
+	if (!c->venc_cmd_uplink[0]) {
+		c->venc_cmd_enabled = true;
+		snprintf(c->venc_cmd_uplink, sizeof(c->venc_cmd_uplink),
+		         "uplink");
+	}
+
+	LOG_INFO("profile: synthesized video/probe/uplink tunnels "
+	         "(%d iface(s), uplink=%s, ch=%d %s)",
+	         iface_count, uplink, channel, ht);
+	return 0;
+}
+
 int cfg_load(const char *path, Config *c)
 {
 	memset(c, 0, sizeof(*c));
@@ -504,26 +744,39 @@ int cfg_load(const char *path, Config *c)
 			c->venc_cmd_rate_limit_ms = (int)lv;
 	}
 
+	int prof_idx = jfind(buf, toks, n, 0, "profile");
 	int tarr = jfind(buf, toks, n, 0, "tunnels");
-	if (tarr < 0 || toks[tarr].type != JT_ARR) {
-		LOG_ERR("config: missing 'tunnels' array");
+	if (prof_idx >= 0 && tarr >= 0) {
+		LOG_ERR("config: 'profile' and 'tunnels' are mutually "
+		        "exclusive — drop one");
 		free(buf); return -1;
 	}
-	int kids = toks[tarr].size;
-	if (kids < 1 || kids > GS_MAX_TUNNELS) {
-		LOG_ERR("config: tunnel count %d out of range [1..%d]",
-		        kids, GS_MAX_TUNNELS);
-		free(buf); return -1;
-	}
-	int ci = tarr + 1;
-	for (int k = 0; k < kids; k++) {
-		if (cfg_parse_tunnel(buf, toks, n, ci, &c->tunnels[k]) < 0) {
-			LOG_ERR("config: tunnel #%d parse failed", k);
+	if (prof_idx >= 0) {
+		if (toks[prof_idx].type != JT_OBJ ||
+		    cfg_expand_profile(buf, toks, n, prof_idx, c) < 0) {
 			free(buf); return -1;
 		}
-		ci = jskip(toks, n, ci);
+	} else {
+		if (tarr < 0 || toks[tarr].type != JT_ARR) {
+			LOG_ERR("config: missing 'tunnels' array (or 'profile')");
+			free(buf); return -1;
+		}
+		int kids = toks[tarr].size;
+		if (kids < 1 || kids > GS_MAX_TUNNELS) {
+			LOG_ERR("config: tunnel count %d out of range [1..%d]",
+			        kids, GS_MAX_TUNNELS);
+			free(buf); return -1;
+		}
+		int ci = tarr + 1;
+		for (int k = 0; k < kids; k++) {
+			if (cfg_parse_tunnel(buf, toks, n, ci, &c->tunnels[k]) < 0) {
+				LOG_ERR("config: tunnel #%d parse failed", k);
+				free(buf); return -1;
+			}
+			ci = jskip(toks, n, ci);
+		}
+		c->tunnel_count = kids;
 	}
-	c->tunnel_count = kids;
 	free(buf);
 
 	/* Forward-port safety (the 2026-06-10 "video flap" class): wfb_rx
@@ -532,7 +785,7 @@ int cfg_load(const char *path, Config *c)
 	 * straight into the H.265 decoder. Reject that outright, and warn on
 	 * any two rx tunnels sharing an effective forward port (an omitted
 	 * udp_out counts as 5600). */
-	for (int k = 0; k < kids; k++) {
+	for (int k = 0; k < c->tunnel_count; k++) {
 		Tunnel *t = &c->tunnels[k];
 		if (strcmp(t->role, "rx") != 0) continue;
 		int eff = t->udp_out_ip[0] ? t->udp_out_port : 5600;

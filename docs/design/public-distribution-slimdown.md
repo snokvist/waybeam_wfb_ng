@@ -1,7 +1,14 @@
 # Slimming the config surface for public distribution
 
-Status: PROPOSAL (audit of the post-PR#58 tree — unified PER-probe +
-RSSI-guard law, bucket FSM removed)
+Status: PHASE 1 IMPLEMENTED (this branch) — public/expert schema split
+(`/schema` vs `/schema?all=1` + WebUI expert checkbox), CLI culled to
+17 flags, `mcs_start`→`mcs_min` and `probe_enabled`→`mcs.enabled`
+folds, S99wfb operator/wiring split with `wfbprobe` default 1, gs.html
+Link-tab manual editors removed, GS `profile` config synthesis
+(`ground/config/profile_example.json`).  Phase 2 (§8 items 6–7) stays
+gated on the walkout calibration cycle.
+
+Original audit follows (counts are pre-Phase-1).
 
 PR #58 already deleted the bucket FSM, `mcs.mode`, 15 tunables and 13
 CLI flags.  This doc audits what is *left* on both daemons and proposes

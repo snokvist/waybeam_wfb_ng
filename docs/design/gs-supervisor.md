@@ -72,6 +72,16 @@ stays small and the webui shell is consistent.
 Single file, default `/etc/waybeam/gs_supervisor.json`. Reload via
 `POST /api/v1/reload` (only changed tunnels are stopped/started).
 
+> **2026-06 addition — `profile` mode.** For the standard deployment a
+> `"profile"` block (ifaces, uplink_iface, channel, ht, txpower_mbm,
+> wfb_bin_dir) replaces the hand-written `tunnels[]` + `system{}` —
+> the supervisor synthesizes the canonical video/probe/uplink tunnels
+> with the link ids/ports that match the vehicle's S99wfb, plus the
+> adapter bring-up/down commands. See
+> `ground/config/profile_example.json`. `profile` and `tunnels` are
+> mutually exclusive; the explicit form below remains the advanced
+> override.
+
 ```json
 {
   "key_file": "/etc/drone.key",
