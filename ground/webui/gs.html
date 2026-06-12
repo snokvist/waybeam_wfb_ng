@@ -358,130 +358,34 @@ select{cursor:pointer;-webkit-appearance:none;appearance:none;background-image:u
 </div>
 
 <!-- ──────────────────────── LINK ──────────────────────── -->
-<!-- Everything that shapes the radio link: adaptive on/off switches at
-     the top (they gate whether the manual knobs below stick), then a
-     side-by-side mirror of the two link endpoints — GS uplink wfb_tx
-     (direct wfb_cmd) on the left, vehicle video wfb_tx (via WCMD) on
-     the right. Quick-fire vehicle wfb_tx presets close out the tab. -->
+<!-- The unified PER+RSSI law on the vehicle owns the radio link (FEC
+     k/n + MCS + PHY mirror). This tab is reduced to the switches that
+     gate it plus vehicle TX power. Manual per-field radio/FEC writes
+     (an emergency, not a workflow) go through the Generic WCMD form on
+     the Encoder tab — B1 write-through means the law adopts them
+     instead of reverting them. -->
 <div class="tab-content" id="tab-link">
 
-  <!-- Adaptive switches — pinned at top so the operator sees at a glance
-       whether the vehicle is auto-managing FEC/MCS. Manual wfb_* knobs
-       below get overwritten on the next adaptive tick unless these are
-       off. -->
+  <!-- Adaptive switches — ON = the vehicle auto-manages FEC sizing and
+       the PER-probe MCS law. Turn off only to pin manual values sent
+       via Generic WCMD. -->
   <div class="adaptive-strip">
     <span class="label">Vehicle adaptive</span>
-    <span class="hint">FEC sizes k/n from EWMA; MCS bucket picks rate from headroom. Turn off to pin manual values from the cards below.</span>
+    <span class="hint">FEC sizes k/n from EWMA; the PER-probe + RSSI-guard law drives MCS. Turn off to pin manual values sent via Generic WCMD (Encoder tab).</span>
     <button class="btn-mini btn-start" onclick="cmdQuick('fec_enabled',1)">fec auto ON</button>
     <button class="btn-mini btn-stop"  onclick="cmdQuick('fec_enabled',0)">fec auto OFF</button>
     <button class="btn-mini btn-start" onclick="cmdQuick('mcs_enabled',1)">mcs auto ON</button>
     <button class="btn-mini btn-stop"  onclick="cmdQuick('mcs_enabled',0)">mcs auto OFF</button>
   </div>
 
-  <div class="split">
-    <!-- GS uplink (direct wfb_cmd to the GS-side tx tunnel) -->
-    <div class="section">
-      <div class="section-header"><h3>Uplink wfb_tx<span class="side-label gs">GS</span></h3>
-        <span class="help">Direct wfb_cmd into this host's tx tunnel control_port. Affects the GS→vehicle uplink only.</span></div>
-      <div class="section-body">
-        <div class="field">
-          <div class="field-label">Tunnel <span class="help">Only tx tunnels with control_port set are valid targets.</span></div>
-          <select id="ctrl-tunnel"></select>
-          <span></span>
-        </div>
-
-        <h4 class="subhead">FEC <span class="h">k/n + timeout</span></h4>
-        <div class="kv-grid">
-          <label for="fec-k">k <span class="help">data shards per FEC block</span></label>
-          <input type="number" id="fec-k" min="1" max="255" value="1">
-
-          <label for="fec-n">n <span class="help">total shards (k + parity)</span></label>
-          <input type="number" id="fec-n" min="1" max="255" value="2">
-
-          <label for="fec-to">timeout_ms <span class="help">empty = leave running value</span></label>
-          <input type="number" id="fec-to" min="0" max="65534" placeholder="(keep)">
-        </div>
-        <div class="action-row">
-          <button class="btn btn-fire"  onclick="ctrlGetFec()">Get FEC</button>
-          <button class="btn btn-apply" onclick="ctrlSetFec()">Set FEC</button>
-        </div>
-        <div class="reply" id="reply-fec"></div>
-
-        <h4 class="subhead">Radio <span class="h">bw / mcs / stbc / ldpc / sgi / vht</span></h4>
-        <div class="kv-grid">
-          <label for="r-stbc">stbc</label>      <input type="number" id="r-stbc" min="0" max="3" value="0">
-          <label for="r-ldpc">ldpc</label>      <input type="number" id="r-ldpc" min="0" max="1" value="0">
-          <label for="r-sgi">short_gi</label>   <input type="number" id="r-sgi"  min="0" max="1" value="0">
-          <label for="r-bw">bandwidth (MHz)</label> <input type="number" id="r-bw" min="5" max="80" value="20">
-          <label for="r-mcs">mcs_index</label>  <input type="number" id="r-mcs"  min="0" max="31" value="1">
-          <label for="r-vhtm">vht_mode</label>  <input type="number" id="r-vhtm" min="0" max="1" value="0">
-          <label for="r-vhtn">vht_nss</label>   <input type="number" id="r-vhtn" min="1" max="4" value="1">
-        </div>
-        <div class="action-row">
-          <button class="btn btn-fire"  onclick="ctrlGetRadio()">Get Radio</button>
-          <button class="btn btn-apply" onclick="ctrlSetRadio()">Set Radio</button>
-        </div>
-        <div class="reply" id="reply-radio"></div>
+  <div class="section">
+    <div class="section-header"><h3>TX power<span class="side-label veh">VEH</span></h3>
+      <span class="help">WCMD over uplink → vehicle <code>iw set txpower</code>. The adaptive law never touches TX power.</span></div>
+    <div class="section-body">
+      <div class="quick-row" id="quick-txpower-row">
+        <span class="qlabel">dBm</span>
       </div>
-    </div>
-
-    <!-- Vehicle video wfb_tx (via WCMD over uplink) -->
-    <div class="section">
-      <div class="section-header"><h3>Video wfb_tx<span class="side-label veh">VEH</span></h3>
-        <span class="help">WCMD over uplink → vehicle link_controller → vehicle wfb_cmd. Adaptive will overwrite these on the next tick unless the toggles above are off.</span></div>
-      <div class="section-body">
-        <h4 class="subhead">FEC <span class="h">manual k/n</span></h4>
-        <div class="quick-row">
-          <span class="qlabel">k</span>
-          <button class="btn-mini btn-start" onclick="cmdQuick('wfb_fec_k',4)">4</button>
-          <button class="btn-mini btn-start" onclick="cmdQuick('wfb_fec_k',6)">6</button>
-          <button class="btn-mini btn-start" onclick="cmdQuick('wfb_fec_k',8)">8</button>
-          <button class="btn-mini btn-start" onclick="cmdQuick('wfb_fec_k',12)">12</button>
-        </div>
-        <div class="quick-row">
-          <span class="qlabel">n</span>
-          <button class="btn-mini btn-start" onclick="cmdQuick('wfb_fec_n',6)">6</button>
-          <button class="btn-mini btn-start" onclick="cmdQuick('wfb_fec_n',8)">8</button>
-          <button class="btn-mini btn-start" onclick="cmdQuick('wfb_fec_n',12)">12</button>
-          <button class="btn-mini btn-start" onclick="cmdQuick('wfb_fec_n',16)">16</button>
-        </div>
-
-        <h4 class="subhead">Radio <span class="h">mcs / bandwidth / ldpc / sgi</span></h4>
-        <div class="quick-row">
-          <span class="qlabel">mcs</span>
-          <button class="btn-mini btn-start" onclick="cmdQuick('wfb_mcs',1)">1</button>
-          <button class="btn-mini btn-start" onclick="cmdQuick('wfb_mcs',2)">2</button>
-          <button class="btn-mini btn-start" onclick="cmdQuick('wfb_mcs',3)">3</button>
-          <button class="btn-mini btn-start" onclick="cmdQuick('wfb_mcs',4)">4</button>
-          <button class="btn-mini btn-start" onclick="cmdQuick('wfb_mcs',5)">5</button>
-        </div>
-        <div class="quick-row">
-          <span class="qlabel">bw</span>
-          <button class="btn-mini btn-start" onclick="cmdQuick('wfb_bandwidth',20)">20</button>
-          <button class="btn-mini btn-start" onclick="cmdQuick('wfb_bandwidth',40)">40</button>
-        </div>
-        <div class="quick-row">
-          <span class="qlabel">ldpc</span>
-          <button class="btn-mini btn-stop"  onclick="cmdQuick('wfb_ldpc',0)">off</button>
-          <button class="btn-mini btn-start" onclick="cmdQuick('wfb_ldpc',1)">on</button>
-        </div>
-        <div class="quick-row">
-          <span class="qlabel">short_gi</span>
-          <button class="btn-mini btn-stop"  onclick="cmdQuick('wfb_short_gi',0)">off</button>
-          <button class="btn-mini btn-start" onclick="cmdQuick('wfb_short_gi',1)">on</button>
-        </div>
-        <div class="quick-row">
-          <span class="qlabel">stbc</span>
-          <button class="btn-mini btn-stop"  onclick="cmdQuick('wfb_stbc',0)">0</button>
-          <button class="btn-mini btn-start" onclick="cmdQuick('wfb_stbc',1)">1</button>
-        </div>
-
-        <h4 class="subhead">TX power <span class="h">vehicle adapter</span></h4>
-        <div class="quick-row" id="quick-txpower-row">
-          <span class="qlabel">dBm</span>
-        </div>
-        <div class="reply" id="reply-cmd-link"></div>
-      </div>
+      <div class="reply" id="reply-cmd-link"></div>
     </div>
   </div>
 </div>
@@ -700,7 +604,6 @@ function renderSysChip(state){
   if(down) down.disabled = (state === 'down');
 }
 
-let lastTunnels=[];
 async function refresh(){
   try{
     const r=await fetchT('/api/v1/status');
@@ -714,9 +617,7 @@ async function refresh(){
     // pull /tunnels for full detail
     const r2=await fetchT('/api/v1/tunnels');
     const tj=await r2.json();
-    lastTunnels=tj;
     renderTunnels(tj);
-    populateCtrlTunnels(tj);
     // /api/v1/ifaces returns the current chan/ht/txpower per adapter.
     let ij=[];
     try{
@@ -1116,75 +1017,6 @@ function renderTunnels(ts){
   }).join('');
 }
 
-/* Per-side latches recording which tunnel we've already auto-filled.
- * Radio and FEC are tracked separately because their wfb_cmd caches
- * land independently (and either one can fail to populate at startup
- * if wfb_tx isn't ready in time — see gs_supervisor.c:871, which
- * retries radio but not fec). A single shared latch waiting for BOTH
- * caused the already-filled side to be re-written on every poll,
- * wiping operator edits in the still-unfilled window.
- *
- * Reset on operator-initiated select change so the new tunnel gets
- * one auto-fill pass per side, then is left alone. */
-let lastRadioFilled='';
-let lastFecFilled='';
-
-function populateCtrlTunnels(ts){
-  const sel=$('#ctrl-tunnel');
-  const cur=sel.value;
-  const txs=(ts||[]).filter(t=>t.role==='tx' && t.control_port>0);
-  sel.innerHTML=txs.length
-    ? txs.map(t=>`<option value="${esc(t.name)}">${esc(t.name)} (control_port ${esc(t.control_port)})</option>`).join('')
-    : `<option value="">no tx tunnels with control_port</option>`;
-  if(txs.find(t=>t.name===cur)) sel.value=cur;
-  if(sel.dataset.firstLoad!=='no'){
-    sel.dataset.firstLoad='no';
-    sel.addEventListener('change', ()=>{
-      // Operator picked a different tunnel — drop both no-overwrite
-      // guards and refill immediately from the new tunnel's live cache.
-      lastRadioFilled=''; lastFecFilled='';
-      populateLinkFormsFromTunnel(sel.value);
-    });
-  }
-  // Auto-fill any side we haven't yet successfully filled for this
-  // tunnel. populateLinkFormsFromTunnel is cheap when both latches
-  // already match (it just checks and returns).
-  if(sel.value && (lastRadioFilled !== sel.value || lastFecFilled !== sel.value)){
-    populateLinkFormsFromTunnel(sel.value);
-  }
-}
-
-/* Pre-populate the set_radio AND set_fec forms from the tx tunnel's
- * live wfb_cmd cache so the operator doesn't have to read t.radio /
- * t.fec off the dashboard and re-type. Skips each side when have:false
- * so the form isn't filled with -1 sentinels before the first wfb_cmd
- * round-trip lands. Each side latches independently — once a side has
- * been filled for this tunnel, subsequent polls leave it alone so
- * operator edits stick even if the other side is still catching up. */
-function populateLinkFormsFromTunnel(name){
-  if(!name) return;
-  const t=(lastTunnels||[]).find(x=>x.name===name);
-  if(!t) return;
-  const setV=(id,v)=>{ if(v!==undefined && v!==null && v>=0){ const el=$(id); if(el) el.value=v; } };
-  if(t.radio && t.radio.have && lastRadioFilled !== name){
-    const r=t.radio;
-    setV('#r-stbc', r.stbc);
-    setV('#r-ldpc', r.ldpc);
-    setV('#r-sgi',  r.short_gi);
-    setV('#r-bw',   r.bw);
-    setV('#r-mcs',  r.mcs);
-    setV('#r-vhtm', r.vht_mode);
-    setV('#r-vhtn', r.vht_nss);
-    lastRadioFilled=name;
-  }
-  if(t.fec && t.fec.have && lastFecFilled !== name){
-    setV('#fec-k', t.fec.k);
-    setV('#fec-n', t.fec.n);
-    /* fec-to is left alone — empty means "keep running value" */
-    lastFecFilled=name;
-  }
-}
-
 async function tunnelAction(name, action){
   try{
     const r=await fetchT(`/api/v1/tunnels/${name}/${action}`);
@@ -1200,30 +1032,6 @@ function setReply(id, j, ok){
   if(!el) return;
   el.className='reply '+(ok?'ok':'err');
   el.textContent=JSON.stringify(j,null,2);
-}
-
-async function ctrlReq(qs, replyId){
-  const tunnel=$('#ctrl-tunnel').value;
-  if(!tunnel){ toast('no tx tunnel selected','err'); return; }
-  try{
-    const r=await fetchT(`/api/v1/tunnels/${tunnel}/control?${qs}`);
-    const j=await r.json();
-    setReply(replyId, j, j.ok);
-    if(!j.ok) toast(`control failed: ${j.error||'rc='+j.rc}`,'err');
-  }catch(e){ setReply(replyId, {ok:false,error:String(e)}, false); }
-}
-
-function ctrlGetFec(){ ctrlReq('cmd=get_fec','#reply-fec'); }
-function ctrlSetFec(){
-  const k=$('#fec-k').value, n=$('#fec-n').value, to=$('#fec-to').value;
-  let qs=`cmd=set_fec&k=${k}&n=${n}`;
-  if(to!=='') qs+=`&fec_timeout_ms=${to}`;
-  ctrlReq(qs,'#reply-fec');
-}
-function ctrlGetRadio(){ ctrlReq('cmd=get_radio','#reply-radio'); }
-function ctrlSetRadio(){
-  const qs=`cmd=set_radio&stbc=${$('#r-stbc').value}&ldpc=${$('#r-ldpc').value}&short_gi=${$('#r-sgi').value}&bandwidth=${$('#r-bw').value}&mcs_index=${$('#r-mcs').value}&vht_mode=${$('#r-vhtm').value}&vht_nss=${$('#r-vhtn').value}`;
-  ctrlReq(qs,'#reply-radio');
 }
 
 async function cmdFire(){

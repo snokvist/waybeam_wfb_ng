@@ -279,19 +279,15 @@ typedef struct {
 		 * for running mcs alone. */
 		bool     enabled;
 
-		/* Adaptive payload sizing. Disabled by default — when off, the
-		 * controller never writes outgoing.maxPayloadSize and venc keeps
-		 * whatever it was started with. Enabled via --max-payload N at
-		 * startup, where N is the operator's path-MTU commitment in
-		 * bytes (576..4000). The selector consults a static
-		 * bitrate→payload tier table (see PAYLOAD_TABLE) and clamps to
-		 * [payload_min, payload_max]. payload_max is *startup-only* and
-		 * intentionally absent from the live tunable registry;
-		 * payload_min is live-mutable. The table is operator-empirical
-		 * — values measured to keep pps under ~1100 across the
-		 * realistic bitrate range; override locally if your hardware
-		 * differs. */
-		int      payload_max;        /* 0 = feature off */
+		/* Adaptive payload sizing. Off (payload_max = 0): the
+		 * controller never writes outgoing.maxPayloadSize and venc
+		 * keeps whatever it was started with. The --max-payload CLI
+		 * enable was dropped in the public-surface slimdown; the sizing
+		 * machinery below (PAYLOAD_TABLE tier selector, clamped to
+		 * [payload_min, payload_max]) is kept intact for an expert
+		 * re-enable. The table is operator-empirical — values measured
+		 * to keep pps under ~1100 across the realistic bitrate range. */
+		int      payload_max;        /* 0 = feature off (no setter today) */
 		int      payload_min;        /* clamped against the venc API floor (576) */
 
 		/* Safe-startup: write a known-safe (bitrate, payload) pair to
@@ -357,8 +353,8 @@ typedef struct {
 		 *   4. probe V+2         — fail -> pre-empt demote; clean -> promote
 		 *                          (promote blocked while 2/3 active)
 		 *   5. hold
-		 * See MCS_STRATEGY.md. */
-		int      mcs_start;         /* cold-start MCS                       */
+		 * See MCS_STRATEGY.md. Cold start begins at mcs_min and lets
+		 * the probe climb. */
 		int      probe_clean_milli; /* V+2 PER <= this (‰) -> promote-ok    */
 		int      probe_fail_milli;  /* V+2 PER >= this (‰) -> pre-empt demote*/
 		int      demote_per_milli;  /* live video PER >= this (‰) -> demote */
@@ -379,9 +375,9 @@ typedef struct {
 		 * instead of promote_dwell_s. */
 		float    reentry_backoff_s; /* flap-guard window (0 = off)          */
 		float    reentry_dwell_s;   /* dwell for re-entry into failed rung  */
-		/* Probe producer (Phase 4). Master live-switch + feeder pacing;
-		 * the endpoints themselves are startup-only (--probe/--probe-feed). */
-		bool     probe_enabled;     /* live on/off for feeder + retune      */
+		/* Probe producer (Phase 4). Feeder pacing; gated by mcs.enabled
+		 * (probe is mandatory for MCS — no separate live switch) and the
+		 * endpoints themselves are startup-only (--probe/--probe-feed). */
 		int      probe_feed_pps;    /* paced PRB packets per second         */
 		int      probe_feed_bytes;  /* PRB packet size (mirror video MTU-ish)*/
 	} mcs;
@@ -2627,9 +2623,9 @@ static SelectDecision selector_update(Selector *s, const Config *cfg,
 	 * climb back up from mcs_min. */
 	if (s->in_failsafe) s->in_failsafe = false;
 
-	/* Cold start: begin low and let the probe promote upward. */
+	/* Cold start: begin at the floor and let the probe promote upward. */
 	if (s->current_mcs < 0)
-		return selector_commit(s, cfg, cfg->mcs.mcs_start, now,
+		return selector_commit(s, cfg, cfg->mcs.mcs_min, now,
 		                       SD_INIT, out_mcs);
 
 	float elapsed = (float)(now - s->last_change_us) / 1e6f;
@@ -2728,6 +2724,12 @@ typedef struct {
 	size_t       offset;      /* offsetof(Config, sub.field) */
 	double       lo, hi;
 	const char  *help;
+	/* Public-surface bit. 1 = operator policy, shown by the default
+	 * /schema (and therefore the WebUI Tune tab). 0 (default) = expert
+	 * mechanics: still readable via /params and writable via /set, and
+	 * listed by /schema?all=1, but hidden from the default UI. New rows
+	 * are expert unless deliberately promoted. */
+	unsigned     pub;
 } TunableDesc;
 
 #define OFF(field)         offsetof(Config, field)
@@ -2742,7 +2744,7 @@ static const TunableDesc TUNABLES[] = {
 	{"common.verbose",         SUB_COMMON, TF_INT,   OFF(verbose),     0, 4,      "log verbosity"},
 
 	/* ── fec ── */
-	{"fec.enabled",                 SUB_FEC, TF_BOOL,  OFF_FEC(enabled),                 0, 0,      "enable FEC subsystem"},
+	{"fec.enabled",                 SUB_FEC, TF_BOOL,  OFF_FEC(enabled),                 0, 0,      "enable FEC subsystem", 1},
 	{"fec.mtu",                     SUB_FEC, TF_INT,   OFF_FEC(mtu),                     100, 65000, "RTP payload budget per packet"},
 	{"fec.min_k",                   SUB_FEC, TF_INT,   OFF_FEC(min_k),                   1, 256,   "min k after sizing"},
 	{"fec.max_k",                   SUB_FEC, TF_INT,   OFF_FEC(max_k),                   1, 256,   "max k after sizing"},
@@ -2759,9 +2761,9 @@ static const TunableDesc TUNABLES[] = {
 	{"fec.k_down_dwell_s",          SUB_FEC, TF_FLOAT, OFF_FEC(k_down_dwell_s),          0.0, 600.0,"k-down dwell"},
 	{"fec.k_up_dwell_s",            SUB_FEC, TF_FLOAT, OFF_FEC(k_up_dwell_s),            0.0, 600.0,"k-up dwell (0 = legacy fast-up)"},
 	{"fec.startup_grace_s",         SUB_FEC, TF_FLOAT, OFF_FEC(startup_grace_s),         0.0, 60.0, "suppress emits for first N s"},
-	{"fec.safety_margin",           SUB_FEC, TF_FLOAT, OFF_FEC(safety_margin),           0.05, 1.0, "fraction of phy_mbps usable"},
-	{"fec.bitrate_min_kbps",        SUB_FEC, TF_LONG,  OFF_FEC(bitrate_min_kbps),        1, 200000, "bitrate floor (kbps)"},
-	{"fec.bitrate_max_kbps",        SUB_FEC, TF_LONG,  OFF_FEC(bitrate_max_kbps),        0, 200000, "bitrate ceiling (kbps; 0 = unlimited)"},
+	{"fec.safety_margin",           SUB_FEC, TF_FLOAT, OFF_FEC(safety_margin),           0.05, 1.0, "fraction of phy_mbps usable", 1},
+	{"fec.bitrate_min_kbps",        SUB_FEC, TF_LONG,  OFF_FEC(bitrate_min_kbps),        1, 200000, "bitrate floor (kbps)", 1},
+	{"fec.bitrate_max_kbps",        SUB_FEC, TF_LONG,  OFF_FEC(bitrate_max_kbps),        0, 200000, "bitrate ceiling (kbps; 0 = unlimited)", 1},
 	{"fec.bitrate_tolerance",       SUB_FEC, TF_FLOAT, OFF_FEC(bitrate_tolerance),       0.0, 1.0,  "re-apply tolerance"},
 	{"fec.bitrate_grace_s",         SUB_FEC, TF_FLOAT, OFF_FEC(bitrate_grace_s),         0.0, 60.0, "post-bitrate-write FEC suppress"},
 	{"fec.mcs_settle_s",            SUB_FEC, TF_FLOAT, OFF_FEC(mcs_settle_s),            0.0, 60.0, "post-MCS-change FEC suppress"},
@@ -2777,20 +2779,21 @@ static const TunableDesc TUNABLES[] = {
 	{"fec.backpressure_fill_pct",   SUB_FEC, TF_INT,   OFF_FEC(backpressure_fill_pct),   0, 100,    "skip-FEC threshold (output queue fill %)"},
 
 	/* ── mcs ── */
-	{"mcs.enabled",                       SUB_MCS, TF_BOOL,  OFF_MCS(enabled),                       0, 0,       "enable MCS subsystem"},
+	{"mcs.enabled",                       SUB_MCS, TF_BOOL,  OFF_MCS(enabled),                       0, 0,       "enable MCS subsystem", 1},
 	{"mcs.rssi_ewma_alpha",               SUB_MCS, TF_FLOAT, OFF_MCS(rssi_ewma_alpha),               0.001, 1.0, "EWMA alpha for RSSI"},
 	{"mcs.loss_ewma_alpha",               SUB_MCS, TF_FLOAT, OFF_MCS(loss_ewma_alpha),               0.001, 1.0, "EWMA alpha for loss ratio"},
 	{"mcs.rssi_aggregator",               SUB_MCS, TF_INT,   OFF_MCS(rssi_aggregator),               0, 2,       "0=best_avg 1=best_max 2=mean_avg"},
 	{"mcs.down_cooldown_s",               SUB_MCS, TF_FLOAT, OFF_MCS(down_cooldown_s),               0.0, 60.0,  "min seconds between demotes (all rules)"},
-	{"mcs.failsafe_timeout_s",            SUB_MCS, TF_FLOAT, OFF_MCS(failsafe_timeout_s),            0.05, 30.0, "watchdog gap before forcing mcs_min"},
+	{"mcs.failsafe_timeout_s",            SUB_MCS, TF_FLOAT, OFF_MCS(failsafe_timeout_s),            0.05, 30.0, "watchdog gap before forcing mcs_min", 1},
 	{"mcs.oscillation_window_s",          SUB_MCS, TF_FLOAT, OFF_MCS(oscillation_window_s),          0.5, 60.0,  "rolling window for changes_in_window stat"},
-	{"mcs.mcs_min",                       SUB_MCS, TF_INT,   OFF_MCS(mcs_min),                       0, 11,      "clamp emit lower bound"},
-	{"mcs.mcs_max",                       SUB_MCS, TF_INT,   OFF_MCS(mcs_max),                       0, 11,      "clamp emit upper bound"},
-	{"mcs.mcs_start",                     SUB_MCS, TF_INT,   OFF_MCS(mcs_start),                     0, 11,      "cold-start MCS index"},
-	{"mcs.rssi_floor_dbm",                SUB_MCS, TF_FLOAT, OFF_MCS(rssi_floor_dbm),                -120.0, 0.0,"guard: demote at/below this smoothed RSSI"},
-	{"mcs.rssi_fade_db_per_s",            SUB_MCS, TF_FLOAT, OFF_MCS(rssi_fade_db_per_s),            0.0, 60.0,  "guard: demote when RSSI falls faster (0=off)"},
-	{"mcs.rssi_fade_arm_dbm",             SUB_MCS, TF_FLOAT, OFF_MCS(rssi_fade_arm_dbm),             -120.0, 0.0,"guard: fade rule armed at/below this RSSI"},
-	{"mcs.rssi_floor_hyst_db",            SUB_MCS, TF_FLOAT, OFF_MCS(rssi_floor_hyst_db),            0.0, 20.0,  "guard: promotes blocked at/below floor + this (must exceed smoothed RSSI noise)"},
+	{"mcs.mcs_min",                       SUB_MCS, TF_INT,   OFF_MCS(mcs_min),                       0, 11,      "clamp emit lower bound (also the cold-start rung)", 1},
+	{"mcs.mcs_max",                       SUB_MCS, TF_INT,   OFF_MCS(mcs_max),                       0, 11,      "clamp emit upper bound", 1},
+	/* RSSI guard knobs are public pending the walkout field-calibration
+	 * cycle (bench RSSI never arms them); revisit after calibration. */
+	{"mcs.rssi_floor_dbm",                SUB_MCS, TF_FLOAT, OFF_MCS(rssi_floor_dbm),                -120.0, 0.0,"guard: demote at/below this smoothed RSSI", 1},
+	{"mcs.rssi_fade_db_per_s",            SUB_MCS, TF_FLOAT, OFF_MCS(rssi_fade_db_per_s),            0.0, 60.0,  "guard: demote when RSSI falls faster (0=off)", 1},
+	{"mcs.rssi_fade_arm_dbm",             SUB_MCS, TF_FLOAT, OFF_MCS(rssi_fade_arm_dbm),             -120.0, 0.0,"guard: fade rule armed at/below this RSSI", 1},
+	{"mcs.rssi_floor_hyst_db",            SUB_MCS, TF_FLOAT, OFF_MCS(rssi_floor_hyst_db),            0.0, 20.0,  "guard: promotes blocked at/below floor + this (must exceed smoothed RSSI noise)", 1},
 	{"mcs.reentry_backoff_s",             SUB_MCS, TF_FLOAT, OFF_MCS(reentry_backoff_s),             0.0, 120.0, "flap guard: window after a demote during which re-entry needs the longer dwell (0 = off)"},
 	{"mcs.reentry_dwell_s",               SUB_MCS, TF_FLOAT, OFF_MCS(reentry_dwell_s),               0.0, 30.0,  "flap guard: dwell for promoting back into the rung that just failed"},
 	{"mcs.probe_clean_milli",             SUB_MCS, TF_INT,   OFF_MCS(probe_clean_milli),             0, 1000,    "probe: V+2 PER <= this permille -> promote-eligible"},
@@ -2799,7 +2802,6 @@ static const TunableDesc TUNABLES[] = {
 	{"mcs.promote_dwell_s",               SUB_MCS, TF_FLOAT, OFF_MCS(promote_dwell_s),               0.0, 60.0,  "probe: min dwell before a promote"},
 	{"mcs.probe_window_s",                SUB_MCS, TF_FLOAT, OFF_MCS(probe_window_s),                0.05, 10.0, "probe: nominal PER window (informational)"},
 	{"mcs.probe_stale_age_s",             SUB_MCS, TF_FLOAT, OFF_MCS(probe_stale_age_s),             0.1, 30.0,  "probe: ignore V+2 rungs older than this"},
-	{"mcs.probe_enabled",                 SUB_MCS, TF_BOOL,  OFF_MCS(probe_enabled),                 0, 0,       "probe: live on/off for the feeder + retune producer"},
 	{"mcs.probe_feed_pps",                SUB_MCS, TF_INT,   OFF_MCS(probe_feed_pps),                1, 200,     "probe: paced PRB feed rate (pkts/s)"},
 	{"mcs.probe_feed_bytes",              SUB_MCS, TF_INT,   OFF_MCS(probe_feed_bytes),              64, 1472,   "probe: PRB packet size (bytes)"},
 
@@ -2964,26 +2966,32 @@ static int params_to_json(const Config *c, char *buf, size_t cap)
 }
 
 /* Schema describes each tunable with type/bounds/help so the WebUI can
- * render an input form without hard-coding field metadata. JSON array. */
-static int schema_to_json(char *buf, size_t cap)
+ * render an input form without hard-coding field metadata. JSON array.
+ * By default only the public (operator-policy) rows are listed; pass
+ * all=true to include the expert mechanics — /set accepts every key
+ * either way. */
+static int schema_to_json(char *buf, size_t cap, bool all)
 {
 	size_t pos = 0;
+	bool first = true;
 	int n = snprintf(buf + pos, cap - pos, "[");
 	if (n < 0) return -1;
 	pos += n;
 	for (size_t i = 0; i < TUNABLES_COUNT; i++) {
 		const TunableDesc *t = &TUNABLES[i];
+		if (!all && !t->pub) continue;
 		const char *type =
 			t->type == TF_INT   ? "int"   :
 			t->type == TF_LONG  ? "long"  :
 			t->type == TF_FLOAT ? "float" : "bool";
 		n = snprintf(buf + pos, cap - pos,
 			"%s{\"name\":\"%s\",\"subsys\":\"%s\",\"type\":\"%s\",\"lo\":%g,\"hi\":%g,\"help\":\"%s\"}",
-			i ? "," : "",
+			first ? "" : ",",
 			t->name, subsys_name(t->subsys), type,
 			t->lo, t->hi, t->help ? t->help : "");
 		if (n < 0 || (size_t)n >= cap - pos) return -1;
 		pos += n;
+		first = false;
 	}
 	n = snprintf(buf + pos, cap - pos, "]");
 	if (n < 0 || (size_t)n >= cap - pos) return -1;
@@ -3229,7 +3237,7 @@ static int append_mcs_json(char *buf, size_t cap, size_t pos,
 		"\"probe\":{\"records\":%u,\"parse_errors\":%u,\"age_s\":%.3f,"
 		"\"v2_mcs\":%d,\"v2_per_milli\":%d,\"v2_accounted\":%ld,\"v2_age_s\":%.3f,"
 		"\"v2_gated\":%s,"
-		"\"configured\":%s,\"enabled\":%s,\"feed_seq\":%u,"
+		"\"configured\":%s,\"feed_seq\":%u,"
 		"\"tuned_mcs\":%d,\"retune_fails\":%u}}",
 		s->cfg->mcs.enabled ? "true" : "false",
 		s->sel->current_mcs,
@@ -3256,7 +3264,6 @@ static int append_mcs_json(char *buf, size_t cap, size_t pos,
 		 * indistinguishable from one it will act on. */
 		(pr && s->probe && pr->last_us < s->probe->gate_us) ? "true" : "false",
 		s->probe_configured ? "true" : "false",
-		s->cfg->mcs.probe_enabled ? "true" : "false",
 		s->probe_feed_seq, s->probe_tuned_mcs, s->probe_retune_fails);
 	if (n < 0 || (size_t)n >= cap - pos) return -1;
 	return n;
@@ -3814,7 +3821,8 @@ static void api_handle_request(ApiClient *c, Config *cfg, ApiSnapshot *snap)
 		else       api_send(c->fd, 500, "text/plain", "json overflow\n", 14);
 	}
 	else if (strcmp(path, "/schema") == 0) {
-		n = schema_to_json(body, sizeof(body));
+		bool all = qs && strstr(qs, "all=1") != NULL;
+		n = schema_to_json(body, sizeof(body), all);
 		if (n > 0) api_send(c->fd, 200, "application/json", body, n);
 		else       api_send(c->fd, 500, "text/plain", "json overflow\n", 14);
 	}
@@ -3955,50 +3963,23 @@ static void usage(const char *prog)
 	fprintf(stderr,
 		"Usage: %s [options]\n"
 		"\n"
+		"The CLI carries wiring/topology only. All tuning is live via the\n"
+		"HTTP API: GET /schema lists the operator-policy knobs (add ?all=1\n"
+		"for the expert mechanics), GET/SET via /set?key=value.\n"
+		"\n"
 		"Common:\n"
 		"  --wfb HOST:PORT          wfb_tx control endpoint (default 127.0.0.1:8000)\n"
 		"  --api-port N             HTTP API + WebUI on :N (default 8765; 0 disables)\n"
 		"  --dry-run                compute but do not send wfb_tx commands\n"
 		"  --iface-mtu N            ip link set dev <iface> mtu N at startup on\n"
-		"                           {csa.iface, wfb-iface}; range [576, 9000].\n"
-		"                           Use with --max-payload above 1472.\n"
+		"                           {csa-iface, wfb-iface}; range [576, 9000]\n"
 		"  -v, --verbose            extra logs\n"
 		"\n"
-		"FEC subsystem (--fec-* / disable with --no-fec):\n"
+		"FEC subsystem (disable with --no-fec):\n"
 		"  --no-fec                 disable FEC subsystem\n"
 		"  --sidecar HOST:PORT      venc sidecar (default 127.0.0.1:5602)\n"
 		"  --venc HOST:PORT         venc HTTP API (default 127.0.0.1:80)\n"
-		"  --wfb-stats-port N       UDP listener for wfb_tx -Y JSON (default 0 = poll mode)\n"
-		"  --mtu N                  packet size budget (default 1446)\n"
-		"  --min-k / --max-k N      k bounds (default 1 / 48)\n"
-		"  --ppf-deadband F         ±F*MTU slack at ppf bucket edges (default 0.15)\n"
-		"  --k-hyst-up N            min Δk to trigger an up-move (default 2)\n"
-		"  --cooldown-up F          min seconds between up-moves (default 1.0)\n"
-		"  --k-down-dwell F         k-down dwell (default 8.0)\n"
-		"  --k-up-dwell F           k-up dwell (default 2.0; 0 = legacy fast-up)\n"
-		"  --startup-grace F        suppress emits for first F s (default 2.0)\n"
-		"  --safety F               fraction of PHY rate usable (default 0.5)\n"
-		"  --bitrate-min N          bitrate floor in kbps (default 1000)\n"
-		"  --bitrate-max N          bitrate ceiling in kbps (default 0 = unlimited)\n"
-		"  --bitrate-tol F          bitrate re-apply tolerance (default 0.15)\n"
-		"  --bitrate-grace F        post-bitrate-write FEC suppress (default 2.0)\n"
-		"  --bitrate-lead-s F       MCS-down: lead between bitrate pre-drop and SET_RADIO (default 0.05)\n"
-		"  --mcs-settle-s F         post-MCS-change FEC suppress (default 5.0)\n"
-		"  --boost-s F              parity boost duration (default 3.0)\n"
-		"  --boost-mult F           parity multiplier during boost (default 1.3)\n"
-		"  --max-payload N          enable adaptive outgoing.maxPayloadSize via\n"
-		"                           bitrate→payload tier table\n"
-		"                           (576..4000; unset = feature off; startup-only).\n"
-		"                           ≤1472 keeps the path on a 1500 MTU; >1472\n"
-		"                           declares jumbo-capable end-to-end. Live\n"
-		"                           tunable: fec.payload_min (default 576).\n"
-		"  --no-safe-startup        disable one-time safe (bitrate, payload)\n"
-		"                           write to venc at controller start. Default\n"
-		"                           ON; bridges the gap between an inherited\n"
-		"                           dangerous venc state and the first natural\n"
-		"                           bitrate write.\n"
 		"  --safe-startup-bitrate N override safe-startup bitrate kbps (default 1500)\n"
-		"  --safe-startup-payload N override safe-startup payload bytes (default 1400)\n"
 		"\n"
 		"MCS subsystem — unified PER-probe law (disable with --no-mcs):\n"
 		"  Promotes when the V+2 probe rung reads clean; demotes on live\n"
@@ -4009,45 +3990,17 @@ static void usage(const char *prog)
 		"  --probe HOST:PORT        probe wfb_tx control endpoint (V+2 producer;\n"
 		"                           retuned to min(video_mcs+2,7) on every commit)\n"
 		"  --probe-feed HOST:PORT   probe wfb_tx udp input for the paced PRB feeder\n"
-		"  --rssi-alpha F           EWMA alpha for RSSI (default 0.3)\n"
-		"  --loss-alpha F           EWMA alpha for loss (default 0.5)\n"
-		"  --aggregator best_avg|best_max|mean_avg  (default best_avg)\n"
-		"  --down-cooldown F        min seconds between demotes, all rules (default 0.2)\n"
-		"  --failsafe F             watchdog gap before forcing mcs_min (default 0.5)\n"
-		"  --osc-window F           rolling window for changes_in_window stat (default 5.0)\n"
-		"  --rssi-floor F           guard: demote at/below this smoothed RSSI dBm (default -85)\n"
-		"  --rssi-fade F            guard: demote when RSSI falls faster than F dB/s,\n"
-		"                           0 disables (default 10)\n"
-		"  --rssi-fade-arm F        guard: fade rule armed at/below this dBm (default -65)\n"
-		"  (probe-law thresholds — clean/fail/demote permille, dwell, pacing —\n"
-		"   and the flap-damping knobs — mcs.rssi_floor_hyst_db,\n"
-		"   mcs.reentry_backoff_s, mcs.reentry_dwell_s — are runtime\n"
-		"   tunables: see /schema)\n"
+		"  --failsafe F             watchdog gap before forcing mcs_min (default 0.5;\n"
+		"                           deployment-dependent — raise for lossy uplinks)\n"
 		"\n"
 		"CSA receiver (off unless --csa-iface set; reuses --stats listener):\n"
 		"  --csa-iface NAME         enable CSA receiver on iface (e.g. wlan0)\n"
-		"  --csa-allowlist CH,...   accepted target channels (default: any)\n"
-		"  --csa-bandwidth BW,...   accepted target bandwidths (default: any)\n"
-		"  --csa-cooldown-ms N      min gap between channel changes (default 2000)\n"
-		"  --csa-no-revert          do not auto-revert if link goes silent\n"
+		"\n"
+		"WCMD proxy:\n"
+		"  --wfb-iface NAME         iface for wfb_txpower writes\n"
 		"\n"
 		"  -h, --help               this message\n",
 		prog);
-}
-
-/* Strict CLI float with range — for safety-critical knobs where a silent
- * atof("85") (sign typo) or atof("abc")=0 would mis-arm a guard rule.
- * Exits on failure: a malformed safety knob must never half-start. */
-static float cli_float_range(const char *opt, const char *arg,
-                             double lo, double hi)
-{
-	double v;
-	if (parse_strict_double(arg, &v) != 0 || v < lo || v > hi) {
-		fprintf(stderr, "%s: invalid value '%s' (expect %g..%g)\n",
-		        opt, arg, lo, hi);
-		exit(1);
-	}
-	return (float)v;
 }
 
 static int parse_hostport(const char *s, char *host, size_t host_sz,
@@ -4063,14 +4016,6 @@ static int parse_hostport(const char *s, char *host, size_t host_sz,
 	if (p <= 0 || p > 65535) return -1;
 	*port = (uint16_t)p;
 	return 0;
-}
-
-static int parse_aggregator(const char *s)
-{
-	if (strcmp(s, "best_avg") == 0) return AGG_BEST_AVG;
-	if (strcmp(s, "best_max") == 0) return AGG_BEST_MAX;
-	if (strcmp(s, "mean_avg") == 0) return AGG_MEAN_AVG;
-	return -1;
 }
 
 /* Cross-field consistency warnings. Per-field bounds are enforced by
@@ -4211,7 +4156,6 @@ static void config_defaults(Config *c)
 	c->mcs.oscillation_window_s = 5.0f;
 	c->mcs.mcs_min = 0;
 	c->mcs.mcs_max = 5;   /* video caps at 5; rungs 6,7 reserved for probing */
-	c->mcs.mcs_start         = 0;     /* cold-start low, let the probe climb */
 	c->mcs.probe_clean_milli = 20;    /* <=2%  -> +2 clean -> promote        */
 	/* fail threshold 200‰ (not 100): with a 0.5 s GS window the rung
 	 * sample is ~accounted = pps/2 packets; at 100‰ a single lost packet
@@ -4226,13 +4170,12 @@ static void config_defaults(Config *c)
 	c->mcs.probe_window_s    = 0.5f;
 	c->mcs.probe_stale_age_s = 1.0f; /* matches ~10 Hz single-stream freshness
 	                                  * (Phase 4; 1.5 was the swept prototype) */
-	/* Probe producer: live-enabled by default, but inert until S99wfb
+	/* Probe producer: runs whenever MCS is enabled, inert until S99wfb
 	 * passes --probe / --probe-feed (ports stay 0). 40 pps × 1400 B
 	 * ≈ 450 kbit/s of probe airtime at the V+2 rate — still negligible,
 	 * and it doubles the per-window PER resolution (~20 packets per
 	 * 0.5 s GS window → 50‰ granularity; 20 pps gave 10-packet windows
 	 * where one lost packet hit the old fail threshold exactly). */
-	c->mcs.probe_enabled     = true;
 	c->mcs.probe_feed_pps    = 40;
 	c->mcs.probe_feed_bytes  = 1400;
 	/* RSSI guard-rails (rules 2/3). Defaults sized for typical wfb-ng
@@ -4299,26 +4242,17 @@ int main(int argc, char **argv)
 	Config cfg;
 	config_defaults(&cfg);
 
+	/* CLI = wiring/topology only (endpoints, ifaces, the
+	 * deployment-dependent failsafe + safe-startup bitrate). Everything
+	 * tunable lives in the /set registry — see /schema. */
 	enum {
 		OPT_WFB = 256, OPT_API_PORT, OPT_DRY_RUN,
 		/* fec */
-		OPT_NO_FEC, OPT_SIDECAR, OPT_VENC, OPT_WFB_STATS_PORT,
-		OPT_MTU, OPT_MINK, OPT_MAXK, OPT_PPF_DEADBAND,
-		OPT_K_HYST_UP, OPT_COOLDOWN_UP, OPT_K_DOWN_DWELL, OPT_K_UP_DWELL,
-		OPT_STARTUP_GRACE, OPT_SAFETY,
-		OPT_BITRATE_MIN, OPT_BITRATE_MAX, OPT_BITRATE_TOL, OPT_BITRATE_GRACE,
-		OPT_BITRATE_LEAD, OPT_MCS_SETTLE, OPT_BOOST_S, OPT_BOOST_MULT,
-		OPT_MAX_PAYLOAD,
-		OPT_NO_SAFE_STARTUP, OPT_SAFE_STARTUP_BITRATE, OPT_SAFE_STARTUP_PAYLOAD,
+		OPT_NO_FEC, OPT_SIDECAR, OPT_VENC, OPT_SAFE_STARTUP_BITRATE,
 		/* mcs */
-		OPT_NO_MCS, OPT_STATS,
-		OPT_RSSI_ALPHA, OPT_LOSS_ALPHA, OPT_AGGREGATOR,
-		OPT_DOWN_COOLDOWN, OPT_FAILSAFE, OPT_OSC_WINDOW,
-		OPT_RSSI_FLOOR, OPT_RSSI_FADE, OPT_RSSI_FADE_ARM,
-		OPT_PROBE, OPT_PROBE_FEED,
+		OPT_NO_MCS, OPT_STATS, OPT_FAILSAFE, OPT_PROBE, OPT_PROBE_FEED,
 		/* csa */
-		OPT_CSA_IFACE, OPT_CSA_ALLOWLIST, OPT_CSA_BANDWIDTH,
-		OPT_CSA_COOLDOWN, OPT_CSA_NO_REVERT,
+		OPT_CSA_IFACE,
 		/* cmd */
 		OPT_WFB_IFACE,
 		/* system */
@@ -4331,47 +4265,13 @@ int main(int argc, char **argv)
 		{"no-fec",         no_argument,       0, OPT_NO_FEC},
 		{"sidecar",        required_argument, 0, OPT_SIDECAR},
 		{"venc",           required_argument, 0, OPT_VENC},
-		{"wfb-stats-port", required_argument, 0, OPT_WFB_STATS_PORT},
-		{"mtu",            required_argument, 0, OPT_MTU},
-		{"min-k",          required_argument, 0, OPT_MINK},
-		{"max-k",          required_argument, 0, OPT_MAXK},
-		{"ppf-deadband",   required_argument, 0, OPT_PPF_DEADBAND},
-		{"k-hyst-up",      required_argument, 0, OPT_K_HYST_UP},
-		{"cooldown-up",    required_argument, 0, OPT_COOLDOWN_UP},
-		{"k-down-dwell",   required_argument, 0, OPT_K_DOWN_DWELL},
-		{"k-up-dwell",     required_argument, 0, OPT_K_UP_DWELL},
-		{"startup-grace",  required_argument, 0, OPT_STARTUP_GRACE},
-		{"safety",         required_argument, 0, OPT_SAFETY},
-		{"bitrate-min",    required_argument, 0, OPT_BITRATE_MIN},
-		{"bitrate-max",    required_argument, 0, OPT_BITRATE_MAX},
-		{"bitrate-tol",    required_argument, 0, OPT_BITRATE_TOL},
-		{"bitrate-grace",  required_argument, 0, OPT_BITRATE_GRACE},
-		{"bitrate-lead-s", required_argument, 0, OPT_BITRATE_LEAD},
-		{"mcs-settle-s",   required_argument, 0, OPT_MCS_SETTLE},
-		{"boost-s",        required_argument, 0, OPT_BOOST_S},
-		{"boost-mult",     required_argument, 0, OPT_BOOST_MULT},
-		{"max-payload",    required_argument, 0, OPT_MAX_PAYLOAD},
-		{"no-safe-startup",      no_argument,       0, OPT_NO_SAFE_STARTUP},
 		{"safe-startup-bitrate", required_argument, 0, OPT_SAFE_STARTUP_BITRATE},
-		{"safe-startup-payload", required_argument, 0, OPT_SAFE_STARTUP_PAYLOAD},
 		{"no-mcs",         no_argument,       0, OPT_NO_MCS},
 		{"stats",          required_argument, 0, OPT_STATS},
-		{"rssi-alpha",     required_argument, 0, OPT_RSSI_ALPHA},
-		{"loss-alpha",     required_argument, 0, OPT_LOSS_ALPHA},
-		{"aggregator",     required_argument, 0, OPT_AGGREGATOR},
-		{"down-cooldown",  required_argument, 0, OPT_DOWN_COOLDOWN},
 		{"failsafe",       required_argument, 0, OPT_FAILSAFE},
-		{"osc-window",     required_argument, 0, OPT_OSC_WINDOW},
-		{"rssi-floor",     required_argument, 0, OPT_RSSI_FLOOR},
-		{"rssi-fade",      required_argument, 0, OPT_RSSI_FADE},
-		{"rssi-fade-arm",  required_argument, 0, OPT_RSSI_FADE_ARM},
 		{"probe",          required_argument, 0, OPT_PROBE},
 		{"probe-feed",     required_argument, 0, OPT_PROBE_FEED},
 		{"csa-iface",      required_argument, 0, OPT_CSA_IFACE},
-		{"csa-allowlist",  required_argument, 0, OPT_CSA_ALLOWLIST},
-		{"csa-bandwidth",  required_argument, 0, OPT_CSA_BANDWIDTH},
-		{"csa-cooldown-ms",required_argument, 0, OPT_CSA_COOLDOWN},
-		{"csa-no-revert",  no_argument,       0, OPT_CSA_NO_REVERT},
 		{"wfb-iface",      required_argument, 0, OPT_WFB_IFACE},
 		{"iface-mtu",      required_argument, 0, OPT_IFACE_MTU},
 		{"verbose",        no_argument,       0, 'v'},
@@ -4379,7 +4279,6 @@ int main(int argc, char **argv)
 		{0, 0, 0, 0},
 	};
 
-	bool mtu_set_by_user = false;
 	int ch;
 	while ((ch = getopt_long(argc, argv, "vh", longopts, NULL)) != -1) {
 		switch (ch) {
@@ -4412,46 +4311,6 @@ int main(int argc, char **argv)
 				fprintf(stderr, "invalid --venc\n"); return 1;
 			}
 			break;
-		case OPT_WFB_STATS_PORT: {
-			int p = atoi(optarg);
-			if (p < 0 || p > 65535) {
-				fprintf(stderr, "invalid --wfb-stats-port\n"); return 1;
-			}
-			cfg.fec.wfb_stats_port = (uint16_t)p;
-			break;
-		}
-		case OPT_MTU:           cfg.fec.mtu              = atoi(optarg);
-		                        mtu_set_by_user = true; break;
-		case OPT_MINK:          cfg.fec.min_k            = atoi(optarg); break;
-		case OPT_MAXK:          cfg.fec.max_k            = atoi(optarg); break;
-		case OPT_PPF_DEADBAND:  cfg.fec.ppf_deadband_frac = (float)atof(optarg); break;
-		case OPT_K_HYST_UP:     cfg.fec.k_hyst_up        = atoi(optarg); break;
-		case OPT_COOLDOWN_UP:   cfg.fec.cooldown_up_s    = (float)atof(optarg); break;
-		case OPT_K_DOWN_DWELL:  cfg.fec.k_down_dwell_s   = (float)atof(optarg); break;
-		case OPT_K_UP_DWELL:    cfg.fec.k_up_dwell_s     = (float)atof(optarg); break;
-		case OPT_STARTUP_GRACE: cfg.fec.startup_grace_s  = (float)atof(optarg); break;
-		case OPT_SAFETY:        cfg.fec.safety_margin    = (float)atof(optarg); break;
-		case OPT_BITRATE_MIN:   cfg.fec.bitrate_min_kbps = atol(optarg); break;
-		case OPT_BITRATE_MAX:   cfg.fec.bitrate_max_kbps = atol(optarg); break;
-		case OPT_BITRATE_TOL:   cfg.fec.bitrate_tolerance = (float)atof(optarg); break;
-		case OPT_BITRATE_GRACE: cfg.fec.bitrate_grace_s   = (float)atof(optarg); break;
-		case OPT_BITRATE_LEAD:  cfg.fec.bitrate_lead_s   = (float)atof(optarg); break;
-		case OPT_MCS_SETTLE:    cfg.fec.mcs_settle_s     = (float)atof(optarg); break;
-		case OPT_BOOST_S:       cfg.fec.boost_s          = (float)atof(optarg); break;
-		case OPT_BOOST_MULT:    cfg.fec.boost_mult       = (float)atof(optarg); break;
-		case OPT_MAX_PAYLOAD: {
-			int p = atoi(optarg);
-			if (p < 576 || p > 4000) {
-				fprintf(stderr,
-				    "invalid --max-payload %d: must be in [576, 4000]\n", p);
-				return 1;
-			}
-			cfg.fec.payload_max = p;
-			break;
-		}
-		case OPT_NO_SAFE_STARTUP:
-			cfg.fec.safe_startup_enabled = false;
-			break;
 		case OPT_SAFE_STARTUP_BITRATE: {
 			long v = atol(optarg);
 			if (v < 100 || v > 100000) {
@@ -4462,47 +4321,13 @@ int main(int argc, char **argv)
 			cfg.fec.safe_startup_bitrate_kbps = v;
 			break;
 		}
-		case OPT_SAFE_STARTUP_PAYLOAD: {
-			int p = atoi(optarg);
-			if (p < 576 || p > 4000) {
-				fprintf(stderr,
-				    "invalid --safe-startup-payload %d: must be in [576, 4000]\n", p);
-				return 1;
-			}
-			cfg.fec.safe_startup_payload = p;
-			break;
-		}
 		case OPT_STATS:
 			if (parse_hostport(optarg, cfg.mcs.stats_host,
 			                   sizeof(cfg.mcs.stats_host), &cfg.mcs.stats_port) != 0) {
 				fprintf(stderr, "invalid --stats\n"); return 1;
 			}
 			break;
-		case OPT_RSSI_ALPHA:     cfg.mcs.rssi_ewma_alpha  = (float)atof(optarg); break;
-		case OPT_LOSS_ALPHA:     cfg.mcs.loss_ewma_alpha  = (float)atof(optarg); break;
-		case OPT_AGGREGATOR: {
-			int a = parse_aggregator(optarg);
-			if (a < 0) {
-				fprintf(stderr, "invalid --aggregator\n"); return 1;
-			}
-			cfg.mcs.rssi_aggregator = a;
-			break;
-		}
-		case OPT_DOWN_COOLDOWN:  cfg.mcs.down_cooldown_s  = (float)atof(optarg); break;
 		case OPT_FAILSAFE:       cfg.mcs.failsafe_timeout_s = (float)atof(optarg); break;
-		case OPT_OSC_WINDOW:     cfg.mcs.oscillation_window_s   = (float)atof(optarg); break;
-		/* Guard-rail knobs: strict parse + same ranges as the /set
-		 * path — "--rssi-floor 85" (dropped sign) would otherwise pin
-		 * floor_hit true and demote to mcs_min forever, silently. */
-		case OPT_RSSI_FLOOR:
-			cfg.mcs.rssi_floor_dbm = cli_float_range("--rssi-floor", optarg, -120, 0);
-			break;
-		case OPT_RSSI_FADE:
-			cfg.mcs.rssi_fade_db_per_s = cli_float_range("--rssi-fade", optarg, 0, 60);
-			break;
-		case OPT_RSSI_FADE_ARM:
-			cfg.mcs.rssi_fade_arm_dbm = cli_float_range("--rssi-fade-arm", optarg, -120, 0);
-			break;
 		case OPT_PROBE:
 			if (parse_hostport(optarg, cfg.probe_host,
 			                   sizeof(cfg.probe_host), &cfg.probe_port) != 0) {
@@ -4519,18 +4344,6 @@ int main(int argc, char **argv)
 		case OPT_CSA_IFACE:
 			snprintf(cfg.csa.iface, sizeof(cfg.csa.iface), "%s", optarg);
 			cfg.csa.enabled = true;
-			break;
-		case OPT_CSA_ALLOWLIST:
-			snprintf(cfg.csa.allow_chan, sizeof(cfg.csa.allow_chan), "%s", optarg);
-			break;
-		case OPT_CSA_BANDWIDTH:
-			snprintf(cfg.csa.allow_bw, sizeof(cfg.csa.allow_bw), "%s", optarg);
-			break;
-		case OPT_CSA_COOLDOWN:
-			cfg.csa.cooldown_ms = strtoll(optarg, NULL, 10);
-			break;
-		case OPT_CSA_NO_REVERT:
-			cfg.csa.no_revert = true;
 			break;
 		case OPT_WFB_IFACE:
 			snprintf(cfg.cmd.wfb_iface, sizeof(cfg.cmd.wfb_iface),
@@ -4551,25 +4364,8 @@ int main(int argc, char **argv)
 		}
 	}
 
-	/* When adaptive payload is enabled and the operator did not pin
-	 * --mtu themselves, default fec.mtu (the FEC k-sizing budget) to
-	 * the payload ceiling. wfb_tx will fragment frames at the venc
-	 * payload boundary, so an mtu lower than the actual emit size makes
-	 * k overshoot. This is a startup-only tie; live operator changes to
-	 * fec.payload_min that produce a smaller selected payload do not
-	 * walk fec.mtu back — that's a follow-up wiring item. */
-	if (cfg.fec.payload_max > 0 && !mtu_set_by_user) {
-		cfg.fec.mtu = cfg.fec.payload_max;
-	}
-	if (cfg.fec.payload_max > 0 && cfg.fec.payload_min > cfg.fec.payload_max) {
-		fprintf(stderr,
-		    "fec.payload_min (%d) > --max-payload (%d)\n",
-		    cfg.fec.payload_min, cfg.fec.payload_max);
-		return 1;
-	}
-
 	/* The unified MCS law promotes on probe data only — without a probe
-	 * producer it would pin video at mcs_start forever. Make the
+	 * producer it would pin video at mcs_min forever. Make the
 	 * dependency explicit instead of degrading silently. */
 	if (cfg.mcs.enabled && cfg.probe_port == 0) {
 		fprintf(stderr, "MCS adaptation requires the V+2 probe producer "
@@ -4640,14 +4436,14 @@ int main(int argc, char **argv)
 			    cfg.fec.payload_max, cfg.fec.payload_min,
 			    cfg.fec.payload_max > 1472 ? " (assumes jumbo path)" : "");
 		} else {
-			LOG_FEC("payload sizing: off (pass --max-payload N to enable)");
+			LOG_FEC("payload sizing: off");
 		}
 	}
 	if (cfg.mcs.enabled) {
-		LOG_MCS("subsys: stats=%s:%u clamp=[%d,%d] start=%d "
+		LOG_MCS("subsys: stats=%s:%u clamp=[%d,%d] "
 		        "guard: floor=%.1fdBm fade=%.1fdB/s(arm<=%.1fdBm)",
 		    cfg.mcs.stats_host, cfg.mcs.stats_port,
-		    cfg.mcs.mcs_min, cfg.mcs.mcs_max, cfg.mcs.mcs_start,
+		    cfg.mcs.mcs_min, cfg.mcs.mcs_max,
 		    (double)cfg.mcs.rssi_floor_dbm,
 		    (double)cfg.mcs.rssi_fade_db_per_s,
 		    (double)cfg.mcs.rssi_fade_arm_dbm);
@@ -4984,8 +4780,7 @@ int main(int argc, char **argv)
 		 * (c) Paced PRB feeder at mcs.probe_feed_pps to the probe
 		 *     wfb_tx udp input. Best-effort connected-UDP sends;
 		 *     errors (probe down) are silently dropped. */
-		bool probe_on = cfg.mcs.enabled &&
-		                cfg.mcs.probe_enabled && !cfg.dry_run;
+		bool probe_on = cfg.mcs.enabled && !cfg.dry_run;
 		if (sel.current_mcs != probe_gate_mcs) {
 			probe.gate_us = now;
 			probe_gate_mcs = sel.current_mcs;

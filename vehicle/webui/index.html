@@ -114,6 +114,8 @@ main{padding:1.2rem;overflow:auto;height:calc(100vh - 86px);max-width:1100px;mar
 .toggle-strip .hint{font-size:.7rem;color:var(--mute);flex:1 1 100%;margin-top:.2rem}
 
 /* Tune tab — sections + parameter rows */
+.tune-expert{display:flex;align-items:center;gap:.45rem;margin:.2rem 0 1rem;font-size:.76rem;color:var(--mute);cursor:pointer;user-select:none}
+.tune-expert input{accent-color:var(--warn)}
 .tune-section{margin-bottom:1.2rem}
 .tune-section h2{margin:0 0 .5rem;font-size:.78rem;text-transform:uppercase;letter-spacing:.06em;font-weight:600;border-left:3px solid var(--common);padding-left:.6rem;color:var(--mute)}
 .tune-section.fec h2{border-left-color:var(--fec);color:var(--fec)}
@@ -235,6 +237,7 @@ main{padding:1.2rem;overflow:auto;height:calc(100vh - 86px);max-width:1100px;mar
 const state = {
   paramsSchema: null,    // [{name, type, lo, hi, help, value, subsys}, ...]
   tuneRendered: false,
+  tuneExpert: false,     // false = /schema (public keys), true = /schema?all=1
   evBuf: [],             // [{t, subsys, msg}, ...] — capped
   evCap: 200,
   filters: {fec:true, mcs:true, common:true},
@@ -541,20 +544,20 @@ function renderStatus(s) {
     phy_mbps: (radio.phy_mbps != null) ? radio.phy_mbps.toFixed(1) : "—",
   });
 
-  // Payload card — adaptive outgoing.maxPayloadSize. When --max-payload
-  // is unset the card shows "off" muted; when enabled it shows the
-  // last value written to venc with two pill flags:
+  // Payload card — adaptive outgoing.maxPayloadSize. When the feature
+  // is off (fec.payload_max = 0, the shipped default) the card shows
+  // "off" muted; when enabled it shows the last value written to venc
+  // with two pill flags:
   //   CAPPED  — the bitrate→payload tier table wanted more headroom
-  //             than --max-payload allowed (operator declined jumbo at
-  //             this rate; expect higher pps);
-  //   JUMBO   — informational, --max-payload > 1472 so the operator
-  //             has declared a jumbo-capable end-to-end path.
+  //             than payload_max allowed (expect higher pps);
+  //   JUMBO   — informational, payload_max > 1472 so the operator has
+  //             declared a jumbo-capable end-to-end path.
   const pld = s.payload || {};
   const cP = $("#c-payload"), cPS = $("#c-payload-sub");
   if (!pld.enabled) {
     cP.textContent = "off";
     cP.className = "v muted";
-    cPS.textContent = "(--max-payload not set)";
+    cPS.textContent = "fixed venc payload";
   } else {
     let flags = "";
     if (pld.table_clipped) flags += '<span class="flag warn">CAPPED</span>';
@@ -629,7 +632,8 @@ async function renderTune() {
   try {
     [params, schema] = await Promise.all([
       fetch("/params", {cache:"no-store"}).then(r => r.json()),
-      fetch("/schema", {cache:"no-store"}).then(r => r.json()),
+      fetch(state.tuneExpert ? "/schema?all=1" : "/schema",
+            {cache:"no-store"}).then(r => r.json()),
     ]);
   } catch (e) {
     root.innerHTML = '<div class="empty">failed to load params (' + e + ')</div>';
@@ -647,6 +651,21 @@ async function renderTune() {
 
   root.innerHTML = "";
   root.appendChild(buildToggleStrips(params));
+  // Expert toggle — default /schema lists only operator-policy keys;
+  // ?all=1 adds the algorithm mechanics. /set accepts both either way.
+  const exp = document.createElement("label");
+  exp.className = "tune-expert";
+  const expCb = document.createElement("input");
+  expCb.type = "checkbox";
+  expCb.checked = state.tuneExpert;
+  expCb.addEventListener("change", () => {
+    state.tuneExpert = expCb.checked;
+    renderTune();
+  });
+  exp.appendChild(expCb);
+  exp.appendChild(document.createTextNode(
+    " show expert keys (algorithm mechanics — defaults are device-validated)"));
+  root.appendChild(exp);
   for (const g of ["common","fec","mcs"]) {
     if (!groups[g].length) continue;
     const sect = document.createElement("div"); sect.className = "tune-section " + g;

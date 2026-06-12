@@ -36,13 +36,15 @@ MCS keep running across hops:
 ```sh
 link_controller --wfb 127.0.0.1:8000 --venc 127.0.0.1:80 \
     --safe-startup-bitrate 4096 \
-    --csa-iface wlan0 \
-    --csa-allowlist 149,153,157,161 \
-    --csa-bandwidth HT20,HT40+
+    --csa-iface wlan0
 ```
 
 Off by default; set `--csa-iface` to enable. Requires the MCS subsystem
-(default-on) since CSA shares the rx_ant socket.
+(default-on) since CSA shares the rx_ant socket. The receiver accepts
+any channel/bandwidth with a 2 s cooldown and auto-revert on silence
+(the former `--csa-allowlist/--csa-bandwidth/--csa-cooldown-ms/
+--csa-no-revert` flags were frozen to these defaults in the
+public-surface slimdown).
 
 ### Standalone agent (cpe510 ground relay, or vehicle without link_controller)
 
