@@ -211,10 +211,56 @@ function wireForms() {
   });
 }
 
+/* ---- live tailing ---- */
+let LIVE = true;
+let LAST_N = -1;
+const POLL_MS = 2000;
+
+function setLiveDot(txt, cls) {
+  const d = document.getElementById("live-dot");
+  if (d) { d.textContent = txt; d.className = cls; }
+}
+
+// Push fresh series into the existing charts (used by the poll). setData with
+// resetScales=true tails the view to the full range — the expected live
+// behaviour; pause via the toggle to inspect a frozen window.
+function applySeries(j) {
+  const S = j.series, t = S.t;
+  document.getElementById("overlay-status").textContent =
+    ` · ${j.n} records · model ${j.model_ver || "(none scored)"}`;
+  CHARTS[0].setData([t, S.rssi_comb, S.snr_avg], true);
+  CHARTS[1].setData([t, S.per, S.pkt_lost], true);
+  CHARTS[2].setData([t, S.mcs, S.tier1_state], true);
+  STATE_BANDS = stateBands(t, S.tier1_state);
+  rebuildBands();
+}
+
+async function pollOnce() {
+  if (!LIVE) { setLiveDot("● paused", "live-paused"); return; }
+  // Never disturb an in-progress label selection / manual zoom.
+  if (LABEL_MODE || PENDING) { setLiveDot("● live (held)", "live-on"); return; }
+  let j;
+  try {
+    const r = await fetch(`/api/session/${SID}/series`);
+    if (!r.ok) return;
+    j = await r.json();
+  } catch (e) { return; }
+  if (j.n !== LAST_N) { applySeries(j); LAST_N = j.n; setLiveDot("● live", "live-on"); }
+  else setLiveDot("● idle", "live-idle");
+}
+
+function startLive() {
+  const cb = document.getElementById("live-toggle");
+  if (cb) { LIVE = cb.checked; cb.addEventListener("change", () => { LIVE = cb.checked; }); }
+  setLiveDot("● live", "live-on");
+  setInterval(pollOnce, POLL_MS);
+}
+
 async function main() {
   const r = await fetch(`/api/session/${SID}/series`);
   if (!r.ok) { document.getElementById("charts").textContent = "failed to load series"; return; }
   const j = await r.json();
+  LAST_N = j.n;
   const S = j.series, t = S.t;
   document.getElementById("overlay-status").textContent =
     ` · ${j.n} records · model ${j.model_ver || "(none scored)"}`;
@@ -254,6 +300,7 @@ async function main() {
 
   wireForms();
   reloadLabels();
+  startLive();
 }
 
 main();
