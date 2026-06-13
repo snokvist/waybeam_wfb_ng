@@ -172,14 +172,14 @@ labels for human review.
 
 ## Conventions
 
-- The SQLite file (`telemetry/wfb.sqlite`) **is committed for now** — it's small
-  early on and travelling with the repo keeps sessions portable. Only the
-  transient WAL/SHM/journal sidecars are git-ignored (so we never commit a
-  half-flushed DB; checkpoint with `PRAGMA wal_checkpoint(TRUNCATE)` before
-  committing). The committed DB ships one clearly-tagged `synthetic-demo` session
-  (source `bench-synthetic`, with `rule-demo` Tier-1 predictions) so the UI is
-  browsable/labelable out of the box — safe to delete once real captures land.
-  Revisit (git-ignore + a migration/export path) once it grows large.
+- The SQLite file (`telemetry/wfb.sqlite`) **is git-ignored** — it is a runtime
+  artifact that live captures (`wfb_ingest.py`) and imports continuously churn,
+  so it doesn't belong in version control. Its WAL/SHM/journal sidecars are
+  ignored too. A fresh clone has no DB; the first `wfb_store.py` / ingest call
+  creates it from `schema.sql`. For a browsable/labelable demo out of the box,
+  regenerate the tagged `synthetic-demo` session with
+  `python3 telemetry/gen_sample.py` (source `bench-synthetic`, `rule-demo`
+  Tier-1 predictions). Back up / share a real DB by copying the single file.
 - Store + ingest are stdlib `sqlite3` only. The web layer is Flask + vendored
   uPlot (`requirements-webui.txt`); no further runtime deps without a decision.
 - `raw_json` is the source of truth; denormalised columns are a cache and can be
