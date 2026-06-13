@@ -29,4 +29,27 @@
   </tbody>
 </table>
 {% endif %}
+
+<script>
+/* Live-refresh the session list (record counts + span grow as a capture runs). */
+(function () {
+  const esc = s => (s == null ? "—" : String(s)).replace(/[&<>]/g,
+    c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+  const span = (a, b) => (a != null && b != null) ? ((b - a) / 1000).toFixed(1) + "s" : "—";
+  async function tick() {
+    let rows;
+    try { const r = await fetch("/api/sessions"); if (!r.ok) return; rows = await r.json(); }
+    catch (e) { return; }
+    const tb = document.querySelector("table.sessions tbody");
+    if (!tb) { if (rows.length) location.reload(); return; }  // 0 → N: build the table
+    tb.innerHTML = rows.map(s =>
+      `<tr onclick="location.href='/session/${s.id}'">` +
+      `<td>${s.id}</td><td>${esc(s.source)}</td><td>${esc(s.scenario)}</td>` +
+      `<td class="num">${s.n_records}</td><td class="num">${span(s.first_ts, s.last_ts)}</td>` +
+      `<td>${esc(s.started_at)}</td><td>${esc(s.location)}</td><td>${esc(s.notes)}</td></tr>`
+    ).join("");
+  }
+  setInterval(tick, 5000);
+})();
+</script>
 {% endblock %}

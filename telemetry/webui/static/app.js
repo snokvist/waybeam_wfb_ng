@@ -25,6 +25,7 @@ let BANDS = [];         // merged, what the plugin draws
 let CHARTS = [];
 let LABEL_MODE = false;
 let PENDING = null;     // {x0, x1} from the active selection
+let ZOOMED = false;     // user has zoomed the x-scale in — hold live tailing
 // A drag below this many px is treated as a click: uPlot fires setSelect with
 // ~0 width on a plain click, so onSelect expands sub-CLICK_PX selections to a
 // small default span — single-clicking a point works, not only dragging a span.
@@ -115,7 +116,7 @@ function makeChart(el, title, series, data, scales, axes) {
     scales: scales || {},
     axes: [{ stroke: axisColor, grid: { stroke: "#21262d" }, ticks: { stroke: "#21262d" } }].concat(axes),
     plugins: [bandsPlugin()],
-    hooks: { setSelect: [onSelect] },
+    hooks: { setSelect: [onSelect], setScale: [onSetScale] },
     series,
   };
   const u = new uPlot(opts, data, el);
@@ -134,6 +135,18 @@ function makeChart(el, title, series, data, scales, axes) {
     u.setSelect({ left: lpx, width: 0, top: 0, height: u.over.clientHeight }, true);
   });
   return u;
+}
+
+// Track whether the user has zoomed the x-axis away from the full data extent.
+// While zoomed, the live poll holds (it would otherwise setData(resetScales)
+// and snap back to full range every 2 s). Double-click (uPlot's built-in zoom
+// reset) restores the full extent → clears the flag → tailing resumes.
+function onSetScale(u, key) {
+  if (key !== "x") return;
+  const d = u.data[0];
+  if (!d || d.length < 2) { ZOOMED = false; return; }
+  const lo = d[0], hi = d[d.length - 1], eps = (hi - lo) * 1e-4 + 1e-6;
+  ZOOMED = (u.scales.x.min > lo + eps) || (u.scales.x.max < hi - eps);
 }
 
 function onSelect(u) {
@@ -270,8 +283,8 @@ function applySeries(j) {
 
 async function pollOnce() {
   if (!LIVE) { setLiveDot("● paused", "live-paused"); return; }
-  // Never disturb an in-progress label selection / manual zoom.
-  if (LABEL_MODE || PENDING) { setLiveDot("● live (held)", "live-on"); return; }
+  // Never disturb an in-progress label selection or a manual zoom.
+  if (LABEL_MODE || PENDING || ZOOMED) { setLiveDot("● live (held)", "live-on"); return; }
   let j;
   try {
     const r = await fetch(`/api/session/${SID}/series`);

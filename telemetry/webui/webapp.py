@@ -102,19 +102,35 @@ def api_series(sid: int):
     # Diversity antennas repeat the same packet set, so the count at a rung is
     # the MAX pkts across ant entries at that rung, not their sum. Fixed 0..7
     # rung set keeps the series count stable across live polls.
+    def _rung(m):
+        # accept a real int rung 0..7 only — reject bools ("mcs": true) and floats
+        return m if isinstance(m, int) and not isinstance(m, bool) and 0 <= m < 8 else None
+
     mcs_dist = {str(m): [0] * len(rows) for m in range(8)}
     for i, r in enumerate(rows):
-        try:
-            ants = json.loads(r["raw_json"]).get("ant", [])
-        except (ValueError, TypeError):
-            continue
         best: dict[int, int] = {}
-        for a in ants:
-            m, p = a.get("mcs"), a.get("pkts", 0)
-            if isinstance(m, int) and 0 <= m < 8 and p > best.get(m, 0):
-                best[m] = p
-        for m, p in best.items():
-            mcs_dist[str(m)][i] = p
+        try:
+            ants = json.loads(r["raw_json"]).get("ant")
+            if isinstance(ants, list):
+                for a in ants:
+                    if not isinstance(a, dict):
+                        continue
+                    m, p = _rung(a.get("mcs")), a.get("pkts", 0)
+                    if m is not None and isinstance(p, (int, float)) \
+                            and not isinstance(p, bool) and p > best.get(m, 0):
+                        best[m] = p
+        except (ValueError, TypeError, AttributeError):
+            best = {}
+        if best:
+            for m, p in best.items():
+                mcs_dist[str(m)][i] = int(p)
+        else:
+            # Fallback for vehicle-uplink sessions (no ant[]): show the
+            # denormalised current MCS as a single-rung mark so the stacked
+            # bar still renders the active rung over time.
+            m = _rung(r["mcs"])
+            if m is not None:
+                mcs_dist[str(m)][i] = 1
 
     # overlay spans converted to x-seconds for the chart's band plugin
     overlays = [{"x0": (h["t0_ms"] - t0) / 1000.0,
