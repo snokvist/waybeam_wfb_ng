@@ -44,9 +44,18 @@ def _latest_model_ver(conn) -> str | None:
     return row["model_ver"] if row else None
 
 
-# capture_session.sh lives in telemetry/ (one dir up from webui/).
-CAPTURE_SH = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "capture_session.sh")
+# capture_session.sh / import_vehicle_session.sh live in telemetry/ (one dir up).
+_TELEMETRY_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+CAPTURE_SH = os.path.join(_TELEMETRY_DIR, "capture_session.sh")
+IMPORT_SH = os.path.join(_TELEMETRY_DIR, "import_vehicle_session.sh")
+
+# Strict input gates for the vehicle-fetch endpoint. The import shell interpolates
+# both values into a remote `ssh` command (`ssh root@$IP "ls $WALKOUT/${SEL}_*"`),
+# so validate here even though we pass argv (no local shell) — these block any
+# injection / stray ssh option from reaching the vehicle.
+import re  # noqa: E402
+_IP_RE = re.compile(r"^\d{1,3}(\.\d{1,3}){3}$")
+_SEL_RE = re.compile(r"^(latest|\d{6})$")
 
 
 @app.route("/")
@@ -81,6 +90,42 @@ def capture_new():
     if r.stderr.strip():
         msg = (msg + "  " + r.stderr.strip()).strip()
     return jsonify(ok=(r.returncode == 0), message=msg, code=r.returncode)
+
+
+@app.route("/api/vehicle/fetch", methods=["POST"])
+def vehicle_fetch():
+    """Pull a vehicle walkout session over the management link and import its
+    link_controller status.jsonl as a `vehicle-uplink` session, so the uplink
+    sits next to the GS downlink for the same walk. Wraps import_vehicle_session.sh
+    (scp + the LOG_SYNC marker-fit importer); the alignment line it prints is
+    surfaced back to the UI. Runs as the web-UI user (its ssh keys reach the
+    vehicle) — no sudo, unlike the root-owned capture ingester."""
+    if not os.path.exists(IMPORT_SH):
+        return jsonify(ok=False, error="import_vehicle_session.sh not found"), 500
+    d = request.get_json(silent=True) or request.form
+    ip = (d.get("ip") or "").strip()
+    sel = (d.get("session") or "latest").strip()
+    if not _IP_RE.match(ip):
+        return jsonify(ok=False, error=f"invalid vehicle IP {ip!r}"), 400
+    if not _SEL_RE.match(sel):
+        return jsonify(ok=False, error="session must be 'latest' or 6 digits"), 400
+    # Point the importer at the SAME db the UI reads (it defaults to its own).
+    env = dict(os.environ, WFB_DB=os.path.abspath(app.config["DB"]))
+    try:
+        r = subprocess.run(["bash", IMPORT_SH, ip, sel],
+                           capture_output=True, text=True, timeout=180, env=env)
+    except subprocess.TimeoutExpired:
+        return jsonify(ok=False, error="vehicle fetch timed out (link slow?)"), 504
+    except OSError as e:
+        return jsonify(ok=False, error=str(e)), 500
+    out = (r.stdout or "").strip()
+    err = (r.stderr or "").strip()
+    # The importer reports its fit/alignment on stderr ("[import-vehicle] aligned …");
+    # carry the last informative line back so the user sees the GS-session match.
+    align = next((ln for ln in reversed(err.splitlines())
+                  if "[import-vehicle]" in ln), "")
+    msg = " · ".join(x for x in (out.splitlines()[-1:] or [""]) + [align] if x).strip(" ·")
+    return jsonify(ok=(r.returncode == 0), message=msg or err or out, code=r.returncode)
 
 
 def _epoch(iso):
@@ -119,22 +164,17 @@ def _find_gs_pair(conn, gs_lo, gs_hi):
     return None
 
 
-@app.route("/api/session/<int:vid>/overlay")
-def overlay_series(vid: int):
-    """Uplink (this vehicle-uplink session) + downlink (its paired GS session)
-    on ONE gs-wall-clock axis. Vehicle records carry gs_unix_ms (stamped by the
-    importer's LOG_SYNC fit); GS records are mapped via the session start epoch +
-    (ts_ms - first_ts_ms), i.e. wfb_rx's real-time 100 ms cadence. The shared
-    x-axis is gs unix SECONDS so uPlot renders wall-clock time."""
-    conn = _conn()
-    vs = store.get_session(conn, vid)
-    if not vs or vs["source"] != "vehicle-uplink":
-        conn.close()
-        abort(404)
-    vt, v_rssi, v_per, v_mcs = [], [], [], []
-    gs_lo = gs_hi = None
-    for r in conn.execute("SELECT rssi_comb, per, mcs, raw_json FROM records "
-                          "WHERE session_id=? ORDER BY ts_ms", (vid,)):
+def _uplink_in_window(conn, lo, hi):
+    """Vehicle-uplink records (from ANY vehicle-uplink session) whose stamped
+    gs_unix_ms falls in [lo, hi] gs-unix-seconds. Keyed on wall-clock, not on the
+    vehicle session's notes label — so a single continuous vehicle log that spans
+    several GS sessions (one file → many GS windows, because the vehicle keeps
+    logging across GS `new capture` breaks) still slices to the right walk."""
+    t, rssi, per, mcs = [], [], [], []
+    for r in conn.execute(
+            "SELECT r.rssi_comb, r.per, r.mcs, r.raw_json FROM records r "
+            "JOIN sessions s ON s.id = r.session_id "
+            "WHERE s.source = 'vehicle-uplink' ORDER BY r.ts_ms"):
         try:
             g = json.loads(r["raw_json"]).get("gs_unix_ms")
         except (ValueError, TypeError):
@@ -142,43 +182,97 @@ def overlay_series(vid: int):
         if not isinstance(g, (int, float)):
             continue
         gs = g / 1000.0
-        vt.append(gs)
-        v_rssi.append(r["rssi_comb"])
-        v_per.append(r["per"])
-        v_mcs.append(r["mcs"])
-        gs_lo = gs if gs_lo is None else min(gs_lo, gs)
-        gs_hi = gs if gs_hi is None else max(gs_hi, gs)
+        if lo is not None and (gs < lo or gs > hi):
+            continue
+        t.append(gs)
+        rssi.append(r["rssi_comb"])
+        per.append(r["per"])
+        mcs.append(r["mcs"])
+    return t, rssi, per, mcs
 
-    gs_sid = _find_gs_pair(conn, gs_lo, gs_hi)
-    gt, g_rssi, g_per, g_snr = [], [], [], []
-    if gs_sid:
-        gsess = store.get_session(conn, gs_sid)
-        start = _epoch(gsess["started_at"]) if gsess else None
-        grows = list(conn.execute(
-            "SELECT ts_ms, rssi_comb, per, snr_avg FROM records "
-            "WHERE session_id=? ORDER BY ts_ms", (gs_sid,)))
-        if grows and start is not None:
-            t0 = grows[0]["ts_ms"]
-            for r in grows:
-                gt.append(start + (r["ts_ms"] - t0) / 1000.0)
-                g_rssi.append(r["rssi_comb"])
-                g_per.append(r["per"])
-                g_snr.append(r["snr_avg"])
+
+def _downlink_in_window(conn, gs_sid, lo, hi):
+    """GS (downlink) records for `gs_sid`, mapped to gs-wall-clock seconds via the
+    session start epoch + wfb_rx's 100 ms cadence, clipped to [lo, hi]."""
+    t, rssi, per, snr = [], [], [], []
+    gsess = store.get_session(conn, gs_sid)
+    start = _epoch(gsess["started_at"]) if gsess else None
+    rows = list(conn.execute(
+        "SELECT ts_ms, rssi_comb, per, snr_avg FROM records "
+        "WHERE session_id=? ORDER BY ts_ms", (gs_sid,)))
+    if rows and start is not None:
+        t0 = rows[0]["ts_ms"]
+        for r in rows:
+            gt = start + (r["ts_ms"] - t0) / 1000.0
+            if lo is not None and (gt < lo or gt > hi):
+                continue
+            t.append(gt)
+            rssi.append(r["rssi_comb"])
+            per.append(r["per"])
+            snr.append(r["snr_avg"])
+    return t, rssi, per, snr
+
+
+@app.route("/api/session/<int:sid>/overlay")
+def overlay_series(sid: int):
+    """Uplink (vehicle, 1 Hz) + downlink (GS, 10 Hz) on ONE gs-wall-clock axis.
+    Works from EITHER end of a walk:
+      * a vehicle-uplink session — window = its stamped gs_unix range, GS side is
+        the paired GS session (latest-started overlapper);
+      * a GS (`live-*`) session — window = the GS session's own span, uplink is
+        the vehicle slice that falls inside it.
+    The uplink is always pulled by wall-clock window (`_uplink_in_window`), so it's
+    correct even when one continuous vehicle log covers several GS sessions."""
+    conn = _conn()
+    s = store.get_session(conn, sid)
+    if not s:
+        conn.close()
+        abort(404)
+    src = s["source"] or ""
+    gs_sid = lo = hi = None
+    if src == "vehicle-uplink":
+        for r in conn.execute("SELECT raw_json FROM records WHERE session_id=? "
+                              "ORDER BY ts_ms", (sid,)):
+            try:
+                g = json.loads(r["raw_json"]).get("gs_unix_ms")
+            except (ValueError, TypeError):
+                g = None
+            if isinstance(g, (int, float)):
+                gs = g / 1000.0
+                lo = gs if lo is None else min(lo, gs)
+                hi = gs if hi is None else max(hi, gs)
+        gs_sid = _find_gs_pair(conn, lo, hi)
+    elif src.startswith("live-"):
+        gs_sid = sid
+        start = _epoch(s["started_at"])
+        rows = list(conn.execute("SELECT ts_ms FROM records WHERE session_id=? "
+                                 "ORDER BY ts_ms", (sid,)))
+        if rows and start is not None:
+            lo = start
+            hi = start + (rows[-1]["ts_ms"] - rows[0]["ts_ms"]) / 1000.0
+    else:
+        conn.close()
+        abort(404)
+
+    ut, u_rssi, u_per, u_mcs = _uplink_in_window(conn, lo, hi)
+    gt, g_rssi, g_per, g_snr = (_downlink_in_window(conn, gs_sid, lo, hi)
+                                if gs_sid else ([], [], [], []))
     conn.close()
     return app.response_class(json.dumps({
-        "vehicle_session": vid, "gs_session": gs_sid,
-        "aligned": bool(vt and gt),
-        "uplink": {"t": vt, "rssi": v_rssi, "per": v_per, "mcs": v_mcs},
+        "session": sid, "source": src, "gs_session": gs_sid,
+        "vehicle_session": sid if src == "vehicle-uplink" else None,
+        "aligned": bool(ut and gt),
+        "uplink": {"t": ut, "rssi": u_rssi, "per": u_per, "mcs": u_mcs},
         "downlink": {"t": gt, "rssi": g_rssi, "per": g_per, "snr": g_snr},
     }), mimetype="application/json")
 
 
-@app.route("/overlay/<int:vid>")
-def overlay_page(vid: int):
+@app.route("/overlay/<int:sid>")
+def overlay_page(sid: int):
     conn = _conn()
-    s = store.get_session(conn, vid)
+    s = store.get_session(conn, sid)
     conn.close()
-    if not s or s["source"] != "vehicle-uplink":
+    if not s or not ((s["source"] or "").startswith(("vehicle-uplink", "live-"))):
         abort(404)
     return render_template("overlay.html", session=dict(s))
 

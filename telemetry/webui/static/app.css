@@ -33,7 +33,11 @@ table.sessions tbody tr:hover td.actions { background: #1b222c; }
 .toolbar { display: flex; align-items: center; gap: .8rem; margin-bottom: 1rem; }
 .toolbar h1 { margin: 0; }
 #new-capture { padding: .3rem .7rem; }
-#capture-status { font-size: .85rem; }
+#capture-status, #vehicle-status { font-size: .85rem; }
+.toolbar-sep { width: 1px; align-self: stretch; background: var(--line); margin: 0 .2rem; }
+.inline-fetch { display: inline-flex; align-items: center; gap: .4rem; margin: 0; }
+.inline-fetch input { padding: .3rem .4rem; }
+.inline-fetch button { padding: .3rem .7rem; white-space: nowrap; }
 a { color: var(--accent); }
 .back { display: inline-block; margin-bottom: .6rem; text-decoration: none; }
 code { background: #1f2630; padding: .1rem .35rem; border-radius: 4px; }
