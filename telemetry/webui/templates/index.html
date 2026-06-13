@@ -14,7 +14,7 @@
 <table class="sessions">
   <thead><tr>
     <th>#</th><th>source</th><th>scenario</th><th>records</th><th>span</th>
-    <th>started</th><th>location</th><th>notes</th>
+    <th>started</th><th>location</th><th>notes</th><th></th>
   </tr></thead>
   <tbody>
   {% for s in sessions %}
@@ -28,6 +28,7 @@
       <td>{{ s.started_at or '—' }}</td>
       <td>{{ s.location or '—' }}</td>
       <td>{{ s.notes or '—' }}</td>
+      <td class="actions"><button class="del-session" data-id="{{ s.id }}" title="Delete session {{ s.id }}">✕</button></td>
     </tr>
   {% endfor %}
   </tbody>
@@ -50,10 +51,31 @@
       `<tr onclick="location.href='/session/${s.id}'">` +
       `<td>${s.id}</td><td>${esc(s.source)}</td><td>${esc(s.scenario)}</td>` +
       `<td class="num">${s.n_records}</td><td class="num">${span(s.first_ts, s.last_ts)}</td>` +
-      `<td>${esc(s.started_at)}</td><td>${esc(s.location)}</td><td>${esc(s.notes)}</td></tr>`
+      `<td>${esc(s.started_at)}</td><td>${esc(s.location)}</td><td>${esc(s.notes)}</td>` +
+      `<td class="actions"><button class="del-session" data-id="${s.id}" title="Delete session ${s.id}">✕</button></td></tr>`
     ).join("");
   }
   setInterval(tick, 5000);
+
+  /* Delete a session (capture phase, so it runs BEFORE the row's navigate-
+     onclick; one listener on the table survives tbody rebuilds by tick()). */
+  const table = document.querySelector("table.sessions");
+  if (table) table.addEventListener("click", async (e) => {
+    const del = e.target.closest(".del-session");
+    if (!del) return;
+    e.stopPropagation(); e.preventDefault();
+    const id = del.dataset.id;
+    if (!confirm(`Delete session ${id} and all its records, predictions and labels?\nThis cannot be undone.`)) return;
+    del.disabled = true; del.textContent = "…";
+    try {
+      const r = await fetch(`/api/session/${id}`, { method: "DELETE" });
+      const j = await r.json();
+      if (j.ok) tick();
+      else { alert("Delete failed: " + (j.error || "unknown")); del.disabled = false; del.textContent = "✕"; }
+    } catch (err) {
+      alert("Delete request failed"); del.disabled = false; del.textContent = "✕";
+    }
+  }, true);
 
   /* "New capture session" — roll a fresh GS ingester session for a clean
      break. Confirms first (it ends the current capture), then refreshes. */
