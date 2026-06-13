@@ -81,9 +81,14 @@ if [ -d "$SCRIPT_DIR/build/wfb-ng" ]; then
     echo "=== Reusing wfb-ng tree from $WFB_DIR ==="
 else
     WFB_DIR="$BUILD_DIR/wfb-ng"
+    # Pin to the same known-good commit as build-armv7.sh so both patches apply.
+    WFB_NG_SHA="af6ba85eface27279709477077d3362c69bb2576"
     if [ ! -d "$WFB_DIR" ]; then
-        echo "=== Cloning wfb-ng into $WFB_DIR ==="
-        git clone --depth 1 https://github.com/svpcom/wfb-ng.git "$WFB_DIR"
+        echo "=== Cloning wfb-ng into $WFB_DIR (pinned $WFB_NG_SHA) ==="
+        git init -q "$WFB_DIR"
+        git -C "$WFB_DIR" remote add origin https://github.com/svpcom/wfb-ng.git
+        git -C "$WFB_DIR" fetch --depth 1 origin "$WFB_NG_SHA"
+        git -C "$WFB_DIR" checkout -q FETCH_HEAD
     fi
 fi
 
@@ -97,6 +102,17 @@ elif git -C "$WFB_DIR" apply --check "$SCRIPT_DIR/shm-input.patch" 2>/dev/null; 
 else
     echo "ERROR: wfb-ng tree at $WFB_DIR is dirty and rejects the patch." >&2
     echo "Run with --clean first if this is the openwrt tree, or clean build/wfb-ng." >&2
+    exit 1
+fi
+
+# peek.patch (NAL-aware link protection) on top of shm-input.patch. Idempotent.
+if git -C "$WFB_DIR" apply --reverse --check "$SCRIPT_DIR/peek.patch" 2>/dev/null; then
+    echo "=== peek.patch already applied ==="
+elif git -C "$WFB_DIR" apply --check "$SCRIPT_DIR/peek.patch" 2>/dev/null; then
+    echo "=== Applying peek.patch ==="
+    git -C "$WFB_DIR" apply "$SCRIPT_DIR/peek.patch"
+else
+    echo "ERROR: peek.patch does not apply on top of shm-input.patch." >&2
     exit 1
 fi
 
@@ -150,9 +166,10 @@ $CROSS_CC  $CFLAGS_BASE -std=gnu99   -c -o "$OBJDIR/radiotap.o"      src/radiota
 # ── wfb_tx ───────────────────────────────────────────────────────────
 echo "=== Building wfb_tx ==="
 $CROSS_CXX $CFLAGS_BASE -std=gnu++11 -c -o "$OBJDIR/tx.o"        src/tx.cpp
+$CROSS_CXX $CFLAGS_BASE -std=gnu++11 -c -o "$OBJDIR/peek.o"      src/peek.cpp
 $CROSS_CC  $CFLAGS_BASE -std=gnu99   -c -o "$OBJDIR/venc_ring.o" src/venc_ring.c
 $CROSS_CXX -o "$BUILD_DIR/wfb_tx" \
-    "$OBJDIR/tx.o" "$OBJDIR/zfex.o" "$OBJDIR/wifibroadcast.o" "$OBJDIR/venc_ring.o" \
+    "$OBJDIR/tx.o" "$OBJDIR/peek.o" "$OBJDIR/zfex.o" "$OBJDIR/wifibroadcast.o" "$OBJDIR/venc_ring.o" \
     $LDFLAGS_BASE -lsodium -lrt $CXX_STATIC_EXTRA
 $CROSS_STRIP "$BUILD_DIR/wfb_tx"
 

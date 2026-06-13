@@ -179,11 +179,24 @@ fi
 
 WFB_DIR="$BUILD_DIR/wfb-ng"
 
+# Pin wfb-ng to a known-good commit so shm-input.patch + peek.patch keep
+# applying.  Upstream master drifts; --depth 1 alone pins nothing.  Bump this
+# (and re-verify both patches) when intentionally moving to a newer wfb-ng.
+WFB_NG_SHA="af6ba85eface27279709477077d3362c69bb2576"
+
 if [ ! -d "$WFB_DIR" ]; then
-    echo "=== Cloning wfb-ng ==="
-    git clone --depth 1 https://github.com/svpcom/wfb-ng.git "$WFB_DIR"
+    echo "=== Cloning wfb-ng (pinned $WFB_NG_SHA) ==="
+    git init -q "$WFB_DIR"
+    git -C "$WFB_DIR" remote add origin https://github.com/svpcom/wfb-ng.git
+    git -C "$WFB_DIR" fetch --depth 1 origin "$WFB_NG_SHA"
+    git -C "$WFB_DIR" checkout -q FETCH_HEAD
 else
     echo "=== wfb-ng already cloned ==="
+    cur=$(git -C "$WFB_DIR" rev-parse HEAD 2>/dev/null || echo unknown)
+    if [ "$cur" != "$WFB_NG_SHA" ]; then
+        echo "WARNING: wfb-ng HEAD ($cur) != pinned $WFB_NG_SHA."
+        echo "         Run with --clean to re-pin if the patches stop applying."
+    fi
 fi
 
 # ── Step 3: Copy venc_ring files + create pcap stub ──────────────────
@@ -215,6 +228,28 @@ else
     echo "ERROR: Existing wfb-ng tree is stale or dirty and does not match shm-input.patch."
     echo "Run ./build_wfb_tx.sh --clean and rebuild so src/tx.cpp is regenerated."
     exit 1
+fi
+
+# ── Step 4b: Apply peek.patch (NAL-aware link protection) ────────────
+# Applies on top of shm-input.patch; adds src/peek.{hpp,cpp} + the wfb_tx
+# PROTECT/DROP/FEC-close hooks and CMD_SET_PEEK/CMD_GET_PEEK.
+
+if git apply --reverse --check "$SCRIPT_DIR/peek.patch" 2>/dev/null; then
+    echo "=== peek.patch already applied ==="
+elif git apply --check "$SCRIPT_DIR/peek.patch" 2>/dev/null; then
+    echo "=== Applying peek.patch ==="
+    git apply "$SCRIPT_DIR/peek.patch"
+    echo "Patch applied successfully."
+else
+    echo "ERROR: peek.patch does not apply on top of shm-input.patch."
+    echo "Run ./build_wfb_tx.sh --clean and rebuild."
+    exit 1
+fi
+
+# Host unit test for the peek engine (pure host code; quick correctness gate).
+if command -v g++ >/dev/null 2>&1; then
+    echo "=== Running host peek unit test ==="
+    g++ -std=gnu++11 -Isrc -o /tmp/test_peek src/test_peek.cpp src/peek.cpp && /tmp/test_peek
 fi
 
 # ── Step 5: Build wfb_tx + wfb_keygen ───────────────────────────────
@@ -258,6 +293,9 @@ rm -f src/*.o
 echo "  Compiling tx.cpp..."
 $CROSS_CXX $WFB_CFLAGS -std=gnu++11 -c -o src/tx.o src/tx.cpp
 
+echo "  Compiling peek.cpp..."
+$CROSS_CXX $WFB_CFLAGS -std=gnu++11 -c -o src/peek.o src/peek.cpp
+
 echo "  Compiling zfex.c..."
 $CROSS_CC $WFB_CFLAGS -std=gnu99 -c -o src/zfex.o src/zfex.c
 
@@ -268,7 +306,7 @@ echo "  Compiling venc_ring.c..."
 $CROSS_CC $WFB_CFLAGS -std=gnu99 -c -o src/venc_ring.o src/venc_ring.c
 
 echo "  Linking wfb_tx..."
-$CROSS_CXX -o wfb_tx src/tx.o src/zfex.o src/wifibroadcast.o src/venc_ring.o $WFB_LDFLAGS
+$CROSS_CXX -o wfb_tx src/tx.o src/peek.o src/zfex.o src/wifibroadcast.o src/venc_ring.o $WFB_LDFLAGS
 
 echo "  Stripping..."
 $CROSS_STRIP wfb_tx
@@ -339,9 +377,11 @@ strip "$BUILD_DIR/wfb_rx_native"
 echo "  Building wfb_tx (native x86_64)..."
 NATIVE_TX_CFLAGS="$NATIVE_CFLAGS -I$WFB_DIR/src/stub"
 g++ $NATIVE_TX_CFLAGS -std=gnu++11 -c -o "$NATIVE_BUILD/tx_native.o" src/tx.cpp
+g++ $NATIVE_TX_CFLAGS -std=gnu++11 -c -o "$NATIVE_BUILD/peek_native.o" src/peek.cpp
 gcc $NATIVE_TX_CFLAGS -std=gnu99 -c -o "$NATIVE_BUILD/venc_ring_native.o" src/venc_ring.c
 g++ -o "$BUILD_DIR/wfb_tx_native" \
     "$NATIVE_BUILD/tx_native.o" \
+    "$NATIVE_BUILD/peek_native.o" \
     "$NATIVE_BUILD/zfex_native.o" \
     "$NATIVE_BUILD/wfb_native.o" \
     "$NATIVE_BUILD/venc_ring_native.o" \

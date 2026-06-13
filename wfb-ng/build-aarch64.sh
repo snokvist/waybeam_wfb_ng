@@ -111,6 +111,13 @@ if ! grep -q "diversity" "$WFB_DIR/src/rx.cpp"; then
     exit 1
 fi
 
+# peek.patch may not be part of build_wfb_tx.sh's pipeline; apply it here if the
+# prepared tree predates it (idempotent — skips if already applied).
+if [ ! -f "$WFB_DIR/src/peek.cpp" ]; then
+    echo "=== Applying peek.patch (NAL-aware link protection) ==="
+    git -C "$WFB_DIR" apply "$SCRIPT_DIR/peek.patch"
+fi
+
 # ── Build flags ──────────────────────────────────────────────────────
 
 # Size-minimization flags (mirrors poc/build_wfb_openwrt.sh CPE510 build).
@@ -160,11 +167,12 @@ rm -f src/*.o
 
 echo "=== Building wfb_tx (aarch64) ==="
 $CROSS_CXX $TX_CFLAGS -std=gnu++11 -c -o src/tx.o            src/tx.cpp
+$CROSS_CXX $TX_CFLAGS -std=gnu++11 -c -o src/peek.o         src/peek.cpp
 $CROSS_CC  $TX_CFLAGS -std=gnu99   -c -o src/zfex.o          src/zfex.c
 $CROSS_CXX $TX_CFLAGS -std=gnu++11 -c -o src/wifibroadcast.o src/wifibroadcast.cpp
 $CROSS_CC  $TX_CFLAGS -std=gnu99   -c -o src/venc_ring.o     src/venc_ring.c
 $CROSS_CXX -o "$OUT_DIR/wfb_tx" \
-    src/tx.o src/zfex.o src/wifibroadcast.o src/venc_ring.o \
+    src/tx.o src/peek.o src/zfex.o src/wifibroadcast.o src/venc_ring.o \
     $TX_LDFLAGS
 $CROSS_STRIP "$OUT_DIR/wfb_tx"
 

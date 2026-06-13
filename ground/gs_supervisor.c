@@ -2267,6 +2267,8 @@ int wcmd_key_from_str(const char *s, size_t n)
 	if (n == 11 && !strncmp(s, "mcs_enabled", 11))   return WCMD_KEY_MCS_ENABLED;
 	if (n == 11 && !strncmp(s, "wfb_txpower", 11))   return WCMD_KEY_WFB_TXPOWER;
 	if (n ==  6 && !strncmp(s, "record",       6))   return WCMD_KEY_RECORD;
+	if (n == 12 && !strncmp(s, "peek_enabled", 12))  return WCMD_KEY_PEEK_ENABLED;
+	if (n == 17 && !strncmp(s, "peek_drop_enabled", 17)) return WCMD_KEY_PEEK_DROP_ENABLED;
 	return -1;
 }
 
@@ -2288,6 +2290,8 @@ const char *wcmd_key_name(int key)
 	case WCMD_KEY_MCS_ENABLED:   return "mcs_enabled";
 	case WCMD_KEY_WFB_TXPOWER:   return "wfb_txpower";
 	case WCMD_KEY_RECORD:        return "record";
+	case WCMD_KEY_PEEK_ENABLED:      return "peek_enabled";
+	case WCMD_KEY_PEEK_DROP_ENABLED: return "peek_drop_enabled";
 	}
 	return "?";
 }

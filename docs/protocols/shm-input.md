@@ -442,7 +442,8 @@ line-oriented tools:
        "pkts_drop":3,"pkts_trunc":2,"fec_timeouts":1,
        "fec_k":12,"fec_n":20},
  "radio":{"mcs":3,"bw":20,"short_gi":0,"stbc":0,"ldpc":0,
-          "vht_mode":0,"vht_nss":0}}
+          "vht_mode":0,"vht_nss":0},
+ "peek":{"enabled":1,"drop":0,"rules":3,"pkts_dropped":0,"fec_closes":120}}
 ```
 
 | Field | Meaning |
@@ -457,6 +458,10 @@ line-oriented tools:
 | `tx.fec_timeouts` | Empty packets sent to close FEC blocks on `-T fec_timeout`. |
 | `tx.fec_k` / `fec_n` | Current FEC sizes (tracks `wfb_tx_cmd set_fec` writes). |
 | `radio.*` | Current radiotap state. `short_gi`/`ldpc`/`vht_mode` are 0/1. |
+| `peek.enabled` / `drop` | NAL-aware peek master switch and drop-shedding toggle (0/1). |
+| `peek.rules` | Number of active action rules (profile + `--peek-rule`). |
+| `peek.pkts_dropped` | Datagrams shed by an armed DROP rule this interval. |
+| `peek.fec_closes` | Frame-boundary FEC blocks closed on the RTP marker this interval. |
 
 `fec_k` / `fec_n` and the entire `radio` block let consumers track
 external `wfb_tx_cmd set_fec` / `set_radio` calls without polling

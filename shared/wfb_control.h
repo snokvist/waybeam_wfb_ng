@@ -15,6 +15,8 @@
  *     get_fec / get_radio:     no body
  *
  *   Response: uint32_t req_id (NB); uint32_t rc (NB); <union body>
+ *     get_peek   body (6 B):   enabled, drop_enabled, n_rules, n_sig_rules,
+ *                              base_mcs, max_delta
  *     On error (rc != 0): only req_id+rc are sent (body omitted).
  *
  * If the value of WFB_FEC_TIMEOUT_KEEP ever changes, update tx_cmd.h in
@@ -29,12 +31,16 @@
 #define WFB_CMD_SET_RADIO  2
 #define WFB_CMD_GET_FEC    3
 #define WFB_CMD_GET_RADIO  4
+#define WFB_CMD_SET_PEEK   5    /* NAL-aware peek toggles (enabled, drop_enabled) */
+#define WFB_CMD_GET_PEEK   6    /* read peek state + rule counts */
 
 /* ── fixed wire lengths ─────────────────────────────────────────────── */
 #define WFB_CMD_REQ_HEADER         5            /* req_id(4) + cmd_id(1) */
 #define WFB_CMD_REQ_GET_RADIO_LEN  WFB_CMD_REQ_HEADER
+#define WFB_CMD_REQ_GET_PEEK_LEN   WFB_CMD_REQ_HEADER
 #define WFB_CMD_REQ_SET_FEC_LEN    (WFB_CMD_REQ_HEADER + 4)
 #define WFB_CMD_REQ_SET_RADIO_LEN  (WFB_CMD_REQ_HEADER + 7)
+#define WFB_CMD_REQ_SET_PEEK_LEN   (WFB_CMD_REQ_HEADER + 2)  /* enabled, drop_enabled */
 
 /* ── sentinels ──────────────────────────────────────────────────────── */
 /* set_fec.fec_timeout_ms = WFB_FEC_TIMEOUT_KEEP means "leave the running
@@ -42,6 +48,10 @@
  * timeout today, so it always sends KEEP; the operator sets the timeout
  * via `wfb_tx -T` at boot.  Mirrored in shm-input.patch (src/tx_cmd.h). */
 #define WFB_FEC_TIMEOUT_KEEP       0xFFFFu
+
+/* set_peek.{enabled,drop_enabled} = WFB_PEEK_KEEP leaves that toggle alone so
+ * the two move independently.  Mirrored in shm-input.patch (src/tx_cmd.h). */
+#define WFB_PEEK_KEEP              0xFFu
 
 /* ── timing ─────────────────────────────────────────────────────────── */
 /* How long the GS supervisor waits for a wfb_tx control-socket reply

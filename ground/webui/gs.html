@@ -378,6 +378,18 @@ select{cursor:pointer;-webkit-appearance:none;appearance:none;background-image:u
     <button class="btn-mini btn-stop"  onclick="cmdQuick('mcs_enabled',0)">mcs auto OFF</button>
   </div>
 
+  <!-- NAL-aware peek (link protection): protect/drop droppable frames on the
+       vehicle wfb_tx. peek master switch + live drop-shedding toggle. Detailed
+       rule/threshold control is via Generic WCMD on the Encoder tab. -->
+  <div class="adaptive-strip">
+    <span class="label">Vehicle peek</span>
+    <span class="hint">NAL-aware link protection on wfb_tx: protect key/ref frames (lower MCS) + frame-boundary FEC close. drop sheds throwaway frames live.</span>
+    <button class="btn-mini btn-start" onclick="cmdQuick('peek_enabled',1)">peek ON</button>
+    <button class="btn-mini btn-stop"  onclick="cmdQuick('peek_enabled',0)">peek OFF</button>
+    <button class="btn-mini btn-start" onclick="cmdQuick('peek_drop_enabled',1)">drop ON</button>
+    <button class="btn-mini btn-stop"  onclick="cmdQuick('peek_drop_enabled',0)">drop OFF</button>
+  </div>
+
   <div class="section">
     <div class="section-header"><h3>TX power<span class="side-label veh">VEH</span></h3>
       <span class="help">WCMD over uplink → vehicle <code>iw set txpower</code>. The adaptive law never touches TX power.</span></div>
@@ -447,6 +459,10 @@ select{cursor:pointer;-webkit-appearance:none;appearance:none;background-image:u
           <optgroup label="vehicle adaptive switches">
             <option value="fec_enabled">fec_enabled</option>
             <option value="mcs_enabled">mcs_enabled</option>
+          </optgroup>
+          <optgroup label="vehicle peek (link protection)">
+            <option value="peek_enabled">peek_enabled (0/1)</option>
+            <option value="peek_drop_enabled">peek_drop_enabled (0/1)</option>
           </optgroup>
         </select>
         <span></span>
@@ -1065,7 +1081,7 @@ async function cmdQuick(key, value){
 
 function pickReplyPane(key){
   /* wfb_* + adaptive switches → Link tab; venc keys → Encoder tab. */
-  if (key.startsWith('wfb_') || key==='fec_enabled' || key==='mcs_enabled') return '#reply-cmd-link';
+  if (key.startsWith('wfb_') || key==='fec_enabled' || key==='mcs_enabled' || key.startsWith('peek_')) return '#reply-cmd-link';
   return '#reply-quick';
 }
 
