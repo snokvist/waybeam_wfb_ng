@@ -1,8 +1,46 @@
 # Design note: peek FEC_CLOSE without padding + proportional parity
 
-Status: **proposed** (not implemented). Follow-up to the shipped gate fix
-(PR #64, `fix/peek-fec-close-gate`). This note is the implementation spec; we
-compact before starting.
+Status: **IMPLEMENTED + device-verified** (2026-06-14, bench 192.168.1.13 + dev-host
+`wfb_rx_native` over real RF). Gated behind `wfb_tx --peek-short-tail` (S99wfb env
+`wfbshorttail=1`); default off = the PR #64 gate. In `wfb-ng/peek.patch`.
+
+Two corrections to this note's original assumptions, found in-tree during
+implementation (the goal — proportional parity, no on-air padding — was
+unaffected; only the mechanism changed):
+
+1. **`fec_encode_simd` in this build has NO `block_nums` param** — it always
+   computes the full `n-k` parity set into `fecs[0..n-k)`, where `fecs[i]` carries
+   check-block id `k+i`. So the TX computes all parity (existing call, unchanged)
+   and simply **injects only the first `p`** fragments on-air (ids `k..k+p-1` are a
+   valid contiguous subset). Simpler than the note assumed.
+2. **The note's recommended signal (a flag in the parity's `wpacket_hdr`) is
+   impossible** — parity fragments are raw FEC bytes with no `wpacket_hdr` (the
+   header is itself FEC-protected data). Replaced by: the **always-zero top bit of
+   the 64-bit `data_nonce`** (`WFB_NONCE_SHORT_TAIL`, bit 63) set on a single
+   boundary marker fragment at index `j`. The marker's `fragment_idx == j` conveys
+   `j`; the bit is authenticated as part of the AEAD nonce/AAD. RX masks it off
+   before deriving `block_idx`, synthesizes `[j+1, k)` as canonical FEC_ONLY
+   zero-pad, and decodes. Completion test changed `== fec_k` -> `>= fec_k`
+   (provably identical for full blocks; required because synthesis can jump
+   `has_fragments` past `k`).
+
+Verification:
+- Host FEC roundtrip (`wfb-ng/tests/peek_short_roundtrip.cpp`): **6700/6700**
+  bit-exact recoveries across codes {8/12, 8/10, 4/6, 16/24, 37/51, 2/3}, payloads
+  {32,512,1024,1448}, all `j in [1,k)`, all single-fragment drops, leading-data
+  multi-drops up to `p`, and the over-loss non-decodability invariant.
+- Device (real RF, peek ON, short-tail ON): `pkt_dec_err=0`, `pkt_lost=0`,
+  smooth video. Backward-compat (new RX + old non-short TX) clean.
+- Airtime A/B at ~1560 incoming pkts/s: gate amp 1.94x (injected ~3061/s) vs
+  short-tail amp 1.43x (~2216/s) = **~27% fewer on-air packets**, overhead roughly
+  halved, AND per-frame isolation restored (60 closes/s = every frame, vs the
+  gate's frame-size-dependent partial closes).
+
+Original spec follows (for the record).
+
+---
+
+Follow-up to the shipped gate fix (PR #64, `fix/peek-fec-close-gate`).
 
 ## Why
 

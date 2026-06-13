@@ -92,17 +92,29 @@ start_wfb() {
     # Override: fw_setenv wfbpeek off|idr|refpred|idr+refpred.
     WFB_PEEK_PROFILE=$(fw_get wfbpeek idr)
 
+    # Short-tail peek close (proportional parity, no on-air zero-padding).
+    # When on, every frame's FEC block closes via close_block_short(): one
+    # boundary marker fragment + p~proportional parity instead of padding to k
+    # on-air + full n-k parity.  Restores full per-frame loss isolation at a
+    # fraction of the airtime the gate gave up.  REQUIRES a SHORT_TAIL-aware RX
+    # (gs_supervisor wfb_rx built from peek.patch >= 2026-06-14); an old RX would
+    # stall short blocks.  Default off => threshold-gated full-padding close.
+    # Override: fw_setenv wfbshorttail 1.
+    WFB_SHORT_TAIL=$(fw_get wfbshorttail 0)
+    WFB_SHORT_TAIL_ARG=""
+    case "$WFB_SHORT_TAIL" in 1|on|yes) WFB_SHORT_TAIL_ARG="--peek-short-tail" ;; esac
+
     # wfb_tx (SHM input from venc).  -T sizes the FEC safety-net timeout
     # to the typical frame period (60 fps ≈ 16 ms); fec_controller can
     # rewrite this at runtime via CMD_SET_FEC's fec_timeout_ms field.
     wfb_tx -K "$KEY" -M $WFB_MCS -B $WFB_BW -k $WFB_K -n $WFB_N \
            -P 1 -Q -S 1 -L 1 -C $WFB_CTRL -T 16 \
            -H "$SHM_RING" -R 2097152 -s 2097152 \
-           --peek-profile "$WFB_PEEK_PROFILE" \
+           --peek-profile "$WFB_PEEK_PROFILE" $WFB_SHORT_TAIL_ARG \
            -l 1000 -i $WFB_TX_LINK -p 0 -x wlan0 \
            >> "$LOG" 2>&1 &
     echo $! > "$PID_TX"
-    log "video wfb_tx up (peek-profile=$WFB_PEEK_PROFILE)"
+    log "video wfb_tx up (peek-profile=$WFB_PEEK_PROFILE short_tail=$WFB_SHORT_TAIL)"
 
     # wfb_rx (uplink data forwarder - decoded packets to 127.0.0.1:5801)
     wfb_rx -K "$KEY" -i $WFB_RX_LINK -u $WFB_RX_FWD_PORT -p 0 wlan0 \
