@@ -1510,7 +1510,7 @@ static int wfb_run_ip_link_mtu(const char *iface, int mtu)
 	return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
 }
 
-#define WCMD_NUM_KEYS 17   /* highest defined WCMD_KEY_* value (incl. peek 16/17) */
+#define WCMD_NUM_KEYS 18   /* highest defined WCMD_KEY_* value (incl. peek 16/17, log_sync 18) */
 
 /* Burst-dedup window: GS may send 3 redundant copies of the same WCMD
  * with the same seq to ride out single-FEC-block losses on the uplink.
@@ -1556,6 +1556,20 @@ typedef struct {
 	bool      radio_written;
 	RadioBody radio_written_body;
 } WcmdState;
+
+/* Most-recent logging-sync marker (WCMD_KEY_LOG_SYNC).  Updated in
+ * wcmd_dispatch on the main poll thread, read by status_to_json on the same
+ * thread (the API server is in-process, no fork), so a plain global is safe.
+ * `recv_uptime_s` is our own log_rel_s() at receipt — a precise pairing
+ * anchor for gs_unix_s that the importer can refine the 1 Hz status sampling
+ * against.  count is the running total of distinct markers applied. */
+static struct {
+	bool     valid;
+	uint16_t seq;
+	int32_t  gs_unix_s;
+	double   recv_uptime_s;
+	uint64_t count;
+} g_logsync = { 0 };
 
 /* Build the venc /api/v1 path for a given (key, value). path must be
  * sized for at least 80 bytes. Returns 0 on success, -1 if key is not
@@ -1730,6 +1744,39 @@ static int wcmd_dispatch(Config *cfg, const WcmdReq *req,
 		st->last_status = resp->status;
 		return -1;
 	}
+
+	/* Logging-sync marker — infrastructure, not an operator command (see
+	 * WCMD_KEY_LOG_SYNC in wcmd_proto.h).  Handled BEFORE the allow_keys_mask
+	 * gate so it works regardless of operator key policy; no clamp, no venc/
+	 * wfb dispatch.  We still dedup the 3-frame burst by (key, seq) so the
+	 * marker is recorded once, and stamp our own uptime at first receipt as a
+	 * precise anchor for the GS wall-clock value.  Always reply OK. */
+	if (key == WCMD_KEY_LOG_SYNC) {
+		uint16_t req_seq   = ntohs(req->seq);
+		int32_t  gs_unix_s = (int32_t)ntohl((uint32_t)req->value);
+		bool dup = (st->last_seq_us[key] != 0 &&
+		            st->last_seq[key] == req_seq &&
+		            now - st->last_seq_us[key] < WCMD_BURST_DEDUP_US);
+		if (dup) {
+			st->coalesced_burst++;
+		} else {
+			g_logsync.valid         = true;
+			g_logsync.seq           = req_seq;
+			g_logsync.gs_unix_s     = gs_unix_s;
+			g_logsync.recv_uptime_s = log_rel_s();
+			g_logsync.count++;
+			wcmd_mark_applied(st, key, req_seq, now);
+			st->accepted++;
+		}
+		resp->status        = WCMD_STATUS_OK;
+		resp->http_status   = htons(0);
+		resp->applied_value = htonl((uint32_t)gs_unix_s);
+		st->last_status      = WCMD_STATUS_OK;
+		st->last_value       = gs_unix_s;
+		st->last_http_status = 0;
+		return 0;
+	}
+
 	if (!(cfg->cmd.allow_keys_mask & (1u << (key - 1)))) {
 		resp->status = WCMD_STATUS_KEY_BLOCKED;
 		st->rejected_blocked++;
@@ -3507,6 +3554,20 @@ static int status_to_json(const ApiSnapshot *s, char *buf, size_t cap)
 	w = append_score_json(buf, cap, pos, s, true);
 	if (w < 0) return -1;
 	pos += w;
+
+	/* Logging-sync marker, when one has been received this run.  The walkout
+	 * logger mirrors /status to SD at 1 Hz, so this rides into status.jsonl;
+	 * the importer dedups by seq and fits (gs_unix_s ↔ uptime) to align the
+	 * vehicle log onto the GS wall-clock (WCMD_KEY_LOG_SYNC). */
+	if (g_logsync.valid) {
+		w = snprintf(buf + pos, cap - pos,
+			",\"logsync\":{\"seq\":%u,\"gs_unix_s\":%ld,"
+			"\"recv_uptime_s\":%.3f,\"count\":%llu}",
+			(unsigned)g_logsync.seq, (long)g_logsync.gs_unix_s,
+			g_logsync.recv_uptime_s, (unsigned long long)g_logsync.count);
+		if (w < 0 || (size_t)w >= cap - pos) return -1;
+		pos += w;
+	}
 
 	w = snprintf(buf + pos, cap - pos, "}");
 	if (w < 0 || (size_t)w >= cap - pos) return -1;

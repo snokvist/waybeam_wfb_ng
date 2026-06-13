@@ -1,7 +1,11 @@
 {% extends "base.html" %}
 {% block title %}sessions · wfb telemetry{% endblock %}
 {% block content %}
-<h1>Sessions</h1>
+<div class="toolbar">
+  <h1>Sessions</h1>
+  <button id="new-capture" type="button" title="Close the current GS capture and start a fresh session (clean break). With LOG_SYNC the vehicle log carries over automatically.">⏺ New capture session</button>
+  <span id="capture-status" class="muted"></span>
+</div>
 {% if not sessions %}
   <p class="empty">No sessions yet. Import a capture:
     <code>python3 telemetry/wfb_store.py import telemetry/real_wfb.jsonl</code>
@@ -50,6 +54,27 @@
     ).join("");
   }
   setInterval(tick, 5000);
+
+  /* "New capture session" — roll a fresh GS ingester session for a clean
+     break. Confirms first (it ends the current capture), then refreshes. */
+  const btn = document.getElementById("new-capture");
+  const st = document.getElementById("capture-status");
+  if (btn) btn.addEventListener("click", async () => {
+    if (!confirm("Close the current GS capture and start a new session?\n" +
+                 "The vehicle keeps logging; LOG_SYNC re-attributes it to the new session.")) return;
+    btn.disabled = true; st.textContent = " rolling…";
+    try {
+      const r = await fetch("/api/capture/new", { method: "POST" });
+      const j = await r.json();
+      st.textContent = j.ok ? " ✓ " + (j.message || "new session started")
+                            : " ✗ " + (j.error || j.message || "failed");
+      if (j.ok) setTimeout(tick, 1500);  // let the fresh ingester open its row
+    } catch (e) {
+      st.textContent = " ✗ request failed";
+    } finally {
+      btn.disabled = false;
+    }
+  });
 })();
 </script>
 {% endblock %}
