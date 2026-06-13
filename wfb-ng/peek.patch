@@ -421,7 +421,7 @@ index 0000000..f0a8f26
 +
 +#endif // WFB_PEEK_HPP
 diff --git a/src/rx.cpp b/src/rx.cpp
-index 136d16d..8979c51 100644
+index 136d16d..2f0f7c6 100644
 --- a/src/rx.cpp
 +++ b/src/rx.cpp
 @@ -967,8 +967,14 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
@@ -441,7 +441,7 @@ index 136d16d..8979c51 100644
  
      /* set::insert returns (iterator, inserted_bool).  When inserted_bool is
       * false the same data_nonce was already in the dedup set — i.e. this
-@@ -1024,6 +1030,28 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
+@@ -1024,6 +1030,39 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
      p->fragment_map[fragment_idx] = decrypted_len;
      p->has_fragments += 1;
  
@@ -453,7 +453,18 @@ index 136d16d..8979c51 100644
 +    // only runs for the marker fragment (the one carrying the SHORT_TAIL bit).
 +    // The synthesized slots are FEC_ONLY, so send_packet() skips them at the
 +    // socket and the fec_recovered counter ignores them (same as on-air padding).
-+    if (short_tail)
++    //
++    // VALIDATE the marker before acting on it: a genuine TX marker is a
++    // canonical pad (FEC_ONLY, packet_size==0) at a real boundary 1 <= j < fec_k.
++    // In plaintext (-x) mode there is no AEAD to reject a forged/corrupt fragment,
++    // so without this check one injected packet with the bit + an attacker-chosen
++    // fragment_idx could bulk-synthesize zero-pad into a live block and truncate a
++    // frame.  If it is not a valid marker, fall through and treat it as an
++    // ordinary fragment (no synthesis).  In AEAD mode forged fragments are already
++    // rejected at decrypt, so this is belt-and-suspenders there.
++    if (short_tail && fragment_idx >= 1 && fragment_idx < fec_k &&
++        (((wpacket_hdr_t*)decrypted)->flags & WFB_PACKET_FEC_ONLY) &&
++        be16toh(((wpacket_hdr_t*)decrypted)->packet_size) == 0)
 +    {
 +        for (int i = fragment_idx + 1; i < fec_k; i++)
 +        {
@@ -470,7 +481,7 @@ index 136d16d..8979c51 100644
      // Check if we use current (oldest) block
      // then we can optimize and don't wait for all K fragments
      // and send packets if there are no gaps in fragments from the beginning of this block
-@@ -1047,8 +1075,14 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
+@@ -1047,8 +1086,14 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
          }
      }
  
@@ -487,6 +498,23 @@ index 136d16d..8979c51 100644
      {
          // send all queued packets in all unfinished blocks before current
          // and then remove that blocks
+@@ -1196,7 +1241,15 @@ void Aggregator::apply_fec(int ring_idx)
+                 j++;
+             }
+ 
+-            assert(j < fec_n);
++            // Insufficient parity to fill this gap.  The caller only invokes
++            // apply_fec when has_fragments >= fec_k, which (for both the normal
++            // full-block path and the SHORT_TAIL synthesized path) guarantees
++            // present_parity >= missing_data -- so this never fires on legitimate
++            // traffic.  Bail gracefully rather than assert/over-read: RS recovery
++            // is all-or-nothing, so if any gap lacks parity the block is
++            // undecodable; leave it partial and let the caller emit what arrived.
++            // (Defends NDEBUG builds + the untrusted-RF / plaintext path.)
++            if (j >= fec_n) return;
+             // FEC packets always have max size between packets in block
+             max_packet_size = max(max_packet_size, rx_ring[ring_idx].fragment_map[j]);
+             in_blocks[i] = rx_ring[ring_idx].fragments[j];
 diff --git a/src/test_peek.cpp b/src/test_peek.cpp
 new file mode 100644
 index 0000000..38c2c21

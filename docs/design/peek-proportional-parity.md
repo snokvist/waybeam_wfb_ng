@@ -24,6 +24,20 @@ unaffected; only the mechanism changed):
    (provably identical for full blocks; required because synthesis can jump
    `has_fragments` past `k`).
 
+Security hardening (post embedded-c review):
+- **RX validates the marker** before synthesizing: a genuine marker is FEC_ONLY,
+  `packet_size==0`, at `1 <= j < fec_k`.  In plaintext (`-x`) mode there is no AEAD
+  to reject a forged/corrupt fragment, so without this a single injected packet
+  with the bit + an attacker-chosen `fragment_idx` could bulk-synthesize zero-pad
+  into a live block and truncate a frame.  Invalid => treated as an ordinary
+  fragment, no synthesis.  (rx.cpp, the `if (short_tail && ...)` guard.)
+- **apply_fec bails gracefully** (`if (j >= fec_n) return;`) instead of
+  `assert(j < fec_n)` if parity is ever insufficient — defends NDEBUG builds and
+  the untrusted-RF path against an out-of-bounds read.  The `>= fec_k` completion
+  test provably implies `present_parity >= missing_data` for legitimate traffic
+  (synthesis fills the tail, so `has_fragments >= k` <=> parity suffices), so this
+  never fires in practice; it is pure defense-in-depth.
+
 Verification:
 - Host FEC roundtrip (`wfb-ng/tests/peek_short_roundtrip.cpp`): **6700/6700**
   bit-exact recoveries across codes {8/12, 8/10, 4/6, 16/24, 37/51, 2/3}, payloads
