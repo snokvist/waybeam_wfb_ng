@@ -155,11 +155,21 @@ def import_vehicle_jsonl(conn, path: str, vehicle_session: str, **meta) -> tuple
         fit = _linfit([a for a, _ in anchors], [g for _, g in anchors])
     if fit:
         a, b = fit
+        # Fit confidence: residual of each marker's gs_unix vs the fitted line.
+        # gs_unix_s is whole seconds (the GS sends time(NULL)), so a clean fit
+        # still shows ~0.5-1.5 s residual from that quantization + uplink jitter.
+        # A large max residual (>~3 s) means the anchors disagree with a single
+        # line — markers from different walks mixed in, or a clock discontinuity.
+        resid = [g - (a * ut + b) for ut, g in anchors]
+        max_resid = max(abs(r) for r in resid)
+        rms_resid = (sum(r * r for r in resid) / len(resid)) ** 0.5
+        quality = "ok" if max_resid <= 3.0 else "SUSPECT"
         ups = [ut for ut, _ in rows]
         gs_lo, gs_hi = a * min(ups) + b, a * max(ups) + b
         ident = _identify_gs_session(conn, gs_lo, gs_hi)
         gs_sid = ident[0] if ident else None
-        align_note = (f"aligned a={a:.6f} b={b:.0f} markers={len(markers)}"
+        align_note = (f"aligned a={a:.6f} b={b:.0f} markers={len(markers)} "
+                      f"resid={rms_resid:.1f}s_rms/{max_resid:.1f}s_max[{quality}]"
                       + (f" gs_session={gs_sid}" if gs_sid else " gs_session=?"))
         notes += f" · {align_note}"
 
