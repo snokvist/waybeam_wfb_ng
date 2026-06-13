@@ -1510,7 +1510,7 @@ static int wfb_run_ip_link_mtu(const char *iface, int mtu)
 	return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
 }
 
-#define WCMD_NUM_KEYS 15   /* highest defined WCMD_KEY_* value */
+#define WCMD_NUM_KEYS 17   /* highest defined WCMD_KEY_* value (incl. peek 16/17) */
 
 /* Burst-dedup window: GS may send 3 redundant copies of the same WCMD
  * with the same seq to ride out single-FEC-block losses on the uplink.
@@ -2962,7 +2962,7 @@ static const TunableDesc TUNABLES[] = {
 	{"cmd.enabled",          SUB_COMMON, TF_BOOL, OFF_CMD(enabled),          0, 0,      "enable venc command proxy on rx_ant socket"},
 	{"cmd.loopback_only",    SUB_COMMON, TF_BOOL, OFF_CMD(loopback_only),    0, 0,      "reject WCMD requests not from 127.0.0.1"},
 	{"cmd.rate_limit_ms",    SUB_COMMON, TF_INT,  OFF_CMD(rate_limit_ms),    0, 60000,  "min ms between same-key applies (0 disables)"},
-	{"cmd.allow_keys_mask",  SUB_COMMON, TF_INT,  OFF_CMD(allow_keys_mask),  0, 0xFFFF, "bitmask of WCMD_KEY_* allowed (1=br,2=fps,4=pl,8=idr,16=fec_k,32=fec_n,64=mcs,128=bw,256=ldpc,512=stbc,1024=sgi,2048=fec_en,4096=mcs_en,8192=txpower,16384=record)"},
+	{"cmd.allow_keys_mask",  SUB_COMMON, TF_INT,  OFF_CMD(allow_keys_mask),  0, 0x1FFFF, "bitmask of WCMD_KEY_* allowed (1=br,2=fps,4=pl,8=idr,16=fec_k,32=fec_n,64=mcs,128=bw,256=ldpc,512=stbc,1024=sgi,2048=fec_en,4096=mcs_en,8192=txpower,16384=record,32768=peek_en,65536=peek_drop)"},
 	{"cmd.bitrate_min_kbps", SUB_COMMON, TF_INT,  OFF_CMD(bitrate_min_kbps), 1, 200000, "min accepted bitrate kbps (fallback when fec disabled)"},
 	{"cmd.bitrate_max_kbps", SUB_COMMON, TF_INT,  OFF_CMD(bitrate_max_kbps), 1, 200000, "max accepted bitrate kbps (fallback when fec disabled)"},
 	{"cmd.fps_min",          SUB_COMMON, TF_INT,  OFF_CMD(fps_min),          1, 240,    "min accepted fps"},
@@ -4360,7 +4360,7 @@ static void config_defaults(Config *c)
 	c->cmd.enabled         = true;
 	c->cmd.loopback_only   = false;
 	c->cmd.rate_limit_ms   = 100;
-	c->cmd.allow_keys_mask = 0x7FFF;     /* keys 1..15 enabled */
+	c->cmd.allow_keys_mask = 0x1FFFF;    /* keys 1..17 enabled (incl. peek 16/17) */
 	c->cmd.bitrate_min_kbps = 100;
 	c->cmd.bitrate_max_kbps = 25000;
 	c->cmd.fps_min          = 1;

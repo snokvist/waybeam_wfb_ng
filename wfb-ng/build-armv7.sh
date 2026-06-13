@@ -377,9 +377,11 @@ strip "$BUILD_DIR/wfb_rx_native"
 echo "  Building wfb_tx (native x86_64)..."
 NATIVE_TX_CFLAGS="$NATIVE_CFLAGS -I$WFB_DIR/src/stub"
 g++ $NATIVE_TX_CFLAGS -std=gnu++11 -c -o "$NATIVE_BUILD/tx_native.o" src/tx.cpp
+g++ $NATIVE_TX_CFLAGS -std=gnu++11 -c -o "$NATIVE_BUILD/peek_native.o" src/peek.cpp
 gcc $NATIVE_TX_CFLAGS -std=gnu99 -c -o "$NATIVE_BUILD/venc_ring_native.o" src/venc_ring.c
 g++ -o "$BUILD_DIR/wfb_tx_native" \
     "$NATIVE_BUILD/tx_native.o" \
+    "$NATIVE_BUILD/peek_native.o" \
     "$NATIVE_BUILD/zfex_native.o" \
     "$NATIVE_BUILD/wfb_native.o" \
     "$NATIVE_BUILD/venc_ring_native.o" \
