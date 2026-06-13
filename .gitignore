@@ -27,14 +27,16 @@ vehicle/webui/index_assets.h
 /tools
 
 # Telemetry / link-ML: generated & reproducible artifacts (rebuild with
-# gen_sample.py / train_tier1.py). The data-session DB telemetry/wfb.sqlite IS
-# committed (small + portable; a tagged demo session); only its transient
-# WAL/SHM/journal sidecars are ignored so we never commit a half-flushed DB.
+# gen_sample.py / train_tier1.py). The data-session DB telemetry/wfb.sqlite is a
+# RUNTIME artifact (live captures churn it) — git-ignored; regenerate the
+# browsable demo with `python3 telemetry/gen_sample.py`. Its WAL/SHM/journal
+# sidecars are ignored too so we never commit a half-flushed DB.
 telemetry/sample_wfb.jsonl
 telemetry/*_wfb.jsonl
 telemetry/model/
 telemetry/model_*/
 telemetry/loop/
+telemetry/*.sqlite
 telemetry/*.sqlite-journal
 telemetry/*.sqlite-wal
 telemetry/*.sqlite-shm
