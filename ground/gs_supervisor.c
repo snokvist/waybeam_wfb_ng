@@ -980,7 +980,8 @@ int tunnel_spawn(Tunnel *t, const char *key_file)
 		t->st_pkt_uniq = 0;
 		t->st_ant_count = 0;
 		t->st_rssi_best = INT_MIN;
-		memset(t->st_mcs_pkts, 0, sizeof(t->st_mcs_pkts));
+		memset(t->st_mcs_win, 0, sizeof(t->st_mcs_win));
+		memset(t->st_mcs_win_sec, 0, sizeof(t->st_mcs_win_sec));
 	} else {
 		t->st_tx_pkts_in = t->st_tx_pkts_out = 0;
 		t->st_tx_bytes_in = t->st_tx_bytes_out = 0;
@@ -1704,13 +1705,22 @@ void stats_drain(Tunnel *t)
 			}
 			t->st_ant_count = ant_count;
 			if (best_rssi != INT_MIN) t->st_rssi_best = best_rssi;
-			/* Accumulate cumulatively (not a per-window snapshot): peek
-			 * PROTECT moves only IDR/param packets — a brief burst once
-			 * per GOP — to lower rungs. A 100 ms snapshot polled at 1 Hz
-			 * almost always misses that window; a running total keeps the
-			 * low rungs visible. Resets on listener (re)open. */
-			for (int m = 0; m < 16; m++)
-				t->st_mcs_pkts[m] += mcs_hist[m];
+			/* Fold this rx_ant window's per-MCS counts into the current
+			 * 1 s ring slot. The API sums the last 10 slots, giving a
+			 * 10 s sliding window: long enough that the brief per-GOP
+			 * PROTECT burst is always captured, short enough that the
+			 * bars track what the link is doing right now. */
+			{
+				uint64_t nsec  = now_us() / 1000000ULL;
+				int      wslot = (int)(nsec % 10);
+				if (t->st_mcs_win_sec[wslot] != nsec) {
+					memset(t->st_mcs_win[wslot], 0,
+					       sizeof(t->st_mcs_win[wslot]));
+					t->st_mcs_win_sec[wslot] = nsec;
+				}
+				for (int m = 0; m < 16; m++)
+					t->st_mcs_win[wslot][m] += mcs_hist[m];
+			}
 
 			/* Boundary-probe PER accumulation + window flush. */
 			if (t->probe)
