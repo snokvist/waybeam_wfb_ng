@@ -32,19 +32,42 @@ grep -q " $SD " /proc/mounts || { echo "walkout: no SD at $SD — logging disabl
 BASE="$SD/walkout"
 mkdir -p "$BASE" || exit 0
 
-# Prune: keep the newest KEEP_SESSIONS-1, then create ours.
+# Monotonic session index. The device has no battery-backed RTC, so wall-clock
+# names jump BACKWARDS on a cold field boot (the clock resets to the build
+# default) — which breaks both lexical ordering and the prune below. Prefix
+# each session with a zero-padded counter that only ever increases: the max of
+# the persisted .seq and the highest existing indexed dir (robust if either is
+# lost), +1. Fixed width => lexical sort == creation order.
+SEQF="$BASE/.seq"
+HI=$( { ls -1d "$BASE"/[0-9][0-9][0-9][0-9][0-9][0-9]_*/ 2>/dev/null \
+            | sed 's#/*$##; s#.*/##; s/_.*//'
+        cat "$SEQF" 2>/dev/null
+      } | grep -E '^[0-9][0-9][0-9][0-9][0-9][0-9]$' | sort | tail -1)
+HI=${HI:-000000}
+NEXT=$(echo "$HI" | sed 's/^0*//'); [ -n "$NEXT" ] || NEXT=0
+NEXT=$((NEXT + 1))
+SEQP=$(printf '%06d' "$NEXT")
+printf '%s\n' "$SEQP" > "$SEQF" 2>/dev/null  # persist before prune can drop dirs
+
+# Prune: keep the newest KEEP_SESSIONS-1. Remove legacy (RTC-named, non-indexed)
+# sessions first — they sort unpredictably against the counter — then the
+# lowest index (the genuine oldest).
 n=$(ls -1d "$BASE"/*/ 2>/dev/null | wc -l)
 while [ "$n" -ge "$KEEP_SESSIONS" ]; do
-    old=$(ls -1d "$BASE"/*/ 2>/dev/null | sort | head -1)
+    old=$(ls -1d "$BASE"/*/ 2>/dev/null \
+            | grep -vE '/[0-9][0-9][0-9][0-9][0-9][0-9]_[^/]*/$' | head -1)
+    [ -n "$old" ] || old=$(ls -1d "$BASE"/[0-9][0-9][0-9][0-9][0-9][0-9]_*/ 2>/dev/null | sort | head -1)
+    [ -n "$old" ] || old=$(ls -1d "$BASE"/*/ 2>/dev/null | sort | head -1)
     [ -n "$old" ] || break
     rm -rf "$old"
     n=$((n-1))
 done
 
-# No RTC: date may be 1970-based pre-NTP. $$ disambiguates same-second boots.
-DIR="$BASE/$(date +%Y%m%d_%H%M%S)_$$"
+# Wall-clock stamp + PID stay in the name for human reference only (never
+# trusted for ordering). $$ disambiguates same-second restarts.
+DIR="$BASE/${SEQP}_$(date +%Y%m%d_%H%M%S)_$$"
 mkdir -p "$DIR" || exit 0
-echo "walkout: logging to $DIR"
+echo "walkout: logging to $DIR (session #$SEQP)"
 
 # Mirror the wfb log (decision lines carry the precise commit timeline).
 # Plain -f (not -F): /tmp/wfb.log exists before we start (S99wfb wrote to
