@@ -363,6 +363,11 @@ int cfg_parse_tunnel(const char *js, JTok *toks, int n, int t_idx, Tunnel *t)
 				return -1;
 		}
 
+		if ((v = jfind(js, toks, n, t_idx, "stats_tap")) >= 0) {
+			if (jstr(js, &toks[v], t->stats_tap, sizeof(t->stats_tap)) < 0)
+				return -1;
+		}
+
 		/* Boundary-probe PER producer (see PROBE_PER_SPEC.md). */
 		if ((v = jfind(js, toks, n, t_idx, "probe")) >= 0) {
 			if (jbool(js, &toks[v], &bv) < 0) return -1;
@@ -1404,6 +1409,22 @@ int stats_listener_open(Tunnel *t)
 		LOG_INFO("tunnel '%s': stats listening on udp:%u",
 		         t->name, (unsigned)t->stats_local_port);
 	}
+
+	/* Optional fire-and-forget logging tap (e.g. the SQLite ingester).
+	 * Parsed independently of stats_out: the tap is a pure copy emitted
+	 * AFTER the back-channel forward, so a dead tap consumer never gates
+	 * stats_out or the vehicle link. */
+	t->stats_tap_active = 0;
+	if (t->stats_tap[0]) {
+		if (parse_host_port(t->stats_tap, &t->stats_tap_addr) == 0) {
+			t->stats_tap_active = 1;
+			LOG_INFO("tunnel '%s': stats tap -> %s",
+			         t->name, t->stats_tap);
+		} else {
+			LOG_WARN("tunnel '%s': stats_tap '%s' unparseable; not tapping",
+			         t->name, t->stats_tap);
+		}
+	}
 	return 0;
 }
 
@@ -1601,6 +1622,16 @@ void stats_drain(Tunnel *t)
 			(void)sendto(t->stats_local_fd, buf, (size_t)got, 0,
 			             (struct sockaddr *)&t->stats_fwd_addr,
 			             sizeof(t->stats_fwd_addr));
+		}
+
+		/* Fire-and-forget logging tap: a raw rx_ant copy to e.g. the
+		 * SQLite ingester, independent of and after the back-channel
+		 * above. Best-effort — a dead tap consumer never affects
+		 * stats_out or the vehicle link. */
+		if (t->stats_tap_active) {
+			(void)sendto(t->stats_local_fd, buf, (size_t)got, 0,
+			             (struct sockaddr *)&t->stats_tap_addr,
+			             sizeof(t->stats_tap_addr));
 		}
 
 		uint32_t iv;
