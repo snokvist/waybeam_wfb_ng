@@ -976,6 +976,7 @@ function renderTunnels(ts){
           <dt>fec rec</dt><dd>${s.pkt_fec_recovered||0}</dd>
           <dt>dec_err</dt><dd>${s.pkt_dec_err||0}</dd>
           <dt>antennas</dt><dd>${s.ant_count||0}${s.rssi_best!==undefined?` · best rssi ${s.rssi_best} dBm`:''}</dd>
+          ${(()=>{const h=s.mcs_hist;if(!h)return '';const ks=Object.keys(h).map(Number).sort((a,b)=>b-a);if(!ks.length)return '';const tot=ks.reduce((a,m)=>a+h[m],0)||1;const parts=ks.map(m=>`<span class="muted">M${m}</span> ${h[m]} <span class="muted">(${(h[m]*100/tot).toFixed(1)}%)</span>`).join(' · ');return `<dt title="received packets per MCS rung — peek PROTECT lands key/param frames on lower rungs">rx mcs</dt><dd>${parts}</dd>`;})()}
         </dl>
       </div>`;
     } else {

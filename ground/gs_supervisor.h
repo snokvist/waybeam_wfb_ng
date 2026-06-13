@@ -235,6 +235,13 @@ typedef struct {
 	uint32_t    st_pkt_uniq;
 	int         st_ant_count;
 	int         st_rssi_best;
+	/* Received-MCS histogram for the latest rx_ant window: per-ant `pkts`
+	 * summed by the entry's received MCS index. Surfaces NAL-aware peek
+	 * PROTECT (key/param frames land on lower rungs) and adaptive-MCS
+	 * changes on the Tunnels tab. Diversity counts each adapter's copy,
+	 * so this is per-antenna receptions, not deduped packets — the rung
+	 * *distribution* is what matters. */
+	uint32_t    st_mcs_pkts[16];
 
 	uint32_t    st_tx_pkts_in;
 	uint32_t    st_tx_pkts_out;

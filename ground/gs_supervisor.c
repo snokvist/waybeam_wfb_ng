@@ -980,6 +980,7 @@ int tunnel_spawn(Tunnel *t, const char *key_file)
 		t->st_pkt_uniq = 0;
 		t->st_ant_count = 0;
 		t->st_rssi_best = INT_MIN;
+		memset(t->st_mcs_pkts, 0, sizeof(t->st_mcs_pkts));
 	} else {
 		t->st_tx_pkts_in = t->st_tx_pkts_out = 0;
 		t->st_tx_bytes_in = t->st_tx_bytes_out = 0;
@@ -1659,6 +1660,7 @@ void stats_drain(Tunnel *t)
 			size_t al = 0;
 			int ant_count = 0;
 			int best_rssi = INT_MIN;
+			uint32_t mcs_hist[16] = {0}; /* per-received-MCS pkt counts, this window */
 			if (json_slice_object(buf, (size_t)got, "ant", &ant, &al) == 0 && al >= 2) {
 				int depth = 0;
 				size_t obj_start = 0;
@@ -1684,8 +1686,17 @@ void stats_drain(Tunnel *t)
 							 * entries by freq:mcs:bw). Last one wins —
 							 * mirrors probe_log.py. */
 							int32_t am;
-							if (json_pick_i32(o, ol, "mcs", &am) == 0)
+							if (json_pick_i32(o, ol, "mcs", &am) == 0) {
 								rec_mcs = am;
+								/* Bucket this entry's pkt count by its
+								 * received MCS for the Tunnels-tab
+								 * histogram (peek PROTECT visibility). */
+								int32_t ap;
+								if (am >= 0 && am < 16 &&
+								    json_pick_i32(o, ol, "pkts", &ap) == 0 &&
+								    ap > 0)
+									mcs_hist[am] += (uint32_t)ap;
+							}
 							ant_count++;
 						}
 					}
@@ -1693,6 +1704,13 @@ void stats_drain(Tunnel *t)
 			}
 			t->st_ant_count = ant_count;
 			if (best_rssi != INT_MIN) t->st_rssi_best = best_rssi;
+			/* Accumulate cumulatively (not a per-window snapshot): peek
+			 * PROTECT moves only IDR/param packets — a brief burst once
+			 * per GOP — to lower rungs. A 100 ms snapshot polled at 1 Hz
+			 * almost always misses that window; a running total keeps the
+			 * low rungs visible. Resets on listener (re)open. */
+			for (int m = 0; m < 16; m++)
+				t->st_mcs_pkts[m] += mcs_hist[m];
 
 			/* Boundary-probe PER accumulation + window flush. */
 			if (t->probe)

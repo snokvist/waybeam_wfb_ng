@@ -150,6 +150,20 @@ int json_emit_tunnel(char *buf, size_t cap, const Tunnel *t, bool full)
 			    t->st_pkt_outgoing, t->st_pkt_dec_err, t->st_pkt_uniq,
 			    t->st_pkt_bytes, t->st_ant_count);
 			if (t->st_rssi_best != INT_MIN) APP(",\"rssi_best\":%d", t->st_rssi_best);
+			/* Received-MCS histogram (peek PROTECT / adaptive-MCS
+			 * visibility). Only non-zero rungs; object omitted when
+			 * no per-MCS data this window. */
+			{
+				int mh_any = 0;
+				for (int m = 0; m < 16; m++) {
+					if (t->st_mcs_pkts[m] == 0) continue;
+					APP("%s\"%d\":%u",
+					    mh_any ? "," : ",\"mcs_hist\":{",
+					    m, t->st_mcs_pkts[m]);
+					mh_any = 1;
+				}
+				if (mh_any) APP("}");
+			}
 			if (t->probe)
 				APP(",\"probe\":{\"window_ms\":%d,"
 				    "\"emitted\":%u,\"stale_dropped\":%u}",
