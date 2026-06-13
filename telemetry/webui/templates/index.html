@@ -27,7 +27,7 @@
         {{ '%.1f'|format((s.last_ts - s.first_ts) / 1000) }}s{% else %}—{% endif %}</td>
       <td>{{ s.started_at or '—' }}</td>
       <td>{{ s.location or '—' }}</td>
-      <td>{{ s.notes or '—' }}</td>
+      <td><div class="cell-clip" title="{{ s.notes or '' }}">{{ s.notes or '—' }}</div></td>
       <td class="actions"><button class="del-session" data-id="{{ s.id }}" title="Delete session {{ s.id }}">✕</button></td>
     </tr>
   {% endfor %}
@@ -38,8 +38,8 @@
 <script>
 /* Live-refresh the session list (record counts + span grow as a capture runs). */
 (function () {
-  const esc = s => (s == null ? "—" : String(s)).replace(/[&<>]/g,
-    c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+  const esc = s => (s == null ? "—" : String(s)).replace(/[&<>"]/g,
+    c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
   const span = (a, b) => (a != null && b != null) ? ((b - a) / 1000).toFixed(1) + "s" : "—";
   async function tick() {
     let rows;
@@ -51,7 +51,8 @@
       `<tr onclick="location.href='/session/${s.id}'">` +
       `<td>${s.id}</td><td>${esc(s.source)}</td><td>${esc(s.scenario)}</td>` +
       `<td class="num">${s.n_records}</td><td class="num">${span(s.first_ts, s.last_ts)}</td>` +
-      `<td>${esc(s.started_at)}</td><td>${esc(s.location)}</td><td>${esc(s.notes)}</td>` +
+      `<td>${esc(s.started_at)}</td><td>${esc(s.location)}</td>` +
+      `<td><div class="cell-clip" title="${esc(s.notes)}">${esc(s.notes)}</div></td>` +
       `<td class="actions"><button class="del-session" data-id="${s.id}" title="Delete session ${s.id}">✕</button></td></tr>`
     ).join("");
   }

@@ -15,8 +15,17 @@ h1 small { color: var(--muted); font-weight: 400; font-size: .8rem; }
 .caveat { font-size: .82rem; color: #d29922; border-left: 3px solid #d29922;
           padding: .4rem .7rem; margin: .4rem 0 1rem; background: #1a1505; }
 .caveat strong { color: #e3b341; }
-td.actions { text-align: center; width: 2rem; }
-.del-session { padding: .1rem .4rem; font-size: .85rem; line-height: 1;
+/* Keep long notes from blowing the table past the viewport (ellipsis + the
+   full text on hover via the title attr). */
+.cell-clip { max-width: 22rem; overflow: hidden; text-overflow: ellipsis;
+             white-space: nowrap; }
+/* Pin the delete column to the right edge so it's always reachable even if the
+   table does overflow; bg must cover content scrolling under it. */
+td.actions { text-align: center; padding: .25rem .5rem;
+             position: sticky; right: 0; background: var(--bg); }
+table.sessions thead th:last-child { position: sticky; right: 0; background: var(--bg); }
+table.sessions tbody tr:hover td.actions { background: #1b222c; }
+.del-session { padding: .3rem .6rem; font-size: 1rem; line-height: 1;
                background: #2d1417; border-color: #5c2226; color: #f85149; }
 .del-session:hover { border-color: #f85149; background: #3d1a1e; }
 .overlay-link { font-size: .8rem; font-weight: 400; margin-left: .6rem; color: var(--accent); text-decoration: none; }
