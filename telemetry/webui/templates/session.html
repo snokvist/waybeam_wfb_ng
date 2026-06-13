@@ -4,8 +4,8 @@
 <a class="back" href="{{ url_for('index') }}">← all sessions</a>
 <h1>Session {{ session.id }}
   <small>{{ session.scenario or '—' }} · {{ session.source or '—' }}</small>
-  {% if session.source == 'vehicle-uplink' %}
-  <a class="overlay-link" href="{{ url_for('overlay_page', vid=session.id) }}">⇅ uplink↔downlink overlay</a>
+  {% if session.source == 'vehicle-uplink' or (session.source or '').startswith('live-') %}
+  <a class="overlay-link" href="{{ url_for('overlay_page', sid=session.id) }}">⇅ uplink↔downlink overlay</a>
   {% endif %}</h1>
 <dl class="meta">
   <div><dt>started</dt><dd>{{ session.started_at or '—' }}</dd></div>

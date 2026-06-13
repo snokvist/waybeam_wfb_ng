@@ -5,6 +5,14 @@
   <h1>Sessions</h1>
   <button id="new-capture" type="button" title="Close the current GS capture and start a fresh session (clean break). With LOG_SYNC the vehicle log carries over automatically.">⏺ New capture session</button>
   <span id="capture-status" class="muted"></span>
+  <span class="toolbar-sep"></span>
+  <form id="vehicle-fetch" class="inline-fetch"
+        title="scp the vehicle's walkout status.jsonl and import it as a vehicle-uplink session (LOG_SYNC marker-fit attributes it to its GS session).">
+    <input name="ip" value="192.168.1.13" size="13" aria-label="vehicle IP" autocomplete="off">
+    <input name="session" value="latest" size="7" aria-label="session (latest or 6 digits)" autocomplete="off">
+    <button type="submit">⬇ Fetch vehicle</button>
+  </form>
+  <span id="vehicle-status" class="muted"></span>
 </div>
 {% if not sessions %}
   <p class="empty">No sessions yet. Import a capture:
@@ -96,6 +104,32 @@
       st.textContent = " ✗ request failed";
     } finally {
       btn.disabled = false;
+    }
+  });
+
+  /* "Fetch vehicle" — scp + import a vehicle walkout session into the same DB.
+     The vehicle keeps logging across GS session breaks, so one fetch may pull a
+     log spanning several walks; the importer's marker-fit attributes it. */
+  const vf = document.getElementById("vehicle-fetch");
+  const vst = document.getElementById("vehicle-status");
+  if (vf) vf.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const ip = vf.elements.ip.value.trim();
+    const session = vf.elements.session.value.trim() || "latest";
+    const sub = vf.querySelector("button");
+    sub.disabled = true; vst.textContent = " fetching… (scp + import)";
+    try {
+      const r = await fetch("/api/vehicle/fetch", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ip, session }),
+      });
+      const j = await r.json();
+      vst.textContent = (j.ok ? " ✓ " : " ✗ ") + (j.message || j.error || "done");
+      if (j.ok) tick();
+    } catch (err) {
+      vst.textContent = " ✗ request failed";
+    } finally {
+      sub.disabled = false;
     }
   });
 })();
