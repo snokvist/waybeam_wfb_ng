@@ -265,14 +265,30 @@ def api_series(sid: int):
             # tooltip (fixed client-side to show per-rung counts), not the data.
             for m, p in best.items():
                 mcs_dist[str(m)][i] = int(p)
-        elif is_vehicle:
-            # Vehicle-uplink sessions have no ant[]: show the denormalised
-            # current MCS as a single-rung mark so the stacked bar still renders
-            # the active rung. Gated on source so a GS blackout row (empty ant)
-            # doesn't draw a phantom rung from its denormalised mcs.
-            m = _rung(r["mcs"])
-            if m is not None:
-                mcs_dist[str(m)][i] = 1
+        # No `ant[]` fallback for vehicle-uplink rows: they have no per-packet
+        # MCS distribution to stack (the old single-unit mark just drew dots).
+        # The vehicle view charts current_mcs as a step line instead.
+
+    # Vehicle-uplink rows carry the controller's STATE, not packet stats. Pull
+    # the two signals the GS columns don't cover — adapter_count (diversity
+    # health) and rssi_slope_db_s (the fade-rate the controller demotes on) —
+    # so the vehicle view can show what actually drove its decisions.
+    vehicle_extra = {}
+    if is_vehicle:
+        adapter, slope = [], []
+        for r in rows:
+            try:
+                sc = json.loads(r["raw_json"]).get("status", {}).get("score", {})
+            except (ValueError, TypeError, AttributeError):
+                sc = {}
+            if not isinstance(sc, dict):
+                sc = {}
+            ac = sc.get("adapter_count")
+            sl = sc.get("rssi_slope_db_s")
+            # adapter_count == -1 is the pre-init sentinel — null it, not a dip.
+            adapter.append(ac if isinstance(ac, (int, float)) and not isinstance(ac, bool) and ac >= 0 else None)
+            slope.append(sl if isinstance(sl, (int, float)) and not isinstance(sl, bool) else None)
+        vehicle_extra = {"adapter_count": adapter, "rssi_slope": slope}
 
     # overlay spans converted to x-seconds for the chart's band plugin
     overlays = [{"x0": (h["t0_ms"] - t0) / 1000.0,
@@ -282,6 +298,7 @@ def api_series(sid: int):
 
     return app.response_class(
         json.dumps({"series": series, "overlays": overlays, "mcs_dist": mcs_dist,
+                    "is_vehicle": is_vehicle, "vehicle_extra": vehicle_extra,
                     "model_ver": model_ver, "n": len(rows)}),
         mimetype="application/json")
 

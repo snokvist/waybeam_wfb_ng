@@ -271,6 +271,7 @@ function wireForms() {
 /* ---- live tailing ---- */
 let LIVE = true;
 let LAST_N = -1;
+let IS_VEHICLE = false;   // set in main() from the series payload's source flag
 const POLL_MS = 2000;
 
 function setLiveDot(txt, cls) {
@@ -285,9 +286,16 @@ function applySeries(j) {
   const S = j.series, t = S.t;
   document.getElementById("overlay-status").textContent =
     ` · ${j.n} records · model ${j.model_ver || "(none scored)"}`;
-  CHARTS[0].setData([t, S.rssi_comb, S.snr_avg], true);
-  CHARTS[1].setData([t, S.per, S.pkt_lost], true);
-  CHARTS[2].setData(mcsStack(t, j.mcs_dist).data, true);
+  if (IS_VEHICLE) {
+    const EX = j.vehicle_extra || {};
+    CHARTS[0].setData([t, S.rssi_comb, EX.adapter_count], true);
+    CHARTS[1].setData([t, S.per], true);
+    CHARTS[2].setData([t, S.mcs, EX.rssi_slope], true);
+  } else {
+    CHARTS[0].setData([t, S.rssi_comb, S.snr_avg], true);
+    CHARTS[1].setData([t, S.per, S.pkt_lost], true);
+    CHARTS[2].setData(mcsStack(t, j.mcs_dist).data, true);
+  }
   STATE_BANDS = stateBands(t, S.tier1_state);
   rebuildBands();
 }
@@ -318,6 +326,7 @@ async function main() {
   if (!r.ok) { document.getElementById("charts").textContent = "failed to load series"; return; }
   const j = await r.json();
   LAST_N = j.n;
+  IS_VEHICLE = !!j.is_vehicle;
   const S = j.series, t = S.t;
   document.getElementById("overlay-status").textContent =
     ` · ${j.n} records · model ${j.model_ver || "(none scored)"}`;
@@ -326,26 +335,54 @@ async function main() {
   const root = document.getElementById("charts");
   const mk = () => { const d = document.createElement("div"); root.appendChild(d); return d; };
 
-  CHARTS = [
-    makeChart(mk(), "RSSI / SNR",
-      [{}, { label: "rssi_comb (dBm)", scale: "rssi", stroke: C.rssi },
-           { label: "snr_avg (dB)", scale: "snr", stroke: C.snr }],
-      [t, S.rssi_comb, S.snr_avg], { rssi: {}, snr: {} },
-      [{ scale: "rssi", stroke: axisColor, grid: { stroke: "#21262d" } },
-       { scale: "snr", side: 1, stroke: axisColor, grid: { show: false } }]),
-    makeChart(mk(), "PER / lost",
-      [{}, { label: "per", scale: "per", stroke: C.per },
-           { label: "pkt_lost", scale: "cnt", stroke: C.lost }],
-      [t, S.per, S.pkt_lost], { per: { range: [0, 1] }, cnt: {} },
-      [{ scale: "per", stroke: axisColor, grid: { stroke: "#21262d" } },
-       { scale: "cnt", side: 1, stroke: axisColor, grid: { show: false } }]),
-    (() => {
-      const st = mcsStack(t, j.mcs_dist);
-      return makeChart(mk(), "MCS distribution (rx pkts / 100 ms, stacked)",
-        st.series, st.data, { pkts: {} },
-        [{ scale: "pkts", stroke: axisColor, grid: { stroke: "#21262d" } }]);
-    })(),
-  ];
+  if (IS_VEHICLE) {
+    // Vehicle-uplink is 1 Hz controller STATE, not packet stats: no SNR, no
+    // pkt_lost, no per-rung packet mix. Chart what the controller actually
+    // tracks — smoothed RSSI + diversity (adapter_count), smoothed loss, and
+    // current_mcs as a step line alongside the fade-rate it demotes on.
+    const EX = j.vehicle_extra || {};
+    CHARTS = [
+      makeChart(mk(), "RSSI (smoothed) / diversity",
+        [{}, { label: "rssi (dBm)", scale: "rssi", stroke: C.rssi },
+             { label: "adapters", scale: "adapters", stroke: C.snr,
+               paths: stepped, points: { show: false } }],
+        [t, S.rssi_comb, EX.adapter_count], { rssi: {}, adapters: { range: [0, 4] } },
+        [{ scale: "rssi", stroke: axisColor, grid: { stroke: "#21262d" } },
+         { scale: "adapters", side: 1, stroke: axisColor, grid: { show: false } }]),
+      makeChart(mk(), "PER (smoothed loss ratio)",
+        [{}, { label: "per", scale: "per", stroke: C.per }],
+        [t, S.per], { per: { range: [0, 1] } },
+        [{ scale: "per", stroke: axisColor, grid: { stroke: "#21262d" } }]),
+      makeChart(mk(), "MCS (current) / RSSI slope",
+        [{}, { label: "mcs", scale: "mcs", stroke: C.rssi,
+               paths: stepped, points: { show: false } },
+             { label: "rssi slope (dB/s)", scale: "slope", stroke: C.lost }],
+        [t, S.mcs, EX.rssi_slope], { mcs: { range: [-0.5, 7.5] }, slope: {} },
+        [{ scale: "mcs", stroke: axisColor, grid: { stroke: "#21262d" } },
+         { scale: "slope", side: 1, stroke: axisColor, grid: { show: false } }]),
+    ];
+  } else {
+    CHARTS = [
+      makeChart(mk(), "RSSI / SNR",
+        [{}, { label: "rssi_comb (dBm)", scale: "rssi", stroke: C.rssi },
+             { label: "snr_avg (dB)", scale: "snr", stroke: C.snr }],
+        [t, S.rssi_comb, S.snr_avg], { rssi: {}, snr: {} },
+        [{ scale: "rssi", stroke: axisColor, grid: { stroke: "#21262d" } },
+         { scale: "snr", side: 1, stroke: axisColor, grid: { show: false } }]),
+      makeChart(mk(), "PER / lost",
+        [{}, { label: "per", scale: "per", stroke: C.per },
+             { label: "pkt_lost", scale: "cnt", stroke: C.lost }],
+        [t, S.per, S.pkt_lost], { per: { range: [0, 1] }, cnt: {} },
+        [{ scale: "per", stroke: axisColor, grid: { stroke: "#21262d" } },
+         { scale: "cnt", side: 1, stroke: axisColor, grid: { show: false } }]),
+      (() => {
+        const st = mcsStack(t, j.mcs_dist);
+        return makeChart(mk(), "MCS distribution (rx pkts / 100 ms, stacked)",
+          st.series, st.data, { pkts: {} },
+          [{ scale: "pkts", stroke: axisColor, grid: { stroke: "#21262d" } }]);
+      })(),
+    ];
+  }
 
   let raf;
   window.addEventListener("resize", () => {
