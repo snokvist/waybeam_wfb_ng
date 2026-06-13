@@ -48,6 +48,7 @@ PYTEST_PY = $(shell test -x .venv/bin/python && echo .venv/bin/python || echo py
 
 test:
 	$(PYTEST_PY) -m pytest tests/protocols -v
+	$(MAKE) -C vehicle test
 
 # Archived controller-logic suite (legacy, ~328 tests).
 test-archive:

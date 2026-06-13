@@ -375,6 +375,16 @@ typedef struct {
 		float    rssi_fade_db_per_s;/* slope demote threshold (0 = off)     */
 		float    rssi_fade_arm_dbm; /* fade rule armed at/below this        */
 		float    rssi_floor_hyst_db;/* promote blocked <= floor + this      */
+		/* Transport backpressure coupling (anti death-spiral). When the
+		 * venc->wfb_tx SHM ring saturates, the probe/video PER reads high
+		 * from local airtime starvation, NOT RF — and demoting MCS starves
+		 * airtime further, deepening the saturation. pressure_demote_block
+		 * suppresses the PER-driven demotes (rules 1 + probe-fail) while the
+		 * sidecar reports in_pressure; the RF guards (floor/fade) stay live.
+		 * pressure_escape_s is the active escape: in_pressure held this long
+		 * with clean RF promotes MCS to drain the ring (0 = escape off). */
+		bool     pressure_demote_block;
+		float    pressure_escape_s;
 		/* Flap damping (promote-side only — demotes are never delayed):
 		 * re-promoting into/above the rung we last demoted from within
 		 * reentry_backoff_s requires reentry_dwell_s of clean probe
@@ -2679,6 +2689,13 @@ typedef struct {
 	 * Demotes are never delayed by this. */
 	int       flap_guard_mcs;
 	uint64_t  flap_guard_us;
+	/* Transport backpressure tracking (anti death-spiral). pressure_since_us
+	 * is the timestamp of the first datagram in the current contiguous
+	 * in_pressure run (0 = not under pressure); the escape fires once it has
+	 * been held pressure_escape_s. escape_count is a /status observability
+	 * counter. */
+	uint64_t  pressure_since_us;
+	uint32_t  pressure_escape_count;
 } Selector;
 
 /* ── Boundary-probe PER state (2026-06-08 control law) ───────────────────
@@ -2743,6 +2760,8 @@ static void selector_init(Selector *s)
 	s->fade_streak = 0;
 	s->flap_guard_mcs = -1;
 	s->flap_guard_us = 0;
+	s->pressure_since_us = 0;
+	s->pressure_escape_count = 0;
 }
 
 static void selector_expire_changes(Selector *s, const Config *cfg, uint64_t now)
@@ -2855,6 +2874,7 @@ static SelectDecision selector_tick_no_data(Selector *s, const Config *cfg,
 static SelectDecision selector_update(Selector *s, const Config *cfg,
                                       const Score *score,
                                       const ProbeState *probe,
+                                      bool in_pressure,
                                       uint64_t now, int *out_mcs)
 {
 	s->last_datagram_us = now;
@@ -2862,6 +2882,20 @@ static SelectDecision selector_update(Selector *s, const Config *cfg,
 	/* Data is flowing again — clear any watchdog failsafe; the probe will
 	 * climb back up from mcs_min. */
 	if (s->in_failsafe) s->in_failsafe = false;
+
+	/* Transport backpressure persistence: track the start of the current
+	 * contiguous in_pressure run (the escape rule keys on how long it has
+	 * held). Reset the moment the ring drains. */
+	if (in_pressure) {
+		if (s->pressure_since_us == 0) s->pressure_since_us = now;
+	} else {
+		s->pressure_since_us = 0;
+	}
+	/* While the SHM ring is saturated the probe/video PER is airtime-
+	 * starvation, not RF — suppress the PER-driven demotes so backpressure
+	 * can't pull MCS down (which would deepen the saturation). RF guards
+	 * (floor/fade) below are transport-independent and stay live. */
+	bool pressure_block = in_pressure && cfg->mcs.pressure_demote_block;
 
 	/* Cold start: begin at the floor and let the probe promote upward. */
 	if (s->current_mcs < 0)
@@ -2889,18 +2923,47 @@ static SelectDecision selector_update(Selector *s, const Config *cfg,
 	s->rssi_fade_active  = fade_hit;
 
 	/* 1. REACTIVE DEMOTE — live video PER spike. smoothed_lost_ratio is a
-	 *    fraction (0..1); compare in per-mille. */
-	if (score->smoothed_lost_ratio * 1000.0f >= (float)cfg->mcs.demote_per_milli) {
+	 *    fraction (0..1); compare in per-mille. Suppressed under transport
+	 *    backpressure: the "loss" is local airtime starvation, not RF. */
+	if (!pressure_block &&
+	    score->smoothed_lost_ratio * 1000.0f >= (float)cfg->mcs.demote_per_milli) {
 		if (can_demote)
 			return selector_commit(s, cfg, s->current_mcs - 1, now,
 			                       SD_DOWN, out_mcs);
 		return SD_NONE;  /* at floor or cooling down */
 	}
 
-	/* 2/3. RSSI GUARD-RAIL DEMOTES — floor first (deeper condition). */
+	/* 2/3. RSSI GUARD-RAIL DEMOTES — floor first (deeper condition). These
+	 *      are real RF signals, independent of the transport, so they fire
+	 *      even under backpressure (a genuine fade still demotes). */
 	if ((floor_hit || fade_hit) && can_demote)
 		return selector_commit(s, cfg, s->current_mcs - 1, now,
 		                       SD_DOWN, out_mcs);
+
+	/* 3.5 BACKPRESSURE ESCAPE — sustained in_pressure with CLEAN RF means the
+	 *     current rung is under-provisioned for the offered load, and the
+	 *     probe PER is contaminated by airtime starvation. Climb to free
+	 *     airtime and drain the ring; this inverts the death-spiral where a
+	 *     low rung starves its own probe and locks the controller down. The
+	 *     RF demotes above already handled a genuine fade, so reaching here
+	 *     with in_pressure means RF is fine. Steps one rung per down_cooldown
+	 *     until the ring drains (in_pressure clears) or mcs_max. */
+	if (in_pressure && cfg->mcs.pressure_escape_s > 0.0f &&
+	    s->pressure_since_us != 0 && s->current_mcs < cfg->mcs.mcs_max) {
+		bool rf_clean = !floor_hit && !fade_sample &&
+		    score->smoothed_rssi >
+		        cfg->mcs.rssi_floor_dbm + cfg->mcs.rssi_floor_hyst_db;
+		float held = (float)(now - s->pressure_since_us) / 1e6f;
+		if (rf_clean && held >= cfg->mcs.pressure_escape_s &&
+		    elapsed >= cfg->mcs.down_cooldown_s) {
+			s->pressure_escape_count++;
+			LOG_MCS("pressure-escape promote: held=%.1fs rssi=%.0f %d->%d",
+			    held, score->smoothed_rssi,
+			    s->current_mcs, s->current_mcs + 1);
+			return selector_commit(s, cfg, s->current_mcs + 1, now,
+			                       SD_UP, out_mcs);
+		}
+	}
 
 	/* 4. PROBE-DRIVEN promote / pre-emptive demote at the V+2 boundary.
 	 *    Records must be (a) fresh per probe_stale_age_s AND (b) newer than
@@ -2917,8 +2980,10 @@ static SelectDecision selector_update(Selector *s, const Config *cfg,
 			 * (clean >= fail, warned at startup/set) a failing rung
 			 * must demote, never promote. */
 			if (pr->per_milli >= cfg->mcs.probe_fail_milli) {
-				/* +2 fail while video healthy -> conservative demote 1. */
-				if (can_demote)
+				/* +2 fail while video healthy -> conservative demote 1.
+				 * Suppressed under backpressure (the rung PER is airtime-
+				 * starved, not RF — the escape rule above handles it). */
+				if (!pressure_block && can_demote)
 					return selector_commit(s, cfg, s->current_mcs - 1,
 					                       now, SD_DOWN, out_mcs);
 			} else if (pr->per_milli <= cfg->mcs.probe_clean_milli) {
@@ -3034,6 +3099,8 @@ static const TunableDesc TUNABLES[] = {
 	{"mcs.rssi_fade_db_per_s",            SUB_MCS, TF_FLOAT, OFF_MCS(rssi_fade_db_per_s),            0.0, 60.0,  "guard: demote when RSSI falls faster (0=off)", 1},
 	{"mcs.rssi_fade_arm_dbm",             SUB_MCS, TF_FLOAT, OFF_MCS(rssi_fade_arm_dbm),             -120.0, 0.0,"guard: fade rule armed at/below this RSSI", 1},
 	{"mcs.rssi_floor_hyst_db",            SUB_MCS, TF_FLOAT, OFF_MCS(rssi_floor_hyst_db),            0.0, 20.0,  "guard: promotes blocked at/below floor + this (must exceed smoothed RSSI noise)", 1},
+	{"mcs.pressure_demote_block",         SUB_MCS, TF_BOOL,  OFF_MCS(pressure_demote_block),         0, 0,       "backpressure: suppress PER/probe demotes while transport in_pressure (anti death-spiral)", 1},
+	{"mcs.pressure_escape_s",             SUB_MCS, TF_FLOAT, OFF_MCS(pressure_escape_s),             0.0, 30.0,  "backpressure: in_pressure held >= this with clean RF -> promote to drain ring (0 = off)", 1},
 	{"mcs.reentry_backoff_s",             SUB_MCS, TF_FLOAT, OFF_MCS(reentry_backoff_s),             0.0, 120.0, "flap guard: window after a demote during which re-entry needs the longer dwell (0 = off)"},
 	{"mcs.reentry_dwell_s",               SUB_MCS, TF_FLOAT, OFF_MCS(reentry_dwell_s),               0.0, 30.0,  "flap guard: dwell for promoting back into the rung that just failed"},
 	{"mcs.probe_clean_milli",             SUB_MCS, TF_INT,   OFF_MCS(probe_clean_milli),             0, 1000,    "probe: V+2 PER <= this permille -> promote-eligible"},
@@ -3469,6 +3536,7 @@ static int append_mcs_json(char *buf, size_t cap, size_t pos,
 		"\"mcs\":{\"enabled\":%s,\"current_mcs\":%d,"
 		"\"in_failsafe\":%s,"
 		"\"rssi_guard\":{\"floor_active\":%s,\"fade_active\":%s},"
+		"\"pressure\":{\"active\":%s,\"held_s\":%.2f,\"escapes\":%u},"
 		"\"flap_guard\":{\"mcs\":%d,\"active\":%s},"
 		"\"commit_count\":%u,\"changes_in_window\":%d,"
 		"\"last_emit_mcs\":%d,\"rx_ant_age_s\":%.3f,"
@@ -3484,6 +3552,10 @@ static int append_mcs_json(char *buf, size_t cap, size_t pos,
 		s->sel->in_failsafe ? "true" : "false",
 		s->sel->rssi_floor_active ? "true" : "false",
 		s->sel->rssi_fade_active ? "true" : "false",
+		s->sel->pressure_since_us != 0 ? "true" : "false",
+		s->sel->pressure_since_us != 0
+			? (double)(now - s->sel->pressure_since_us) / 1e6 : 0.0,
+		s->sel->pressure_escape_count,
 		s->sel->flap_guard_mcs,
 		(s->sel->flap_guard_mcs >= 0 && s->sel->flap_guard_us != 0 &&
 		 (double)(now - s->sel->flap_guard_us) / 1e6 <
@@ -4410,6 +4482,12 @@ static void config_defaults(Config *c)
 	c->mcs.oscillation_window_s = 5.0f;
 	c->mcs.mcs_min = 0;
 	c->mcs.mcs_max = 5;   /* video caps at 5; rungs 6,7 reserved for probing */
+	/* Transport backpressure coupling (anti death-spiral): on by default,
+	 * escape after 2 s of held pressure. Inert on links with no SHM sidecar
+	 * (in_pressure never asserts) and on the bench (RF clean, ring never
+	 * saturates) — only engages when a saturated ring meets good RF. */
+	c->mcs.pressure_demote_block = true;
+	c->mcs.pressure_escape_s     = 2.0f;
 	c->mcs.probe_clean_milli = 20;    /* <=2%  -> +2 clean -> promote        */
 	/* fail threshold 200‰ (not 100): with a 0.5 s GS window the rung
 	 * sample is ~accounted = pps/2 packets; at 100‰ a single lost packet
@@ -4491,6 +4569,7 @@ static void config_defaults(Config *c)
  * Main loop
  * ───────────────────────────────────────────────────────────────────── */
 
+#ifndef LC_TEST_NO_MAIN
 int main(int argc, char **argv)
 {
 	Config cfg;
@@ -5715,7 +5794,9 @@ int main(int argc, char **argv)
 				int new_mcs = -1;
 				Selector sel_snap = sel;
 				SelectDecision sd = selector_update(&sel, &cfg, &score,
-				                                    &probe, last_rx_ant_us,
+				                                    &probe,
+				                                    last_transport_in_pressure != 0,
+				                                    last_rx_ant_us,
 				                                    &new_mcs);
 				if (sd == SD_NONE) {
 					/* Realign block — an external party touched wfb_tx
@@ -5965,3 +6046,4 @@ int main(int argc, char **argv)
 	    fec_ctrl.update_count, sel.commit_count);
 	return 0;
 }
+#endif /* LC_TEST_NO_MAIN */

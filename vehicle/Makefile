@@ -32,7 +32,7 @@ LDFLAGS_COMMON = -lm
 DEPLOY_HOST ?= 192.168.1.13
 DEPLOY_DIR  ?= /tmp
 
-.PHONY: all webui clean deploy host help
+.PHONY: all webui clean deploy host help test
 
 all: $(OUT)
 
@@ -63,6 +63,19 @@ host: $(OUT_HOST)
 $(OUT_HOST): $(SRC) $(CSA_HDR) $(WEBUI_HDR) | $(BUILD_DIR)
 	cc $(CFLAGS_COMMON) $(SHARED_INC) -I. -Icsa -Iwebui -g -o $@ $(SRC) $(LDFLAGS_COMMON)
 	@echo "[link] host build: $@"
+
+# Host unit test for the MCS control law. test_selector_law.c #includes
+# link_controller.c with -DLC_TEST_NO_MAIN (so its main() is excluded) and
+# drives selector_update() directly; csa/csa.c is linked for the file-scope
+# CSA refs the daemon carries.
+TEST_SELECTOR = $(BUILD_DIR)/test_selector_law
+test: $(TEST_SELECTOR)
+	@$(TEST_SELECTOR)
+
+$(TEST_SELECTOR): ../tests/test_selector_law.c $(SRC) $(CSA_HDR) $(WEBUI_HDR) | $(BUILD_DIR)
+	cc $(CFLAGS_COMMON) -Wno-unused-function -DLC_TEST_NO_MAIN $(SHARED_INC) \
+		-I. -Icsa -Iwebui -g \
+		-o $@ ../tests/test_selector_law.c csa/csa.c $(LDFLAGS_COMMON)
 
 clean:
 	rm -f $(OUT) $(OUT_HOST) $(WEBUI_HDR)
