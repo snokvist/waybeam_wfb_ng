@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import signal
 import socket
 import sys
 import time
@@ -50,6 +51,16 @@ def main() -> None:
     for f in META_FIELDS:
         ap.add_argument(f"--{f.replace('_', '-')}", dest=f, default=None)
     args = ap.parse_args()
+
+    # Daemonized with `&`, this process inherits SIG_IGN for SIGINT and Python
+    # keeps an inherited ignore — so a bare `kill -INT` is a no-op and the
+    # session would never close cleanly (ended_at stays NULL, port held).
+    # Install explicit handlers so BOTH signals unwind through the `finally`
+    # (close_session + final commit).
+    def _shutdown(_signum, _frame):
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGINT, _shutdown)
+    signal.signal(signal.SIGTERM, _shutdown)
 
     conn = store.connect(args.db)
     store.init_db(conn)  # idempotent
