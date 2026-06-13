@@ -3,7 +3,10 @@
 {% block content %}
 <a class="back" href="{{ url_for('index') }}">← all sessions</a>
 <h1>Session {{ session.id }}
-  <small>{{ session.scenario or '—' }} · {{ session.source or '—' }}</small></h1>
+  <small>{{ session.scenario or '—' }} · {{ session.source or '—' }}</small>
+  {% if session.source == 'vehicle-uplink' or (session.source or '').startswith('live-') %}
+  <a class="overlay-link" href="{{ url_for('overlay_page', sid=session.id) }}">⇅ uplink↔downlink overlay</a>
+  {% endif %}</h1>
 <dl class="meta">
   <div><dt>started</dt><dd>{{ session.started_at or '—' }}</dd></div>
   <div><dt>location</dt><dd>{{ session.location or '—' }}</dd></div>
@@ -36,6 +39,8 @@
   <span class="chip hl-action">action</span>
   <span class="chip hl-state">state</span>
   <span id="overlay-status" class="muted"></span>
+  <label class="live-toggle"><input type="checkbox" id="live-toggle" checked> live</label>
+  <span id="live-dot" class="muted"></span>
 </div>
 
 <label class="labelmode"><input type="checkbox" id="label-mode">

@@ -59,6 +59,26 @@ stay searchable.
   `--iface-mtu N` (range [576, 9000]) which fork+execvp's
   `ip link set dev <iface> mtu N` against `{csa.iface, cmd.wfb_iface}`
   at startup.  Skipped under `--dry-run`.
+- **Failsafe watchdog has no CSA-hop coupling (latent, same class as the
+  backpressure spiral).** `selector_tick_no_data` demotes to `mcs_min` on
+  rx_ant staleness > `failsafe_timeout_s`, but a CSA channel hop is a
+  *deliberate* self-induced rx_ant dead-zone. Nothing gates the watchdog
+  against an in-progress hop, so a slow re-acquisition would force the
+  floor mid-hop (and the spurious SET_RADIO could race the channel
+  switch). NOT currently biting: deployed `failsafe_timeout_s = 2.0` and
+  measured hops re-acquire in ~118 ms (2026-06-10), and it self-recovers
+  (re-climbs, not a lock-up) — so this is a robustness hardening, not the
+  death-spiral the backpressure fix addressed. Fix: suppress the failsafe
+  demote while `csa_st ∈ {ARMED, VERIFY}` (treat `t_switch`→`t_revert` as
+  a watchdog grace window) and bump `last_datagram_us` on confirmed
+  post-hop link-alive. Found by the 2026-06-13 feedback-trap sweep.
+- **Post-CSA-hop RSSI step can spuriously arm the fade-demote (minor,
+  mostly guarded).** The first well-spaced sample after a hop differences
+  RSSI across the channel change → large false negative slope. Already
+  blunted by the `dt > 2 s` slope reset + the `FADE_PERSIST_SAMPLES = 3`
+  streak filter, leaving only the 0.5–2 s hop window marginally exposed.
+  Cure with the same fix: force a slope re-baseline on the CSA `COMMITTED`
+  transition. Found by the 2026-06-13 sweep.
 
 ## WCMD / link_controller
 

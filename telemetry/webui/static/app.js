@@ -25,6 +25,7 @@ let BANDS = [];         // merged, what the plugin draws
 let CHARTS = [];
 let LABEL_MODE = false;
 let PENDING = null;     // {x0, x1} from the active selection
+let ZOOMED = false;     // user has zoomed the x-scale in — hold live tailing
 // A drag below this many px is treated as a click: uPlot fires setSelect with
 // ~0 width on a plain click, so onSelect expands sub-CLICK_PX selections to a
 // small default span — single-clicking a point works, not only dragging a span.
@@ -72,7 +73,51 @@ function rebuildBands() {
 
 /* ---- charts ---- */
 const stepped = uPlot.paths.stepped({ align: 1 });
+const bars = uPlot.paths.bars({ size: [1.0, Infinity], align: 1 });
 const axisColor = "#8b949e";
+
+// MCS rung colours: warm/low = degraded or peek-protected rungs, cool/high =
+// healthy bulk (M5 matches the existing blue). Index = MCS index.
+const MCS_COLORS = ["#f85149", "#db6d28", "#d29922", "#bf8700",
+                    "#3fb950", "#58a6ff", "#388bfd", "#1f6feb"];
+
+// Build a stacked-bar dataset from per-rung packet counts. uPlot has no native
+// stacking, so we emit CUMULATIVE heights (bottom=M0 … top=M7) and draw rungs
+// back-to-front (tallest cumulative first) — each opaque bar over-paints the
+// one below, leaving each rung's own segment visible. Fixed 8 rungs so the
+// series count never changes between live polls.
+function mcsStack(t, dist) {
+  const N = t.length;
+  const seg = [];
+  for (let m = 0; m < 8; m++) {
+    const a = dist && dist[String(m)];
+    seg[m] = a && a.length === N ? a : new Array(N).fill(0);
+  }
+  const cum = [];
+  for (let m = 0; m < 8; m++) {
+    cum[m] = new Array(N);
+    for (let i = 0; i < N; i++)
+      cum[m][i] = (m === 0 ? 0 : cum[m - 1][i]) + (+seg[m][i] || 0);
+  }
+  const data = [t], series = [{}];
+  for (let m = 7; m >= 0; m--) {            // top → bottom = draw back → front
+    data.push(cum[m]);
+    // Legend/tooltip must show this rung's OWN packet count, not the
+    // cumulative stack height the bar geometry is drawn from. Each series'
+    // datum is cum[m]; the rung below it is the next series (m-1), so
+    // seg[m] = cum[m] - cum[m-1] = data[si] - data[si+1] (0 for bottom rung
+    // M0, which has no series below it). This stays correct across live polls
+    // because it reads the live chart data, not a captured array.
+    series.push({ label: `M${m}`, scale: "pkts", stroke: MCS_COLORS[m],
+                  fill: MCS_COLORS[m], paths: bars, points: { show: false },
+                  value: (u, v, si, di) => {
+                    if (v == null) return "";
+                    const below = (u.data[si + 1] && u.data[si + 1][di]) || 0;
+                    return Math.round(v - below);
+                  } });
+  }
+  return { data, series };
+}
 
 function makeChart(el, title, series, data, scales, axes) {
   const opts = {
@@ -82,7 +127,7 @@ function makeChart(el, title, series, data, scales, axes) {
     scales: scales || {},
     axes: [{ stroke: axisColor, grid: { stroke: "#21262d" }, ticks: { stroke: "#21262d" } }].concat(axes),
     plugins: [bandsPlugin()],
-    hooks: { setSelect: [onSelect] },
+    hooks: { setSelect: [onSelect], setScale: [onSetScale] },
     series,
   };
   const u = new uPlot(opts, data, el);
@@ -101,6 +146,18 @@ function makeChart(el, title, series, data, scales, axes) {
     u.setSelect({ left: lpx, width: 0, top: 0, height: u.over.clientHeight }, true);
   });
   return u;
+}
+
+// Track whether the user has zoomed the x-axis away from the full data extent.
+// While zoomed, the live poll holds (it would otherwise setData(resetScales)
+// and snap back to full range every 2 s). Double-click (uPlot's built-in zoom
+// reset) restores the full extent → clears the flag → tailing resumes.
+function onSetScale(u, key) {
+  if (key !== "x") return;
+  const d = u.data[0];
+  if (!d || d.length < 2) { ZOOMED = false; return; }
+  const lo = d[0], hi = d[d.length - 1], eps = (hi - lo) * 1e-4 + 1e-6;
+  ZOOMED = (u.scales.x.min > lo + eps) || (u.scales.x.max < hi - eps);
 }
 
 function onSelect(u) {
@@ -211,10 +268,65 @@ function wireForms() {
   });
 }
 
+/* ---- live tailing ---- */
+let LIVE = true;
+let LAST_N = -1;
+let IS_VEHICLE = false;   // set in main() from the series payload's source flag
+const POLL_MS = 2000;
+
+function setLiveDot(txt, cls) {
+  const d = document.getElementById("live-dot");
+  if (d) { d.textContent = txt; d.className = cls; }
+}
+
+// Push fresh series into the existing charts (used by the poll). setData with
+// resetScales=true tails the view to the full range — the expected live
+// behaviour; pause via the toggle to inspect a frozen window.
+function applySeries(j) {
+  const S = j.series, t = S.t;
+  document.getElementById("overlay-status").textContent =
+    ` · ${j.n} records · model ${j.model_ver || "(none scored)"}`;
+  if (IS_VEHICLE) {
+    const EX = j.vehicle_extra || {};
+    CHARTS[0].setData([t, S.rssi_comb, EX.adapter_count], true);
+    CHARTS[1].setData([t, S.per], true);
+    CHARTS[2].setData([t, S.mcs, EX.rssi_slope], true);
+  } else {
+    CHARTS[0].setData([t, S.rssi_comb, S.snr_avg], true);
+    CHARTS[1].setData([t, S.per, S.pkt_lost], true);
+    CHARTS[2].setData(mcsStack(t, j.mcs_dist).data, true);
+  }
+  STATE_BANDS = stateBands(t, S.tier1_state);
+  rebuildBands();
+}
+
+async function pollOnce() {
+  if (!LIVE) { setLiveDot("● paused", "live-paused"); return; }
+  // Never disturb an in-progress label selection or a manual zoom.
+  if (LABEL_MODE || PENDING || ZOOMED) { setLiveDot("● live (held)", "live-on"); return; }
+  let j;
+  try {
+    const r = await fetch(`/api/session/${SID}/series`);
+    if (!r.ok) return;
+    j = await r.json();
+  } catch (e) { return; }
+  if (j.n !== LAST_N) { applySeries(j); LAST_N = j.n; setLiveDot("● live", "live-on"); }
+  else setLiveDot("● idle", "live-idle");
+}
+
+function startLive() {
+  const cb = document.getElementById("live-toggle");
+  if (cb) { LIVE = cb.checked; cb.addEventListener("change", () => { LIVE = cb.checked; }); }
+  setLiveDot("● live", "live-on");
+  setInterval(pollOnce, POLL_MS);
+}
+
 async function main() {
   const r = await fetch(`/api/session/${SID}/series`);
   if (!r.ok) { document.getElementById("charts").textContent = "failed to load series"; return; }
   const j = await r.json();
+  LAST_N = j.n;
+  IS_VEHICLE = !!j.is_vehicle;
   const S = j.series, t = S.t;
   document.getElementById("overlay-status").textContent =
     ` · ${j.n} records · model ${j.model_ver || "(none scored)"}`;
@@ -223,26 +335,54 @@ async function main() {
   const root = document.getElementById("charts");
   const mk = () => { const d = document.createElement("div"); root.appendChild(d); return d; };
 
-  CHARTS = [
-    makeChart(mk(), "RSSI / SNR",
-      [{}, { label: "rssi_comb (dBm)", scale: "rssi", stroke: C.rssi },
-           { label: "snr_avg (dB)", scale: "snr", stroke: C.snr }],
-      [t, S.rssi_comb, S.snr_avg], { rssi: {}, snr: {} },
-      [{ scale: "rssi", stroke: axisColor, grid: { stroke: "#21262d" } },
-       { scale: "snr", side: 1, stroke: axisColor, grid: { show: false } }]),
-    makeChart(mk(), "PER / lost",
-      [{}, { label: "per", scale: "per", stroke: C.per },
-           { label: "pkt_lost", scale: "cnt", stroke: C.lost }],
-      [t, S.per, S.pkt_lost], { per: { range: [0, 1] }, cnt: {} },
-      [{ scale: "per", stroke: axisColor, grid: { stroke: "#21262d" } },
-       { scale: "cnt", side: 1, stroke: axisColor, grid: { show: false } }]),
-    makeChart(mk(), "MCS / Tier-1 state",
-      [{}, { label: "mcs", scale: "mcs", stroke: C.mcs, paths: stepped },
-           { label: "tier1_state", scale: "state", stroke: C.tier1, paths: stepped }],
-      [t, S.mcs, S.tier1_state], { mcs: {}, state: { range: [-0.2, 2.2] } },
-      [{ scale: "mcs", stroke: axisColor, grid: { stroke: "#21262d" } },
-       { scale: "state", side: 1, stroke: axisColor, grid: { show: false } }]),
-  ];
+  if (IS_VEHICLE) {
+    // Vehicle-uplink is 1 Hz controller STATE, not packet stats: no SNR, no
+    // pkt_lost, no per-rung packet mix. Chart what the controller actually
+    // tracks — smoothed RSSI + diversity (adapter_count), smoothed loss, and
+    // current_mcs as a step line alongside the fade-rate it demotes on.
+    const EX = j.vehicle_extra || {};
+    CHARTS = [
+      makeChart(mk(), "RSSI (smoothed) / diversity",
+        [{}, { label: "rssi (dBm)", scale: "rssi", stroke: C.rssi },
+             { label: "adapters", scale: "adapters", stroke: C.snr,
+               paths: stepped, points: { show: false } }],
+        [t, S.rssi_comb, EX.adapter_count], { rssi: {}, adapters: { range: [0, 4] } },
+        [{ scale: "rssi", stroke: axisColor, grid: { stroke: "#21262d" } },
+         { scale: "adapters", side: 1, stroke: axisColor, grid: { show: false } }]),
+      makeChart(mk(), "PER (smoothed loss ratio)",
+        [{}, { label: "per", scale: "per", stroke: C.per }],
+        [t, S.per], { per: { range: [0, 1] } },
+        [{ scale: "per", stroke: axisColor, grid: { stroke: "#21262d" } }]),
+      makeChart(mk(), "MCS (current) / RSSI slope",
+        [{}, { label: "mcs", scale: "mcs", stroke: C.rssi,
+               paths: stepped, points: { show: false } },
+             { label: "rssi slope (dB/s)", scale: "slope", stroke: C.lost }],
+        [t, S.mcs, EX.rssi_slope], { mcs: { range: [-0.5, 7.5] }, slope: {} },
+        [{ scale: "mcs", stroke: axisColor, grid: { stroke: "#21262d" } },
+         { scale: "slope", side: 1, stroke: axisColor, grid: { show: false } }]),
+    ];
+  } else {
+    CHARTS = [
+      makeChart(mk(), "RSSI / SNR",
+        [{}, { label: "rssi_comb (dBm)", scale: "rssi", stroke: C.rssi },
+             { label: "snr_avg (dB)", scale: "snr", stroke: C.snr }],
+        [t, S.rssi_comb, S.snr_avg], { rssi: {}, snr: {} },
+        [{ scale: "rssi", stroke: axisColor, grid: { stroke: "#21262d" } },
+         { scale: "snr", side: 1, stroke: axisColor, grid: { show: false } }]),
+      makeChart(mk(), "PER / lost",
+        [{}, { label: "per", scale: "per", stroke: C.per },
+             { label: "pkt_lost", scale: "cnt", stroke: C.lost }],
+        [t, S.per, S.pkt_lost], { per: { range: [0, 1] }, cnt: {} },
+        [{ scale: "per", stroke: axisColor, grid: { stroke: "#21262d" } },
+         { scale: "cnt", side: 1, stroke: axisColor, grid: { show: false } }]),
+      (() => {
+        const st = mcsStack(t, j.mcs_dist);
+        return makeChart(mk(), "MCS distribution (rx pkts / 100 ms, stacked)",
+          st.series, st.data, { pkts: {} },
+          [{ scale: "pkts", stroke: axisColor, grid: { stroke: "#21262d" } }]);
+      })(),
+    ];
+  }
 
   let raf;
   window.addEventListener("resize", () => {
@@ -254,6 +394,7 @@ async function main() {
 
   wireForms();
   reloadLabels();
+  startLive();
 }
 
 main();

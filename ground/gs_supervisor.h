@@ -102,7 +102,12 @@ extern const int GS_BACKOFF_MS[7];
 #define WCMD_KEY_RECORD         15
 #define WCMD_KEY_PEEK_ENABLED      16
 #define WCMD_KEY_PEEK_DROP_ENABLED 17
-#define WCMD_KEY_MAX            17
+#define WCMD_KEY_MAX            17   /* highest OPERATOR key (/api/v1/cmd) */
+/* Logging-sync marker (infra, not an operator command — see
+ * shared/wcmd_proto.h).  Emitted by logsync_emit() on its own ~10 s timer,
+ * NOT through the operator /api/v1/cmd path, so it lives above WCMD_KEY_MAX
+ * and never indexes the per-operator-key rate-limit array. */
+#define WCMD_KEY_LOG_SYNC       18
 #define WCMD_BURST_FRAMES        3
 
 /* ---------- log helpers --------------------------------------------- */
@@ -168,6 +173,12 @@ typedef struct {
 	char        udp_out_ip[GS_ARG_MAX];
 	int         udp_out_port;
 	char        stats_out[GS_ARG_MAX];
+	/* Optional fire-and-forget logging tap: a raw rx_ant copy is sent here
+	 * (e.g. the SQLite telemetry ingester) IN ADDITION to stats_out. Never
+	 * inline in the back-channel — stats_out is forwarded first and a
+	 * dead/stalled tap consumer can never affect the uplink feed or the
+	 * vehicle link. See DATASTORE.md. */
+	char        stats_tap[GS_ARG_MAX];
 	/* rx-only: boundary-probe PER producer ("probe": true).
 	 * The tunnel's raw rx_ant is NOT re-emitted to stats_out (it would
 	 * pollute the vehicle's video scorer); instead stats_drain()
@@ -207,6 +218,8 @@ typedef struct {
 	uint16_t            stats_local_port;
 	struct sockaddr_in  stats_fwd_addr;
 	int                 stats_fwd_active;
+	struct sockaddr_in  stats_tap_addr;
+	int                 stats_tap_active;
 	char                stats_local_arg[GS_ARG_MAX];
 
 	/* probe PER accumulator (rx + probe only). One bucket per received
