@@ -160,10 +160,13 @@ _Static_assert(sizeof(SidecarTransportInfo) == 16,
 #define CMD_SET_RADIO          WFB_CMD_SET_RADIO
 #define CMD_GET_FEC            WFB_CMD_GET_FEC
 #define CMD_GET_RADIO          WFB_CMD_GET_RADIO
+#define CMD_SET_PEEK           WFB_CMD_SET_PEEK
+#define CMD_GET_PEEK           WFB_CMD_GET_PEEK
 #define CMD_REQ_HEADER         WFB_CMD_REQ_HEADER
 #define CMD_REQ_GET_RADIO_LEN  WFB_CMD_REQ_GET_RADIO_LEN
 #define CMD_REQ_SET_FEC_LEN    WFB_CMD_REQ_SET_FEC_LEN
 #define CMD_REQ_SET_RADIO_LEN  WFB_CMD_REQ_SET_RADIO_LEN
+#define CMD_REQ_SET_PEEK_LEN   WFB_CMD_REQ_SET_PEEK_LEN
 
 #pragma pack(push, 1)
 typedef struct {
@@ -183,6 +186,7 @@ typedef struct {
 		struct { uint8_t k, n; uint16_t fec_timeout_ms; } set_fec;
 		RadioBody                                          set_radio;
 		struct { uint8_t pad; }                            get_radio;
+		struct { uint8_t enabled, drop_enabled; }          set_peek;
 	} u;
 } CmdReq;
 
@@ -1312,6 +1316,18 @@ static int wfb_stats_handle_datagram(const char *body,
 		    drops, trunc);
 	}
 
+	/* NAL-aware peek activity (additive fields; absent on a pre-peek wfb_tx,
+	 * in which case these stay 0).  Surfaced so an operator can confirm the
+	 * feature is actually shedding/closing once toggled on via WCMD. */
+	long peek_en = 0, peek_dropped = 0, peek_closes = 0;
+	(void)json_get_int(body, "pkts_dropped", &peek_dropped);
+	(void)json_get_int(body, "fec_closes",   &peek_closes);
+	(void)json_get_int(body, "enabled",      &peek_en);
+	if (peek_en && (peek_dropped > 0 || peek_closes > 0)) {
+		LOG_FEC("wfb-stats: peek shed %ld frames, %ld frame-boundary FEC closes",
+		    peek_dropped, peek_closes);
+	}
+
 	long seq = -1;
 	if (json_get_int(body, "seq", &seq) == 0 && seq >= 0) {
 		if (*last_seq >= 0) {
@@ -1440,6 +1456,8 @@ static int wfb_send_set_fec(const Config *cfg, int k, int n);
 static int wfb_get_fec(const Config *cfg, int *k_out, int *n_out, int *to_out);
 static int wfb_get_radio(const Config *cfg, RadioBody *out);
 static int wfb_set_radio(const Config *cfg, const RadioBody *params);
+/* enabled/drop_enabled are 0/1 or WFB_PEEK_KEEP to leave that toggle alone. */
+static int wfb_set_peek(const Config *cfg, uint8_t enabled, uint8_t drop_enabled);
 
 /* fork+exec `iw dev <iface> set txpower fixed <mBm>`; returns iw's exit
  * status (0 on success). Synchronous; the call typically returns within
@@ -1621,6 +1639,8 @@ static int wcmd_clamp_value(const Config *cfg, uint8_t key, int32_t *value)
 	case WCMD_KEY_FEC_ENABLED:
 	case WCMD_KEY_MCS_ENABLED:
 	case WCMD_KEY_RECORD:
+	case WCMD_KEY_PEEK_ENABLED:
+	case WCMD_KEY_PEEK_DROP_ENABLED:
 		lo = 0; hi = 1;
 		break;
 	case WCMD_KEY_WFB_TXPOWER:
@@ -1768,6 +1788,45 @@ static int wcmd_dispatch(Config *cfg, const WcmdReq *req,
 		st->accepted++;
 		st->last_status = resp->status;
 		st->last_value  = new_state ? 1 : 0;
+		st->last_http_status = 0;
+		(void)clamp_rc;
+		return 0;
+	}
+
+	/* NAL-aware peek toggles — local wfb_cmd round-trip (CMD_SET_PEEK).
+	 * Unlike the radio/FEC keys, peek is never overwritten by the adaptive
+	 * subsystems, so the toggle sticks until the next WCMD or restart.
+	 * Addressing one key sends WFB_PEEK_KEEP for the other so they move
+	 * independently. */
+	if (key == WCMD_KEY_PEEK_ENABLED || key == WCMD_KEY_PEEK_DROP_ENABLED) {
+		if (cfg->dry_run) {
+			resp->status = WCMD_STATUS_OK;
+			resp->http_status   = htons(0);
+			resp->applied_value = htonl((uint32_t)(value ? 1 : 0));
+			wcmd_mark_applied(st, key, req_seq, now);
+			st->accepted++;
+			st->last_status = resp->status;
+			st->last_value  = value ? 1 : 0;
+			st->last_http_status = 0;
+			return 0;
+		}
+		uint8_t en   = (key == WCMD_KEY_PEEK_ENABLED)      ? (value ? 1 : 0) : WFB_PEEK_KEEP;
+		uint8_t drop = (key == WCMD_KEY_PEEK_DROP_ENABLED) ? (value ? 1 : 0) : WFB_PEEK_KEEP;
+		int rc = wfb_set_peek(cfg, en, drop);
+		if (rc != 0) {
+			resp->status = WCMD_STATUS_HTTP_ERROR;
+			resp->http_status = htons(0);
+			st->http_errors++;
+			st->last_status = resp->status;
+			return 0;
+		}
+		resp->status        = WCMD_STATUS_OK;
+		resp->http_status   = htons(0);
+		resp->applied_value = htonl((uint32_t)(value ? 1 : 0));
+		wcmd_mark_applied(st, key, req_seq, now);
+		st->accepted++;
+		st->last_status      = resp->status;
+		st->last_value       = value ? 1 : 0;
 		st->last_http_status = 0;
 		(void)clamp_rc;
 		return 0;
@@ -2117,6 +2176,42 @@ static int wfb_set_radio_at(const char *host, uint16_t port,
 static int wfb_set_radio(const Config *cfg, const RadioBody *params)
 {
 	return wfb_set_radio_at(cfg->wfb_host, cfg->wfb_port, params);
+}
+
+/* CMD_SET_PEEK round-trip.  Mirrors wfb_set_radio: send the two toggles
+ * (WFB_PEEK_KEEP leaves one untouched), wait for the rc==0 ack.  No adaptive
+ * subsystem touches peek, so the toggle sticks until the next WCMD or restart. */
+static int wfb_set_peek(const Config *cfg, uint8_t enabled, uint8_t drop_enabled)
+{
+	struct sockaddr_in dst;
+	if (resolve_ipv4(cfg->wfb_host, cfg->wfb_port, &dst) != 0) return -1;
+	int fd = socket(AF_INET, SOCK_DGRAM, 0);
+	if (fd < 0) return -1;
+
+	uint32_t req_id = g_req_id++;
+	CmdReq req = {0};
+	req.req_id = htonl(req_id);
+	req.cmd_id = CMD_SET_PEEK;
+	req.u.set_peek.enabled      = enabled;
+	req.u.set_peek.drop_enabled = drop_enabled;
+
+	if (sendto(fd, &req, CMD_REQ_SET_PEEK_LEN, 0,
+	           (const struct sockaddr*)&dst, sizeof(dst)) != CMD_REQ_SET_PEEK_LEN) {
+		close(fd);
+		return -1;
+	}
+
+	struct pollfd p = { .fd = fd, .events = POLLIN };
+	int pr = poll(&p, 1, 300);
+	if (pr <= 0) { close(fd); return -1; }
+
+	CmdResp resp = {0};
+	ssize_t n = recv(fd, &resp, sizeof(resp), 0);
+	close(fd);
+	if (n < (ssize_t)(sizeof(uint32_t) * 2)) return -1;
+	if (ntohl(resp.req_id) != req_id) return -1;
+	if (ntohl(resp.rc) != 0) return -1;
+	return 0;
 }
 
 /* ── MCS-down ordered-commit machinery ─────────────────────────────────

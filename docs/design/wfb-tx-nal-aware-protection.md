@@ -17,10 +17,22 @@ spec and this repo disagree, **this document wins** for implementation.
 > the per-level radiotap cache (rebuilt on `CMD_SET_RADIO`), and
 > `CMD_SET_PEEK`/`CMD_GET_PEEK` + `wfb_tx_cmd peek` verbs. The three
 > `wfb-ng/build-*.sh` scripts apply `peek.patch` and compile/link `peek.o`.
-> Verified on the host: engine unit test passes; `wfb_tx` + `wfb_tx_cmd`
-> compile (`-Wall`) and **link** clean with `peek.o`. Not yet done: on-target
-> bench/loopback (§10.2-10.6), the venc-repo `build_wfb_tx.sh` wiring, peek
-> counters in the `-Y` JSON, and the wfb-ng SHA pin (§7).
+>
+> **Operator surface (done):** the `-Y` tx_stats JSON carries a `peek` object
+> (`enabled`, `drop`, `rules`, `pkts_dropped`, `fec_closes`). Two WCMD keys —
+> `WCMD_KEY_PEEK_ENABLED` (16) and `WCMD_KEY_PEEK_DROP_ENABLED` (17),
+> `shared/wcmd_proto.h` — tunnel ground→vehicle. `vehicle/link_controller.c`
+> handles them via `wfb_set_peek()` (`CMD_SET_PEEK`, opcode 5 in
+> `shared/wfb_control.h`) and logs peek activity from tx_stats.
+> `ground/gs_supervisor.c` accepts `peek_enabled`/`peek_drop_enabled` on
+> `/api/v1/cmd`, and the WebUI (Vehicle Control tab) has peek/drop ON/OFF
+> buttons + dropdown entries.
+>
+> Verified on the host: peek unit test (26 checks) passes; `wfb_tx` +
+> `wfb_tx_cmd` compile (`-Wall`) and **link** clean with `peek.o`;
+> `link_controller` + `gs_supervisor` build (`-Wall -Wextra`); `make test`
+> 58/58 green. Not yet done: on-target bench/loopback (§10.2-10.6), the
+> venc-repo `build_wfb_tx.sh` wiring, and the wfb-ng SHA pin (§7).
 
 The design intent in `CLAUDE.md` — *"M-bit in wfb_tx aligns every frame's
 final block, so block loss never contaminates adjacent frames"* — describes a

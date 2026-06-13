@@ -100,7 +100,9 @@ extern const int GS_BACKOFF_MS[7];
 #define WCMD_KEY_MCS_ENABLED    13
 #define WCMD_KEY_WFB_TXPOWER    14
 #define WCMD_KEY_RECORD         15
-#define WCMD_KEY_MAX            16
+#define WCMD_KEY_PEEK_ENABLED      16
+#define WCMD_KEY_PEEK_DROP_ENABLED 17
+#define WCMD_KEY_MAX            17
 #define WCMD_BURST_FRAMES        3
 
 /* ---------- log helpers --------------------------------------------- */

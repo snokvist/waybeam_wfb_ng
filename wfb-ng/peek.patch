@@ -604,7 +604,7 @@ index 0000000..38c2c21
 +    return g_fail ? 1 : 0;
 +}
 diff --git a/src/tx.cpp b/src/tx.cpp
-index 2dc86ea..7b1201b 100644
+index 2dc86ea..63fb79a 100644
 --- a/src/tx.cpp
 +++ b/src/tx.cpp
 @@ -22,6 +22,7 @@
@@ -623,7 +623,44 @@ index 2dc86ea..7b1201b 100644
  
  // --- UDP stats push (-Y host:port) ---
  //
-@@ -157,10 +159,57 @@ static void stats_udp_emit_tx(uint64_t ts_ms, int interval_ms,
+@@ -130,10 +132,12 @@ static void stats_udp_emit_tx(uint64_t ts_ms, int interval_ms,
+                               uint32_t pkts_drop, uint32_t pkts_trunc,
+                               uint32_t fec_timeouts,
+                               int fec_k, int fec_n,
+-                              const radiotap_header_t &rt)
++                              const radiotap_header_t &rt,
++                              uint32_t peek_dropped, uint32_t peek_closes,
++                              int peek_enabled, int peek_drop, int peek_rules)
+ {
+     if (!g_stats_udp_enabled) return;
+-    char buf[512];
++    char buf[640];
+     uint64_t this_seq = g_stats_seq++;
+     int len = snprintf(buf, sizeof(buf),
+         "{\"ts_ms\":%" PRIu64 ",\"type\":\"tx_stats\",\"ver\":1,\"seq\":%" PRIu64 ",\"interval_ms\":%d,"
+@@ -141,7 +145,9 @@ static void stats_udp_emit_tx(uint64_t ts_ms, int interval_ms,
+         "\"pkts_drop\":%u,\"pkts_trunc\":%u,\"fec_timeouts\":%u,"
+         "\"fec_k\":%d,\"fec_n\":%d},"
+         "\"radio\":{\"mcs\":%u,\"bw\":%u,\"short_gi\":%u,\"stbc\":%u,\"ldpc\":%u,"
+-        "\"vht_mode\":%u,\"vht_nss\":%u}}\n",
++        "\"vht_mode\":%u,\"vht_nss\":%u},"
++        "\"peek\":{\"enabled\":%d,\"drop\":%d,\"rules\":%d,"
++        "\"pkts_dropped\":%u,\"fec_closes\":%u}}\n",
+         ts_ms, this_seq, interval_ms,
+         pkts_in, bytes_in, pkts_out, bytes_out,
+         pkts_drop, pkts_trunc, fec_timeouts,
+@@ -149,7 +155,9 @@ static void stats_udp_emit_tx(uint64_t ts_ms, int interval_ms,
+         (unsigned)rt.mcs_index, (unsigned)rt.bandwidth,
+         (unsigned)(rt.short_gi ? 1 : 0),
+         (unsigned)rt.stbc, (unsigned)(rt.ldpc ? 1 : 0),
+-        (unsigned)(rt.vht_mode ? 1 : 0), (unsigned)rt.vht_nss);
++        (unsigned)(rt.vht_mode ? 1 : 0), (unsigned)rt.vht_nss,
++        peek_enabled, peek_drop, peek_rules,
++        peek_dropped, peek_closes);
+     if (len <= 0 || len >= (int)sizeof(buf)) return;
+     (void)sendto(g_stats_udp_fd, buf, (size_t)len, 0,
+                  (const struct sockaddr*)&g_stats_udp_dst,
+@@ -157,10 +165,57 @@ static void stats_udp_emit_tx(uint64_t ts_ms, int interval_ms,
  }
  // --- end stats push ---
  
@@ -681,7 +718,7 @@ index 2dc86ea..7b1201b 100644
      encrypt_data(true),     /* AEAD on by default; -x disables per-fragment AEAD */
      epoch(epoch),
      channel_id(channel_id),
-@@ -311,6 +360,8 @@ RawSocketTransmitter::RawSocketTransmitter(int k, int n, const string &keypair,
+@@ -311,6 +366,8 @@ RawSocketTransmitter::RawSocketTransmitter(int k, int n, const string &keypair,
      current_output(0),
      ieee80211_seq(0),
      radiotap_header(radiotap_header),
@@ -690,7 +727,7 @@ index 2dc86ea..7b1201b 100644
      frame_type(frame_type),
      use_qdisc(use_qdisc),
      fwmark_base(fwmark_base),
-@@ -318,6 +369,8 @@ RawSocketTransmitter::RawSocketTransmitter(int k, int n, const string &keypair,
+@@ -318,6 +375,8 @@ RawSocketTransmitter::RawSocketTransmitter(int k, int n, const string &keypair,
      inject_retries(inject_retries),
      inject_retry_delay(inject_retry_delay)
  {
@@ -699,7 +736,7 @@ index 2dc86ea..7b1201b 100644
      for(auto it=wlans.begin(); it!=wlans.end(); it++)
      {
          int fd = socket(PF_PACKET, SOCK_RAW, 0);
-@@ -363,6 +416,27 @@ RawSocketTransmitter::RawSocketTransmitter(int k, int n, const string &keypair,
+@@ -363,6 +422,27 @@ RawSocketTransmitter::RawSocketTransmitter(int k, int n, const string &keypair,
      }
  }
  
@@ -727,7 +764,7 @@ index 2dc86ea..7b1201b 100644
  void RawSocketTransmitter::inject_packet(const uint8_t *buf, size_t size)
  {
      assert(size <= MAX_FORWARDER_PACKET_SIZE);
-@@ -384,11 +458,17 @@ void RawSocketTransmitter::inject_packet(const uint8_t *buf, size_t size)
+@@ -384,11 +464,17 @@ void RawSocketTransmitter::inject_packet(const uint8_t *buf, size_t size)
      ieee_hdr[FRAME_SEQ_HB] = (ieee80211_seq >> 8) & 0xff;
      ieee80211_seq += 16;
  
@@ -747,7 +784,7 @@ index 2dc86ea..7b1201b 100644
              },
              // ieee80211 header
              { .iov_base = (void*)ieee_hdr,
-@@ -781,6 +861,11 @@ bool Transmitter::send_packet(const uint8_t *buf, size_t size, uint8_t flags)
+@@ -781,6 +867,11 @@ bool Transmitter::send_packet(const uint8_t *buf, size_t size, uint8_t flags)
          return false;
      }
  
@@ -759,7 +796,7 @@ index 2dc86ea..7b1201b 100644
      wpacket_hdr_t *packet_hdr = (wpacket_hdr_t*)block[fragment_idx];
  
      packet_hdr->flags = flags;
-@@ -800,6 +885,10 @@ bool Transmitter::send_packet(const uint8_t *buf, size_t size, uint8_t flags)
+@@ -800,6 +891,10 @@ bool Transmitter::send_packet(const uint8_t *buf, size_t size, uint8_t flags)
          set_mark(0);
      }
  
@@ -770,7 +807,7 @@ index 2dc86ea..7b1201b 100644
      send_block_fragment(sizeof(wpacket_hdr_t) + size);
      max_packet_size = max(max_packet_size, sizeof(wpacket_hdr_t) + size);
      fragment_idx += 1;
-@@ -812,6 +901,10 @@ bool Transmitter::send_packet(const uint8_t *buf, size_t size, uint8_t flags)
+@@ -812,6 +907,10 @@ bool Transmitter::send_packet(const uint8_t *buf, size_t size, uint8_t flags)
      // mark fec packets with fwmark + 1
      set_mark(1);
  
@@ -781,7 +818,7 @@ index 2dc86ea..7b1201b 100644
      while (fragment_idx < fec_n)
      {
          if(fec_delay > 0)
-@@ -902,6 +995,8 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
+@@ -902,6 +1001,8 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
      uint32_t count_b_injected = 0;  // successfully injected bytes (include additional fec packets)
      uint32_t count_p_dropped = 0;   // dropped due to rxq overflows or injection timeout
      uint32_t count_p_truncated = 0; // injected large packets that were truncated
@@ -790,7 +827,20 @@ index 2dc86ea..7b1201b 100644
      int start_fd_idx = 0;
  
      // --- SHM ring attach (non-fatal: retry loop handles producer lifecycle) ---
-@@ -1046,6 +1141,12 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
+@@ -1033,7 +1134,11 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
+                                   count_p_dropped, count_p_truncated,
+                                   count_p_fec_timeouts,
+                                   fec_k_now, fec_n_now,
+-                                  rt);
++                                  rt,
++                                  count_p_peek_dropped, count_p_peek_closes,
++                                  g_peek_cfg.enabled ? 1 : 0,
++                                  g_peek_cfg.drop_enabled ? 1 : 0,
++                                  g_peek_cfg.n_rules);
+             }
+ 
+             if(count_p_dropped)
+@@ -1046,6 +1151,12 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
                  WFB_ERR("%u packets truncated\n", count_p_truncated);
              }
  
@@ -803,7 +853,7 @@ index 2dc86ea..7b1201b 100644
              count_p_fec_timeouts = 0;
              count_p_incoming = 0;
              count_b_incoming = 0;
-@@ -1053,6 +1154,8 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
+@@ -1053,6 +1164,8 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
              count_b_injected = 0;
              count_p_dropped = 0;
              count_p_truncated = 0;
@@ -812,7 +862,7 @@ index 2dc86ea..7b1201b 100644
  
              log_send_ts = cur_ts + log_interval - ((cur_ts - log_send_ts) % log_interval);
          }
-@@ -1227,6 +1330,45 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
+@@ -1227,6 +1340,45 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
                  }
                  break;
  
@@ -858,7 +908,7 @@ index 2dc86ea..7b1201b 100644
                  default:
                  {
                      resp.rc = htonl(ENOTSUP);
-@@ -1346,7 +1488,8 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
+@@ -1346,7 +1498,8 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
                      session_key_announce_ts = cur_ts + SESSION_KEY_ANNOUNCE_MSEC;
                  }
  
@@ -868,7 +918,7 @@ index 2dc86ea..7b1201b 100644
  
                  if (cur_ts >= log_send_ts)
                  {
-@@ -1482,7 +1625,8 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
+@@ -1482,7 +1635,8 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
                          session_key_announce_ts = cur_ts + SESSION_KEY_ANNOUNCE_MSEC;
                      }
  
@@ -878,7 +928,7 @@ index 2dc86ea..7b1201b 100644
  
                      if (cur_ts >= log_send_ts)  // log timeout expired
                      {
-@@ -2161,8 +2305,37 @@ int main(int argc, char * const *argv)
+@@ -2161,8 +2315,37 @@ int main(int argc, char * const *argv)
      int encrypt_data = 1;           // -x (no-AEAD flag) flips to 0
      const char *stats_udp_target = NULL;  // -Y host:port; NULL = disabled
  
