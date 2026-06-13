@@ -38,6 +38,48 @@ claim true again. (Stale-doc cleanup — the M-bit wording in `CLAUDE.md` and
 
 ---
 
+## 0.1 Verification status (read before implementing)
+
+This plan mixes two kinds of claim. Treat them differently:
+
+**Verified against this repo** (`shm-input.patch`, `vehicle/`, `docs/`,
+`build-*.sh`, `shared/`):
+- SHM drain loop shape, `SHM_DRAIN_MAX = 128`, the `t->send_packet(buf, rsize,
+  0)` hook site (`shm-input.patch` SHM read path).
+- `-T` is a coarse idle close, not per-frame (`docs/protocols/shm-input.md:164`).
+- Existing FEC close via `while(t->send_packet(NULL,0,WFB_PACKET_FEC_ONLY))`
+  (`CMD_SET_FEC`) and single close (`-T`); RX suppresses synthetic FEC_ONLY
+  slots from `fec_recovered`. So RX already decodes early-closed blocks.
+- `t->get_radiotap_header()` exists and returns the **live** header (the patch
+  reads it for `-Y`; `shm-input.md` says it reflects applied `set_radio` values).
+- `CMD_*` ids 1–4 in use; `cmd_set_fec`/`cmd_get_fec` already carry
+  `fec_timeout_ms`; send-sizing uses `offsetof(cmd_*_t, u) + sizeof(arm)`.
+- wfb_tx is linked by explicit `g++` lines in `build-*.sh` (no Makefile use).
+- SHM carries full RTP datagrams (`streamMode rtp`, slot = `maxPayloadSize+12`).
+- link_controller writes `CMD_SET_RADIO` **mcs_index-only**, other radio fields
+  preserved from a startup `CMD_GET_RADIO` sync (`link_controller.c:5-16`).
+- UDP video fallback is documented (`shm-input.md:242-256`).
+- `-r` partial-block parity ratio exists (`shm-input.md:150`).
+- `WCMD_KEY_FEC_ENABLED=12`/`WCMD_KEY_MCS_ENABLED=13` exist as the toggle precedent.
+
+**Inherited from the upstream spec — NOT re-verified here.** `wfb-ng` source is
+**not vendored**; `build-armv7.sh:184` does `git clone --depth 1
+https://github.com/svpcom/wfb-ng.git`, so the following live in stock wfb-ng and
+must be **re-confirmed against the actual cloned tree at implementation time**
+(and `--depth 1` pins no revision — master can drift from what the spec read):
+- the UDP `recvmsg` → `send_packet` call site (the *second* peek hook);
+- the `CMD_SET_RADIO` runtime handler (where the radiotap rebuild hook lands);
+- `init_radiotap_header(...)` signature, `radiotap_header_t` having no
+  `MCS_IDX_OFF`, `inject_packet()` building `iovec[0]` from the header,
+  `set_mark()` per-fragment carry, parity emit over `fragment_idx fec_k..fec_n`;
+- the `waybeam_venc` `TRAIL_N`/`TRAIL_R` rewrite (#142) the `refpred` profile
+  depends on (sibling repo, not this one).
+
+**Action:** pin the wfb-ng clone to a known SHA in `build-*.sh` before
+implementing, so the spec's symbol-level claims stay valid across rebuilds.
+
+---
+
 ## 1. Where the peek actually runs (the big one)
 
 In `shm-input.patch`, `data_source()` has **two** input paths:
@@ -74,9 +116,11 @@ In `shm-input.patch`, `data_source()` has **two** input paths:
    `while(t->send_packet(NULL,0,WFB_PACKET_FEC_ONLY));` and
    `fec_close_ts = get_time_ms() + fec_timeout` (re-arm).
 3. Call `emit_with_peek(...)` from **both** the SHM drain loop (replacing the
-   bare `t->send_packet(buf, rsize, 0)`) **and** the UDP recvmsg branch
-   (replacing its `t->send_packet(...)`). One code path, two callers — mirrors
-   how the spec keeps the engine transport-agnostic.
+   verified `t->send_packet(buf, rsize, 0)` at the SHM hook site) **and** the
+   UDP recvmsg branch (replacing its `t->send_packet(...)` — that call site is
+   **stock wfb-ng**, below the `rc > 0: events detected` comment the patch
+   references; confirm it against the cloned tree). One code path, two callers —
+   mirrors how the spec keeps the engine transport-agnostic.
 
 **Why hook both, not SHM-only.** In the *deployed* vehicle config only the SHM
 path carries protectable video, so SHM-only would be functionally complete
@@ -167,10 +211,15 @@ adaptation tick. So PROTECT needs a cache that follows the radio:
    (clamped at 0), reusing **the current radiotap params** — only `mcs_index`
    varies. There is no byte-poke; `init_radiotap_header` builds the bytes
    (spec §6 confirmed — the real struct has no `MCS_IDX_OFF`).
-2. **Rebuild trigger:** the `CMD_SET_RADIO` handler already exists in `tx.cpp`;
-   after it applies the new radiotap header, it must (a) recompute `proto_hdr[]`
-   from the new params and (b) set `peek_cfg.base_mcs = new mcs_index`. Add the
-   same rebuild at startup once the initial header is built.
+2. **Rebuild trigger:** the `CMD_SET_RADIO` handler is **stock wfb-ng** (not in
+   `shm-input.patch`; confirm location in the cloned tree). After it applies the
+   new radiotap header, add: (a) recompute `proto_hdr[]` from the new params and
+   (b) set `peek_cfg.base_mcs = new mcs_index`. Do the same rebuild at startup
+   once the initial header is built. Because link_controller changes
+   **mcs_index only** (other radio fields are pinned from the startup
+   `GET_RADIO` sync — `link_controller.c:5-16`), the rebuild can derive every
+   `proto_hdr[d]` from `get_radiotap_header()`'s current fields, varying only
+   the MCS — no need to track stbc/ldpc/gi/bw/vht separately.
 3. `inject_packet()` selects `iovec[0]` from `proto_hdr[level]` for the current
    fragment, where `level` is the running per-packet PROTECT depth (carried the
    way `set_mark(uint32_t)` already carries per-fragment TX state — set on the
@@ -262,6 +311,16 @@ $CROSS_CXX -o wfb_tx src/tx.o src/peek.o src/zfex.o src/wifibroadcast.o src/venc
    cost. Bench whether the selector needs a PROTECT-aware airtime margin, or
    whether keeping Δ small for the `refpred` base + bursty `idr` is enough
    (spec §9 airtime budget).
+5. **Per-frame close × `-r` partial-block parity.** Marker-close makes most
+   blocks *small* (a P-frame is often 1-3 packets « `k`), so each closes as a
+   partial block whose parity count is governed by `-r` (`shm-input.md:150`),
+   not by `n-k`. Confirm the protection/airtime trade-off of `-r` under
+   one-block-per-frame: the removed M-bit implementation presumably tuned this,
+   so check git history for the prior `-r` guidance before re-deriving.
+6. **Pin the wfb-ng clone.** `build-*.sh` clones `--depth 1` master (§0.1).
+   Pin a SHA so the spec's stock-symbol claims (`init_radiotap_header`,
+   `inject_packet`, the `CMD_SET_RADIO` handler, the UDP send site) can't drift
+   out from under the implementation between rebuilds.
 
 ---
 
