@@ -25,11 +25,12 @@ items as they land; fold finished design into memory/specs.
       → one `(gs_ts ↔ vehicle_up)` anchor → exact map. **Touches the frozen
       WCMD wire protocol** (`shared/wcmd_proto.h`, `make test`, vendored
       copies) — scope as its own change.
-- [ ] **Phase 2c — GS ingester session per walk.** The orphaned ingester
-      currently spans gs_supervisor restarts as ONE `sessions` row (pidfile
-      guard makes `start` a no-op). Roll the GS session when a new vehicle
-      `session_seq` appears (ties GS↔vehicle 1:1), or restart the ingester on
-      each `system.up`. (Confirm against review findings.)
+- [~] **Phase 2c — GS ingester session per walk.** PARTIAL: `capture_session.sh
+      start` now reclaims the port (pidfile + /proc scan, INT→TERM→KILL) and
+      rolls a FRESH session per bring-up, so the orphan-spans-many-walks bug is
+      gone. Still open: key the session on the vehicle `session_seq` (Phase 2b)
+      so a GS session maps 1:1 to a vehicle walk rather than to a supervisor
+      bring-up.
 - [ ] **Capture the probe (downlink PER) into the DB too?** Only the video
       tunnel raw rx_ant is tapped today. The probe stream is `{type:probe}` —
       decide: ingest as its own session/source, or leave to the back-channel.
@@ -40,19 +41,34 @@ items as they land; fold finished design into memory/specs.
       monotonic naming + 1 Hz sync + `stats_tap` + ingester + webui + vehicle
       importer. Decide: land as one, or split telemetry-capture into its own PR.
 
-## Improvements (queued — some pending the integration review)
+## Done this session (review fixes + improvements)
 
-- [ ] **Auto-fill objective session metadata.** GS sessions open blank; have
-      `capture_session.sh` pass `--channel/--tx-power/--antenna-cfg` (from the
-      GS config) to the ingester so each session is self-describing. Subjective
-      fields (scenario/location/weather/notes) stay manual via the UI editor.
-- [ ] **MCS chart fallback for vehicle sessions.** The stacked MCS bar is fed by
-      `raw_json.ant[]` (downlink only); vehicle-uplink records have no `ant`, so
-      their `mcs` (current_mcs) doesn't render. In `/series`, when `ant` is
-      absent fall back to a single-rung count from the denormalised `mcs` so the
-      bar shows the vehicle's active MCS over time.
-- [ ] **Session-list auto-refresh.** `/` (index) record counts are static —
-      add a light poll so a growing live capture updates without a manual reload.
+- [x] **Live webui pause + zoom-safe refresh** (user request). The session view
+      has a `live` toggle (pause) and HOLDS the 2 s poll while a label-select OR
+      a manual zoom is active (`ZOOMED` flag via a setScale hook) — refresh never
+      snaps a zoomed/selected region back. (`6063041`, `1e43337`.)
+- [x] **Phantom ANT 4-7 fixed** (user report). link_controller deduped rx_ant by
+      antenna id; ant_count is now distinct antennas (4), not entry count.
+      Unit-tested + device-verified. (`06dcae3`.)
+- [x] **C1 (critical)** `/series` 500 on malformed `ant[]` fixed.  **D** vehicle
+      sessions show MCS via a `current_mcs` fallback.  **F** session-list
+      auto-refresh.  **N2** stats_tap gated `!probe`.  **E** auto-filled session
+      metadata (channel/tx-power/antenna).  (`1e43337`, `6ec36df`, capture commit.)
+- [x] **Ingester shutdown + orphan reclaim (S2 + SIG_IGN).** Explicit signal
+      handlers (a backgrounded ingester inherits SIG_IGN — `kill -INT` was a
+      no-op, so sessions never closed and orphans were unkillable); `start` now
+      reclaims the port and rolls a fresh session.
+
+## Improvements (still queued)
+
+- [ ] **git-ignore `wfb.sqlite` (it's now a runtime artifact).** The committed DB
+      ships only the synthetic-demo session; live captures shouldn't churn it.
+      Per DATASTORE.md "revisit git-ignore once it grows" — do it now: gitignore
+      the DB + WAL/SHM, keep a `schema.sql`-built empty DB or a tiny seed.
+- [ ] **Incremental `/series` (review N1).** The endpoint returns ALL rows and
+      re-parses every `raw_json` for `mcs_dist` on every 2 s live poll — O(N) and
+      rising (a 30-min walk re-parses ~18k rows each tick). Add `?since_id=` and
+      append client-side, or cache mcs_dist per record.
 
 ## Field (more walks — different kinds)
 
