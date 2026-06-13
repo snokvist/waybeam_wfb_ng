@@ -201,6 +201,37 @@ def api_sessions():
     return jsonify(out)
 
 
+@app.route("/api/session/<int:sid>", methods=["DELETE"])
+def delete_session(sid: int):
+    """Remove a session and all its rows (records, their predictions, labels).
+    Refuses the ACTIVE capture (an open live-* session the ingester is still
+    writing) — deleting it would make every subsequent ingester insert fail the
+    session_id foreign key. Roll a new capture first, then delete the old one."""
+    conn = _conn()
+    s = store.get_session(conn, sid)
+    if not s:
+        conn.close()
+        abort(404)
+    if s["source"] and s["source"].startswith("live-") and not s["ended_at"]:
+        conn.close()
+        return jsonify(ok=False,
+                       error="refusing to delete the active capture — roll a new "
+                             "session first, then delete this one"), 409
+    conn.execute("PRAGMA busy_timeout=8000")
+    try:
+        with conn:  # one transaction; children before parent (FKs are ON)
+            conn.execute("DELETE FROM predictions WHERE record_id IN "
+                         "(SELECT id FROM records WHERE session_id=?)", (sid,))
+            conn.execute("DELETE FROM records WHERE session_id=?", (sid,))
+            conn.execute("DELETE FROM labels WHERE session_id=?", (sid,))
+            conn.execute("DELETE FROM sessions WHERE id=?", (sid,))
+    except Exception as e:  # noqa: BLE001 — surface DB errors (e.g. lock) to the UI
+        conn.close()
+        return jsonify(ok=False, error=str(e)), 500
+    conn.close()
+    return jsonify(ok=True, deleted=sid)
+
+
 @app.route("/api/session/<int:sid>/series")
 def api_series(sid: int):
     """Aligned arrays for uPlot + label/ML overlays. x is seconds since session start."""
