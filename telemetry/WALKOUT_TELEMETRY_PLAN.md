@@ -17,20 +17,24 @@ items as they land; fold finished design into memory/specs.
       `import_vehicle_session.sh <ip> [seq|latest]` pulls the session dir over
       the mgmt link post-walk (zero flight burden) and imports it. Validated by
       importing walk `000002` (session 3, RSSI −88..0 incl. the blackout).
-- [ ] **Phase 2b — in-band filename + uptime announce (precise alignment).**
-      MVP correlates by filename but each session keeps its own relative
-      timeline. To overlay uplink vs downlink on one time axis, have the vehicle
-      announce `{session_seq, uptime_s}` over the back-channel (tiny; e.g. a
-      WCMD GET or a field in the existing stream); GS stamps arrival wall-clock
-      → one `(gs_ts ↔ vehicle_up)` anchor → exact map. **Touches the frozen
-      WCMD wire protocol** (`shared/wcmd_proto.h`, `make test`, vendored
-      copies) — scope as its own change.
-- [~] **Phase 2c — GS ingester session per walk.** PARTIAL: `capture_session.sh
-      start` now reclaims the port (pidfile + /proc scan, INT→TERM→KILL) and
-      rolls a FRESH session per bring-up, so the orphan-spans-many-walks bug is
-      gone. Still open: key the session on the vehicle `session_seq` (Phase 2b)
-      so a GS session maps 1:1 to a vehicle walk rather than to a supervisor
-      bring-up.
+- [ ] **Phase 2b+2c — periodic LOG_SYNC markers (sync + identify in one).**
+      The GS emits `LOG_SYNC{seq, gs_unix_ms}` upstream every ~10 s ("an IDR for
+      log sync"), riding the existing WCMD uplink (3×-redundant + deduped, so a
+      fade just drops one marker). The vehicle's link_controller logs each on
+      receipt: `logsync seq=N gs_ms=T up=<uptime>` → mirrored to the SD by the
+      walkout logger. Post-walk, `import_vehicle_session.py` parses the markers
+      → `(gs_ms, vehicle_up)` pairs → a **line fit** (drift-corrected, not a
+      single anchor) → remap the vehicle records onto the GS wall-clock axis so
+      uplink + downlink overlay on one timeline. **Identification falls out:** the
+      marker `gs_ms` values fall inside one GS session's wall-clock span → that's
+      the GS↔vehicle pairing (no separate session-seq announce needed).
+      Surface: additive opcode in `shared/wcmd_proto.h` (+ `make test` + vendored
+      copies), a 10 s timer in gs_supervisor's WCMD emit, a handler in
+      link_controller, marker parsing + the fit in the importer. Keep it minimal.
+      (Supersedes the earlier 2b uptime-anchor and 2c session-keying ideas.)
+      Note: `capture_session.sh` already rolls a fresh GS session per bring-up,
+      so the orphan-spans-many-walks bug is already gone — markers handle the
+      1:1 pairing.
 - [ ] **Capture the probe (downlink PER) into the DB too?** Only the video
       tunnel raw rx_ant is tapped today. The probe stream is `{type:probe}` —
       decide: ingest as its own session/source, or leave to the back-channel.
