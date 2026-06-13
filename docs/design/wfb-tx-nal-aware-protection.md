@@ -10,11 +10,15 @@ protocol, and FEC-close mechanics away from stock `svpcom/wfb-ng`. Where the
 spec and this repo disagree, **this document wins** for implementation.
 
 The design intent in `CLAUDE.md` — *"M-bit in wfb_tx aligns every frame's
-final block, so block loss never contaminates adjacent frames"* — is **not yet
-implemented** in `shm-input.patch` (the shipped `-T` is a coarse idle timeout,
-explicitly *"not a per-frame close"*, `docs/protocols/shm-input.md:164`). The
-spec's **mandatory FEC_CLOSE signal IS that M-bit mechanism.** Implementing
-this plan is what makes the `CLAUDE.md` claim true.
+final block, so block loss never contaminates adjacent frames"* — describes a
+mechanism that **was implemented at one point and then removed**; the
+`CLAUDE.md` and `docs/protocols/shm-input.md` references to it are **stale**.
+What ships today in `shm-input.patch` is only the coarse `-T` idle timeout,
+explicitly *"not a per-frame close"* (`docs/protocols/shm-input.md:164`). The
+spec's **mandatory FEC_CLOSE signal re-introduces that per-frame close** as a
+data-driven marker rule. Implementing this plan is what makes the `CLAUDE.md`
+claim true again. (Stale-doc cleanup — the M-bit wording in `CLAUDE.md` and
+`shm-input.md` — should land with the implementation, not before.)
 
 ---
 
@@ -23,7 +27,7 @@ this plan is what makes the `CLAUDE.md` claim true.
 | Spec assumption (`svpcom/wfb-ng`) | This repo (`shm-input.patch`) | Impact |
 |---|---|---|
 | Peek runs after `recvmsg` in the UDP `data_source()` branch | **Vehicle video ingests from a SHM ring (`-H`)**; the hot path is the `venc_ring_read()` drain loop, not `recvmsg` | Peek hook moves into the SHM drain loop; factor a shared helper so the UDP branch (audio / non-SHM) gets it too |
-| Frame-boundary FEC close is *new* but described against `-T` only | `-T` exists but is a **coarse idle timeout, not per-frame**; no marker close anywhere | The mandatory FEC_CLOSE is genuinely new work here and is the "M-bit" `CLAUDE.md` promises |
+| Frame-boundary FEC close is *new* but described against `-T` only | `-T` exists but is a **coarse idle timeout, not per-frame**; the per-frame "M-bit" close **was added then removed** (stale in `CLAUDE.md` / `shm-input.md`) | The mandatory FEC_CLOSE re-introduces the per-frame close; ship the stale-doc cleanup with it |
 | `base_mcs` is a static CLI value | **`base_mcs` is dynamic** — link_controller's MCS selector writes `CMD_SET_RADIO` at runtime | PROTECT's prebuilt per-level radiotap cache must **rebuild on every `CMD_SET_RADIO`**, and `peek_cfg.base_mcs` must track it |
 | `CMD_SET_FEC` union arm is `{k,n}` | This repo extended it to `{k,n,fec_timeout_ms}` (`tx_cmd.h`) | New `CMD_SET_PEEK=5`/`CMD_GET_PEEK=6` still slot in cleanly; mirror the `offsetof(...) + sizeof(arm)` send-sizing the repo already uses |
 | "Add `peek.cpp` to Makefile/CMakeLists" | wfb_tx is built by **explicit per-file `g++` lines** in `wfb-ng/build-{armv7,aarch64,openwrt}.sh`, bypassing wfb-ng's own Makefile | Add a `peek.cpp` compile step + `src/peek.o` to the link line in **all three** build scripts; ship `peek.{hpp,cpp}` and the `tx.cpp`/`tx_cmd.*` edits inside `shm-input.patch` (or a companion `peek.patch` applied after it) |
@@ -73,6 +77,25 @@ In `shm-input.patch`, `data_source()` has **two** input paths:
    bare `t->send_packet(buf, rsize, 0)`) **and** the UDP recvmsg branch
    (replacing its `t->send_packet(...)`). One code path, two callers — mirrors
    how the spec keeps the engine transport-agnostic.
+
+**Why hook both, not SHM-only.** In the *deployed* vehicle config only the SHM
+path carries protectable video, so SHM-only would be functionally complete
+today. But hook both anyway, because:
+
+- it's **~one line** — both call sites are inside `data_source()` with the same
+  `fec_close_ts`/`fec_timeout` locals in scope, and the peek logic is entirely
+  in the shared helper;
+- it's **zero-cost when off** — audio and the uplink/WCMD `wfb_tx` instances are
+  separate processes running profile `off`; `enabled=false` skips the whole
+  pipeline (spec §9), so they pay nothing;
+- it **avoids a silent dead-zone** — `docs/protocols/shm-input.md` documents a
+  UDP fallback for *video* ("Switching back to UDP mode" → `server:
+  udp://…:5600`, `wfb_tx -u 5600`). SHM-only would make the feature a silent
+  no-op in that mode — video on UDP, no protection, no error. The shared helper
+  keeps parity for free.
+
+The clean implementation **is** the shared helper called from both sites, not a
+SHM-only special case.
 
 **Per-packet vs per-batch:** the FEC_CLOSE must fire **inside** the drain
 `for(;;)` loop, on the marked fragment, *not* at batch end — otherwise a
