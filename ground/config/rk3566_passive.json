@@ -1,0 +1,35 @@
+{
+  "_comment": "RK3566 / Radxa3e aarch64 ground station — PASSIVE video receiver. Single card wlx84fc1450bcde, RX-only: decodes the vehicle's video downlink (link 207) to 127.0.0.1:5600. NO uplink TX, NO probe RX, NO back-channel stats_out — this node never transmits and does not participate in the control link. Channel MUST match the vehicle's current TX channel (161/HT20, matching the active GS); a passive RX does not follow CSA hops, so re-tune by hand if the link hops.",
+
+  "key_file": "/etc/drone.key",
+
+  "http": { "bind": "0.0.0.0", "port": 80 },
+
+  "system": {
+    "up": [
+      "ip link set wlx84fc1450bcde down",
+      "iw dev wlx84fc1450bcde set monitor otherbss",
+      "sleep 0.5",
+      "ip link set wlx84fc1450bcde up",
+      "sleep 0.5",
+      "iw dev wlx84fc1450bcde set channel 161"
+    ],
+    "down": [
+      "ip link set wlx84fc1450bcde down"
+    ]
+  },
+
+  "tunnels": [
+    {
+      "_comment": "Video downlink RX (single card). link_id 207 / radio_port 0 match the vehicle's video wfb_tx; -x and -l 100 match the active GS video tunnel. udp_out omitted -> wfb_rx default 127.0.0.1:5600 (local decoder/pixelpilot). No stats_out: passive, no uplink to forward to — gs_supervisor still wires -Y into its own local listener, so RSSI/MCS show in the WebUI.",
+      "name": "video",
+      "role": "rx",
+      "binary": "/usr/bin/wfb_rx",
+      "interfaces": ["wlx84fc1450bcde"],
+      "link_id": 207,
+      "radio_port": 0,
+      "extra_args": ["-x", "-l", "100"],
+      "autostart": true
+    }
+  ]
+}

@@ -1,0 +1,77 @@
+#!/bin/sh
+#
+# S46gs_supervisor — Waybeam ground station passive video RX (Buildroot init)
+#
+# Dedicated SINGLE-CARD passive receiver. gs_supervisor reads
+# /etc/gs_supervisor.json, brings wlx84fc1450bcde into monitor mode (via the
+# config's system.up steps), and runs wfb_rx to decode the vehicle's video
+# downlink (link 207) to 127.0.0.1:5600. No uplink TX, no probe RX.
+#
+# Management/SSH is over eth0, NOT WiFi — so this node does not run STA WiFi.
+# S45waybeam-wifi is intentionally disabled on this host (renamed out of the
+# S?? boot glob): a card running wpa_supplicant in managed mode cannot also be
+# in monitor mode, so the STA manager and gs_supervisor cannot share the one
+# card. See ground/init/README.md.
+#
+# Install: cp to /etc/init.d/S46gs_supervisor ; chmod +x ; disable S45.
+
+# gs_supervisor shells out (execvp) to iw/ip with the *inherited* PATH, which
+# is minimal under init — pin a full PATH so monitor bring-up resolves them.
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+
+DAEMON="gs_supervisor"
+DAEMON_BIN="/usr/bin/gs_supervisor"
+DAEMON_ARGS="--config /etc/gs_supervisor.json"
+PIDFILE="/var/run/gs_supervisor.pid"
+IFACE="wlx84fc1450bcde"
+IFACE_WAIT=30   # seconds to wait for the USB adapter to enumerate at boot
+
+wait_for_iface() {
+	i=0
+	while [ ! -e "/sys/class/net/$IFACE" ]; do
+		i=$((i + 1))
+		if [ "$i" -ge "$IFACE_WAIT" ]; then
+			echo -n "(WARN: $IFACE absent after ${IFACE_WAIT}s) "
+			return 1
+		fi
+		sleep 1
+	done
+	return 0
+}
+
+start() {
+	echo -n "Starting $DAEMON: "
+	wait_for_iface
+	start-stop-daemon -S -b -m -p "$PIDFILE" -x "$DAEMON_BIN" -- $DAEMON_ARGS
+	echo "OK"
+}
+
+stop() {
+	echo -n "Stopping $DAEMON: "
+	# SIGTERM (start-stop-daemon default) lets gs_supervisor run its config
+	# system.down and reap wfb_rx cleanly. Never SIGKILL.
+	start-stop-daemon -K -p "$PIDFILE"
+	echo "OK"
+}
+
+restart() {
+	stop
+	sleep 1
+	start
+}
+
+case "$1" in
+	start)
+		start
+		;;
+	stop)
+		stop
+		;;
+	restart|reload)
+		restart
+		;;
+	*)
+		echo "Usage: $0 {start|stop|restart}"
+		exit 1
+esac
