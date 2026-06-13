@@ -1,13 +1,13 @@
 {
-  "_comment": "Host x86 ground station — two RTL88x2 USB adapters, both on channel 161.",
-  "_comment_iface_a": "wlx40a5ef2f229b — RX-only diversity adapter",
-  "_comment_iface_b": "wlx40a5ef2f2308 — RX diversity + uplink TX",
-  "_comment_nm": "Both adapters are pinned NM-unmanaged in /etc/NetworkManager/conf.d/99-wfb-unmanaged.conf (by MAC), so no nmcli managed toggling is needed here — that toggling raced NM and intermittently left an adapter in 'managed' after 'ip link up'.",
-
+  "_comment": "Host x86 ground station \u2014 two RTL88x2 USB adapters, both on channel 161.",
+  "_comment_iface_a": "wlx40a5ef2f229b \u2014 RX-only diversity adapter",
+  "_comment_iface_b": "wlx40a5ef2f2308 \u2014 RX diversity + uplink TX",
+  "_comment_nm": "Both adapters are pinned NM-unmanaged in /etc/NetworkManager/conf.d/99-wfb-unmanaged.conf (by MAC), so no nmcli managed toggling is needed here \u2014 that toggling raced NM and intermittently left an adapter in 'managed' after 'ip link up'.",
   "key_file": "/etc/drone.key",
-
-  "http": { "bind": "0.0.0.0", "port": 80 },
-
+  "http": {
+    "bind": "0.0.0.0",
+    "port": 80
+  },
   "system": {
     "up": [
       "ip link set wlx40a5ef2f229b down",
@@ -18,7 +18,6 @@
       "iw dev wlx40a5ef2f229b set channel 161",
       "sleep 0.5",
       "iw dev wlx40a5ef2f229b set txpower fixed 2000",
-
       "ip link set wlx40a5ef2f2308 down",
       "iw dev wlx40a5ef2f2308 set monitor otherbss",
       "sleep 0.5",
@@ -27,42 +26,57 @@
       "iw dev wlx40a5ef2f2308 set channel 161",
       "sleep 0.5",
       "iw dev wlx40a5ef2f2308 set txpower fixed 2000",
-
-      "/home/snokvist/dev/waybeam-coordination/waybeam_wfb_ng/ground/scripts/walkout_logger.sh start"
+      "/home/snokvist/dev/waybeam-coordination/waybeam_wfb_ng/ground/scripts/walkout_logger.sh start",
+      "/home/snokvist/dev/waybeam-coordination/waybeam_wfb_ng/telemetry/capture_session.sh start"
     ],
     "down": [
+      "/home/snokvist/dev/waybeam-coordination/waybeam_wfb_ng/telemetry/capture_session.sh stop",
       "/home/snokvist/dev/waybeam-coordination/waybeam_wfb_ng/ground/scripts/walkout_logger.sh stop",
       "ip link set wlx40a5ef2f229b down",
       "ip link set wlx40a5ef2f2308 down"
     ]
   },
-
   "tunnels": [
     {
       "_comment": "Diversity RX. udp_out omitted -> wfb_rx default 127.0.0.1:5600. Stats forwarded to uplink TX UDP-in for back-channel.",
       "name": "video",
       "role": "rx",
       "binary": "/home/snokvist/dev/waybeam-coordination/waybeam_wfb_ng/wfb-ng/build/wfb_rx_native",
-      "interfaces": ["wlx40a5ef2f229b", "wlx40a5ef2f2308"],
+      "interfaces": [
+        "wlx40a5ef2f229b",
+        "wlx40a5ef2f2308"
+      ],
       "link_id": 207,
       "radio_port": 0,
       "stats_out": "127.0.0.1:6600",
-      "extra_args": ["-x", "-l", "100"],
-      "autostart": true
+      "extra_args": [
+        "-x",
+        "-l",
+        "100"
+      ],
+      "autostart": true,
+      "stats_tap": "127.0.0.1:6700"
     },
     {
-      "_comment": "Boundary-probe RX (PROBE_PER_SPEC.md). Matches the vehicle's probe wfb_tx (S99wfb, wfbprobe=1, link 50/port 50). probe:true makes the supervisor compute windowed per-MCS PER and forward {type:probe} records to stats_out (uplink back-channel) INSTEAD of raw rx_ant. udp_out MUST be an explicit dead port — never 5600 (RTP video); the supervisor rejects the config otherwise.",
+      "_comment": "Boundary-probe RX (PROBE_PER_SPEC.md). Matches the vehicle's probe wfb_tx (S99wfb, wfbprobe=1, link 50/port 50). probe:true makes the supervisor compute windowed per-MCS PER and forward {type:probe} records to stats_out (uplink back-channel) INSTEAD of raw rx_ant. udp_out MUST be an explicit dead port \u2014 never 5600 (RTP video); the supervisor rejects the config otherwise.",
       "name": "probe",
       "role": "rx",
       "binary": "/home/snokvist/dev/waybeam-coordination/waybeam_wfb_ng/wfb-ng/build/wfb_rx_native",
-      "interfaces": ["wlx40a5ef2f229b", "wlx40a5ef2f2308"],
+      "interfaces": [
+        "wlx40a5ef2f229b",
+        "wlx40a5ef2f2308"
+      ],
       "link_id": 50,
       "radio_port": 50,
       "udp_out": "127.0.0.1:5751",
       "stats_out": "127.0.0.1:6600",
       "probe": true,
       "probe_window_ms": 500,
-      "extra_args": ["-x", "-l", "100"],
+      "extra_args": [
+        "-x",
+        "-l",
+        "100"
+      ],
       "autostart": true
     },
     {
@@ -70,17 +84,24 @@
       "name": "uplink",
       "role": "tx",
       "binary": "/home/snokvist/dev/waybeam-coordination/waybeam_wfb_ng/wfb-ng/build/wfb_tx_native",
-      "interfaces": ["wlx40a5ef2f2308"],
+      "interfaces": [
+        "wlx40a5ef2f2308"
+      ],
       "link_id": 208,
       "radio_port": 0,
       "udp_in_port": 6600,
       "control_port": 8000,
-      "fec": { "k": 1, "n": 2 },
-      "extra_args": ["-T", "1"],
+      "fec": {
+        "k": 1,
+        "n": 2
+      },
+      "extra_args": [
+        "-T",
+        "1"
+      ],
       "autostart": true
     }
   ],
-
   "venc_cmd": {
     "enabled": true,
     "uplink_tunnel": "uplink",
