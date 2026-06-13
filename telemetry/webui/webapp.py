@@ -72,9 +72,11 @@ def api_sessions():
 def api_series(sid: int):
     """Aligned arrays for uPlot + label/ML overlays. x is seconds since session start."""
     conn = _conn()
-    if not store.get_session(conn, sid):
+    sess = store.get_session(conn, sid)
+    if not sess:
         conn.close()
         abort(404)
+    is_vehicle = (sess["source"] == "vehicle-uplink")
     rows = store.get_records(conn, sid)
     model_ver = _latest_model_ver(conn)
 
@@ -124,10 +126,11 @@ def api_series(sid: int):
         if best:
             for m, p in best.items():
                 mcs_dist[str(m)][i] = int(p)
-        else:
-            # Fallback for vehicle-uplink sessions (no ant[]): show the
-            # denormalised current MCS as a single-rung mark so the stacked
-            # bar still renders the active rung over time.
+        elif is_vehicle:
+            # Vehicle-uplink sessions have no ant[]: show the denormalised
+            # current MCS as a single-rung mark so the stacked bar still renders
+            # the active rung. Gated on source so a GS blackout row (empty ant)
+            # doesn't draw a phantom rung from its denormalised mcs.
             m = _rung(r["mcs"])
             if m is not None:
                 mcs_dist[str(m)][i] = 1
