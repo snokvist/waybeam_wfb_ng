@@ -1627,8 +1627,11 @@ void stats_drain(Tunnel *t)
 		/* Fire-and-forget logging tap: a raw rx_ant copy to e.g. the
 		 * SQLite ingester, independent of and after the back-channel
 		 * above. Best-effort — a dead tap consumer never affects
-		 * stats_out or the vehicle link. */
-		if (t->stats_tap_active) {
+		 * stats_out or the vehicle link. Gated on !probe like the
+		 * back-channel: a probe tunnel's raw rx_ant is not link quality
+		 * (it carries {type:probe} records instead) and would mislead
+		 * the store. */
+		if (t->stats_tap_active && !t->probe) {
 			(void)sendto(t->stats_local_fd, buf, (size_t)got, 0,
 			             (struct sockaddr *)&t->stats_tap_addr,
 			             sizeof(t->stats_tap_addr));
