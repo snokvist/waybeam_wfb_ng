@@ -95,5 +95,11 @@ while :; do
             fi
         fi
     fi
+    # Flush to the SD every second. The card is vfat (no journal) and a flight
+    # battery can be yanked at any instant; without this, up to ~30 s of samples
+    # (dirty_expire) and the buffered lc.log tail sit in the page cache and are
+    # lost on a hard power cut. A 1 Hz fsync of <1 KB is negligible wear/CPU and
+    # bounds worst-case loss to the last single sample.
+    sync
     sleep 1
 done
