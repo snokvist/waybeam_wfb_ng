@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import subprocess
 import sys
 
 # wfb_store lives one dir up (telemetry/); make it importable when run directly.
@@ -42,12 +43,43 @@ def _latest_model_ver(conn) -> str | None:
     return row["model_ver"] if row else None
 
 
+# capture_session.sh lives in telemetry/ (one dir up from webui/).
+CAPTURE_SH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "capture_session.sh")
+
+
 @app.route("/")
 def index():
     conn = _conn()
     sessions = [dict(r) for r in store.list_sessions(conn)]
     conn.close()
     return render_template("index.html", sessions=sessions)
+
+
+@app.route("/api/capture/new", methods=["POST"])
+def capture_new():
+    """Roll a fresh GS capture session for a clean break: close the current
+    ingester (stamps ended_at) and start a new one (new `sessions` row).
+    `capture_session.sh start` reclaims the UDP port and re-launches, so it IS
+    the roll. The ingester runs as root (launched by gs_supervisor), so we go
+    through `sudo -n`. With LOG_SYNC active the vehicle keeps logging
+    continuously and the importer attributes its records to whichever GS
+    session was live — so this boundary carries to the vehicle data with no
+    vehicle restart."""
+    if not os.path.exists(CAPTURE_SH):
+        return jsonify(ok=False, error="capture_session.sh not found"), 500
+    try:
+        # Fixed argv, no user input — not shell-interpolated, so no injection.
+        r = subprocess.run(["sudo", "-n", "bash", CAPTURE_SH, "start"],
+                           capture_output=True, text=True, timeout=20)
+    except subprocess.TimeoutExpired:
+        return jsonify(ok=False, error="capture_session.sh timed out"), 504
+    except OSError as e:
+        return jsonify(ok=False, error=str(e)), 500
+    msg = (r.stdout or "").strip()
+    if r.stderr.strip():
+        msg = (msg + "  " + r.stderr.strip()).strip()
+    return jsonify(ok=(r.returncode == 0), message=msg, code=r.returncode)
 
 
 @app.route("/session/<int:sid>")
@@ -124,6 +156,12 @@ def api_series(sid: int):
         except (ValueError, TypeError, AttributeError):
             best = {}
         if best:
+            # Keep ALL rungs present in the record — the downlink legitimately
+            # carries packets at two rungs at once: the bulk video stream plus a
+            # steady low-rate peek-PROTECT sub-stream (key/param frames sent at a
+            # more robust MCS). Charting both is the point — it shows protection
+            # working. The apparent "all rungs active" smear was the cumulative
+            # tooltip (fixed client-side to show per-rung counts), not the data.
             for m, p in best.items():
                 mcs_dist[str(m)][i] = int(p)
         elif is_vehicle:

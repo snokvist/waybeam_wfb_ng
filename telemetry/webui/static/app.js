@@ -102,8 +102,19 @@ function mcsStack(t, dist) {
   const data = [t], series = [{}];
   for (let m = 7; m >= 0; m--) {            // top → bottom = draw back → front
     data.push(cum[m]);
+    // Legend/tooltip must show this rung's OWN packet count, not the
+    // cumulative stack height the bar geometry is drawn from. Each series'
+    // datum is cum[m]; the rung below it is the next series (m-1), so
+    // seg[m] = cum[m] - cum[m-1] = data[si] - data[si+1] (0 for bottom rung
+    // M0, which has no series below it). This stays correct across live polls
+    // because it reads the live chart data, not a captured array.
     series.push({ label: `M${m}`, scale: "pkts", stroke: MCS_COLORS[m],
-                  fill: MCS_COLORS[m], paths: bars, points: { show: false } });
+                  fill: MCS_COLORS[m], paths: bars, points: { show: false },
+                  value: (u, v, si, di) => {
+                    if (v == null) return "";
+                    const below = (u.data[si + 1] && u.data[si + 1][di]) || 0;
+                    return Math.round(v - below);
+                  } });
   }
   return { data, series };
 }

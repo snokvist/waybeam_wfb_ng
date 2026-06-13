@@ -113,6 +113,29 @@
 #define WCMD_KEY_PEEK_ENABLED      16   /* wfb_tx peek enabled (0/1) */
 #define WCMD_KEY_PEEK_DROP_ENABLED 17   /* wfb_tx peek drop_enabled (0/1) */
 
+/*
+ * Logging sync marker — GS → vehicle, for post-walk log time-alignment.
+ * NOT an operator command: it carries no venc/wfb action and does NOT touch
+ * the radio.  The GS emits one every ~10 s with `value` = gs_unix_seconds
+ * (CLOCK_REALTIME) and the WCMD `seq` as the marker id.  link_controller
+ * records (seq, gs_unix_s, its own uptime at receipt) into /status as a
+ * "logsync" object; the walkout logger mirrors that to the SD card.  Post-
+ * walk the importer fits the (gs_unix_s ↔ vehicle uptime) pairs into a line
+ * and remaps the vehicle records onto the GS wall-clock — and the gs_unix
+ * span identifies which GS capture session the walk belongs to (so a GS
+ * "new session" mid-walk re-attributes the vehicle log automatically).
+ *
+ * Dispatch differs from operator keys: the proxy bypasses cmd.allow_keys_mask
+ * (this is infrastructure, not an operator-gated action) but still honours
+ * cmd.enabled, since it shares the uplink command path.  It is the one key
+ * with no clamp window and no HTTP/wfb_cmd side effect.
+ *
+ * Y2038: `value` is int32, so the seconds stamp truncates after 2038-01-19.
+ * Benign here — the importer fits deltas (slope≈1, offset absorbs the base),
+ * and a single walk never straddles the rollover, so relative alignment holds.
+ */
+#define WCMD_KEY_LOG_SYNC       18   /* value = gs_unix_seconds; seq = marker id */
+
 /* Status codes returned in CMD_RESP */
 #define WCMD_STATUS_OK           0
 #define WCMD_STATUS_DISABLED     1   /* cmd subsystem off (cmd.enabled=false) */

@@ -49,7 +49,11 @@ ingester_pids() {
     for d in /proc/[0-9]*; do
         p=${d#/proc/}
         [ "$p" = "$$" ] && continue
-        c=$(tr '\0' ' ' < "$d/cmdline" 2>/dev/null) || continue
+        # A process can exit between the glob and this read; `< file` failing is
+        # a SHELL redirect error (not caught by tr's 2>/dev/null), so suppress
+        # the whole substitution's stderr or it leaks into the API response.
+        c=$(cat "$d/cmdline" 2>/dev/null | tr '\0' ' ') || continue
+        [ -n "$c" ] || continue
         case "$c" in
             # anchor on the trailing " --db" so --listen 6700 can't match 67005
             *"wfb_ingest.py --listen $LISTEN --db"*) printf '%s\n' "$p" ;;

@@ -12,6 +12,10 @@ header { display: flex; align-items: baseline; gap: .6rem;
 main { padding: 1.1rem; max-width: 1200px; margin: 0 auto; }
 h1 { font-size: 1.3rem; margin: .2rem 0 1rem; }
 h1 small { color: var(--muted); font-weight: 400; font-size: .8rem; }
+.toolbar { display: flex; align-items: center; gap: .8rem; margin-bottom: 1rem; }
+.toolbar h1 { margin: 0; }
+#new-capture { padding: .3rem .7rem; }
+#capture-status { font-size: .85rem; }
 a { color: var(--accent); }
 .back { display: inline-block; margin-bottom: .6rem; text-decoration: none; }
 code { background: #1f2630; padding: .1rem .35rem; border-radius: 4px; }

@@ -1127,6 +1127,10 @@ int run_iw_set_channel(const char *iface, int chan, const char *ht)
 	return rc;
 }
 
+/* LOG_SYNC marker cadence (ms) — see logsync_emit() / WCMD_KEY_LOG_SYNC. */
+#define GS_LOGSYNC_INTERVAL_MS 10000
+static void logsync_emit(const Config *c);
+
 /* Periodic tick: handle SIGKILL escalation + backoff respawn, plus
  * deferred TX state queries (~500 ms after spawn so wfb_tx has bound
  * its control socket).  CSA + scan state machines are driven from
@@ -1172,6 +1176,17 @@ static void supervisor_tick(Config *c)
 
 	csa_tick(c, t_us);
 	scan_tick(c, t_us);
+
+	/* Logging-sync heartbeat: one LOG_SYNC marker up the WCMD uplink every
+	 * GS_LOGSYNC_INTERVAL_MS so post-walk the vehicle log can be fit onto the
+	 * GS wall-clock and attributed to this GS capture session.  First tick
+	 * fires immediately (gate starts at 0) so an early anchor lands even on a
+	 * short run. */
+	static uint64_t logsync_next_ms = 0;
+	if (t_ms >= logsync_next_ms) {
+		logsync_next_ms = t_ms + GS_LOGSYNC_INTERVAL_MS;
+		logsync_emit(c);
+	}
 }
 
 /* ---------- system commands ------------------------------------------ */
@@ -2284,6 +2299,12 @@ uint64_t g_wcmd_emit_frames     = 0; /* wire frames sent (bursts × copies actua
 uint64_t g_wcmd_emit_rate_limit = 0; /* /api/v1/cmd rejections by per-key window */
 uint64_t g_wcmd_emit_failed     = 0; /* sendto failed entirely (no copy on the wire) */
 
+/* Logging-sync marker emit state — kept separate from the operator WCMD
+ * counters above so the WebUI's "commands emitted" stats aren't inflated by
+ * the 10 s heartbeat.  Shares g_wcmd_seq so every marker still gets a wire-
+ * unique seq (the vehicle dedups the 3-frame burst per (key, seq)). */
+uint64_t g_logsync_emit_total = 0;   /* markers emitted (≥1 copy on the wire) */
+
 int wcmd_key_from_str(const char *s, size_t n)
 {
 	if (n == 12 && !strncmp(s, "bitrate_kbps",  12)) return WCMD_KEY_BITRATE_KBPS;
@@ -2391,6 +2412,56 @@ int wcmd_emit(const Config *c, int key, int32_t value, uint16_t *seq_out)
 	}
 	g_wcmd_emit_failed++;
 	return last_err ? last_err : -1;
+}
+
+/* Emit one LOG_SYNC marker up the WCMD uplink (see WCMD_KEY_LOG_SYNC in
+ * shared/wcmd_proto.h).  Mirrors wcmd_emit's socket/burst path but carries a
+ * CLOCK_REALTIME wall-clock seconds stamp instead of an operator value, and
+ * touches only g_logsync_emit_total so the operator cmd stats stay clean.
+ * Fire-and-forget: a dropped marker just means one fewer alignment anchor —
+ * the importer's line fit tolerates gaps.  No-op when the cmd subsystem or
+ * uplink tunnel is unavailable (same gating as wcmd_emit). */
+static void logsync_emit(const Config *c)
+{
+	if (!c->venc_cmd_enabled) return;
+	const Tunnel *up = NULL;
+	for (int i = 0; i < c->tunnel_count; i++) {
+		if (!strcmp(c->tunnels[i].name, c->venc_cmd_uplink) &&
+		    !strcmp(c->tunnels[i].role, "tx")) {
+			up = &c->tunnels[i];
+			break;
+		}
+	}
+	if (!up || up->udp_in_port <= 0) return;
+
+	int s = socket(AF_INET, SOCK_DGRAM, 0);
+	if (s < 0) return;
+	struct sockaddr_in dst = {
+		.sin_family = AF_INET,
+		.sin_port   = htons((uint16_t)up->udp_in_port),
+	};
+	dst.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+
+	uint16_t seq = ++g_wcmd_seq;
+	int32_t  gs_unix_s = (int32_t)time(NULL);
+	WcmdReq req = {
+		.magic    = htonl(WCMD_MAGIC),
+		.version  = WCMD_VERSION,
+		.msg_type = WCMD_MSG_REQ,
+		.seq      = htons(seq),
+		.key      = WCMD_KEY_LOG_SYNC,
+		.flags    = 0,
+		._pad     = 0,
+		.value    = (int32_t)htonl((uint32_t)gs_unix_s),
+	};
+	int sent = 0;
+	for (int i = 0; i < WCMD_BURST_FRAMES; i++) {
+		if (sendto(s, &req, sizeof(req), 0,
+		           (struct sockaddr *)&dst, sizeof(dst)) == sizeof(req))
+			sent++;
+	}
+	close(s);
+	if (sent > 0) g_logsync_emit_total++;
 }
 
 
