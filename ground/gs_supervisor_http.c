@@ -150,6 +150,29 @@ int json_emit_tunnel(char *buf, size_t cap, const Tunnel *t, bool full)
 			    t->st_pkt_outgoing, t->st_pkt_dec_err, t->st_pkt_uniq,
 			    t->st_pkt_bytes, t->st_ant_count);
 			if (t->st_rssi_best != INT_MIN) APP(",\"rssi_best\":%d", t->st_rssi_best);
+			/* Received-MCS histogram over the last 10 s (peek PROTECT /
+			 * adaptive-MCS visibility). Sum the ring slots stamped
+			 * within the window; only non-zero rungs; object omitted
+			 * when there is no per-MCS data. */
+			{
+				uint64_t nsec = now_us() / 1000000ULL;
+				uint32_t win[16] = {0};
+				for (int sl = 0; sl < 10; sl++) {
+					if (t->st_mcs_win_sec[sl] == 0) continue;
+					if (nsec - t->st_mcs_win_sec[sl] >= 10) continue;
+					for (int m = 0; m < 16; m++)
+						win[m] += t->st_mcs_win[sl][m];
+				}
+				int mh_any = 0;
+				for (int m = 0; m < 16; m++) {
+					if (win[m] == 0) continue;
+					APP("%s\"%d\":%u",
+					    mh_any ? "," : ",\"mcs_hist\":{",
+					    m, win[m]);
+					mh_any = 1;
+				}
+				if (mh_any) APP("}");
+			}
 			if (t->probe)
 				APP(",\"probe\":{\"window_ms\":%d,"
 				    "\"emitted\":%u,\"stale_dropped\":%u}",

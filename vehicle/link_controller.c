@@ -2464,6 +2464,9 @@ static bool scorer_update(Scorer *s, const Config *cfg, const char *body,
 	float sum = 0.0f;
 	int   count = 0;
 	bool  saw_any = false;
+	char  seen_id[ANT_MAX][24];   /* antenna ids already given a slot (wfb id is
+	                               * up to a 16-hex-char %PRIx64 — 24 leaves room
+	                               * so two ids never collide via truncation) */
 
 	out->ant_count = 0;
 	for (int i = 0; i < ANT_MAX; i++) out->ant_avg[i] = -200.0f;
@@ -2486,8 +2489,39 @@ static bool scorer_update(Scorer *s, const Config *cfg, const char *body,
 		} else {
 			if (!saw_any || val > best) best = val;
 		}
-		if (out->ant_count < ANT_MAX)
-			out->ant_avg[out->ant_count++] = (float)avg;
+		/* Collapse multiple-MCS entries for the SAME physical antenna into
+		 * one slot. wfb_rx -Y emits one ant[] entry per (freq,mcs,bw,id), so
+		 * during an MCS transition the same antenna id appears at two rungs;
+		 * counting "rssi": occurrences (not ids) briefly inflates ant_count
+		 * and shows phantom antennas 4..7 in the UI. Key by id, keep the best
+		 * (max) avg across that antenna's rungs. The id sits before "rssi":
+		 * within the same object, i.e. between p and r. */
+		char id[24] = "";
+		{
+			const char *idp = strstr(p, "\"id\":");
+			if (idp && idp < r) {
+				idp += 5;
+				while (*idp == ' ' || *idp == '"') idp++;
+				int k = 0;
+				while (*idp && *idp != '"' && *idp != ',' &&
+				       *idp != '}' && k < (int)sizeof(id) - 1)
+					id[k++] = *idp++;
+				id[k] = 0;
+			}
+		}
+		int slot = -1;
+		if (id[0]) {
+			for (int k = 0; k < out->ant_count; k++)
+				if (strcmp(seen_id[k], id) == 0) { slot = k; break; }
+		}
+		if (slot >= 0) {
+			if ((float)avg > out->ant_avg[slot])
+				out->ant_avg[slot] = (float)avg;   /* best rung for this antenna */
+		} else if (out->ant_count < ANT_MAX) {
+			slot = out->ant_count++;
+			snprintf(seen_id[slot], sizeof seen_id[slot], "%s", id);
+			out->ant_avg[slot] = (float)avg;
+		}
 		count++;
 		saw_any = true;
 		const char *brace_close = strchr(r, '}');
@@ -2497,6 +2531,12 @@ static bool scorer_update(Scorer *s, const Config *cfg, const char *body,
 
 	if (!saw_any) return false;
 
+	/* NOTE: the per-antenna dedup above collapses ant_avg[]/ant_count (the UI
+	 * list) but NOT sum/count — so AGG_MEAN_AVG (opt-in; deployed default is
+	 * AGG_BEST_AVG) still double-weights a duplicate-id rung during an MCS
+	 * transition. The default best=max(avg) path is idempotent over duplicates
+	 * and unaffected. If mean_avg is ever made default, switch this to a mean
+	 * over the deduped ant_avg[0..ant_count). */
 	float raw = (cfg->mcs.rssi_aggregator == AGG_MEAN_AVG)
 	    ? (sum / (float)count)
 	    : best;

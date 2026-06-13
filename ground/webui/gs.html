@@ -90,6 +90,12 @@ code,pre,.mono{font-family:'JetBrains Mono',monospace;font-size:.85em}
 .stats-panel.stats-empty{opacity:.55}
 .stats-head{display:flex;align-items:center;gap:.5rem;font-size:.7rem;letter-spacing:.06em;text-transform:uppercase;color:var(--text-dim);margin-bottom:.35rem;font-family:'JetBrains Mono',monospace}
 .stats-grid{margin-bottom:0;font-size:.74rem}
+.mcsbars{display:flex;flex-direction:column;gap:2px;margin-top:1px}
+.mcsrow{display:flex;align-items:center;gap:.4rem;font-size:.7rem;line-height:1.35}
+.mcsrow .lab{width:2.4em;color:var(--text-dim);font-family:'JetBrains Mono',monospace}
+.mcsrow .track{flex:1;height:9px;background:var(--bg);border:1px solid var(--border);border-radius:2px;overflow:hidden}
+.mcsrow .track i{display:block;height:100%;border-radius:1px;transition:width .3s ease}
+.mcsrow .pct{width:3.4em;text-align:right;color:var(--text);font-variant-numeric:tabular-nums;font-family:'JetBrains Mono',monospace}
 .tunnel-actions{display:flex;gap:.4rem;flex-wrap:wrap}
 .btn-mini{padding:3px 10px;border-radius:4px;cursor:pointer;font-size:.72rem;font-weight:600;font-family:'JetBrains Mono',monospace;border:1px solid var(--border);background:var(--bg);color:var(--text);transition:all .15s;text-transform:uppercase;letter-spacing:.04em}
 .btn-mini:hover:not(:disabled){border-color:var(--text-dim);color:var(--text-bright)}
@@ -976,6 +982,7 @@ function renderTunnels(ts){
           <dt>fec rec</dt><dd>${s.pkt_fec_recovered||0}</dd>
           <dt>dec_err</dt><dd>${s.pkt_dec_err||0}</dd>
           <dt>antennas</dt><dd>${s.ant_count||0}${s.rssi_best!==undefined?` · best rssi ${s.rssi_best} dBm`:''}</dd>
+          ${(()=>{const h=s.mcs_hist;if(!h)return '';const ks=Object.keys(h).map(Number).sort((a,b)=>b-a);if(!ks.length)return '';const tot=ks.reduce((a,m)=>a+h[m],0)||1;const top=ks[0];const rows=ks.map(m=>{const pct=h[m]*100/tot;const w=Math.min(100,Math.max(pct,1.5));const col=(m===top)?'var(--blue)':'var(--warn)';const p=pct<9.95?pct.toFixed(1):Math.round(pct);return `<div class="mcsrow"><span class="lab">M${m}</span><span class="track"><i style="width:${w.toFixed(1)}%;background:${col}"></i></span><span class="pct" title="${h[m]} pkts">${p}%</span></div>`;}).join('');return `<dt title="received packets per MCS rung, last 10 s — peek PROTECT lands key/param frames on lower rungs (amber)">rx mcs <span class="muted">10s</span></dt><dd><div class="mcsbars">${rows}</div></dd>`;})()}
         </dl>
       </div>`;
     } else {
