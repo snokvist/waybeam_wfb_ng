@@ -5,10 +5,19 @@
 <h1>Uplink ↔ Downlink overlay
   <small>vehicle session {{ session.id }} · {{ session.scenario or '—' }}</small></h1>
 <p class="muted">
-  Uplink = the vehicle's own view (GS→vehicle, weak GS TX — craters first).
-  Downlink = the GS capture (vehicle→GS, strong vehicle TX). Both on one GS
-  wall-clock axis via the LOG_SYNC fit.
+  Uplink = the vehicle's own view (GS→vehicle, weak GS TX). Downlink = the GS
+  capture (vehicle→GS, strong vehicle TX). Both on one GS wall-clock axis via
+  the LOG_SYNC fit.
   <span id="overlay-meta"></span>
+</p>
+<p class="caveat">
+  ⚠ The two RSSI traces come from <em>different receivers</em> (vehicle radio vs
+  GS diversity adapters) with different antenna gains and noise floors, so their
+  <strong>absolute dBm values are not directly comparable</strong> — a 3 dB gap
+  between the lines is not necessarily a real path-loss difference. Read this
+  chart for <strong>fade timing</strong> (do the two craters line up, or does one
+  lead?) and the <strong>PER chart</strong> (loss is loss, directly comparable),
+  not for absolute RSSI deltas.
 </p>
 <div class="legend">
   <span class="chip" style="background:#58a6ff;color:#0d1117">uplink (vehicle)</span>
