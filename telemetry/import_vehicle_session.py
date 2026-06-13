@@ -54,7 +54,10 @@ def import_vehicle_jsonl(conn, path: str, vehicle_session: str, **meta) -> tuple
                 bad += 1
                 continue
             up = d.get("up")
-            ts_ms = int((up if isinstance(up, (int, float)) else 0) * 1000)
+            if not isinstance(up, (int, float)):
+                bad += 1   # no monotonic timestamp — skip, don't pile rows at t=0
+                continue
+            ts_ms = int(up * 1000)
             rssi = _g(d, "status", "score", "smoothed_rssi")
             raw = _g(d, "status", "score", "raw_rssi")
             spread = abs(rssi - raw) if isinstance(rssi, (int, float)) and isinstance(raw, (int, float)) else None

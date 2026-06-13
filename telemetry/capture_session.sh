@@ -51,7 +51,8 @@ ingester_pids() {
         [ "$p" = "$$" ] && continue
         c=$(tr '\0' ' ' < "$d/cmdline" 2>/dev/null) || continue
         case "$c" in
-            *"wfb_ingest.py --listen $LISTEN"*) printf '%s\n' "$p" ;;
+            # anchor on the trailing " --db" so --listen 6700 can't match 67005
+            *"wfb_ingest.py --listen $LISTEN --db"*) printf '%s\n' "$p" ;;
         esac
     done
 }
