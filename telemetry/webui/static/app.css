@@ -78,3 +78,11 @@ table.labels th, table.labels td { text-align: left; padding: .4rem .6rem;
   border-bottom: 1px solid var(--line); }
 table.labels th { color: var(--muted); font-weight: 500; }
 button.del { padding: .15rem .5rem; font-size: .8rem; }
+
+/* live-tail indicator + toggle (session detail) */
+.live-toggle { margin-left: .6em; font-size: .85em; color: #8b949e; cursor: pointer; }
+.live-toggle input { vertical-align: middle; }
+#live-dot { margin-left: .5em; font-size: .85em; }
+.live-on     { color: #3fb950; }   /* growing */
+.live-idle   { color: #8b949e; }   /* no new records */
+.live-paused { color: #d29922; }   /* toggled off */
