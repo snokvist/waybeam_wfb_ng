@@ -420,6 +420,101 @@ index 0000000..f0a8f26
 +peek_outcome_t peek(const uint8_t *buf, size_t len, const peek_cfg_t *cfg);
 +
 +#endif // WFB_PEEK_HPP
+diff --git a/src/rx.cpp b/src/rx.cpp
+index 136d16d..2f0f7c6 100644
+--- a/src/rx.cpp
++++ b/src/rx.cpp
+@@ -967,8 +967,14 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
+     assert(decrypted_len >= sizeof(wpacket_hdr_t));
+     assert(decrypted_len <= MAX_FEC_PAYLOAD);
+ 
+-    uint64_t block_idx = be64toh(block_hdr->data_nonce) >> 8;
+-    uint8_t fragment_idx = (uint8_t)(be64toh(block_hdr->data_nonce) & 0xff);
++    uint64_t raw_nonce = be64toh(block_hdr->data_nonce);
++    // SHORT_TAIL rides the top bit; mask it off before deriving block_idx so the
++    // MAX_BLOCK_IDX guard below doesn't false-trip.  When set, this fragment is
++    // the boundary marker of a TX short-close: real data ends at fragment_idx,
++    // and slots [fragment_idx+1, fec_k) were never transmitted (synthesized below).
++    bool short_tail = (raw_nonce & WFB_NONCE_SHORT_TAIL) != 0;
++    uint64_t block_idx = (raw_nonce >> 8) & MAX_BLOCK_IDX;
++    uint8_t fragment_idx = (uint8_t)(raw_nonce & 0xff);
+ 
+     /* set::insert returns (iterator, inserted_bool).  When inserted_bool is
+      * false the same data_nonce was already in the dedup set — i.e. this
+@@ -1024,6 +1030,39 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
+     p->fragment_map[fragment_idx] = decrypted_len;
+     p->has_fragments += 1;
+ 
++    // SHORT_TAIL: the TX short-closed this block at j == fragment_idx real data
++    // fragments.  Slots [j+1, fec_k) were never transmitted -- synthesize them
++    // locally as canonical FEC_ONLY zero-pad (byte-identical to what the TX fed
++    // the FEC encoder) so the block can complete with the proportional parity
++    // that DID arrive.  Idempotent (skips slots already present); guarded so it
++    // only runs for the marker fragment (the one carrying the SHORT_TAIL bit).
++    // The synthesized slots are FEC_ONLY, so send_packet() skips them at the
++    // socket and the fec_recovered counter ignores them (same as on-air padding).
++    //
++    // VALIDATE the marker before acting on it: a genuine TX marker is a
++    // canonical pad (FEC_ONLY, packet_size==0) at a real boundary 1 <= j < fec_k.
++    // In plaintext (-x) mode there is no AEAD to reject a forged/corrupt fragment,
++    // so without this check one injected packet with the bit + an attacker-chosen
++    // fragment_idx could bulk-synthesize zero-pad into a live block and truncate a
++    // frame.  If it is not a valid marker, fall through and treat it as an
++    // ordinary fragment (no synthesis).  In AEAD mode forged fragments are already
++    // rejected at decrypt, so this is belt-and-suspenders there.
++    if (short_tail && fragment_idx >= 1 && fragment_idx < fec_k &&
++        (((wpacket_hdr_t*)decrypted)->flags & WFB_PACKET_FEC_ONLY) &&
++        be16toh(((wpacket_hdr_t*)decrypted)->packet_size) == 0)
++    {
++        for (int i = fragment_idx + 1; i < fec_k; i++)
++        {
++            if (p->fragment_map[i]) continue;
++            memset(p->fragments[i], '\0', MAX_FEC_PAYLOAD);
++            wpacket_hdr_t *h = (wpacket_hdr_t*)p->fragments[i];
++            h->flags = WFB_PACKET_FEC_ONLY;
++            h->packet_size = htobe16(0);
++            p->fragment_map[i] = sizeof(wpacket_hdr_t);
++            p->has_fragments += 1;
++        }
++    }
++
+     // Check if we use current (oldest) block
+     // then we can optimize and don't wait for all K fragments
+     // and send packets if there are no gaps in fragments from the beginning of this block
+@@ -1047,8 +1086,14 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
+         }
+     }
+ 
+-    // Check that this block has K elements (with gaps) and can be recovered via FEC
+-    if(p->fragment_to_send_idx < fec_k && p->has_fragments == fec_k)
++    // Check that this block has K elements (with gaps) and can be recovered via FEC.
++    // ">=" not "==": a SHORT_TAIL block synthesizes its [j+1,k) tail in one step,
++    // so has_fragments can jump past fec_k when real data + parity already arrived.
++    // For a normal (full) block has_fragments reaches exactly fec_k at the moment
++    // the block is evicted, so ">=" is identical there.  ">=" also guarantees the
++    // apply_fec parity-availability invariant: missing_data = k - present_low_k <=
++    // has_fragments - present_low_k = present_parity.
++    if(p->fragment_to_send_idx < fec_k && p->has_fragments >= fec_k)
+     {
+         // send all queued packets in all unfinished blocks before current
+         // and then remove that blocks
+@@ -1196,7 +1241,15 @@ void Aggregator::apply_fec(int ring_idx)
+                 j++;
+             }
+ 
+-            assert(j < fec_n);
++            // Insufficient parity to fill this gap.  The caller only invokes
++            // apply_fec when has_fragments >= fec_k, which (for both the normal
++            // full-block path and the SHORT_TAIL synthesized path) guarantees
++            // present_parity >= missing_data -- so this never fires on legitimate
++            // traffic.  Bail gracefully rather than assert/over-read: RS recovery
++            // is all-or-nothing, so if any gap lacks parity the block is
++            // undecodable; leave it partial and let the caller emit what arrived.
++            // (Defends NDEBUG builds + the untrusted-RF / plaintext path.)
++            if (j >= fec_n) return;
+             // FEC packets always have max size between packets in block
+             max_packet_size = max(max_packet_size, rx_ring[ring_idx].fragment_map[j]);
+             in_blocks[i] = rx_ring[ring_idx].fragments[j];
 diff --git a/src/test_peek.cpp b/src/test_peek.cpp
 new file mode 100644
 index 0000000..38c2c21
@@ -604,7 +699,7 @@ index 0000000..38c2c21
 +    return g_fail ? 1 : 0;
 +}
 diff --git a/src/tx.cpp b/src/tx.cpp
-index 2dc86ea..9da4d8c 100644
+index 2dc86ea..72a4316 100644
 --- a/src/tx.cpp
 +++ b/src/tx.cpp
 @@ -22,6 +22,7 @@
@@ -660,7 +755,7 @@ index 2dc86ea..9da4d8c 100644
      if (len <= 0 || len >= (int)sizeof(buf)) return;
      (void)sendto(g_stats_udp_fd, buf, (size_t)len, 0,
                   (const struct sockaddr*)&g_stats_udp_dst,
-@@ -157,10 +165,57 @@ static void stats_udp_emit_tx(uint64_t ts_ms, int interval_ms,
+@@ -157,10 +165,93 @@ static void stats_udp_emit_tx(uint64_t ts_ms, int interval_ms,
  }
  // --- end stats push ---
  
@@ -672,6 +767,15 @@ index 2dc86ea..9da4d8c 100644
 +// arms it. main() calls peek_cfg_init() so the mandatory FEC_CLOSE signal is
 +// seeded even when armed later by command.
 +static peek_cfg_t g_peek_cfg;
++
++// Peek short-tail close (proportional parity, no on-air zero-padding).  When
++// true, peek closes EVERY frame's block via close_block_short() -- cheap enough
++// to run per-frame, restoring full per-frame loss isolation while emitting only
++// p ~ proportional parity instead of padding to k + full n-k parity.  Default
++// false => the threshold-gated full-padding close (backward-compatible; the RX
++// needs the SHORT_TAIL-aware build before this is enabled).  Set by
++// --peek-short-tail.
++static bool g_peek_short_tail = false;
 +
 +// Run one datagram through peek and emit it. Shared by the SHM drain loop and
 +// the UDP recvmsg path so both transports behave identically (and audio/uplink
@@ -700,11 +804,38 @@ index 2dc86ea..9da4d8c 100644
 +
 +    if (o.signals & PEEK_SIG_FEC_CLOSE)
 +    {
-+        // Close the block on the access-unit boundary. Enqueue order matters:
-+        // the marked fragment is already in (above), so parity covers it.
-+        while (t->send_packet(NULL, 0, WFB_PACKET_FEC_ONLY));
-+        if (fec_timeout > 0) fec_close_ts = get_time_ms() + fec_timeout;
-+        count_peek_closes += 1;
++        if (g_peek_short_tail)
++        {
++            // Short-tail close: proportional parity, no on-air zero-padding.
++            // Cheap enough to run on EVERY frame, so no k/2 gate -- this restores
++            // full per-frame loss isolation that the gate gave up.  close_block_short
++            // is a no-op when no block is open (returns false).
++            if (t->close_block_short())
++            {
++                if (fec_timeout > 0) fec_close_ts = get_time_ms() + fec_timeout;
++                count_peek_closes += 1;
++            }
++        }
++        else
++        {
++            // Threshold-gate the per-frame block close.  Closing a near-empty block
++            // zero-pads it to k ON-AIR and emits full n-k parity (see send_packet
++            // FEC_ONLY path), so a P-frame-heavy 60/120fps stream would put ~fec_n
++            // packets on air per frame regardless of payload — overflowing the TX
++            // ring.  Only honor the close once the block holds a worthwhile fraction
++            // of k; smaller frames carry into the next block (it still auto-closes
++            // at k, and tiny-frame loss isolation is cheap).
++            // NOTE: verify-stage fixed threshold (k/2); #2 turns this into a knob.
++            int k = t->block_k();
++            if (k <= 0 || (int)t->block_fill() * 2 >= k)
++            {
++                // Enqueue order matters: the marked fragment is already in (above),
++                // so parity covers it.
++                while (t->send_packet(NULL, 0, WFB_PACKET_FEC_ONLY));
++                if (fec_timeout > 0) fec_close_ts = get_time_ms() + fec_timeout;
++                count_peek_closes += 1;
++            }
++        }
 +    }
 +    return true;
 +}
@@ -718,7 +849,7 @@ index 2dc86ea..9da4d8c 100644
      encrypt_data(true),     /* AEAD on by default; -x disables per-fragment AEAD */
      epoch(epoch),
      channel_id(channel_id),
-@@ -311,6 +366,8 @@ RawSocketTransmitter::RawSocketTransmitter(int k, int n, const string &keypair,
+@@ -311,6 +402,8 @@ RawSocketTransmitter::RawSocketTransmitter(int k, int n, const string &keypair,
      current_output(0),
      ieee80211_seq(0),
      radiotap_header(radiotap_header),
@@ -727,7 +858,7 @@ index 2dc86ea..9da4d8c 100644
      frame_type(frame_type),
      use_qdisc(use_qdisc),
      fwmark_base(fwmark_base),
-@@ -318,6 +375,8 @@ RawSocketTransmitter::RawSocketTransmitter(int k, int n, const string &keypair,
+@@ -318,6 +411,8 @@ RawSocketTransmitter::RawSocketTransmitter(int k, int n, const string &keypair,
      inject_retries(inject_retries),
      inject_retry_delay(inject_retry_delay)
  {
@@ -736,7 +867,7 @@ index 2dc86ea..9da4d8c 100644
      for(auto it=wlans.begin(); it!=wlans.end(); it++)
      {
          int fd = socket(PF_PACKET, SOCK_RAW, 0);
-@@ -363,6 +422,27 @@ RawSocketTransmitter::RawSocketTransmitter(int k, int n, const string &keypair,
+@@ -363,6 +458,27 @@ RawSocketTransmitter::RawSocketTransmitter(int k, int n, const string &keypair,
      }
  }
  
@@ -764,7 +895,7 @@ index 2dc86ea..9da4d8c 100644
  void RawSocketTransmitter::inject_packet(const uint8_t *buf, size_t size)
  {
      assert(size <= MAX_FORWARDER_PACKET_SIZE);
-@@ -384,11 +464,17 @@ void RawSocketTransmitter::inject_packet(const uint8_t *buf, size_t size)
+@@ -384,11 +500,17 @@ void RawSocketTransmitter::inject_packet(const uint8_t *buf, size_t size)
      ieee_hdr[FRAME_SEQ_HB] = (ieee80211_seq >> 8) & 0xff;
      ieee80211_seq += 16;
  
@@ -784,7 +915,29 @@ index 2dc86ea..9da4d8c 100644
              },
              // ieee80211 header
              { .iov_base = (void*)ieee_hdr,
-@@ -781,6 +867,11 @@ bool Transmitter::send_packet(const uint8_t *buf, size_t size, uint8_t flags)
+@@ -729,7 +851,7 @@ void RemoteTransmitter::dump_stats(uint64_t ts, uint32_t &injected_packets, uint
+ 
+ 
+ 
+-void Transmitter::send_block_fragment(size_t packet_size)
++void Transmitter::send_block_fragment(size_t packet_size, bool short_tail)
+ {
+     uint8_t ciphertext[MAX_FORWARDER_PACKET_SIZE];
+     wblock_hdr_t *block_hdr = (wblock_hdr_t*)ciphertext;
+@@ -741,7 +863,11 @@ void Transmitter::send_block_fragment(size_t packet_size)
+     // still dedupe by (block_idx, fragment_idx) and FEC decoding keeps
+     // working identically.
+     block_hdr->packet_type = encrypt_data ? WFB_PACKET_DATA : WFB_PACKET_DATA_PLAIN;
+-    block_hdr->data_nonce = htobe64(((block_idx & BLOCK_IDX_MASK) << 8) + fragment_idx);
++    uint64_t data_nonce = ((block_idx & BLOCK_IDX_MASK) << 8) + fragment_idx;
++    // SHORT_TAIL marker rides the always-zero top bit; it is authenticated as
++    // part of the AEAD nonce/AAD below.
++    if (short_tail) data_nonce |= WFB_NONCE_SHORT_TAIL;
++    block_hdr->data_nonce = htobe64(data_nonce);
+ 
+     if (encrypt_data)
+     {
+@@ -781,6 +907,11 @@ bool Transmitter::send_packet(const uint8_t *buf, size_t size, uint8_t flags)
          return false;
      }
  
@@ -796,7 +949,7 @@ index 2dc86ea..9da4d8c 100644
      wpacket_hdr_t *packet_hdr = (wpacket_hdr_t*)block[fragment_idx];
  
      packet_hdr->flags = flags;
-@@ -800,6 +891,10 @@ bool Transmitter::send_packet(const uint8_t *buf, size_t size, uint8_t flags)
+@@ -800,6 +931,10 @@ bool Transmitter::send_packet(const uint8_t *buf, size_t size, uint8_t flags)
          set_mark(0);
      }
  
@@ -807,7 +960,7 @@ index 2dc86ea..9da4d8c 100644
      send_block_fragment(sizeof(wpacket_hdr_t) + size);
      max_packet_size = max(max_packet_size, sizeof(wpacket_hdr_t) + size);
      fragment_idx += 1;
-@@ -812,6 +907,10 @@ bool Transmitter::send_packet(const uint8_t *buf, size_t size, uint8_t flags)
+@@ -812,6 +947,10 @@ bool Transmitter::send_packet(const uint8_t *buf, size_t size, uint8_t flags)
      // mark fec packets with fwmark + 1
      set_mark(1);
  
@@ -818,7 +971,89 @@ index 2dc86ea..9da4d8c 100644
      while (fragment_idx < fec_n)
      {
          if(fec_delay > 0)
-@@ -902,6 +1001,8 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
+@@ -847,6 +986,81 @@ bool Transmitter::send_packet(const uint8_t *buf, size_t size, uint8_t flags)
+     return true;
+ }
+ 
++bool Transmitter::close_block_short(void)
++{
++    int j = fragment_idx;
++    if (j <= 0)      return false;   // no block open
++    if (j >= fec_k)  return false;   // full block: caller should let send_packet close it
++
++    // Canonical pad bytes for slots [j, k): flags=FEC_ONLY, packet_size=0, zero
++    // payload.  Must be BYTE-IDENTICAL to what the RX synthesizes for [j+1, k)
++    // (and to slot j, which we transmit as the marker) so the RS math matches.
++    for (int i = j; i < fec_k; i++)
++    {
++        wpacket_hdr_t *h = (wpacket_hdr_t*)block[i];
++        h->flags = WFB_PACKET_FEC_ONLY;
++        h->packet_size = htobe16(0);
++        memset(block[i] + sizeof(wpacket_hdr_t), '\0', MAX_FEC_PAYLOAD - sizeof(wpacket_hdr_t));
++    }
++    max_packet_size = max(max_packet_size, sizeof(wpacket_hdr_t));
++
++    // Transmit ONLY the boundary marker (slot j) on-air, with the SHORT_TAIL
++    // bit set.  Its fragment_idx == j tells RX where real data ends.  Ride it at
++    // the block's toughest PROTECT level (like parity) so the signal is at least
++    // as robust as the data it bounds.  Slots [j+1, k) are NOT transmitted.
++    set_mark(0);
++    apply_tx_level(0, true, false);
++    fragment_idx = j;
++    send_block_fragment(sizeof(wpacket_hdr_t), /*short_tail=*/true);
++
++    // Compute the FULL parity set into block[k .. n) (the codec is all-or-
++    // nothing), then transmit only the first p of them.  Parity fragment i
++    // carries check-block id k+i, so the first p form a valid contiguous subset.
++    zfex_status_code_t _rc = fec_encode_simd(fec_p, (const uint8_t**)block, block + fec_k, ZFEX_ROUND_UP_SIMD(max_packet_size));
++    assert(_rc == ZFEX_SC_OK);
++
++    int parity_total = fec_n - fec_k;
++    // p = round(j*(n-k)/k), integer round-half-up, clamped to [1, n-k].
++    int p = (parity_total > 0) ? ((j * parity_total + fec_k / 2) / fec_k) : 0;
++    if (parity_total > 0 && p < 1) p = 1;
++    if (p > parity_total) p = parity_total;
++
++    set_mark(1);
++    apply_tx_level(0, true, false);   // parity at block_max_level (Option A)
++
++    for (int i = 0; i < p; i++)
++    {
++        if (fec_delay > 0)
++        {
++            struct timespec t = { .tv_sec = (time_t)(fec_delay / 1000000),
++                                  .tv_nsec = (suseconds_t)(fec_delay % 1000000) * 1000 };
++            int rc = clock_nanosleep(CLOCK_MONOTONIC, 0, &t, NULL);
++            if(rc != 0 && rc != EINTR)
++            {
++                throw runtime_error(string_format("clock_nanosleep: %s", strerror(rc)));
++            }
++        }
++        fragment_idx = fec_k + i;
++        send_block_fragment(max_packet_size);
++    }
++
++    block_idx += 1;
++    fragment_idx = 0;
++    max_packet_size = 0;
++
++    // Generate new session key after MAX_BLOCK_IDX blocks (mirror send_packet).
++    if (block_idx > MAX_BLOCK_IDX)
++    {
++        init_session(fec_k, fec_n);
++        for(int i = 0; i < fec_n - fec_k + 1; i++)
++        {
++            send_session_key();
++        }
++    }
++
++    return true;
++}
++
+ // Extract SO_RXQ_OVFL counter
+ uint32_t extract_rxq_overflow(struct msghdr *msg)
+ {
+@@ -902,6 +1116,8 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
      uint32_t count_b_injected = 0;  // successfully injected bytes (include additional fec packets)
      uint32_t count_p_dropped = 0;   // dropped due to rxq overflows or injection timeout
      uint32_t count_p_truncated = 0; // injected large packets that were truncated
@@ -827,7 +1062,7 @@ index 2dc86ea..9da4d8c 100644
      int start_fd_idx = 0;
  
      // --- SHM ring attach (non-fatal: retry loop handles producer lifecycle) ---
-@@ -1033,7 +1134,11 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
+@@ -1033,7 +1249,11 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
                                    count_p_dropped, count_p_truncated,
                                    count_p_fec_timeouts,
                                    fec_k_now, fec_n_now,
@@ -840,7 +1075,7 @@ index 2dc86ea..9da4d8c 100644
              }
  
              if(count_p_dropped)
-@@ -1046,6 +1151,12 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
+@@ -1046,6 +1266,12 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
                  WFB_ERR("%u packets truncated\n", count_p_truncated);
              }
  
@@ -853,7 +1088,7 @@ index 2dc86ea..9da4d8c 100644
              count_p_fec_timeouts = 0;
              count_p_incoming = 0;
              count_b_incoming = 0;
-@@ -1053,6 +1164,8 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
+@@ -1053,6 +1279,8 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
              count_b_injected = 0;
              count_p_dropped = 0;
              count_p_truncated = 0;
@@ -862,7 +1097,7 @@ index 2dc86ea..9da4d8c 100644
  
              log_send_ts = cur_ts + log_interval - ((cur_ts - log_send_ts) % log_interval);
          }
-@@ -1227,6 +1340,56 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
+@@ -1227,6 +1455,56 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
                  }
                  break;
  
@@ -919,7 +1154,7 @@ index 2dc86ea..9da4d8c 100644
                  default:
                  {
                      resp.rc = htonl(ENOTSUP);
-@@ -1346,7 +1509,8 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
+@@ -1346,7 +1624,8 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
                      session_key_announce_ts = cur_ts + SESSION_KEY_ANNOUNCE_MSEC;
                  }
  
@@ -929,7 +1164,7 @@ index 2dc86ea..9da4d8c 100644
  
                  if (cur_ts >= log_send_ts)
                  {
-@@ -1482,7 +1646,8 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
+@@ -1482,7 +1761,8 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
                          session_key_announce_ts = cur_ts + SESSION_KEY_ANNOUNCE_MSEC;
                      }
  
@@ -939,7 +1174,7 @@ index 2dc86ea..9da4d8c 100644
  
                      if (cur_ts >= log_send_ts)  // log timeout expired
                      {
-@@ -2161,8 +2326,37 @@ int main(int argc, char * const *argv)
+@@ -2161,8 +2441,42 @@ int main(int argc, char * const *argv)
      int encrypt_data = 1;           // -x (no-AEAD flag) flips to 0
      const char *stats_udp_target = NULL;  // -Y host:port; NULL = disabled
  
@@ -947,10 +1182,11 @@ index 2dc86ea..9da4d8c 100644
 +    // NAL-aware peek: seed the mandatory FEC_CLOSE signal; profile/rules below
 +    // arm it. Left disabled unless --peek-profile / --peek-rule says otherwise.
 +    peek_cfg_init(&g_peek_cfg);
-+    enum { OPT_PEEK_PROFILE = 0x100, OPT_PEEK_RULE };
++    enum { OPT_PEEK_PROFILE = 0x100, OPT_PEEK_RULE, OPT_PEEK_SHORT_TAIL };
 +    static struct option peek_longopts[] = {
-+        {"peek-profile", required_argument, NULL, OPT_PEEK_PROFILE},
-+        {"peek-rule",    required_argument, NULL, OPT_PEEK_RULE},
++        {"peek-profile",    required_argument, NULL, OPT_PEEK_PROFILE},
++        {"peek-rule",       required_argument, NULL, OPT_PEEK_RULE},
++        {"peek-short-tail", no_argument,       NULL, OPT_PEEK_SHORT_TAIL},
 +        {NULL, 0, NULL, 0}
 +    };
 +
@@ -975,14 +1211,47 @@ index 2dc86ea..9da4d8c 100644
 +            break;
 +        }
 +
++        case OPT_PEEK_SHORT_TAIL:
++            g_peek_short_tail = true;
++            break;
++
          case 'I':
              tx_mode = INJECTOR;
              srv_port = atoi(optarg);
+@@ -2337,6 +2651,12 @@ int main(int argc, char * const *argv)
+             WFB_INFO("\nAEAD option:\n"
+                      "  -x   disable per-fragment AEAD (emit WFB_PACKET_DATA_PLAIN; session still signed).\n"
+                      "       RX must run with -x too or DATA_PLAIN packets are dropped.\n");
++            WFB_INFO("\nPeek options:\n"
++                     "  --peek-profile <off|idr|refpred|idr+refpred>  arm NAL-aware peek (default off)\n"
++                     "  --peek-rule <spec>                            add/override one granular peek rule\n"
++                     "  --peek-short-tail                             close each frame's block with\n"
++                     "       proportional parity + no on-air zero-padding (SHORT_TAIL marker).  Needs a\n"
++                     "       SHORT_TAIL-aware RX.  Default off => threshold-gated full-padding close.\n");
+             WFB_INFO("Default: K='%s', k=%d, n=%d, fec_delay=%u [us], udp_port=%d, link_id=0x%06x, radio_port=%u, epoch=%" PRIu64 ", bandwidth=%d guard_interval=%s stbc=%d ldpc=%d mcs_index=%d vht_nss=%d, vht_mode=%d, fec_timeout=%d, log_interval=%d, rcv_buf=system_default, snd_buf=system_default, frame_type=data, mirror=false, use_qdisc=false, fwmark=%u, control_port=%d, inject_retries=%u, inject_retry_delay=%u, aead=%s\n",
+                      keypair.c_str(), k, n, fec_delay, udp_port, link_id, radio_port, epoch, bandwidth, short_gi ? "short" : "long", stbc, ldpc, mcs_index, vht_nss, vht_mode, fec_timeout, log_interval, fwmark, control_port, inject_retries, inject_retry_delay, encrypt_data ? "on" : "off");
+             WFB_INFO("Radio MTU: %lu\n", (unsigned long)MAX_PAYLOAD_SIZE);
 diff --git a/src/tx.hpp b/src/tx.hpp
-index e7a2cdc..a994aa7 100644
+index e7a2cdc..92303a4 100644
 --- a/src/tx.hpp
 +++ b/src/tx.hpp
-@@ -90,9 +90,21 @@ public:
+@@ -77,6 +77,15 @@ public:
+     bool send_packet(const uint8_t *buf, size_t size, uint8_t flags);
+     void send_session_key(void);
+     void init_session(int k, int n);
++    // Close the currently-open block as a SHORT block: transmit one boundary
++    // marker fragment (FEC_ONLY, SHORT_TAIL nonce bit, fragment_idx == j) plus
++    // p = round(j*(n-k)/k) proportional parity, WITHOUT zero-padding slots
++    // [j+1, k) on-air.  RX reads j from the marker and synthesizes [j+1, k)
++    // locally.  This is the airtime-cheap replacement for the peek per-frame
++    // FEC_CLOSE (which pads to k on-air + full n-k parity).  No-op + returns
++    // false if no block is open (fragment_idx == 0) or it is already full
++    // (fragment_idx == fec_k).  Returns true if a short block was emitted.
++    bool close_block_short(void);
+     // Per-fragment AEAD is toggled via the -x CLI flag at startup (there is
+     // no wfb_cmd for this — switching mid-session would invalidate the RX's
+     // current session state and require a re-handshake the protocol doesn't
+@@ -90,14 +99,35 @@ public:
      virtual void dump_stats(uint64_t ts, uint32_t &injected_packets, uint32_t &dropped_packets, uint32_t &injected_bytes) = 0;
      virtual void update_radiotap_header(radiotap_header_t &radiotap_header) = 0;
      virtual radiotap_header_t get_radiotap_header(void) = 0;
@@ -990,6 +1259,13 @@ index e7a2cdc..a994aa7 100644
 +    // send_packet (0 = base MCS). Consumed and reset to 0 each send_packet, so
 +    // a caller that never sets it gets base-rate transmission unchanged.
 +    void set_tx_level(uint8_t level) { tx_level = level; }
++    // Current open-block fill (data fragments enqueued this block, 0..fec_k) and
++    // the live RS k.  peek_emit reads these to threshold-gate the per-frame
++    // FEC_CLOSE: closing a near-empty block zero-pads it to k on-air + full
++    // n-k parity (see send_packet FEC_ONLY path), which on a P-frame-heavy
++    // 60/120fps stream inflates the on-air packet rate severalfold.
++    uint8_t block_fill() const { return fragment_idx; }
++    int     block_k()    const { return fec_k; }
  protected:
      virtual void inject_packet(const uint8_t *buf, size_t size) = 0;
      virtual void set_mark(uint32_t idx) = 0;
@@ -1004,7 +1280,15 @@ index e7a2cdc..a994aa7 100644
  
  private:
      Transmitter(const Transmitter&);
-@@ -107,6 +119,7 @@ private:
+     Transmitter& operator=(const Transmitter&);
+-    void send_block_fragment(size_t packet_size);
++    // short_tail sets the WFB_NONCE_SHORT_TAIL bit on the data_nonce (used only
++    // by close_block_short for the boundary marker fragment).
++    void send_block_fragment(size_t packet_size, bool short_tail = false);
+     void deinit_session(void);
+ 
+     fec_t* fec_p;
+@@ -107,6 +137,7 @@ private:
      uint8_t fragment_idx;
      uint8_t** block;
      size_t max_packet_size;
@@ -1012,7 +1296,7 @@ index e7a2cdc..a994aa7 100644
      // Per-fragment AEAD (startup-only, no runtime command).  True = ChaCha20-
      // Poly1305 on each data fragment; false = plaintext with a
      // WFB_PACKET_DATA_PLAIN header (skips encrypt + 16 B tag on wire).
-@@ -182,6 +195,7 @@ public:
+@@ -182,6 +213,7 @@ public:
      virtual void update_radiotap_header(radiotap_header_t &radiotap_header)
      {
          this->radiotap_header = radiotap_header;
@@ -1020,7 +1304,7 @@ index e7a2cdc..a994aa7 100644
      }
  
      virtual radiotap_header_t get_radiotap_header(void)
-@@ -197,6 +211,23 @@ private:
+@@ -197,6 +229,23 @@ private:
          fwmark = fwmark_base + idx;
      }
  
@@ -1044,7 +1328,7 @@ index e7a2cdc..a994aa7 100644
      const uint32_t channel_id;
      int current_output;
      uint16_t ieee80211_seq;
-@@ -204,6 +235,11 @@ private:
+@@ -204,6 +253,11 @@ private:
      std::map<int, uint32_t> fd_fwmarks;
      tx_antenna_stat_t antenna_stat;
      radiotap_header_t radiotap_header;
@@ -1199,3 +1483,24 @@ index a992d0d..f78e155 100644
 +        } __attribute__ ((packed)) cmd_get_peek;
      } __attribute__ ((packed)) u;
  } __attribute__ ((packed)) cmd_resp_t;
+diff --git a/src/wifibroadcast.hpp b/src/wifibroadcast.hpp
+index 0d746d3..b341a60 100644
+--- a/src/wifibroadcast.hpp
++++ b/src/wifibroadcast.hpp
+@@ -185,6 +185,16 @@ static const uint8_t ieee80211_header[] __attribute__((unused)) = {
+ #define BLOCK_IDX_MASK ((1LLU << 56) - 1)
+ #define MAX_BLOCK_IDX ((1LLU << 55) - 1)
+ 
++// data_nonce SHORT_TAIL marker (top bit, bit 63).  block_idx <= MAX_BLOCK_IDX
++// (2^55-1) so (block_idx << 8) never reaches bit 63 -- it is always 0 on the
++// wire today, which makes it a safe, backward-distinguishable flag.  Set by the
++// TX peek short-close on the single boundary fragment at index j (the first pad
++// slot) to tell the RX "real data ends here; synthesize slots [j+1, k) as
++// canonical FEC_ONLY zero-pad" instead of receiving them on-air.  The bit is
++// part of the AEAD AAD (the whole nonce), so it is authenticated for free.
++// RX must mask it off before computing block_idx.
++#define WFB_NONCE_SHORT_TAIL (1ULL << 63)
++
+ // packet types
+ #define WFB_PACKET_DATA          0x1
+ #define WFB_PACKET_SESSION       0x2
