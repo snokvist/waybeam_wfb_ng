@@ -72,7 +72,40 @@ function rebuildBands() {
 
 /* ---- charts ---- */
 const stepped = uPlot.paths.stepped({ align: 1 });
+const bars = uPlot.paths.bars({ size: [1.0, Infinity], align: 1 });
 const axisColor = "#8b949e";
+
+// MCS rung colours: warm/low = degraded or peek-protected rungs, cool/high =
+// healthy bulk (M5 matches the existing blue). Index = MCS index.
+const MCS_COLORS = ["#f85149", "#db6d28", "#d29922", "#bf8700",
+                    "#3fb950", "#58a6ff", "#388bfd", "#1f6feb"];
+
+// Build a stacked-bar dataset from per-rung packet counts. uPlot has no native
+// stacking, so we emit CUMULATIVE heights (bottom=M0 … top=M7) and draw rungs
+// back-to-front (tallest cumulative first) — each opaque bar over-paints the
+// one below, leaving each rung's own segment visible. Fixed 8 rungs so the
+// series count never changes between live polls.
+function mcsStack(t, dist) {
+  const N = t.length;
+  const seg = [];
+  for (let m = 0; m < 8; m++) {
+    const a = dist && dist[String(m)];
+    seg[m] = a && a.length === N ? a : new Array(N).fill(0);
+  }
+  const cum = [];
+  for (let m = 0; m < 8; m++) {
+    cum[m] = new Array(N);
+    for (let i = 0; i < N; i++)
+      cum[m][i] = (m === 0 ? 0 : cum[m - 1][i]) + (+seg[m][i] || 0);
+  }
+  const data = [t], series = [{}];
+  for (let m = 7; m >= 0; m--) {            // top → bottom = draw back → front
+    data.push(cum[m]);
+    series.push({ label: `M${m}`, scale: "pkts", stroke: MCS_COLORS[m],
+                  fill: MCS_COLORS[m], paths: bars, points: { show: false } });
+  }
+  return { data, series };
+}
 
 function makeChart(el, title, series, data, scales, axes) {
   const opts = {
@@ -230,7 +263,7 @@ function applySeries(j) {
     ` · ${j.n} records · model ${j.model_ver || "(none scored)"}`;
   CHARTS[0].setData([t, S.rssi_comb, S.snr_avg], true);
   CHARTS[1].setData([t, S.per, S.pkt_lost], true);
-  CHARTS[2].setData([t, S.mcs, S.tier1_state], true);
+  CHARTS[2].setData(mcsStack(t, j.mcs_dist).data, true);
   STATE_BANDS = stateBands(t, S.tier1_state);
   rebuildBands();
 }
@@ -282,12 +315,12 @@ async function main() {
       [t, S.per, S.pkt_lost], { per: { range: [0, 1] }, cnt: {} },
       [{ scale: "per", stroke: axisColor, grid: { stroke: "#21262d" } },
        { scale: "cnt", side: 1, stroke: axisColor, grid: { show: false } }]),
-    makeChart(mk(), "MCS / Tier-1 state",
-      [{}, { label: "mcs", scale: "mcs", stroke: C.mcs, paths: stepped },
-           { label: "tier1_state", scale: "state", stroke: C.tier1, paths: stepped }],
-      [t, S.mcs, S.tier1_state], { mcs: {}, state: { range: [-0.2, 2.2] } },
-      [{ scale: "mcs", stroke: axisColor, grid: { stroke: "#21262d" } },
-       { scale: "state", side: 1, stroke: axisColor, grid: { show: false } }]),
+    (() => {
+      const st = mcsStack(t, j.mcs_dist);
+      return makeChart(mk(), "MCS distribution (rx pkts / 100 ms, stacked)",
+        st.series, st.data, { pkts: {} },
+        [{ scale: "pkts", stroke: axisColor, grid: { stroke: "#21262d" } }]);
+    })(),
   ];
 
   let raf;

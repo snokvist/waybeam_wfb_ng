@@ -97,6 +97,25 @@ def api_series(sid: int):
         series[c] = [r[c] for r in rows]            # may contain nulls (e.g. snr_avg)
     series["tier1_state"] = [tier1.get(r["id"]) for r in rows]
 
+    # Per-received-MCS packet counts per record, for a stacked-bar view of the
+    # MCS mix over time (a single mcs line can't show bulk-vs-protected split).
+    # Diversity antennas repeat the same packet set, so the count at a rung is
+    # the MAX pkts across ant entries at that rung, not their sum. Fixed 0..7
+    # rung set keeps the series count stable across live polls.
+    mcs_dist = {str(m): [0] * len(rows) for m in range(8)}
+    for i, r in enumerate(rows):
+        try:
+            ants = json.loads(r["raw_json"]).get("ant", [])
+        except (ValueError, TypeError):
+            continue
+        best: dict[int, int] = {}
+        for a in ants:
+            m, p = a.get("mcs"), a.get("pkts", 0)
+            if isinstance(m, int) and 0 <= m < 8 and p > best.get(m, 0):
+                best[m] = p
+        for m, p in best.items():
+            mcs_dist[str(m)][i] = p
+
     # overlay spans converted to x-seconds for the chart's band plugin
     overlays = [{"x0": (h["t0_ms"] - t0) / 1000.0,
                  "x1": (h["t1_ms"] - t0) / 1000.0,
@@ -104,7 +123,7 @@ def api_series(sid: int):
                 for h in human]
 
     return app.response_class(
-        json.dumps({"series": series, "overlays": overlays,
+        json.dumps({"series": series, "overlays": overlays, "mcs_dist": mcs_dist,
                     "model_ver": model_ver, "n": len(rows)}),
         mimetype="application/json")
 
