@@ -493,6 +493,17 @@ def main() -> None:
     ap.add_argument("--debug", action="store_true")
     args = ap.parse_args()
     app.config["DB"] = args.db
+    # Ensure the DB exists with schema before serving. sqlite creates an empty
+    # file on first connect, but connect() does NOT run schema.sql — so a
+    # missing/fresh DB (e.g. the live file was rotated or never initialised)
+    # would 500 on the first SELECT in list_sessions(). init_db is idempotent
+    # (schema.sql is all CREATE ... IF NOT EXISTS), so this is a no-op on a
+    # populated store and yields an empty-but-valid UI on a fresh one.
+    _seed = store.connect(args.db)
+    try:
+        store.init_db(_seed)
+    finally:
+        _seed.close()
     app.run(host=args.host, port=args.port, debug=args.debug)
 
 
