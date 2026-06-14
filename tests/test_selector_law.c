@@ -167,6 +167,53 @@ int main(void)
 	CHECK(s.pressure_since_us == 0, "pressure timer clears when in_pressure drops");
 	CHECK(d == SD_DOWN, "probe-fail demote resumes once pressure clears");
 
+	printf("[hard flap-freeze — 2-rung trap]\n");
+	/* Reproduce the mcs_max==mcs_min+1 trap: every promote back into the top
+	 * rung re-fails on its own retune burst. Defaults: flap_freeze_count 3,
+	 * window 6 s, hold 10 s. Drive 3 fast re-demotes FROM rung 1 (simulating
+	 * the promote-back between them by resetting current_mcs) and confirm the
+	 * freeze latches on the 3rd. */
+	cfg.mcs.mcs_min = 0;
+	cfg.mcs.mcs_max = 1;
+	mk_sel(&s, 1);
+	(void)selector_commit(&s, &cfg, 0, BASE,                SD_DOWN, &out);
+	CHECK(s.flap_freeze_mcs < 0, "1st re-demote does not yet freeze");
+	s.current_mcs = 1;
+	(void)selector_commit(&s, &cfg, 0, BASE + 1 * SEC_US,   SD_DOWN, &out);
+	CHECK(s.flap_freeze_mcs < 0, "2nd re-demote does not yet freeze");
+	s.current_mcs = 1;
+	(void)selector_commit(&s, &cfg, 0, BASE + 2 * SEC_US,   SD_DOWN, &out);
+	CHECK(s.flap_freeze_mcs == 1 && s.flap_demote_streak == 3,
+	      "3rd fast re-demote latches the freeze on rung 1");
+
+	/* Frozen: a clean, FRESH V+2 probe that WOULD promote 0->1 is refused; the
+	 * lower rung is held. Park last_change far back so dwell can't be the
+	 * blocker, and stamp the probe at the call time so staleness can't be it
+	 * either — the freeze is the only thing standing in the way. */
+	s.current_mcs = 0; s.last_change_us = BASE - 10 * SEC_US;
+	sc = mk_score(-40, 0, 0.0f); mk_probe(&pr, 2, 0);
+	pr.rung[2].last_us = BASE + 2 * SEC_US; pr.last_any_us = BASE + 2 * SEC_US;
+	out = -1; d = selector_update(&s, &cfg, &sc, &pr, false, BASE + 2 * SEC_US, &out);
+	CHECK(d == SD_NONE, "clean-probe promote is BLOCKED while frozen (holds lower rung)");
+
+	/* After flap_freeze_s the freeze lifts and the (fresh) probe may climb. */
+	s.current_mcs = 0; s.last_change_us = BASE - 10 * SEC_US;
+	sc = mk_score(-40, 0, 0.0f); mk_probe(&pr, 2, 0);
+	pr.rung[2].last_us = BASE + 13 * SEC_US; pr.last_any_us = BASE + 13 * SEC_US;
+	out = -1; d = selector_update(&s, &cfg, &sc, &pr, false, BASE + 13 * SEC_US, &out);
+	CHECK(d == SD_UP && out == 1, "freeze lifts after flap_freeze_s -> promote resumes");
+
+	/* A real walk-away degrade steps down through DIFFERENT rungs (5->4->3...),
+	 * even rapidly — the same-rung requirement keeps the streak at 1, so a
+	 * genuine cascade never trips the freeze. */
+	cfg.mcs.mcs_max = 5;
+	mk_sel(&s, 5);
+	(void)selector_commit(&s, &cfg, 4, BASE,                SD_DOWN, &out);
+	(void)selector_commit(&s, &cfg, 3, BASE + 1 * SEC_US,   SD_DOWN, &out);
+	(void)selector_commit(&s, &cfg, 2, BASE + 2 * SEC_US,   SD_DOWN, &out);
+	CHECK(s.flap_freeze_mcs < 0 && s.flap_demote_streak == 1,
+	      "multi-rung walk-away cascade does NOT freeze (different rungs)");
+
 	printf("\n%s (%d failure%s)\n", g_fail ? "FAILED" : "PASSED",
 	       g_fail, g_fail == 1 ? "" : "s");
 	return g_fail ? 1 : 0;

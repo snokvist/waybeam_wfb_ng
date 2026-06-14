@@ -391,6 +391,18 @@ typedef struct {
 		 * instead of promote_dwell_s. */
 		float    reentry_backoff_s; /* flap-guard window (0 = off)          */
 		float    reentry_dwell_s;   /* dwell for re-entry into failed rung  */
+		/* Hard flap-freeze (promote-side backstop on top of the soft
+		 * reentry dwell above). When a rung is re-demoted from
+		 * flap_freeze_count times in a row, each within flap_freeze_window_s
+		 * of the last, the controller PINS the rung below and refuses to
+		 * re-promote into the offending rung for flap_freeze_s. Unlike the
+		 * reentry dwell (which only stretches the period), this stops the
+		 * oscillation outright — for the 2-rung [min,min+1] trap where every
+		 * promote triggers a probe-retune burst that re-trips the demote.
+		 * flap_freeze_count == 0 disables it. */
+		int      flap_freeze_count;    /* fast re-demotes to trip (0 = off)  */
+		float    flap_freeze_window_s; /* max spacing between counted demotes*/
+		float    flap_freeze_s;        /* how long to pin the lower rung     */
 		/* Probe producer (Phase 4). Feeder pacing; gated by mcs.enabled
 		 * (probe is mandatory for MCS — no separate live switch) and the
 		 * endpoints themselves are startup-only (--probe/--probe-feed). */
@@ -2694,6 +2706,17 @@ typedef struct {
 	 * Demotes are never delayed by this. */
 	int       flap_guard_mcs;
 	uint64_t  flap_guard_us;
+	/* Hard flap-freeze ("hold the lower rung"). flap_demote_streak counts
+	 * consecutive fast re-demotes from the SAME rung (each within
+	 * flap_freeze_window_s of the last); flap_last_demote_us spaces them.
+	 * Once the streak reaches flap_freeze_count, flap_freeze_mcs latches the
+	 * offending rung and flap_freeze_until_us holds for flap_freeze_s, during
+	 * which any promote that would step into/above flap_freeze_mcs is
+	 * refused — pinning the controller on the rung below. */
+	int       flap_demote_streak;
+	uint64_t  flap_last_demote_us;
+	int       flap_freeze_mcs;
+	uint64_t  flap_freeze_until_us;
 	/* Transport backpressure tracking (anti death-spiral). pressure_since_us
 	 * is the timestamp of the first datagram in the current contiguous
 	 * in_pressure run (0 = not under pressure); the escape fires once it has
@@ -2765,6 +2788,10 @@ static void selector_init(Selector *s)
 	s->fade_streak = 0;
 	s->flap_guard_mcs = -1;
 	s->flap_guard_us = 0;
+	s->flap_demote_streak = 0;
+	s->flap_last_demote_us = 0;
+	s->flap_freeze_mcs = -1;
+	s->flap_freeze_until_us = 0;
 	s->pressure_since_us = 0;
 	s->pressure_escape_count = 0;
 }
@@ -2818,10 +2845,40 @@ static SelectDecision selector_commit(Selector *s, const Config *cfg,
 		if (prev >= 0 && s->current_mcs < prev) {
 			uint64_t backoff_us =
 			    (uint64_t)(cfg->mcs.reentry_backoff_s * 1e6f);
+			int old_guard = s->flap_guard_mcs;
 			if (s->flap_guard_mcs < prev ||
 			    now - s->flap_guard_us > backoff_us)
 				s->flap_guard_mcs = prev;
 			s->flap_guard_us = now;
+
+			/* Hard flap-freeze detection: a demote FROM the same rung
+			 * we already flagged, spaced within flap_freeze_window_s of
+			 * the previous such demote, is one oscillation cycle. A
+			 * wider-spaced or different-rung demote opens a fresh episode
+			 * (streak=1) — this is what separates a fast flap from a slow
+			 * walk-away degrade (whose demotes step through ever-lower
+			 * rungs, many seconds apart). Once the streak reaches
+			 * flap_freeze_count, latch the rung and start the hold. */
+			if (cfg->mcs.flap_freeze_count > 0) {
+				uint64_t win_us =
+				    (uint64_t)(cfg->mcs.flap_freeze_window_s * 1e6f);
+				bool same_rung_fast = (prev == old_guard) &&
+				    s->flap_last_demote_us != 0 &&
+				    now - s->flap_last_demote_us <= win_us;
+				s->flap_demote_streak =
+				    same_rung_fast ? s->flap_demote_streak + 1 : 1;
+				s->flap_last_demote_us = now;
+				if (s->flap_demote_streak >= cfg->mcs.flap_freeze_count) {
+					if (s->flap_freeze_mcs != prev)
+						LOG_MCS("flap-freeze: rung %d re-demoted %dx in a row "
+						    "-> pin MCS %d for %.1fs",
+						    prev, s->flap_demote_streak, prev - 1,
+						    (double)cfg->mcs.flap_freeze_s);
+					s->flap_freeze_mcs = prev;
+					s->flap_freeze_until_us = now +
+					    (uint64_t)(cfg->mcs.flap_freeze_s * 1e6f);
+				}
+			}
 		}
 	}
 	*out_mcs = s->current_mcs;
@@ -2869,7 +2926,10 @@ static SelectDecision selector_tick_no_data(Selector *s, const Config *cfg,
  *                          rssi_floor_hyst_db of hysteresis so promotes
  *                          don't resume on the knife-edge), and promotes
  *                          back into a recently-failed rung wait
- *                          reentry_dwell_s (flap guard).
+ *                          reentry_dwell_s (soft flap guard). A rung
+ *                          re-demoted flap_freeze_count times fast is
+ *                          PINNED out for flap_freeze_s (hard flap-freeze),
+ *                          holding the rung below outright.
  *   5. hold
  * Demotes are FAST (down_cooldown_s, cascade allowed, never delayed by the
  * flap guard); promotes are SLOW (probe-verified per rung, dwell, guards).
@@ -2887,6 +2947,14 @@ static SelectDecision selector_update(Selector *s, const Config *cfg,
 	/* Data is flowing again — clear any watchdog failsafe; the probe will
 	 * climb back up from mcs_min. */
 	if (s->in_failsafe) s->in_failsafe = false;
+
+	/* Lift an expired flap-freeze so the probe may attempt the rung again
+	 * (it re-freezes if it flaps anew). Done here, not in the promote path,
+	 * so the freeze still clears even if probe records stop arriving. */
+	if (s->flap_freeze_mcs >= 0 && now >= s->flap_freeze_until_us) {
+		s->flap_freeze_mcs = -1;
+		s->flap_demote_streak = 0;
+	}
 
 	/* Transport backpressure persistence: track the start of the current
 	 * contiguous in_pressure run (the escape rule keys on how long it has
@@ -2999,6 +3067,15 @@ static SelectDecision selector_update(Selector *s, const Config *cfg,
 				bool promote_guard = fade_sample ||
 				    score->smoothed_rssi <= cfg->mcs.rssi_floor_dbm +
 				                            cfg->mcs.rssi_floor_hyst_db;
+				/* Hard flap-freeze: a rung that oscillated too fast is
+				 * pinned out — refuse to step into/above it until the
+				 * hold expires (held on the rung below). Stronger than
+				 * the reentry-dwell soft guard, which only stretches the
+				 * period. Expiry is handled at the top of selector_update. */
+				if (s->flap_freeze_mcs >= 0 &&
+				    now < s->flap_freeze_until_us &&
+				    s->current_mcs + 1 >= s->flap_freeze_mcs)
+					promote_guard = true;
 				/* Flap guard: re-promoting into/above the rung that
 				 * failed this episode needs the longer re-entry dwell. */
 				float need_dwell = cfg->mcs.promote_dwell_s;
@@ -3108,6 +3185,9 @@ static const TunableDesc TUNABLES[] = {
 	{"mcs.pressure_escape_s",             SUB_MCS, TF_FLOAT, OFF_MCS(pressure_escape_s),             0.0, 30.0,  "backpressure: in_pressure held >= this with clean RF -> promote to drain ring (0 = off)", 1},
 	{"mcs.reentry_backoff_s",             SUB_MCS, TF_FLOAT, OFF_MCS(reentry_backoff_s),             0.0, 120.0, "flap guard: window after a demote during which re-entry needs the longer dwell (0 = off)"},
 	{"mcs.reentry_dwell_s",               SUB_MCS, TF_FLOAT, OFF_MCS(reentry_dwell_s),               0.0, 30.0,  "flap guard: dwell for promoting back into the rung that just failed"},
+	{"mcs.flap_freeze_count",             SUB_MCS, TF_INT,   OFF_MCS(flap_freeze_count),             0, 50,      "flap freeze: fast re-demotes from one rung that pin the rung below (0 = off)", 1},
+	{"mcs.flap_freeze_window_s",          SUB_MCS, TF_FLOAT, OFF_MCS(flap_freeze_window_s),          0.5, 30.0,  "flap freeze: max spacing between counted re-demotes", 1},
+	{"mcs.flap_freeze_s",                 SUB_MCS, TF_FLOAT, OFF_MCS(flap_freeze_s),                 0.0, 120.0, "flap freeze: how long to hold the lower rung once tripped", 1},
 	{"mcs.probe_clean_milli",             SUB_MCS, TF_INT,   OFF_MCS(probe_clean_milli),             0, 1000,    "probe: V+2 PER <= this permille -> promote-eligible"},
 	{"mcs.probe_fail_milli",              SUB_MCS, TF_INT,   OFF_MCS(probe_fail_milli),              0, 1000,    "probe: V+2 PER >= this permille -> pre-emptive demote"},
 	{"mcs.demote_per_milli",              SUB_MCS, TF_INT,   OFF_MCS(demote_per_milli),              0, 1000,    "probe: live video PER >= this permille -> reactive demote"},
@@ -3591,7 +3671,7 @@ static int append_mcs_json(char *buf, size_t cap, size_t pos,
 		"\"in_failsafe\":%s,"
 		"\"rssi_guard\":{\"floor_active\":%s,\"fade_active\":%s},"
 		"\"pressure\":{\"active\":%s,\"held_s\":%.2f,\"escapes\":%u},"
-		"\"flap_guard\":{\"mcs\":%d,\"active\":%s},"
+		"\"flap_guard\":{\"mcs\":%d,\"active\":%s,\"freeze_mcs\":%d,\"frozen\":%s},"
 		"\"commit_count\":%u,\"changes_in_window\":%d,"
 		"\"last_emit_mcs\":%d,\"rx_ant_age_s\":%.3f,"
 		"\"bitrate_lead_s\":%.3f,"
@@ -3614,6 +3694,9 @@ static int append_mcs_json(char *buf, size_t cap, size_t pos,
 		(s->sel->flap_guard_mcs >= 0 && s->sel->flap_guard_us != 0 &&
 		 (double)(now - s->sel->flap_guard_us) / 1e6 <
 		     (double)s->cfg->mcs.reentry_backoff_s) ? "true" : "false",
+		s->sel->flap_freeze_mcs,
+		(s->sel->flap_freeze_mcs >= 0 &&
+		 now < s->sel->flap_freeze_until_us) ? "true" : "false",
 		s->sel->commit_count, s->sel->changes_count,
 		s->last_emit_mcs, rx_age_s,
 		(double)s->cfg->fec.bitrate_lead_s,
@@ -4653,6 +4736,19 @@ static void config_defaults(Config *c)
 	c->mcs.rssi_floor_hyst_db = 6.0f;
 	c->mcs.reentry_backoff_s  = 5.0f;
 	c->mcs.reentry_dwell_s    = 2.0f;
+	/* Hard flap-freeze: 3 re-demotes from the SAME rung (≈2 full oscillation
+	 * cycles), each within 10 s of the last, pins the rung below for 10 s.
+	 * Sized to catch the 2-rung trap (mcs_max one step above mcs_min, where
+	 * every promote re-fails on its own probe-retune burst). The window is
+	 * deliberately wider than the observed flap period (~6.5 s on-device,
+	 * since the soft reentry dwell already stretches each cycle to ~2 s+) so
+	 * the streak actually chains. A real walk-away degrade does NOT trip it:
+	 * those demotes step through DIFFERENT descending rungs, so the
+	 * same-rung requirement resets the streak; a healthy link never
+	 * re-fails a rung at all. */
+	c->mcs.flap_freeze_count    = 3;
+	c->mcs.flap_freeze_window_s = 10.0f;
+	c->mcs.flap_freeze_s        = 10.0f;
 
 	/* CSA: off until --csa-iface is set. */
 	c->csa.enabled = false;
