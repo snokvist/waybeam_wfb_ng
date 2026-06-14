@@ -294,7 +294,8 @@ function applySeries(j) {
   } else {
     CHARTS[0].setData([t, S.rssi_comb, S.snr_avg], true);
     CHARTS[1].setData([t, S.per, S.pkt_lost], true);
-    CHARTS[2].setData(mcsStack(t, j.mcs_dist).data, true);
+    CHARTS[2].setData([t, S.fec_rec, S.pkt_lost], true);
+    CHARTS[3].setData(mcsStack(t, j.mcs_dist).data, true);
   }
   STATE_BANDS = stateBands(t, S.tier1_state);
   rebuildBands();
@@ -382,6 +383,14 @@ async function main() {
         [t, S.per, S.pkt_lost], { per: { range: [0, 1] }, cnt: {} },
         [{ scale: "per", stroke: axisColor, grid: { stroke: "#21262d" } },
          { scale: "cnt", side: 1, stroke: axisColor, grid: { show: false } }]),
+      // FEC-recovered vs lost: the real "is the video healthy" signal.
+      // fec_rec climbing while lost stays ~0 = FEC is absorbing the channel;
+      // lost lifting off zero = under-protection / actual video loss.
+      makeChart(mk(), "FEC recovered / lost (rx pkts / 100 ms)",
+        [{}, { label: "fec_rec", scale: "cnt", stroke: C.snr },
+             { label: "pkt_lost", scale: "cnt", stroke: C.lost }],
+        [t, S.fec_rec, S.pkt_lost], { cnt: {} },
+        [{ scale: "cnt", stroke: axisColor, grid: { stroke: "#21262d" } }]),
       (() => {
         const st = mcsStack(t, j.mcs_dist);
         return makeChart(mk(), "MCS distribution (rx pkts / 100 ms, stacked)",
