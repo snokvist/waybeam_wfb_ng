@@ -527,7 +527,7 @@ select{cursor:pointer;-webkit-appearance:none;appearance:none;background-image:u
       <ul class="ep-list">
         <li><a href="/api/v1/status"  target="_blank" rel="noopener">gs_supervisor /api/v1/status</a> <span class="muted">:80 · tunnels, packet counts, RSSI</span></li>
         <li><a href="/api/v1/tunnels" target="_blank" rel="noopener">gs_supervisor /api/v1/tunnels</a> <span class="muted">full per-tunnel detail</span></li>
-        <li><a id="ep-telemetry" target="_blank" rel="noopener">Telemetry / SQLite WebUI</a> <span class="muted">:8080 · capture sessions, RSSI/SNR/FEC charts</span></li>
+        <li><a id="ep-telemetry" target="_blank" rel="noopener">Telemetry / SQLite WebUI</a> <span class="muted">:8088 · capture sessions, RSSI/SNR/FEC charts</span></li>
       </ul>
     </div>
   </div>
@@ -540,7 +540,7 @@ select{cursor:pointer;-webkit-appearance:none;appearance:none;background-image:u
         <tr><th>Port</th><th>Host</th><th>Service</th></tr>
         <tr><td>8765</td><td>vehicle</td><td>link_controller WebUI / API</td></tr>
         <tr><td>80</td><td>ground</td><td>gs_supervisor WebUI / API (this page)</td></tr>
-        <tr><td>8080</td><td>ground</td><td>telemetry SQLite WebUI (Flask)</td></tr>
+        <tr><td>8088</td><td>ground</td><td>telemetry SQLite WebUI (Flask)</td></tr>
         <tr><td>5600</td><td>ground</td><td>decoded video RTP out (wfb_rx)</td></tr>
       </table>
     </div>
@@ -1244,7 +1244,7 @@ function initEndpoints(){
   box.addEventListener('input', ()=>{ localStorage.setItem('wbVehicleIp', box.value.trim()); epApplyVehicleIp(); });
   epApplyVehicleIp();
   const tel=$('#ep-telemetry');
-  if(tel) tel.href = 'http://'+location.hostname+':8080/';
+  if(tel) tel.href = 'http://'+location.hostname+':8088/';
 }
 
 document.addEventListener('DOMContentLoaded', ()=>{
