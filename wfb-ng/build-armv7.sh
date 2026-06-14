@@ -246,12 +246,6 @@ else
     exit 1
 fi
 
-# Host unit test for the peek engine (pure host code; quick correctness gate).
-if command -v g++ >/dev/null 2>&1; then
-    echo "=== Running host peek unit test ==="
-    g++ -std=gnu++11 -Isrc -o /tmp/test_peek src/test_peek.cpp src/peek.cpp && /tmp/test_peek
-fi
-
 # ── Step 5: Build wfb_tx + wfb_keygen ───────────────────────────────
 
 echo "=== Building wfb_tx ==="

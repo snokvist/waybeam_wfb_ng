@@ -101,17 +101,18 @@
 #define WCMD_KEY_RECORD         15   /* /api/v1/record/{start,stop} */
 
 /*
- * Vehicle wfb_tx NAL-aware peek (link protection) toggles.  These tunnel a
- * wfb_cmd CMD_SET_PEEK into the proxy → vehicle wfb_tx control_port, mirroring
- * the FEC/MCS enable switches above.  Value is binary (1 = on, 0 = off); the
- * proxy sends WFB_PEEK_KEEP for the field not addressed so the two toggles move
- * independently.  PEEK_ENABLED is the master feature switch; PEEK_DROP_ENABLED
- * arms live shedding of droppable (TRAIL_N) frames and is a no-op while the
- * feature is off.  Frame-boundary FEC close is always active when enabled and
- * has no separate toggle.
+ * Vehicle wfb_tx peek (per-frame FEC close) master switch.  Tunnels a wfb_cmd
+ * CMD_SET_PEEK into the proxy → vehicle wfb_tx control_port, mirroring the
+ * FEC/MCS enable switches above.  Value is binary (1 = on, 0 = off).  When on,
+ * wfb_tx closes each video frame's FEC block at the RTP marker (per-frame loss
+ * isolation + tighter delivery timing).
+ *
+ * Key 17 (PEEK_DROP_ENABLED) is RETIRED: the NAL-aware PROTECT/DROP peek modes
+ * were removed.  The number stays reserved so 18/19 keep their wire values; do
+ * not reuse it.
  */
 #define WCMD_KEY_PEEK_ENABLED      16   /* wfb_tx peek enabled (0/1) */
-#define WCMD_KEY_PEEK_DROP_ENABLED 17   /* wfb_tx peek drop_enabled (0/1) */
+/* 17 reserved (was WCMD_KEY_PEEK_DROP_ENABLED) — do not reuse */
 
 /*
  * Logging sync marker — GS → vehicle, for post-walk log time-alignment.

@@ -394,16 +394,12 @@ select{cursor:pointer;-webkit-appearance:none;appearance:none;background-image:u
     <button class="btn-mini btn-stop"  onclick="cmdQuick('mcs_enabled',0)">mcs auto OFF</button>
   </div>
 
-  <!-- NAL-aware peek (link protection): protect/drop droppable frames on the
-       vehicle wfb_tx. peek master switch + live drop-shedding toggle. Detailed
-       rule/threshold control is via Generic WCMD on the Encoder tab. -->
+  <!-- Vehicle peek: per-frame FEC close on wfb_tx. Master on/off switch. -->
   <div class="adaptive-strip">
     <span class="label">Vehicle peek</span>
-    <span class="hint">NAL-aware link protection on wfb_tx: protect key/ref frames (lower MCS) + frame-boundary FEC close. drop sheds throwaway frames live.</span>
+    <span class="hint">Per-frame FEC close on wfb_tx: close each video frame's FEC block at the RTP marker for per-frame loss isolation + tighter delivery timing.</span>
     <button class="btn-mini btn-start" onclick="cmdQuick('peek_enabled',1)">peek ON</button>
     <button class="btn-mini btn-stop"  onclick="cmdQuick('peek_enabled',0)">peek OFF</button>
-    <button class="btn-mini btn-start" onclick="cmdQuick('peek_drop_enabled',1)">drop ON</button>
-    <button class="btn-mini btn-stop"  onclick="cmdQuick('peek_drop_enabled',0)">drop OFF</button>
   </div>
 
   <div class="section">
@@ -476,9 +472,8 @@ select{cursor:pointer;-webkit-appearance:none;appearance:none;background-image:u
             <option value="fec_enabled">fec_enabled</option>
             <option value="mcs_enabled">mcs_enabled</option>
           </optgroup>
-          <optgroup label="vehicle peek (link protection)">
+          <optgroup label="vehicle peek (per-frame FEC close)">
             <option value="peek_enabled">peek_enabled (0/1)</option>
-            <option value="peek_drop_enabled">peek_drop_enabled (0/1)</option>
           </optgroup>
         </select>
         <span></span>
@@ -1043,7 +1038,7 @@ function renderTunnels(ts){
           <dt>fec rec</dt><dd>${s.pkt_fec_recovered||0}</dd>
           <dt>dec_err</dt><dd>${s.pkt_dec_err||0}</dd>
           <dt>antennas</dt><dd>${s.ant_count||0}${s.rssi_best!==undefined?` · best rssi ${s.rssi_best} dBm`:''}</dd>
-          ${(()=>{const h=s.mcs_hist;if(!h)return '';const ks=Object.keys(h).map(Number).sort((a,b)=>b-a);if(!ks.length)return '';const tot=ks.reduce((a,m)=>a+h[m],0)||1;const top=ks[0];const rows=ks.map(m=>{const pct=h[m]*100/tot;const w=Math.min(100,Math.max(pct,1.5));const col=(m===top)?'var(--blue)':'var(--warn)';const p=pct<9.95?pct.toFixed(1):Math.round(pct);return `<div class="mcsrow"><span class="lab">M${m}</span><span class="track"><i style="width:${w.toFixed(1)}%;background:${col}"></i></span><span class="pct" title="${h[m]} pkts">${p}%</span></div>`;}).join('');return `<dt title="received packets per MCS rung, last 10 s — peek PROTECT lands key/param frames on lower rungs (amber)">rx mcs <span class="muted">10s</span></dt><dd><div class="mcsbars">${rows}</div></dd>`;})()}
+          ${(()=>{const h=s.mcs_hist;if(!h)return '';const ks=Object.keys(h).map(Number).sort((a,b)=>b-a);if(!ks.length)return '';const tot=ks.reduce((a,m)=>a+h[m],0)||1;const top=ks[0];const rows=ks.map(m=>{const pct=h[m]*100/tot;const w=Math.min(100,Math.max(pct,1.5));const col=(m===top)?'var(--blue)':'var(--warn)';const p=pct<9.95?pct.toFixed(1):Math.round(pct);return `<div class="mcsrow"><span class="lab">M${m}</span><span class="track"><i style="width:${w.toFixed(1)}%;background:${col}"></i></span><span class="pct" title="${h[m]} pkts">${p}%</span></div>`;}).join('');return `<dt title="received packets per MCS rung, last 10 s">rx mcs <span class="muted">10s</span></dt><dd><div class="mcsbars">${rows}</div></dd>`;})()}
         </dl>
       </div>`;
     } else {

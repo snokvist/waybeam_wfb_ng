@@ -747,7 +747,7 @@ function buildToggleStrips(params) {
 // fields, so they go through /cmd (not /set). Fire-and-flash, like the
 // gs_supervisor "Vehicle peek" + "Encoder quick fires" strips — peek state
 // isn't in /status, so no stateful ON/OFF reflection.
-const WCMD_KEY = { FORCE_IDR: 4, RECORD: 15, PEEK_ENABLED: 16, PEEK_DROP_ENABLED: 17 };
+const WCMD_KEY = { FORCE_IDR: 4, RECORD: 15, PEEK_ENABLED: 16 };
 const WCMD_STATUS = { 0:"OK", 1:"DISABLED", 2:"UNKNOWN_KEY", 3:"KEY_BLOCKED",
   4:"OUT_OF_RANGE", 5:"RATE_LIMITED", 6:"HTTP_ERROR", 7:"BAD_FORMAT", 8:"NOT_PERMITTED" };
 
@@ -770,15 +770,13 @@ function buildCommandStrip() {
   };
   group("peek",   [{text:"ON",  key:WCMD_KEY.PEEK_ENABLED,      val:1},
                    {text:"OFF", key:WCMD_KEY.PEEK_ENABLED,      val:0}]);
-  group("drop",   [{text:"ON",  key:WCMD_KEY.PEEK_DROP_ENABLED, val:1},
-                   {text:"OFF", key:WCMD_KEY.PEEK_DROP_ENABLED, val:0}]);
   group("idr",    [{text:"force", key:WCMD_KEY.FORCE_IDR, val:0}]);
   group("record", [{text:"start", key:WCMD_KEY.RECORD, val:1},
                    {text:"stop",  key:WCMD_KEY.RECORD, val:0}]);
   const hint = document.createElement("span"); hint.className = "hint";
   hint.textContent = "Local WCMD apply (loopback) — same keys the ground sends. "
-    + "peek = NAL-aware link protection on wfb_tx (protect key/ref frames + "
-    + "frame-boundary FEC close); drop sheds throwaway frames live; idr forces a "
+    + "peek = per-frame FEC close on wfb_tx (close each video frame's FEC block "
+    + "at the RTP marker for loss isolation + tighter timing); idr forces a "
     + "keyframe; record toggles the venc DVR. Honours cmd.* policy + the 100 ms "
     + "per-key rate limit.";
   strip.appendChild(hint);

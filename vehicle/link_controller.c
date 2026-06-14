@@ -187,7 +187,7 @@ typedef struct {
 		struct { uint8_t k, n; uint16_t fec_timeout_ms; } set_fec;
 		RadioBody                                          set_radio;
 		struct { uint8_t pad; }                            get_radio;
-		struct { uint8_t enabled, drop_enabled; }          set_peek;
+		struct { uint8_t enabled; }                        set_peek;
 	} u;
 } CmdReq;
 
@@ -197,8 +197,7 @@ typedef struct {
 	union {
 		RadioBody                                          get_radio;
 		struct { uint8_t k, n; uint16_t fec_timeout_ms; } get_fec;
-		struct { uint8_t enabled, drop_enabled, n_rules, n_sig_rules,
-		         base_mcs, max_delta; }                    get_peek;
+		struct { uint8_t enabled; }                        get_peek;
 	} u;
 } CmdResp;
 #pragma pack(pop)
@@ -1375,16 +1374,14 @@ static int wfb_stats_handle_datagram(const char *body,
 		    drops, trunc);
 	}
 
-	/* NAL-aware peek activity (additive fields; absent on a pre-peek wfb_tx,
-	 * in which case these stay 0).  Surfaced so an operator can confirm the
-	 * feature is actually shedding/closing once toggled on via WCMD. */
-	long peek_en = 0, peek_dropped = 0, peek_closes = 0;
-	(void)json_get_int(body, "pkts_dropped", &peek_dropped);
+	/* Peek activity (additive fields; absent on a pre-peek wfb_tx, in which
+	 * case these stay 0).  Surfaced so an operator can confirm the per-frame
+	 * FEC close is actually firing once toggled on via WCMD. */
+	long peek_en = 0, peek_closes = 0;
 	(void)json_get_int(body, "fec_closes",   &peek_closes);
 	(void)json_get_int(body, "enabled",      &peek_en);
-	if (peek_en && (peek_dropped > 0 || peek_closes > 0)) {
-		LOG_FEC("wfb-stats: peek shed %ld frames, %ld frame-boundary FEC closes",
-		    peek_dropped, peek_closes);
+	if (peek_en && peek_closes > 0) {
+		LOG_FEC("wfb-stats: peek %ld frame-boundary FEC closes", peek_closes);
 	}
 
 	long seq = -1;
@@ -1515,11 +1512,11 @@ static int wfb_send_set_fec(const Config *cfg, int k, int n);
 static int wfb_get_fec(const Config *cfg, int *k_out, int *n_out, int *to_out);
 static int wfb_get_radio(const Config *cfg, RadioBody *out);
 static int wfb_set_radio(const Config *cfg, const RadioBody *params);
-/* enabled/drop_enabled are 0/1 or WFB_PEEK_KEEP to leave that toggle alone. */
-static int wfb_set_peek(const Config *cfg, uint8_t enabled, uint8_t drop_enabled);
+/* enabled is 0/1 or WFB_PEEK_KEEP to leave the toggle alone. */
+static int wfb_set_peek(const Config *cfg, uint8_t enabled);
 /* Read back the wfb_tx peek state (CMD_GET_PEEK). All out params optional. */
 typedef struct {
-	int enabled, drop_enabled, n_rules, n_sig_rules, base_mcs, max_delta;
+	int enabled;
 } PeekStatus;
 static int wfb_get_peek(const Config *cfg, PeekStatus *out);
 
@@ -1927,7 +1924,6 @@ static int wcmd_clamp_value(const Config *cfg, uint8_t key, int32_t *value)
 	case WCMD_KEY_MCS_ENABLED:
 	case WCMD_KEY_RECORD:
 	case WCMD_KEY_PEEK_ENABLED:
-	case WCMD_KEY_PEEK_DROP_ENABLED:
 		lo = 0; hi = 1;
 		break;
 	case WCMD_KEY_WFB_TXPOWER:
@@ -2144,9 +2140,8 @@ static int wcmd_dispatch(Config *cfg, const WcmdReq *req,
 	/* NAL-aware peek toggles — local wfb_cmd round-trip (CMD_SET_PEEK).
 	 * Unlike the radio/FEC keys, peek is never overwritten by the adaptive
 	 * subsystems, so the toggle sticks until the next WCMD or restart.
-	 * Addressing one key sends WFB_PEEK_KEEP for the other so they move
-	 * independently. */
-	if (key == WCMD_KEY_PEEK_ENABLED || key == WCMD_KEY_PEEK_DROP_ENABLED) {
+	 * Peek = per-frame FEC close; this is its on/off master switch. */
+	if (key == WCMD_KEY_PEEK_ENABLED) {
 		if (cfg->dry_run) {
 			resp->status = WCMD_STATUS_OK;
 			resp->http_status   = htons(0);
@@ -2158,9 +2153,7 @@ static int wcmd_dispatch(Config *cfg, const WcmdReq *req,
 			st->last_http_status = 0;
 			return 0;
 		}
-		uint8_t en   = (key == WCMD_KEY_PEEK_ENABLED)      ? (value ? 1 : 0) : WFB_PEEK_KEEP;
-		uint8_t drop = (key == WCMD_KEY_PEEK_DROP_ENABLED) ? (value ? 1 : 0) : WFB_PEEK_KEEP;
-		int rc = wfb_set_peek(cfg, en, drop);
+		int rc = wfb_set_peek(cfg, value ? 1 : 0);
 		if (rc != 0) {
 			resp->status = WCMD_STATUS_HTTP_ERROR;
 			resp->http_status = htons(0);
@@ -2169,13 +2162,10 @@ static int wcmd_dispatch(Config *cfg, const WcmdReq *req,
 			return 0;
 		}
 		/* Read back the applied state so the log reflects the actual wfb_tx
-		 * config (and the protect floor it derived), not just our request. */
+		 * config, not just our request. */
 		PeekStatus ps;
 		if (wfb_get_peek(cfg, &ps) == 0) {
-			int floor = ps.base_mcs - ps.max_delta;
-			if (floor < 0) floor = 0;
-			LOG_FEC("peek: enabled=%d drop=%d rules=%d base_mcs=%d floor_mcs=%d",
-			    ps.enabled, ps.drop_enabled, ps.n_rules, ps.base_mcs, floor);
+			LOG_FEC("peek: enabled=%d", ps.enabled);
 		}
 		resp->status        = WCMD_STATUS_OK;
 		resp->http_status   = htons(0);
@@ -2535,10 +2525,10 @@ static int wfb_set_radio(const Config *cfg, const RadioBody *params)
 	return wfb_set_radio_at(cfg->wfb_host, cfg->wfb_port, params);
 }
 
-/* CMD_SET_PEEK round-trip.  Mirrors wfb_set_radio: send the two toggles
- * (WFB_PEEK_KEEP leaves one untouched), wait for the rc==0 ack.  No adaptive
- * subsystem touches peek, so the toggle sticks until the next WCMD or restart. */
-static int wfb_set_peek(const Config *cfg, uint8_t enabled, uint8_t drop_enabled)
+/* CMD_SET_PEEK round-trip.  Send the enable toggle (WFB_PEEK_KEEP leaves it
+ * untouched), wait for the rc==0 ack.  No adaptive subsystem touches peek, so
+ * the toggle sticks until the next WCMD or restart. */
+static int wfb_set_peek(const Config *cfg, uint8_t enabled)
 {
 	struct sockaddr_in dst;
 	if (resolve_ipv4(cfg->wfb_host, cfg->wfb_port, &dst) != 0) return -1;
@@ -2549,8 +2539,7 @@ static int wfb_set_peek(const Config *cfg, uint8_t enabled, uint8_t drop_enabled
 	CmdReq req = {0};
 	req.req_id = htonl(req_id);
 	req.cmd_id = CMD_SET_PEEK;
-	req.u.set_peek.enabled      = enabled;
-	req.u.set_peek.drop_enabled = drop_enabled;
+	req.u.set_peek.enabled = enabled;
 
 	if (sendto(fd, &req, CMD_REQ_SET_PEEK_LEN, 0,
 	           (const struct sockaddr*)&dst, sizeof(dst)) != CMD_REQ_SET_PEEK_LEN) {
@@ -2572,8 +2561,7 @@ static int wfb_set_peek(const Config *cfg, uint8_t enabled, uint8_t drop_enabled
 }
 
 /* CMD_GET_PEEK round-trip.  Returns 0 and fills *out on success.  The response
- * body is 6 bytes (enabled, drop_enabled, n_rules, n_sig_rules, base_mcs,
- * max_delta); a pre-peek wfb_tx replies rc=ENOTSUP and we return -1. */
+ * body is 1 byte (enabled); a pre-peek wfb_tx replies rc=ENOTSUP and we return -1. */
 static int wfb_get_peek(const Config *cfg, PeekStatus *out)
 {
 	struct sockaddr_in dst;
@@ -2603,12 +2591,7 @@ static int wfb_get_peek(const Config *cfg, PeekStatus *out)
 	if (ntohl(resp.req_id) != req_id) return -1;
 	if (ntohl(resp.rc) != 0) return -1;
 	if (out) {
-		out->enabled      = resp.u.get_peek.enabled;
-		out->drop_enabled = resp.u.get_peek.drop_enabled;
-		out->n_rules      = resp.u.get_peek.n_rules;
-		out->n_sig_rules  = resp.u.get_peek.n_sig_rules;
-		out->base_mcs     = resp.u.get_peek.base_mcs;
-		out->max_delta    = resp.u.get_peek.max_delta;
+		out->enabled = resp.u.get_peek.enabled;
 	}
 	return 0;
 }
@@ -3468,7 +3451,7 @@ static const TunableDesc TUNABLES[] = {
 	{"cmd.enabled",          SUB_COMMON, TF_BOOL, OFF_CMD(enabled),          0, 0,      "enable venc command proxy on rx_ant socket"},
 	{"cmd.loopback_only",    SUB_COMMON, TF_BOOL, OFF_CMD(loopback_only),    0, 0,      "reject WCMD requests not from 127.0.0.1"},
 	{"cmd.rate_limit_ms",    SUB_COMMON, TF_INT,  OFF_CMD(rate_limit_ms),    0, 60000,  "min ms between same-key applies (0 disables)"},
-	{"cmd.allow_keys_mask",  SUB_COMMON, TF_INT,  OFF_CMD(allow_keys_mask),  0, 0x1FFFF, "bitmask of WCMD_KEY_* allowed (1=br,2=fps,4=pl,8=idr,16=fec_k,32=fec_n,64=mcs,128=bw,256=ldpc,512=stbc,1024=sgi,2048=fec_en,4096=mcs_en,8192=txpower,16384=record,32768=peek_en,65536=peek_drop)"},
+	{"cmd.allow_keys_mask",  SUB_COMMON, TF_INT,  OFF_CMD(allow_keys_mask),  0, 0xFFFF, "bitmask of WCMD_KEY_* allowed (1=br,2=fps,4=pl,8=idr,16=fec_k,32=fec_n,64=mcs,128=bw,256=ldpc,512=stbc,1024=sgi,2048=fec_en,4096=mcs_en,8192=txpower,16384=record,32768=peek_en)"},
 	{"cmd.bitrate_min_kbps", SUB_COMMON, TF_INT,  OFF_CMD(bitrate_min_kbps), 1, 200000, "min accepted bitrate kbps (fallback when fec disabled)"},
 	{"cmd.bitrate_max_kbps", SUB_COMMON, TF_INT,  OFF_CMD(bitrate_max_kbps), 1, 200000, "max accepted bitrate kbps (fallback when fec disabled)"},
 	{"cmd.fps_min",          SUB_COMMON, TF_INT,  OFF_CMD(fps_min),          1, 240,    "min accepted fps"},
@@ -5102,7 +5085,7 @@ static void config_defaults(Config *c)
 	c->cmd.enabled         = true;
 	c->cmd.loopback_only   = false;
 	c->cmd.rate_limit_ms   = 100;
-	c->cmd.allow_keys_mask = 0x1FFFF;    /* keys 1..17 enabled (incl. peek 16/17) */
+	c->cmd.allow_keys_mask = 0xFFFF;     /* keys 1..16 enabled (incl. peek_en 16) */
 	c->cmd.bitrate_min_kbps = 100;
 	c->cmd.bitrate_max_kbps = 25000;
 	c->cmd.fps_min          = 1;

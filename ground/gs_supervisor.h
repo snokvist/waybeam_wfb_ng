@@ -101,8 +101,8 @@ extern const int GS_BACKOFF_MS[7];
 #define WCMD_KEY_WFB_TXPOWER    14
 #define WCMD_KEY_RECORD         15
 #define WCMD_KEY_PEEK_ENABLED      16
-#define WCMD_KEY_PEEK_DROP_ENABLED 17
-#define WCMD_KEY_MAX            17   /* highest OPERATOR key (/api/v1/cmd) */
+/* 17 reserved (was WCMD_KEY_PEEK_DROP_ENABLED) — do not reuse */
+#define WCMD_KEY_MAX            16   /* highest OPERATOR key (/api/v1/cmd) */
 /* Logging-sync marker (infra, not an operator command — see
  * shared/wcmd_proto.h).  Emitted by logsync_emit() on its own ~10 s timer,
  * NOT through the operator /api/v1/cmd path, so it lives above WCMD_KEY_MAX

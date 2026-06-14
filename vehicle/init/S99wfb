@@ -100,34 +100,15 @@ start_wfb() {
     iw dev wlan0 set channel $WFB_CHANNEL $WFB_HTMODE >> "$LOG" 2>&1
     iw dev wlan0 set txpower fixed $WFB_TXPOWER >> "$LOG" 2>&1
 
-    # NAL-aware peek protection. The --peek-profile loads the PROTECT/DROP
-    # action-rule table at launch; the WCMD/WebUI toggle only arms/disarms
-    # the pipeline and cannot load rules.
-    #   close (default) — armed, per-frame FEC close ONLY: full per-frame loss
-    #     isolation + tighter RTP timing, with NO key-frame MCS down-shift.
-    #   idr — additionally protects param-sets (base MCS-2) + IDR/CRA key frames
-    #     (base MCS-1) vs the live adaptive MCS. Robust on a marginal link, but
-    #     the key-frame MCS down-shift is a periodic airtime spike that can flap
-    #     the MCS loop on a strong link (memory: wfb_ng_peek_idr_profile_airtime_spike).
-    #   off — peek fully disabled (no per-frame close).
-    #   refpred/idr+refpred add trail_n DROP and are UNSAFE unless the encoder
-    #     emits true disposable frames (Star6E HEVC refPred no-ops — see memory).
-    # Override: fw_setenv wfbpeek off|close|idr|refpred|idr+refpred.
+    # Peek = per-frame FEC close. --peek-profile selects the startup state; the
+    # WCMD/WebUI peek toggle arms/disarms it live.
+    #   close (default) — armed: close each video frame's FEC block at the RTP
+    #     marker for per-frame loss isolation + tighter RTP timing.
+    #   off — peek disabled (no per-frame close).
+    # The old NAL-aware PROTECT/DROP profiles (idr/refpred) and the short-tail
+    # close were removed — both flapped the MCS loop; only the gate close ships.
+    # Override: fw_setenv wfbpeek off|close.
     WFB_PEEK_PROFILE=$(fw_get wfbpeek close)
-
-    # Short-tail peek close (proportional parity, no on-air zero-padding):
-    # close_block_short() emits one boundary marker fragment + ~proportional
-    # parity instead of padding to k on-air + full n-k parity. More airtime-
-    # efficient than the gate close, BUT device-verified to perturb the FEC+MCS
-    # control loop -- it brings back the MCS flap + fps drops with peek on (the
-    # gate close is rock-solid; see memory wfb_ng_peek_idr_profile_airtime_spike).
-    # So Default OFF = the threshold-gated full-padding close. Short-tail is an
-    # opt-in for airtime-constrained links that can tolerate the flap, and still
-    # REQUIRES a SHORT_TAIL-aware RX (gs_supervisor wfb_rx from peek.patch).
-    # Override: fw_setenv wfbshorttail 1   (enable the short-tail close).
-    WFB_SHORT_TAIL=$(fw_get wfbshorttail 0)
-    WFB_SHORT_TAIL_ARG=""
-    case "$WFB_SHORT_TAIL" in 1|on|yes) WFB_SHORT_TAIL_ARG="--peek-short-tail" ;; esac
 
     # wfb_tx (SHM input from venc).  -T sizes the FEC safety-net timeout
     # to the typical frame period (60 fps ≈ 16 ms); fec_controller can
@@ -135,7 +116,7 @@ start_wfb() {
     wfb_tx -K "$KEY" -M $WFB_MCS -B $WFB_BW -k $WFB_K -n $WFB_N \
            -P 1 -Q -S 1 -L 1 -C $WFB_CTRL -T 16 \
            -H "$SHM_RING" -R 2097152 -s 2097152 \
-           --peek-profile "$WFB_PEEK_PROFILE" $WFB_SHORT_TAIL_ARG \
+           --peek-profile "$WFB_PEEK_PROFILE" \
            -l 1000 -i $WFB_TX_LINK -p 0 -x wlan0 \
            >> "$LOG" 2>&1 &
     echo $! > "$PID_TX"

@@ -1,130 +1,31 @@
 diff --git a/src/peek.cpp b/src/peek.cpp
 new file mode 100644
-index 0000000..47108a1
+index 0000000..fa8b346
 --- /dev/null
 +++ b/src/peek.cpp
-@@ -0,0 +1,303 @@
-+// wfb_tx NAL-aware link protection — classification engine (peek).
-+// See peek.hpp for the contract and docs/design/wfb-tx-nal-aware-protection.md.
+@@ -0,0 +1,53 @@
++// wfb_tx per-frame FEC close (peek) — classification engine. See peek.hpp.
++//
++// peek() answers one question: "does this datagram end a video frame?" (RTP
++// marker bit). If so it signals FEC_CLOSE and tx.cpp closes the open FEC block
++// at the frame boundary. Nothing else — the NAL-aware PROTECT/DROP rules and
++// short-tail close were removed.
 +
 +#include "peek.hpp"
 +
 +#include <string.h>
-+#include <stdlib.h>
-+#include <vector>
-+
-+// HEVC nuh_type values we care about.
-+enum {
-+    HEVC_TRAIL_N   = 0,
-+    HEVC_TRAIL_R   = 1,
-+    HEVC_IDR_W_RADL = 19,
-+    HEVC_IDR_N_LP  = 20,
-+    HEVC_CRA       = 21,
-+    HEVC_VPS       = 32,
-+    HEVC_SPS       = 33,
-+    HEVC_PPS       = 34,
-+    HEVC_FU        = 49, // fragmentation unit; real type in nal[2]
-+};
-+
-+// H.264 nal_unit_type values.
-+enum {
-+    H264_IDR = 5,
-+    H264_SPS = 7,
-+    H264_PPS = 8,
-+    H264_FUA = 28, // fragmentation unit A; real type in nal[1]
-+};
-+
-+static inline uint64_t bit(unsigned t) { return (uint64_t)1u << t; }
-+
-+// Locate the codec payload (first NAL byte) inside an RTP datagram. Returns a
-+// byte offset from buf, or 0 (fail-open to datagram start) if anything is too
-+// short to parse.
-+static size_t locate_payload(const uint8_t *buf, size_t len)
-+{
-+    if (len < 12) return 0;                         // not even a fixed RTP header
-+    size_t off = 12 + 4 * (size_t)(buf[0] & 0x0F);  // CSRC list
-+    if (buf[0] & 0x10) {                            // extension header present
-+        if (off + 4 > len) return 0;
-+        uint16_t ext_words = (uint16_t)((buf[off + 2] << 8) | buf[off + 3]);
-+        off += 4 + 4 * (size_t)ext_words;
-+    }
-+    if (off >= len) return 0;
-+    return off;
-+}
-+
-+// Extract the effective NAL type at nal_off for the configured proto, applying
-+// FU indirection so every fragment of an access unit reports the same type.
-+// Returns 0xFF when the bytes available are too short to decide.
-+static uint8_t nal_type(const uint8_t *buf, size_t len, size_t nal_off, uint8_t proto)
-+{
-+    size_t avail = (nal_off <= len) ? (len - nal_off) : 0;
-+    const uint8_t *nal = buf + nal_off;
-+
-+    if (proto == PEEK_PROTO_HEVC) {
-+        if (avail < 2) return 0xFF;
-+        uint8_t t = (uint8_t)((nal[0] >> 1) & 0x3F);
-+        if (t == HEVC_FU) {
-+            if (avail < 3) return 0xFF;
-+            return (uint8_t)(nal[2] & 0x3F); // FU header carries original type
-+        }
-+        return t;
-+    } else { // PEEK_PROTO_H264
-+        if (avail < 1) return 0xFF;
-+        uint8_t t = (uint8_t)(nal[0] & 0x1F);
-+        if (t == H264_FUA) {
-+            if (avail < 2) return 0xFF;
-+            return (uint8_t)(nal[1] & 0x1F);
-+        }
-+        return t;
-+    }
-+}
-+
-+static bool match_one(const peek_match_t *m, const uint8_t *buf, size_t len,
-+                      size_t nal_off, uint8_t t)
-+{
-+    if (m->kind == PEEK_MATCH_NAL_TYPE) {
-+        if (t == 0xFF) return false;       // undecidable type never matches
-+        if (t >= 64) return false;          // out of mask range
-+        return (m->u.nal.type_mask >> t) & 1u;
-+    }
-+    // PEEK_MATCH_BYTE_MASK
-+    size_t base = (m->u.byte.anchor == PEEK_ANCHOR_DATAGRAM) ? 0 : nal_off;
-+    size_t i = base + m->u.byte.off;
-+    if (i >= len) return false;
-+    return (buf[i] & m->u.byte.mask) == m->u.byte.val;
-+}
 +
 +void peek_cfg_init(peek_cfg_t *cfg)
 +{
 +    memset(cfg, 0, sizeof(*cfg));
 +    cfg->enabled = false;
-+    cfg->drop_enabled = false;
 +    // Mandatory frame-boundary signal: RTP marker bit = datagram byte 1, 0x80.
-+    cfg->sig_rules[0].match.kind = PEEK_MATCH_BYTE_MASK;
-+    cfg->sig_rules[0].match.u.byte.anchor = PEEK_ANCHOR_DATAGRAM;
-+    cfg->sig_rules[0].match.u.byte.off = 1;
-+    cfg->sig_rules[0].match.u.byte.mask = 0x80;
-+    cfg->sig_rules[0].match.u.byte.val = 0x80;
-+    cfg->sig_rules[0].signal = PEEK_SIG_FEC_CLOSE;
++    cfg->sig_rules[0].match.off  = 1;
++    cfg->sig_rules[0].match.mask = 0x80;
++    cfg->sig_rules[0].match.val  = 0x80;
++    cfg->sig_rules[0].signal     = PEEK_SIG_FEC_CLOSE;
 +    cfg->n_sig_rules = 1;
 +}
-+
-+// helpers to append an action rule
-+static void add_nal_rule(peek_cfg_t *cfg, uint8_t proto, uint64_t mask,
-+                         peek_action_t act, uint8_t delta)
-+{
-+    if (cfg->n_rules >= PEEK_MAX_RULES) return;
-+    peek_rule_t *r = &cfg->rules[cfg->n_rules++];
-+    memset(r, 0, sizeof(*r));
-+    r->match.kind = PEEK_MATCH_NAL_TYPE;
-+    r->match.u.nal.proto = proto;
-+    r->match.u.nal.type_mask = mask;
-+    r->action = act;
-+    r->mcs_delta = delta;
-+}
-+
-+static const uint64_t HEVC_PARAMSETS = bit(HEVC_VPS) | bit(HEVC_SPS) | bit(HEVC_PPS);
-+static const uint64_t HEVC_KEY       = bit(HEVC_IDR_W_RADL) | bit(HEVC_IDR_N_LP) | bit(HEVC_CRA);
 +
 +bool peek_cfg_set_profile(peek_cfg_t *cfg, const char *profile)
 +{
@@ -134,387 +35,138 @@ index 0000000..47108a1
 +        return true;
 +    }
 +    if (strcmp(profile, "close") == 0) {
-+        // Armed, frame-boundary FEC close ONLY: peek_cfg_init() already installed
-+        // the mandatory FEC_CLOSE sig rule, and we add no NAL action rules -- so
-+        // every frame's block is closed for per-frame loss isolation with NO
-+        // key-frame MCS down-shift (unlike "idr"). The jitter/isolation upside
-+        // without the GOP-cadence airtime spike that flaps the MCS loop.
++        // Armed: the mandatory FEC_CLOSE signal closes every frame's block.
 +        cfg->enabled = true;
-+        return true;
-+    }
-+    if (strcmp(profile, "idr") == 0) {
-+        cfg->enabled = true;
-+        add_nal_rule(cfg, PEEK_PROTO_HEVC, HEVC_PARAMSETS, PEEK_ACT_PROTECT, 2);
-+        add_nal_rule(cfg, PEEK_PROTO_HEVC, HEVC_KEY,       PEEK_ACT_PROTECT, 1);
-+        return true;
-+    }
-+    if (strcmp(profile, "refpred") == 0) {
-+        cfg->enabled = true;
-+        add_nal_rule(cfg, PEEK_PROTO_HEVC, bit(HEVC_TRAIL_R), PEEK_ACT_PROTECT, 1);
-+        add_nal_rule(cfg, PEEK_PROTO_HEVC, bit(HEVC_TRAIL_N), PEEK_ACT_DROP,    0);
-+        return true;
-+    }
-+    if (strcmp(profile, "idr+refpred") == 0) {
-+        cfg->enabled = true;
-+        add_nal_rule(cfg, PEEK_PROTO_HEVC, HEVC_PARAMSETS,                 PEEK_ACT_PROTECT, 2);
-+        add_nal_rule(cfg, PEEK_PROTO_HEVC, HEVC_KEY | bit(HEVC_TRAIL_R),   PEEK_ACT_PROTECT, 1);
-+        add_nal_rule(cfg, PEEK_PROTO_HEVC, bit(HEVC_TRAIL_N),              PEEK_ACT_DROP,    0);
 +        return true;
 +    }
 +    return false; // unknown
 +}
 +
-+// Map a NAL-type token to a HEVC/H.264 bit. Recognises a small vocabulary
-+// shared by both protocols where it makes sense.
-+static bool token_to_mask(uint8_t proto, const char *tok, uint64_t *out)
-+{
-+    struct { const char *name; uint8_t proto; uint64_t mask; } tbl[] = {
-+        { "trail_n", PEEK_PROTO_HEVC, bit(HEVC_TRAIL_N) },
-+        { "trail_r", PEEK_PROTO_HEVC, bit(HEVC_TRAIL_R) },
-+        { "idr",     PEEK_PROTO_HEVC, bit(HEVC_IDR_W_RADL) | bit(HEVC_IDR_N_LP) },
-+        { "cra",     PEEK_PROTO_HEVC, bit(HEVC_CRA) },
-+        { "vps",     PEEK_PROTO_HEVC, bit(HEVC_VPS) },
-+        { "sps",     PEEK_PROTO_HEVC, bit(HEVC_SPS) },
-+        { "pps",     PEEK_PROTO_HEVC, bit(HEVC_PPS) },
-+        { "params",  PEEK_PROTO_HEVC, HEVC_PARAMSETS },
-+        { "idr",     PEEK_PROTO_H264, bit(H264_IDR) },
-+        { "sps",     PEEK_PROTO_H264, bit(H264_SPS) },
-+        { "pps",     PEEK_PROTO_H264, bit(H264_PPS) },
-+        { "params",  PEEK_PROTO_H264, bit(H264_SPS) | bit(H264_PPS) },
-+    };
-+    for (size_t i = 0; i < sizeof(tbl) / sizeof(tbl[0]); i++) {
-+        if (tbl[i].proto == proto && strcmp(tbl[i].name, tok) == 0) {
-+            *out = tbl[i].mask;
-+            return true;
-+        }
-+    }
-+    return false;
-+}
-+
-+bool peek_cfg_add_rule(peek_cfg_t *cfg, const char *spec, std::string *err)
-+{
-+    // <proto>:<action>:<types>[:dN]
-+    std::string s(spec ? spec : "");
-+    std::vector<std::string> parts;
-+    size_t start = 0;
-+    for (;;) {
-+        size_t c = s.find(':', start);
-+        parts.push_back(s.substr(start, c == std::string::npos ? c : c - start));
-+        if (c == std::string::npos) break;
-+        start = c + 1;
-+    }
-+    if (parts.size() < 3) { if (err) *err = "expected <proto>:<action>:<types>[:dN]"; return false; }
-+
-+    uint8_t proto;
-+    if (parts[0] == "hevc" || parts[0] == "h265") proto = PEEK_PROTO_HEVC;
-+    else if (parts[0] == "h264" || parts[0] == "avc") proto = PEEK_PROTO_H264;
-+    else { if (err) *err = "proto must be hevc|h265|h264|avc"; return false; }
-+
-+    peek_action_t action;
-+    if (parts[1] == "pass")    action = PEEK_ACT_PASS;
-+    else if (parts[1] == "protect") action = PEEK_ACT_PROTECT;
-+    else if (parts[1] == "drop")    action = PEEK_ACT_DROP;
-+    else { if (err) *err = "action must be pass|protect|drop"; return false; }
-+
-+    uint8_t delta = (action == PEEK_ACT_PROTECT) ? 1 : 0;
-+    if (parts.size() >= 4 && !parts[3].empty()) {
-+        const char *d = parts[3].c_str();
-+        if (*d == 'd') d++;
-+        if (strncmp(d, "elta", 4) == 0) d += 4; // accept "delta2"
-+        char *endp;
-+        long v = strtol(d, &endp, 10);
-+        if (*endp != '\0' || v < 0 || v > PEEK_MAX_DELTA) {
-+            if (err) *err = "delta must be 0..4 (write dN)";
-+            return false;
-+        }
-+        delta = (uint8_t)v;
-+    }
-+
-+    // types is a comma list
-+    uint64_t mask = 0;
-+    std::string types = parts[2];
-+    size_t ts = 0;
-+    while (ts <= types.size()) {
-+        size_t c = types.find(',', ts);
-+        std::string tok = types.substr(ts, c == std::string::npos ? c : c - ts);
-+        if (!tok.empty()) {
-+            uint64_t m;
-+            if (!token_to_mask(proto, tok.c_str(), &m)) {
-+                if (err) *err = "unknown NAL token '" + tok + "'";
-+                return false;
-+            }
-+            mask |= m;
-+        }
-+        if (c == std::string::npos) break;
-+        ts = c + 1;
-+    }
-+    if (mask == 0) { if (err) *err = "no NAL types given"; return false; }
-+    if (cfg->n_rules >= PEEK_MAX_RULES) { if (err) *err = "rule table full"; return false; }
-+
-+    add_nal_rule(cfg, proto, mask, action, delta);
-+    cfg->enabled = true; // any explicit rule arms the pipeline
-+    return true;
-+}
-+
 +peek_outcome_t peek(const uint8_t *buf, size_t len, const peek_cfg_t *cfg)
 +{
-+    peek_outcome_t out = { PEEK_ACT_PASS, 0, 0 };
++    peek_outcome_t out = { 0 };
 +    if (!cfg || !cfg->enabled) return out;
 +
-+    size_t nal_off = locate_payload(buf, len);
-+    // proto for the NAL decode is taken per-rule; decode lazily by proto.
-+    // Most deployments are single-proto, so decode both only if needed.
-+    uint8_t t_hevc = 0xFE, t_h264 = 0xFE; // 0xFE = not yet decoded
-+
-+    // action rules: first match wins
-+    for (uint8_t i = 0; i < cfg->n_rules; i++) {
-+        const peek_rule_t *r = &cfg->rules[i];
-+        uint8_t t = 0xFF;
-+        if (r->match.kind == PEEK_MATCH_NAL_TYPE) {
-+            uint8_t proto = r->match.u.nal.proto;
-+            if (proto == PEEK_PROTO_HEVC) {
-+                if (t_hevc == 0xFE) t_hevc = nal_type(buf, len, nal_off, PEEK_PROTO_HEVC);
-+                t = t_hevc;
-+            } else {
-+                if (t_h264 == 0xFE) t_h264 = nal_type(buf, len, nal_off, PEEK_PROTO_H264);
-+                t = t_h264;
-+            }
-+        }
-+        if (match_one(&r->match, buf, len, nal_off, t)) {
-+            out.action = r->action;
-+            out.mcs_delta = r->mcs_delta;
-+            break;
-+        }
-+    }
-+
-+    // signal rules: accumulate all. (Skipped by the caller for dropped pkts.)
++    // Signal rules: accumulate all matches (byte-mask anchored at datagram start).
 +    for (uint8_t i = 0; i < cfg->n_sig_rules; i++) {
-+        const peek_sig_rule_t *r = &cfg->sig_rules[i];
-+        uint8_t t = 0xFF;
-+        if (r->match.kind == PEEK_MATCH_NAL_TYPE) {
-+            uint8_t proto = r->match.u.nal.proto;
-+            if (proto == PEEK_PROTO_HEVC) {
-+                if (t_hevc == 0xFE) t_hevc = nal_type(buf, len, nal_off, PEEK_PROTO_HEVC);
-+                t = t_hevc;
-+            } else {
-+                if (t_h264 == 0xFE) t_h264 = nal_type(buf, len, nal_off, PEEK_PROTO_H264);
-+                t = t_h264;
-+            }
-+        }
-+        if (match_one(&r->match, buf, len, nal_off, t)) {
-+            out.signals |= r->signal;
-+        }
++        const peek_sig_rule_t *s = &cfg->sig_rules[i];
++        size_t idx = s->match.off;
++        if (idx >= len) continue;
++        if ((buf[idx] & s->match.mask) == s->match.val)
++            out.signals |= s->signal;
 +    }
 +    return out;
 +}
 diff --git a/src/peek.hpp b/src/peek.hpp
 new file mode 100644
-index 0000000..f0a8f26
+index 0000000..65e9762
 --- /dev/null
 +++ b/src/peek.hpp
-@@ -0,0 +1,116 @@
+@@ -0,0 +1,67 @@
 +// -*- C++ -*-
 +//
-+// wfb_tx NAL-aware link protection — classification engine (peek).
++// wfb_tx per-frame FEC close (peek).
 +//
-+// Self-contained, host-testable. No wfb-ng / libsodium / pcap dependency:
-+// peek() is a pure function over a datagram + a config table. The transmit
-+// side (radiotap MCS select, FEC close, drop) lives in tx.cpp; this file only
-+// answers "what should happen to this datagram?".
++// Self-contained, host-testable: peek() is a pure function over a datagram +
++// a config. The ONLY thing peek does is detect the RTP frame-boundary marker
++// (the M-bit at the end of each video frame) and signal a FEC block close, so
++// each frame's final block is closed on its own boundary (per-frame loss
++// isolation + tighter delivery timing). The transmit side (the threshold-gated
++// close) lives in tx.cpp.
 +//
-+// Design + rationale: docs/design/wfb-tx-nal-aware-protection.md (waybeam_wfb_ng)
-+// and waybeam_venc#143 (the canonical spec).
++// (The historical NAL-aware PROTECT/DROP action rules and the short-tail close
++// were removed — they perturbed the FEC/MCS control loop; only the
++// frame-boundary FEC close survives.)
 +
 +#ifndef WFB_PEEK_HPP
 +#define WFB_PEEK_HPP
 +
 +#include <stdint.h>
 +#include <stddef.h>
-+#include <string>
 +
-+// ---- generic matcher, shared by action rules and signal rules ----
-+typedef enum {
-+    PEEK_MATCH_NAL_TYPE = 0, // decode HEVC/H.264 NAL type, test type_mask
-+    PEEK_MATCH_BYTE_MASK,    // raw test: (base[off] & mask) == val
-+} peek_match_kind_t;
-+
-+typedef enum { PEEK_PROTO_HEVC = 0, PEEK_PROTO_H264 = 1 } peek_proto_t;
-+
-+typedef enum {
-+    PEEK_ANCHOR_DATAGRAM = 0, // off measured from datagram byte 0 (RTP header)
-+    PEEK_ANCHOR_PAYLOAD,      // off measured from start of codec payload (post-RTP)
-+} peek_anchor_t;
-+
++// Byte-mask match, anchored at the datagram start (used for the RTP marker bit).
 +typedef struct {
-+    peek_match_kind_t kind;
-+    union {
-+        struct {                 // PEEK_MATCH_NAL_TYPE
-+            uint8_t  proto;      // peek_proto_t
-+            uint64_t type_mask;  // bit i set => NAL type i matches
-+        } nal;
-+        struct {                 // PEEK_MATCH_BYTE_MASK
-+            uint8_t  anchor;     // peek_anchor_t
-+            uint16_t off;
-+            uint8_t  mask;
-+            uint8_t  val;        // match iff (byte & mask) == val
-+        } byte;
-+    } u;
++    uint16_t off;
++    uint8_t  mask;
++    uint8_t  val;   // match iff (buf[off] & mask) == val
 +} peek_match_t;
 +
-+// ---- outcome 1: per-packet transmit action (first match wins) ----
-+typedef enum {
-+    PEEK_ACT_PASS = 0,   // transmit at base MCS
-+    PEEK_ACT_PROTECT,    // transmit at base_mcs - mcs_delta
-+    PEEK_ACT_DROP,       // discard before FEC (if drop_enabled)
-+} peek_action_t;
-+
-+typedef struct {
-+    peek_match_t  match;
-+    peek_action_t action;
-+    uint8_t       mcs_delta;     // PROTECT only; steps below base MCS
-+} peek_rule_t;
-+
-+// ---- outcome 2: control signals (accumulate all matches) ----
++// ---- control signals (accumulate all matches) ----
 +typedef enum {
 +    PEEK_SIG_FEC_CLOSE = 1u << 0, // close the FEC block at this packet
 +} peek_signal_t;
 +
 +typedef struct {
 +    peek_match_t match;
-+    uint16_t     signal;         // bitmask of peek_signal_t
++    uint16_t     signal;          // bitmask of peek_signal_t
 +} peek_sig_rule_t;
 +
-+#define PEEK_MAX_RULES      8
 +#define PEEK_MAX_SIG_RULES  4
-+// Largest mcs_delta any rule may request; bounds the prebuilt radiotap cache.
-+#define PEEK_MAX_DELTA      4
 +
 +typedef struct {
 +    bool            enabled;       // master pipeline toggle (live)
-+    bool            drop_enabled;  // arm DROP-action rules (live)
-+    uint8_t         base_mcs;      // mirror of the configured MCS (observability)
-+    peek_rule_t     rules[PEEK_MAX_RULES];
-+    uint8_t         n_rules;
 +    peek_sig_rule_t sig_rules[PEEK_MAX_SIG_RULES]; // seeded with mandatory FEC_CLOSE
 +    uint8_t         n_sig_rules;
 +} peek_cfg_t;
 +
 +// Result of classifying one datagram.
 +typedef struct {
-+    peek_action_t action;   // PASS / PROTECT / DROP
-+    uint8_t       mcs_delta; // valid when action == PROTECT
-+    uint16_t      signals;  // bitmask of peek_signal_t
++    uint16_t signals;  // bitmask of peek_signal_t
 +} peek_outcome_t;
 +
 +// ---- public API ----
 +
 +// Zero a cfg and seed the mandatory frame-boundary FEC_CLOSE signal rule
-+// (RTP marker bit). After this the signal table is never empty. enabled is
-+// left false; caller flips it via profile/args/CMD_SET_PEEK.
++// (RTP marker bit). enabled is left false; the caller flips it via the startup
++// profile or CMD_SET_PEEK.
 +void peek_cfg_init(peek_cfg_t *cfg);
 +
-+// Expand a startup profile name into the action table (and re-seed the
-+// mandatory signal). Recognised: "off", "idr", "refpred", "idr+refpred".
-+// Returns true on success, false on an unknown profile (cfg left as init).
++// Startup profile: "off" => disabled, "close" => enabled (frame-boundary FEC
++// close). Returns false on an unknown profile (cfg left as init).
 +bool peek_cfg_set_profile(peek_cfg_t *cfg, const char *profile);
 +
-+// Append/override one granular action rule from a --peek-rule spec, e.g.
-+//   "hevc:protect:idr,cra:d1"   "h264:drop:trail_n"   "hevc:pass:vps"
-+// Δ may be written "d2", "delta2", or omitted (defaults to 1 for protect).
-+// Returns true on success. On parse error returns false and sets *err.
-+bool peek_cfg_add_rule(peek_cfg_t *cfg, const char *spec, std::string *err);
-+
-+// Classify one datagram. buf/len is the full datagram as it sits in the ring /
-+// recv buffer (RTP header included). Fail-open: short/unparseable => PASS, 0.
++// Classify one datagram. buf/len is the full datagram (RTP header included).
++// Fail-open: short/unparseable => no signals.
 +peek_outcome_t peek(const uint8_t *buf, size_t len, const peek_cfg_t *cfg);
 +
 +#endif // WFB_PEEK_HPP
 diff --git a/src/rx.cpp b/src/rx.cpp
-index 136d16d..2f0f7c6 100644
+index 136d16d..2213e27 100644
 --- a/src/rx.cpp
 +++ b/src/rx.cpp
-@@ -967,8 +967,14 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
+@@ -967,8 +967,9 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
      assert(decrypted_len >= sizeof(wpacket_hdr_t));
      assert(decrypted_len <= MAX_FEC_PAYLOAD);
  
 -    uint64_t block_idx = be64toh(block_hdr->data_nonce) >> 8;
 -    uint8_t fragment_idx = (uint8_t)(be64toh(block_hdr->data_nonce) & 0xff);
 +    uint64_t raw_nonce = be64toh(block_hdr->data_nonce);
-+    // SHORT_TAIL rides the top bit; mask it off before deriving block_idx so the
-+    // MAX_BLOCK_IDX guard below doesn't false-trip.  When set, this fragment is
-+    // the boundary marker of a TX short-close: real data ends at fragment_idx,
-+    // and slots [fragment_idx+1, fec_k) were never transmitted (synthesized below).
-+    bool short_tail = (raw_nonce & WFB_NONCE_SHORT_TAIL) != 0;
 +    uint64_t block_idx = (raw_nonce >> 8) & MAX_BLOCK_IDX;
 +    uint8_t fragment_idx = (uint8_t)(raw_nonce & 0xff);
  
      /* set::insert returns (iterator, inserted_bool).  When inserted_bool is
       * false the same data_nonce was already in the dedup set — i.e. this
-@@ -1024,6 +1030,39 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
-     p->fragment_map[fragment_idx] = decrypted_len;
-     p->has_fragments += 1;
- 
-+    // SHORT_TAIL: the TX short-closed this block at j == fragment_idx real data
-+    // fragments.  Slots [j+1, fec_k) were never transmitted -- synthesize them
-+    // locally as canonical FEC_ONLY zero-pad (byte-identical to what the TX fed
-+    // the FEC encoder) so the block can complete with the proportional parity
-+    // that DID arrive.  Idempotent (skips slots already present); guarded so it
-+    // only runs for the marker fragment (the one carrying the SHORT_TAIL bit).
-+    // The synthesized slots are FEC_ONLY, so send_packet() skips them at the
-+    // socket and the fec_recovered counter ignores them (same as on-air padding).
-+    //
-+    // VALIDATE the marker before acting on it: a genuine TX marker is a
-+    // canonical pad (FEC_ONLY, packet_size==0) at a real boundary 1 <= j < fec_k.
-+    // In plaintext (-x) mode there is no AEAD to reject a forged/corrupt fragment,
-+    // so without this check one injected packet with the bit + an attacker-chosen
-+    // fragment_idx could bulk-synthesize zero-pad into a live block and truncate a
-+    // frame.  If it is not a valid marker, fall through and treat it as an
-+    // ordinary fragment (no synthesis).  In AEAD mode forged fragments are already
-+    // rejected at decrypt, so this is belt-and-suspenders there.
-+    if (short_tail && fragment_idx >= 1 && fragment_idx < fec_k &&
-+        (((wpacket_hdr_t*)decrypted)->flags & WFB_PACKET_FEC_ONLY) &&
-+        be16toh(((wpacket_hdr_t*)decrypted)->packet_size) == 0)
-+    {
-+        for (int i = fragment_idx + 1; i < fec_k; i++)
-+        {
-+            if (p->fragment_map[i]) continue;
-+            memset(p->fragments[i], '\0', MAX_FEC_PAYLOAD);
-+            wpacket_hdr_t *h = (wpacket_hdr_t*)p->fragments[i];
-+            h->flags = WFB_PACKET_FEC_ONLY;
-+            h->packet_size = htobe16(0);
-+            p->fragment_map[i] = sizeof(wpacket_hdr_t);
-+            p->has_fragments += 1;
-+        }
-+    }
-+
-     // Check if we use current (oldest) block
-     // then we can optimize and don't wait for all K fragments
-     // and send packets if there are no gaps in fragments from the beginning of this block
-@@ -1047,8 +1086,14 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
+@@ -1047,8 +1048,11 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
          }
      }
  
 -    // Check that this block has K elements (with gaps) and can be recovered via FEC
 -    if(p->fragment_to_send_idx < fec_k && p->has_fragments == fec_k)
 +    // Check that this block has K elements (with gaps) and can be recovered via FEC.
-+    // ">=" not "==": a SHORT_TAIL block synthesizes its [j+1,k) tail in one step,
-+    // so has_fragments can jump past fec_k when real data + parity already arrived.
-+    // For a normal (full) block has_fragments reaches exactly fec_k at the moment
-+    // the block is evicted, so ">=" is identical there.  ">=" also guarantees the
-+    // apply_fec parity-availability invariant: missing_data = k - present_low_k <=
-+    // has_fragments - present_low_k = present_parity.
++    // has_fragments reaches exactly fec_k as the block is evicted; ">=" is used so
++    // the apply_fec parity-availability invariant holds: missing_data = k -
++    // present_low_k <= has_fragments - present_low_k = present_parity.
 +    if(p->fragment_to_send_idx < fec_k && p->has_fragments >= fec_k)
      {
          // send all queued packets in all unfinished blocks before current
          // and then remove that blocks
-@@ -1196,7 +1241,15 @@ void Aggregator::apply_fec(int ring_idx)
+@@ -1196,7 +1200,14 @@ void Aggregator::apply_fec(int ring_idx)
                  j++;
              }
  
 -            assert(j < fec_n);
 +            // Insufficient parity to fill this gap.  The caller only invokes
-+            // apply_fec when has_fragments >= fec_k, which (for both the normal
-+            // full-block path and the SHORT_TAIL synthesized path) guarantees
++            // apply_fec when has_fragments >= fec_k, which guarantees
 +            // present_parity >= missing_data -- so this never fires on legitimate
 +            // traffic.  Bail gracefully rather than assert/over-read: RS recovery
 +            // is all-or-nothing, so if any gap lacks parity the block is
@@ -524,191 +176,8 @@ index 136d16d..2f0f7c6 100644
              // FEC packets always have max size between packets in block
              max_packet_size = max(max_packet_size, rx_ring[ring_idx].fragment_map[j]);
              in_blocks[i] = rx_ring[ring_idx].fragments[j];
-diff --git a/src/test_peek.cpp b/src/test_peek.cpp
-new file mode 100644
-index 0000000..38c2c21
---- /dev/null
-+++ b/src/test_peek.cpp
-@@ -0,0 +1,177 @@
-+// Host unit test for the NAL-aware peek engine. No hardware, no wfb-ng deps.
-+// Build: g++ -std=gnu++11 -o test_peek src/test_peek.cpp src/peek.cpp && ./test_peek
-+
-+#include "peek.hpp"
-+#include <stdio.h>
-+#include <string.h>
-+#include <vector>
-+
-+static int g_fail = 0;
-+static int g_total = 0;
-+
-+#define CHECK(cond, msg) do { \
-+    g_total++; \
-+    if (!(cond)) { g_fail++; printf("FAIL: %s\n", msg); } \
-+} while (0)
-+
-+// Build an RTP datagram: 12-byte header (marker optional) + NAL bytes.
-+static std::vector<uint8_t> rtp(bool marker, std::initializer_list<uint8_t> nal)
-+{
-+    std::vector<uint8_t> p(12, 0);
-+    p[0] = 0x80;                       // V=2, no CSRC, no extension
-+    p[1] = (uint8_t)((marker ? 0x80 : 0x00) | 0x60); // M | PT=96
-+    for (uint8_t b : nal) p.push_back(b);
-+    return p;
-+}
-+
-+// HEVC single-NAL first byte for a given nuh_type.
-+static uint8_t hevc(uint8_t type) { return (uint8_t)(type << 1); }
-+
-+static peek_outcome_t run(const peek_cfg_t &cfg, const std::vector<uint8_t> &d)
-+{
-+    return peek(d.data(), d.size(), &cfg);
-+}
-+
-+int main(void)
-+{
-+    // ---- profile: idr (HEVC) ----
-+    {
-+        peek_cfg_t cfg;
-+        bool ok = peek_cfg_set_profile(&cfg, "idr");
-+        CHECK(ok && cfg.enabled, "idr profile loads");
-+
-+        // VPS => PROTECT delta 2
-+        auto o = run(cfg, rtp(false, { hevc(32), 0x01 }));
-+        CHECK(o.action == PEEK_ACT_PROTECT && o.mcs_delta == 2, "idr: VPS protect d2");
-+
-+        // SPS/PPS also d2
-+        o = run(cfg, rtp(false, { hevc(34), 0x01 }));
-+        CHECK(o.action == PEEK_ACT_PROTECT && o.mcs_delta == 2, "idr: PPS protect d2");
-+
-+        // IDR_W_RADL => PROTECT delta 1
-+        o = run(cfg, rtp(false, { hevc(19), 0x00 }));
-+        CHECK(o.action == PEEK_ACT_PROTECT && o.mcs_delta == 1, "idr: IDR protect d1");
-+
-+        // CRA => PROTECT delta 1
-+        o = run(cfg, rtp(false, { hevc(21), 0x00 }));
-+        CHECK(o.action == PEEK_ACT_PROTECT && o.mcs_delta == 1, "idr: CRA protect d1");
-+
-+        // TRAIL_R => PASS (idr profile leaves non-key frames alone)
-+        o = run(cfg, rtp(false, { hevc(1), 0x00 }));
-+        CHECK(o.action == PEEK_ACT_PASS, "idr: TRAIL_R pass");
-+
-+        // marker bit raises FEC_CLOSE regardless of action
-+        o = run(cfg, rtp(true, { hevc(1), 0x00 }));
-+        CHECK(o.action == PEEK_ACT_PASS && (o.signals & PEEK_SIG_FEC_CLOSE),
-+              "idr: marker on TRAIL_R => PASS + FEC_CLOSE");
-+
-+        // marker clear => no FEC_CLOSE
-+        o = run(cfg, rtp(false, { hevc(19), 0x00 }));
-+        CHECK(!(o.signals & PEEK_SIG_FEC_CLOSE), "idr: no marker => no FEC_CLOSE");
-+
-+        // FU-A indirection: HEVC FU (type 49) carrying IDR(19) => PROTECT d1
-+        // nal[0]=49<<1=0x62, nal[1]=layer/tid, nal[2]=S|type(19)=0x80|19
-+        o = run(cfg, rtp(false, { 0x62, 0x01, (uint8_t)(0x80 | 19) }));
-+        CHECK(o.action == PEEK_ACT_PROTECT && o.mcs_delta == 1, "idr: FU-A IDR protect d1");
-+    }
-+
-+    // ---- profile: refpred (HEVC) ----
-+    {
-+        peek_cfg_t cfg;
-+        peek_cfg_set_profile(&cfg, "refpred");
-+
-+        auto o = run(cfg, rtp(false, { hevc(1), 0 }));       // TRAIL_R
-+        CHECK(o.action == PEEK_ACT_PROTECT && o.mcs_delta == 1, "refpred: TRAIL_R protect d1");
-+
-+        o = run(cfg, rtp(true, { hevc(0), 0 }));             // TRAIL_N + marker
-+        CHECK(o.action == PEEK_ACT_DROP, "refpred: TRAIL_N drop");
-+        CHECK(o.signals & PEEK_SIG_FEC_CLOSE,
-+              "refpred: peek still reports FEC_CLOSE on dropped pkt (caller gates)");
-+
-+        o = run(cfg, rtp(false, { hevc(19), 0 }));           // IDR not handled here
-+        CHECK(o.action == PEEK_ACT_PASS, "refpred: IDR pass (out of profile scope)");
-+    }
-+
-+    // ---- profile: idr+refpred ----
-+    {
-+        peek_cfg_t cfg;
-+        peek_cfg_set_profile(&cfg, "idr+refpred");
-+
-+        auto o = run(cfg, rtp(false, { hevc(33), 0 }));      // SPS
-+        CHECK(o.action == PEEK_ACT_PROTECT && o.mcs_delta == 2, "idr+refpred: SPS d2");
-+        o = run(cfg, rtp(false, { hevc(19), 0 }));           // IDR
-+        CHECK(o.action == PEEK_ACT_PROTECT && o.mcs_delta == 1, "idr+refpred: IDR d1");
-+        o = run(cfg, rtp(false, { hevc(1), 0 }));            // TRAIL_R
-+        CHECK(o.action == PEEK_ACT_PROTECT && o.mcs_delta == 1, "idr+refpred: TRAIL_R d1");
-+        o = run(cfg, rtp(false, { hevc(0), 0 }));            // TRAIL_N
-+        CHECK(o.action == PEEK_ACT_DROP, "idr+refpred: TRAIL_N drop");
-+    }
-+
-+    // ---- granular --peek-rule, H.264 ----
-+    {
-+        peek_cfg_t cfg;
-+        peek_cfg_init(&cfg);
-+        std::string err;
-+        bool ok = peek_cfg_add_rule(&cfg, "h264:protect:idr:d1", &err);
-+        CHECK(ok, "h264 rule parses");
-+        if (!ok) printf("  err: %s\n", err.c_str());
-+
-+        // H.264 single-NAL IDR: nal[0]&0x1F=5 => 0x65
-+        auto o = run(cfg, rtp(false, { 0x65, 0x00 }));
-+        CHECK(o.action == PEEK_ACT_PROTECT && o.mcs_delta == 1, "h264: IDR protect d1");
-+
-+        // H.264 FU-A (28) carrying IDR(5): nal[0]=0x7C, nal[1]=S|5=0x85
-+        o = run(cfg, rtp(false, { 0x7C, 0x85 }));
-+        CHECK(o.action == PEEK_ACT_PROTECT && o.mcs_delta == 1, "h264: FU-A IDR protect d1");
-+
-+        // non-IDR slice (type 1) => PASS
-+        o = run(cfg, rtp(false, { 0x61, 0x00 }));
-+        CHECK(o.action == PEEK_ACT_PASS, "h264: non-IDR pass");
-+    }
-+
-+    // ---- fail-open / edge cases ----
-+    {
-+        peek_cfg_t cfg;
-+        peek_cfg_set_profile(&cfg, "idr");
-+
-+        // too short to be RTP
-+        std::vector<uint8_t> tiny = { 0x80, 0x60, 0x00 };
-+        auto o = peek(tiny.data(), tiny.size(), &cfg);
-+        CHECK(o.action == PEEK_ACT_PASS && o.signals == 0, "short datagram => PASS, no signals");
-+
-+        // RTP header present but no NAL bytes
-+        o = run(cfg, rtp(true, {}));
-+        CHECK(o.action == PEEK_ACT_PASS, "empty payload => PASS");
-+        // marker still detected on a header-only datagram (byte 1 test)
-+        CHECK(o.signals & PEEK_SIG_FEC_CLOSE, "empty payload marker => FEC_CLOSE");
-+
-+        // disabled cfg: no action, no signals, even with marker
-+        peek_cfg_t off;
-+        peek_cfg_set_profile(&off, "off");
-+        o = run(off, rtp(true, { hevc(19), 0 }));
-+        CHECK(o.action == PEEK_ACT_PASS && o.signals == 0, "off profile => zero-cost passthrough");
-+    }
-+
-+    // ---- RTP with CSRC + extension: payload offset math ----
-+    {
-+        peek_cfg_t cfg;
-+        peek_cfg_set_profile(&cfg, "idr");
-+        // CC=1 (one CSRC, +4), X=1 (extension): byte0 = 0x80|0x10|0x01 = 0x91
-+        std::vector<uint8_t> p;
-+        p.push_back(0x91);
-+        p.push_back(0x60);
-+        for (int i = 0; i < 10; i++) p.push_back(0); // rest of fixed header
-+        for (int i = 0; i < 4; i++) p.push_back(0);  // 1 CSRC
-+        // extension header: 2 bytes profile + 2 bytes length(=1 word)
-+        p.push_back(0); p.push_back(0); p.push_back(0x00); p.push_back(0x01);
-+        for (int i = 0; i < 4; i++) p.push_back(0);  // 1 extension word
-+        // now the NAL: VPS
-+        p.push_back(hevc(32)); p.push_back(0x01);
-+        auto o = peek(p.data(), p.size(), &cfg);
-+        CHECK(o.action == PEEK_ACT_PROTECT && o.mcs_delta == 2,
-+              "RTP CSRC+ext: payload located, VPS protect d2");
-+    }
-+
-+    printf("\n%d/%d checks passed\n", g_total - g_fail, g_total);
-+    return g_fail ? 1 : 0;
-+}
 diff --git a/src/tx.cpp b/src/tx.cpp
-index 2dc86ea..6643c25 100644
+index 2dc86ea..de99b5d 100644
 --- a/src/tx.cpp
 +++ b/src/tx.cpp
 @@ -22,6 +22,7 @@
@@ -727,14 +196,13 @@ index 2dc86ea..6643c25 100644
  
  // --- UDP stats push (-Y host:port) ---
  //
-@@ -130,10 +132,12 @@ static void stats_udp_emit_tx(uint64_t ts_ms, int interval_ms,
+@@ -130,10 +132,11 @@ static void stats_udp_emit_tx(uint64_t ts_ms, int interval_ms,
                                uint32_t pkts_drop, uint32_t pkts_trunc,
                                uint32_t fec_timeouts,
                                int fec_k, int fec_n,
 -                              const radiotap_header_t &rt)
 +                              const radiotap_header_t &rt,
-+                              uint32_t peek_dropped, uint32_t peek_closes,
-+                              int peek_enabled, int peek_drop, int peek_rules)
++                              uint32_t peek_closes, int peek_enabled)
  {
      if (!g_stats_udp_enabled) return;
 -    char buf[512];
@@ -742,177 +210,82 @@ index 2dc86ea..6643c25 100644
      uint64_t this_seq = g_stats_seq++;
      int len = snprintf(buf, sizeof(buf),
          "{\"ts_ms\":%" PRIu64 ",\"type\":\"tx_stats\",\"ver\":1,\"seq\":%" PRIu64 ",\"interval_ms\":%d,"
-@@ -141,7 +145,9 @@ static void stats_udp_emit_tx(uint64_t ts_ms, int interval_ms,
+@@ -141,7 +144,8 @@ static void stats_udp_emit_tx(uint64_t ts_ms, int interval_ms,
          "\"pkts_drop\":%u,\"pkts_trunc\":%u,\"fec_timeouts\":%u,"
          "\"fec_k\":%d,\"fec_n\":%d},"
          "\"radio\":{\"mcs\":%u,\"bw\":%u,\"short_gi\":%u,\"stbc\":%u,\"ldpc\":%u,"
 -        "\"vht_mode\":%u,\"vht_nss\":%u}}\n",
 +        "\"vht_mode\":%u,\"vht_nss\":%u},"
-+        "\"peek\":{\"enabled\":%d,\"drop\":%d,\"rules\":%d,"
-+        "\"pkts_dropped\":%u,\"fec_closes\":%u}}\n",
++        "\"peek\":{\"enabled\":%d,\"fec_closes\":%u}}\n",
          ts_ms, this_seq, interval_ms,
          pkts_in, bytes_in, pkts_out, bytes_out,
          pkts_drop, pkts_trunc, fec_timeouts,
-@@ -149,7 +155,9 @@ static void stats_udp_emit_tx(uint64_t ts_ms, int interval_ms,
+@@ -149,7 +153,8 @@ static void stats_udp_emit_tx(uint64_t ts_ms, int interval_ms,
          (unsigned)rt.mcs_index, (unsigned)rt.bandwidth,
          (unsigned)(rt.short_gi ? 1 : 0),
          (unsigned)rt.stbc, (unsigned)(rt.ldpc ? 1 : 0),
 -        (unsigned)(rt.vht_mode ? 1 : 0), (unsigned)rt.vht_nss);
 +        (unsigned)(rt.vht_mode ? 1 : 0), (unsigned)rt.vht_nss,
-+        peek_enabled, peek_drop, peek_rules,
-+        peek_dropped, peek_closes);
++        peek_enabled, peek_closes);
      if (len <= 0 || len >= (int)sizeof(buf)) return;
      (void)sendto(g_stats_udp_fd, buf, (size_t)len, 0,
                   (const struct sockaddr*)&g_stats_udp_dst,
-@@ -157,10 +165,93 @@ static void stats_udp_emit_tx(uint64_t ts_ms, int interval_ms,
+@@ -157,6 +162,50 @@ static void stats_udp_emit_tx(uint64_t ts_ms, int interval_ms,
  }
  // --- end stats push ---
  
-+// --- NAL-aware peek (link protection) ---
++// --- peek (per-frame FEC close) ---
 +//
 +// One process-wide config; data_source reads it on every datagram and
-+// CMD_SET_PEEK mutates the two live toggles. Zero-initialised => enabled=false
-+// => peek() is a no-op (zero-cost passthrough) until a profile/arg/command
-+// arms it. main() calls peek_cfg_init() so the mandatory FEC_CLOSE signal is
-+// seeded even when armed later by command.
++// CMD_SET_PEEK mutates the live enable toggle. Zero-initialised => enabled=false
++// => peek() is a no-op (zero-cost passthrough) until the profile/command arms
++// it. main() calls peek_cfg_init() so the mandatory FEC_CLOSE signal is seeded
++// even when armed later by command.
 +static peek_cfg_t g_peek_cfg;
-+
-+// Peek short-tail close (proportional parity, no on-air zero-padding).  When
-+// true, peek closes EVERY frame's block via close_block_short() -- cheap enough
-+// to run per-frame, restoring full per-frame loss isolation while emitting only
-+// p ~ proportional parity instead of padding to k + full n-k parity.  Default
-+// false => the threshold-gated full-padding close (backward-compatible; the RX
-+// needs the SHORT_TAIL-aware build before this is enabled).  Set by
-+// --peek-short-tail.
-+static bool g_peek_short_tail = false;
 +
 +// Run one datagram through peek and emit it. Shared by the SHM drain loop and
 +// the UDP recvmsg path so both transports behave identically (and audio/uplink
-+// instances, running with peek off, pay nothing). Returns true if transmitted,
-+// false if dropped. Re-arms fec_close_ts when a frame-boundary close fires.
++// instances, running with peek off, pay nothing). Always transmits; re-arms
++// fec_close_ts when a frame-boundary close fires.
 +static inline bool peek_emit(Transmitter *t, const uint8_t *buf, size_t rsize,
 +                             int fec_timeout, uint64_t &fec_close_ts,
-+                             uint32_t &count_peek_dropped, uint32_t &count_peek_closes)
++                             uint32_t &count_peek_closes)
 +{
 +    peek_outcome_t o = peek(buf, rsize, &g_peek_cfg);
-+
-+    if (o.action == PEEK_ACT_DROP && g_peek_cfg.drop_enabled)
-+    {
-+        // Dropped before the FEC block: no send, and signals are not evaluated
-+        // (the previous transmitted frame already closed on its own marker).
-+        count_peek_dropped += 1;
-+        return false;
-+    }
-+
-+    if (o.action == PEEK_ACT_PROTECT)
-+    {
-+        t->set_tx_level(o.mcs_delta);
-+    }
 +
 +    t->send_packet(buf, rsize, 0);
 +
 +    if (o.signals & PEEK_SIG_FEC_CLOSE)
 +    {
-+        if (g_peek_short_tail)
++        // Threshold-gate the per-frame block close.  Closing a near-empty block
++        // zero-pads it to k ON-AIR and emits full n-k parity (see send_packet
++        // FEC_ONLY path), so a P-frame-heavy 60/120fps stream would put ~fec_n
++        // packets on air per frame regardless of payload — overflowing the TX
++        // ring.  Only honor the close once the block holds a worthwhile fraction
++        // of k; smaller frames carry into the next block (it still auto-closes
++        // at k, and tiny-frame loss isolation is cheap).
++        int k = t->block_k();
++        if (k <= 0 || (int)t->block_fill() * 2 >= k)
 +        {
-+            // Short-tail close: proportional parity, no on-air zero-padding.
-+            // Cheap enough to run on EVERY frame, so no k/2 gate -- this restores
-+            // full per-frame loss isolation that the gate gave up.  close_block_short
-+            // is a no-op when no block is open (returns false).
-+            if (t->close_block_short())
-+            {
-+                if (fec_timeout > 0) fec_close_ts = get_time_ms() + fec_timeout;
-+                count_peek_closes += 1;
-+            }
-+        }
-+        else
-+        {
-+            // Threshold-gate the per-frame block close.  Closing a near-empty block
-+            // zero-pads it to k ON-AIR and emits full n-k parity (see send_packet
-+            // FEC_ONLY path), so a P-frame-heavy 60/120fps stream would put ~fec_n
-+            // packets on air per frame regardless of payload — overflowing the TX
-+            // ring.  Only honor the close once the block holds a worthwhile fraction
-+            // of k; smaller frames carry into the next block (it still auto-closes
-+            // at k, and tiny-frame loss isolation is cheap).
-+            // NOTE: verify-stage fixed threshold (k/2); #2 turns this into a knob.
-+            int k = t->block_k();
-+            if (k <= 0 || (int)t->block_fill() * 2 >= k)
-+            {
-+                // Enqueue order matters: the marked fragment is already in (above),
-+                // so parity covers it.
-+                while (t->send_packet(NULL, 0, WFB_PACKET_FEC_ONLY));
-+                if (fec_timeout > 0) fec_close_ts = get_time_ms() + fec_timeout;
-+                count_peek_closes += 1;
-+            }
++            // Enqueue order matters: the marked fragment is already in (above),
++            // so parity covers it.
++            while (t->send_packet(NULL, 0, WFB_PACKET_FEC_ONLY));
++            if (fec_timeout > 0) fec_close_ts = get_time_ms() + fec_timeout;
++            count_peek_closes += 1;
 +        }
 +    }
 +    return true;
 +}
-+// --- end NAL-aware peek ---
++// --- end peek ---
 +
  Transmitter::Transmitter(int k, int n, const string &keypair, uint64_t epoch, uint32_t channel_id, uint32_t fec_delay, vector<tags_item_t> &tags) : \
      fec_p(NULL), fec_k(-1), fec_n(-1),
      block_idx(0), fragment_idx(0),
-     max_packet_size(0),
-+    tx_level(0),
-     encrypt_data(true),     /* AEAD on by default; -x disables per-fragment AEAD */
-     epoch(epoch),
-     channel_id(channel_id),
-@@ -311,6 +402,8 @@ RawSocketTransmitter::RawSocketTransmitter(int k, int n, const string &keypair,
-     current_output(0),
-     ieee80211_seq(0),
-     radiotap_header(radiotap_header),
-+    cur_level(0),
-+    block_max_level(0),
-     frame_type(frame_type),
-     use_qdisc(use_qdisc),
-     fwmark_base(fwmark_base),
-@@ -318,6 +411,8 @@ RawSocketTransmitter::RawSocketTransmitter(int k, int n, const string &keypair,
-     inject_retries(inject_retries),
-     inject_retry_delay(inject_retry_delay)
- {
-+    rebuild_protect_headers();
-+
-     for(auto it=wlans.begin(); it!=wlans.end(); it++)
-     {
-         int fd = socket(PF_PACKET, SOCK_RAW, 0);
-@@ -363,6 +458,27 @@ RawSocketTransmitter::RawSocketTransmitter(int k, int n, const string &keypair,
-     }
- }
- 
-+void RawSocketTransmitter::rebuild_protect_headers(void)
-+{
-+    // protect_hdr[d] = base radio params with mcs_index reduced by d (clamped
-+    // at 0). Index 0 reproduces the base header exactly. Re-derives from the
-+    // live radiotap_header so it tracks adaptive CMD_SET_RADIO changes; only
-+    // mcs_index varies (link_controller changes nothing else at runtime).
-+    protect_hdr.clear();
-+    for (int d = 0; d <= PEEK_MAX_DELTA; d++)
-+    {
-+        int mcs = (int)radiotap_header.mcs_index - d;
-+        if (mcs < 0) mcs = 0;
-+        protect_hdr.push_back(init_radiotap_header(radiotap_header.stbc,
-+                                                   radiotap_header.ldpc,
-+                                                   radiotap_header.short_gi,
-+                                                   radiotap_header.bandwidth,
-+                                                   (uint8_t)mcs,
-+                                                   radiotap_header.vht_mode,
-+                                                   radiotap_header.vht_nss));
-+    }
-+}
-+
- void RawSocketTransmitter::inject_packet(const uint8_t *buf, size_t size)
- {
-     assert(size <= MAX_FORWARDER_PACKET_SIZE);
-@@ -384,11 +500,17 @@ void RawSocketTransmitter::inject_packet(const uint8_t *buf, size_t size)
+@@ -384,11 +433,13 @@ void RawSocketTransmitter::inject_packet(const uint8_t *buf, size_t size)
      ieee_hdr[FRAME_SEQ_HB] = (ieee80211_seq >> 8) & 0xff;
      ieee80211_seq += 16;
  
-+    // PROTECT: pick the prebuilt header for this fragment's level. protect_hdr[0]
-+    // mirrors radiotap_header, so cur_level==0 is byte-identical to no-peek.
-+    const radiotap_header_t &rt =
-+        (!protect_hdr.empty() && cur_level < protect_hdr.size())
-+            ? protect_hdr[cur_level] : radiotap_header;
++    const radiotap_header_t &rt = radiotap_header;
 +
      struct iovec iov[3] = \
          {
@@ -924,189 +297,56 @@ index 2dc86ea..6643c25 100644
              },
              // ieee80211 header
              { .iov_base = (void*)ieee_hdr,
-@@ -729,7 +851,7 @@ void RemoteTransmitter::dump_stats(uint64_t ts, uint32_t &injected_packets, uint
- 
- 
- 
--void Transmitter::send_block_fragment(size_t packet_size)
-+void Transmitter::send_block_fragment(size_t packet_size, bool short_tail)
- {
-     uint8_t ciphertext[MAX_FORWARDER_PACKET_SIZE];
-     wblock_hdr_t *block_hdr = (wblock_hdr_t*)ciphertext;
-@@ -741,7 +863,11 @@ void Transmitter::send_block_fragment(size_t packet_size)
+@@ -741,7 +792,8 @@ void Transmitter::send_block_fragment(size_t packet_size)
      // still dedupe by (block_idx, fragment_idx) and FEC decoding keeps
      // working identically.
      block_hdr->packet_type = encrypt_data ? WFB_PACKET_DATA : WFB_PACKET_DATA_PLAIN;
 -    block_hdr->data_nonce = htobe64(((block_idx & BLOCK_IDX_MASK) << 8) + fragment_idx);
 +    uint64_t data_nonce = ((block_idx & BLOCK_IDX_MASK) << 8) + fragment_idx;
-+    // SHORT_TAIL marker rides the always-zero top bit; it is authenticated as
-+    // part of the AEAD nonce/AAD below.
-+    if (short_tail) data_nonce |= WFB_NONCE_SHORT_TAIL;
 +    block_hdr->data_nonce = htobe64(data_nonce);
  
      if (encrypt_data)
      {
-@@ -781,6 +907,11 @@ bool Transmitter::send_packet(const uint8_t *buf, size_t size, uint8_t flags)
-         return false;
-     }
- 
-+    // Consume the PROTECT level set for this packet (0 if none). Reset so a
-+    // later send without set_tx_level transmits at base rate.
-+    uint8_t lvl = tx_level;
-+    tx_level = 0;
-+
-     wpacket_hdr_t *packet_hdr = (wpacket_hdr_t*)block[fragment_idx];
- 
-     packet_hdr->flags = flags;
-@@ -800,6 +931,10 @@ bool Transmitter::send_packet(const uint8_t *buf, size_t size, uint8_t flags)
-         set_mark(0);
-     }
- 
-+    // Select this data fragment's radiotap level (PROTECT) and fold it into
-+    // the running block max used for parity.
-+    apply_tx_level(lvl, false, fragment_idx == 0);
-+
-     send_block_fragment(sizeof(wpacket_hdr_t) + size);
-     max_packet_size = max(max_packet_size, sizeof(wpacket_hdr_t) + size);
-     fragment_idx += 1;
-@@ -812,6 +947,10 @@ bool Transmitter::send_packet(const uint8_t *buf, size_t size, uint8_t flags)
-     // mark fec packets with fwmark + 1
-     set_mark(1);
- 
-+    // Parity injects at the block's most-robust level (Option A) so it
-+    // survives at least as well as the toughest data fragment it protects.
-+    apply_tx_level(0, true, false);
-+
-     while (fragment_idx < fec_n)
-     {
-         if(fec_delay > 0)
-@@ -847,6 +986,81 @@ bool Transmitter::send_packet(const uint8_t *buf, size_t size, uint8_t flags)
-     return true;
- }
- 
-+bool Transmitter::close_block_short(void)
-+{
-+    int j = fragment_idx;
-+    if (j <= 0)      return false;   // no block open
-+    if (j >= fec_k)  return false;   // full block: caller should let send_packet close it
-+
-+    // Canonical pad bytes for slots [j, k): flags=FEC_ONLY, packet_size=0, zero
-+    // payload.  Must be BYTE-IDENTICAL to what the RX synthesizes for [j+1, k)
-+    // (and to slot j, which we transmit as the marker) so the RS math matches.
-+    for (int i = j; i < fec_k; i++)
-+    {
-+        wpacket_hdr_t *h = (wpacket_hdr_t*)block[i];
-+        h->flags = WFB_PACKET_FEC_ONLY;
-+        h->packet_size = htobe16(0);
-+        memset(block[i] + sizeof(wpacket_hdr_t), '\0', MAX_FEC_PAYLOAD - sizeof(wpacket_hdr_t));
-+    }
-+    max_packet_size = max(max_packet_size, sizeof(wpacket_hdr_t));
-+
-+    // Transmit ONLY the boundary marker (slot j) on-air, with the SHORT_TAIL
-+    // bit set.  Its fragment_idx == j tells RX where real data ends.  Ride it at
-+    // the block's toughest PROTECT level (like parity) so the signal is at least
-+    // as robust as the data it bounds.  Slots [j+1, k) are NOT transmitted.
-+    set_mark(0);
-+    apply_tx_level(0, true, false);
-+    fragment_idx = j;
-+    send_block_fragment(sizeof(wpacket_hdr_t), /*short_tail=*/true);
-+
-+    // Compute the FULL parity set into block[k .. n) (the codec is all-or-
-+    // nothing), then transmit only the first p of them.  Parity fragment i
-+    // carries check-block id k+i, so the first p form a valid contiguous subset.
-+    zfex_status_code_t _rc = fec_encode_simd(fec_p, (const uint8_t**)block, block + fec_k, ZFEX_ROUND_UP_SIMD(max_packet_size));
-+    assert(_rc == ZFEX_SC_OK);
-+
-+    int parity_total = fec_n - fec_k;
-+    // p = round(j*(n-k)/k), integer round-half-up, clamped to [1, n-k].
-+    int p = (parity_total > 0) ? ((j * parity_total + fec_k / 2) / fec_k) : 0;
-+    if (parity_total > 0 && p < 1) p = 1;
-+    if (p > parity_total) p = parity_total;
-+
-+    set_mark(1);
-+    apply_tx_level(0, true, false);   // parity at block_max_level (Option A)
-+
-+    for (int i = 0; i < p; i++)
-+    {
-+        if (fec_delay > 0)
-+        {
-+            struct timespec t = { .tv_sec = (time_t)(fec_delay / 1000000),
-+                                  .tv_nsec = (suseconds_t)(fec_delay % 1000000) * 1000 };
-+            int rc = clock_nanosleep(CLOCK_MONOTONIC, 0, &t, NULL);
-+            if(rc != 0 && rc != EINTR)
-+            {
-+                throw runtime_error(string_format("clock_nanosleep: %s", strerror(rc)));
-+            }
-+        }
-+        fragment_idx = fec_k + i;
-+        send_block_fragment(max_packet_size);
-+    }
-+
-+    block_idx += 1;
-+    fragment_idx = 0;
-+    max_packet_size = 0;
-+
-+    // Generate new session key after MAX_BLOCK_IDX blocks (mirror send_packet).
-+    if (block_idx > MAX_BLOCK_IDX)
-+    {
-+        init_session(fec_k, fec_n);
-+        for(int i = 0; i < fec_n - fec_k + 1; i++)
-+        {
-+            send_session_key();
-+        }
-+    }
-+
-+    return true;
-+}
-+
- // Extract SO_RXQ_OVFL counter
- uint32_t extract_rxq_overflow(struct msghdr *msg)
- {
-@@ -902,6 +1116,8 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
+@@ -902,6 +954,7 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
      uint32_t count_b_injected = 0;  // successfully injected bytes (include additional fec packets)
      uint32_t count_p_dropped = 0;   // dropped due to rxq overflows or injection timeout
      uint32_t count_p_truncated = 0; // injected large packets that were truncated
-+    uint32_t count_p_peek_dropped = 0; // datagrams shed by an armed peek DROP rule
 +    uint32_t count_p_peek_closes = 0;  // frame-boundary FEC closes triggered by peek
      int start_fd_idx = 0;
  
      // --- SHM ring attach (non-fatal: retry loop handles producer lifecycle) ---
-@@ -1033,7 +1249,11 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
+@@ -1033,7 +1086,9 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
                                    count_p_dropped, count_p_truncated,
                                    count_p_fec_timeouts,
                                    fec_k_now, fec_n_now,
 -                                  rt);
 +                                  rt,
-+                                  count_p_peek_dropped, count_p_peek_closes,
-+                                  g_peek_cfg.enabled ? 1 : 0,
-+                                  g_peek_cfg.drop_enabled ? 1 : 0,
-+                                  g_peek_cfg.n_rules);
++                                  count_p_peek_closes,
++                                  g_peek_cfg.enabled ? 1 : 0);
              }
  
              if(count_p_dropped)
-@@ -1046,6 +1266,12 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
+@@ -1046,6 +1101,11 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
                  WFB_ERR("%u packets truncated\n", count_p_truncated);
              }
  
-+            if(g_peek_cfg.enabled && (count_p_peek_dropped || count_p_peek_closes))
++            if(g_peek_cfg.enabled && count_p_peek_closes)
 +            {
-+                WFB_INFO("peek: %u dropped, %u frame-boundary FEC closes\n",
-+                         count_p_peek_dropped, count_p_peek_closes);
++                WFB_INFO("peek: %u frame-boundary FEC closes\n", count_p_peek_closes);
 +            }
 +
              count_p_fec_timeouts = 0;
              count_p_incoming = 0;
              count_b_incoming = 0;
-@@ -1053,6 +1279,8 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
+@@ -1053,6 +1113,7 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
              count_b_injected = 0;
              count_p_dropped = 0;
              count_p_truncated = 0;
-+            count_p_peek_dropped = 0;
 +            count_p_peek_closes = 0;
  
              log_send_ts = cur_ts + log_interval - ((cur_ts - log_send_ts) % log_interval);
          }
-@@ -1227,6 +1455,56 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
+@@ -1227,6 +1288,39 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
                  }
                  break;
  
@@ -1119,15 +359,12 @@ index 2dc86ea..6643c25 100644
 +                        continue;
 +                    }
 +
-+                    // Each toggle moves independently; WFB_PEEK_KEEP leaves it.
++                    // WFB_PEEK_KEEP leaves the toggle untouched.
 +                    if (req.u.cmd_set_peek.enabled != WFB_PEEK_KEEP)
 +                        g_peek_cfg.enabled = (req.u.cmd_set_peek.enabled != 0);
-+                    if (req.u.cmd_set_peek.drop_enabled != WFB_PEEK_KEEP)
-+                        g_peek_cfg.drop_enabled = (req.u.cmd_set_peek.drop_enabled != 0);
 +
 +                    sendto(fd, &resp, offsetof(cmd_resp_t, u), MSG_DONTWAIT, (sockaddr*)&from_addr, addr_size);
-+                    WFB_INFO("peek: enabled=%d drop_enabled=%d (%d action rules)\n",
-+                             g_peek_cfg.enabled, g_peek_cfg.drop_enabled, g_peek_cfg.n_rules);
++                    WFB_INFO("peek: enabled=%d\n", g_peek_cfg.enabled);
 +                }
 +                break;
 +
@@ -1140,21 +377,7 @@ index 2dc86ea..6643c25 100644
 +                        continue;
 +                    }
 +
-+                    // Largest PROTECT depth in the action table (parity/floor hint).
-+                    uint8_t max_delta = 0;
-+                    for (uint8_t i = 0; i < g_peek_cfg.n_rules; i++)
-+                    {
-+                        if (g_peek_cfg.rules[i].action == PEEK_ACT_PROTECT &&
-+                            g_peek_cfg.rules[i].mcs_delta > max_delta)
-+                            max_delta = g_peek_cfg.rules[i].mcs_delta;
-+                    }
-+
-+                    resp.u.cmd_get_peek.enabled      = g_peek_cfg.enabled ? 1 : 0;
-+                    resp.u.cmd_get_peek.drop_enabled = g_peek_cfg.drop_enabled ? 1 : 0;
-+                    resp.u.cmd_get_peek.n_rules      = g_peek_cfg.n_rules;
-+                    resp.u.cmd_get_peek.n_sig_rules  = g_peek_cfg.n_sig_rules;
-+                    resp.u.cmd_get_peek.base_mcs     = t->get_radiotap_header().mcs_index;
-+                    resp.u.cmd_get_peek.max_delta    = max_delta;
++                    resp.u.cmd_get_peek.enabled = g_peek_cfg.enabled ? 1 : 0;
 +
 +                    sendto(fd, &resp, offsetof(cmd_resp_t, u) + sizeof(resp.u.cmd_get_peek), MSG_DONTWAIT, (sockaddr*)&from_addr, addr_size);
 +                }
@@ -1163,39 +386,37 @@ index 2dc86ea..6643c25 100644
                  default:
                  {
                      resp.rc = htonl(ENOTSUP);
-@@ -1346,7 +1624,8 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
+@@ -1346,7 +1440,8 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
                      session_key_announce_ts = cur_ts + SESSION_KEY_ANNOUNCE_MSEC;
                  }
  
 -                t->send_packet(buf, rsize, 0);
 +                peek_emit(t.get(), buf, rsize, fec_timeout, fec_close_ts,
-+                          count_p_peek_dropped, count_p_peek_closes);
++                          count_p_peek_closes);
  
                  if (cur_ts >= log_send_ts)
                  {
-@@ -1482,7 +1761,8 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
+@@ -1482,7 +1577,8 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
                          session_key_announce_ts = cur_ts + SESSION_KEY_ANNOUNCE_MSEC;
                      }
  
 -                    t->send_packet(buf, rsize, 0);
 +                    peek_emit(t.get(), buf, rsize, fec_timeout, fec_close_ts,
-+                              count_p_peek_dropped, count_p_peek_closes);
++                              count_p_peek_closes);
  
                      if (cur_ts >= log_send_ts)  // log timeout expired
                      {
-@@ -2161,8 +2441,42 @@ int main(int argc, char * const *argv)
+@@ -2161,8 +2257,25 @@ int main(int argc, char * const *argv)
      int encrypt_data = 1;           // -x (no-AEAD flag) flips to 0
      const char *stats_udp_target = NULL;  // -Y host:port; NULL = disabled
  
 -    while ((opt = getopt(argc, argv, "dI:K:k:n:u:U:p:F:l:B:G:S:L:M:N:D:T:i:e:R:s:f:mVQP:C:J:E:H:xY:")) != -1) {
 +    // NAL-aware peek: seed the mandatory FEC_CLOSE signal; profile/rules below
-+    // arm it. Left disabled unless --peek-profile / --peek-rule says otherwise.
++    // arm it. Left disabled unless --peek-profile close says otherwise.
 +    peek_cfg_init(&g_peek_cfg);
-+    enum { OPT_PEEK_PROFILE = 0x100, OPT_PEEK_RULE, OPT_PEEK_SHORT_TAIL };
++    enum { OPT_PEEK_PROFILE = 0x100 };
 +    static struct option peek_longopts[] = {
 +        {"peek-profile",    required_argument, NULL, OPT_PEEK_PROFILE},
-+        {"peek-rule",       required_argument, NULL, OPT_PEEK_RULE},
-+        {"peek-short-tail", no_argument,       NULL, OPT_PEEK_SHORT_TAIL},
 +        {NULL, 0, NULL, 0}
 +    };
 +
@@ -1204,71 +425,33 @@ index 2dc86ea..6643c25 100644
 +        case OPT_PEEK_PROFILE:
 +            if (!peek_cfg_set_profile(&g_peek_cfg, optarg))
 +            {
-+                WFB_ERR("Unknown --peek-profile '%s' (off|close|idr|refpred|idr+refpred)\n", optarg);
++                WFB_ERR("Unknown --peek-profile '%s' (off|close)\n", optarg);
 +                exit(1);
 +            }
-+            break;
-+
-+        case OPT_PEEK_RULE:
-+        {
-+            std::string perr;
-+            if (!peek_cfg_add_rule(&g_peek_cfg, optarg, &perr))
-+            {
-+                WFB_ERR("--peek-rule '%s': %s\n", optarg, perr.c_str());
-+                exit(1);
-+            }
-+            break;
-+        }
-+
-+        case OPT_PEEK_SHORT_TAIL:
-+            g_peek_short_tail = true;
 +            break;
 +
          case 'I':
              tx_mode = INJECTOR;
              srv_port = atoi(optarg);
-@@ -2337,6 +2651,13 @@ int main(int argc, char * const *argv)
+@@ -2337,6 +2450,10 @@ int main(int argc, char * const *argv)
              WFB_INFO("\nAEAD option:\n"
                       "  -x   disable per-fragment AEAD (emit WFB_PACKET_DATA_PLAIN; session still signed).\n"
                       "       RX must run with -x too or DATA_PLAIN packets are dropped.\n");
 +            WFB_INFO("\nPeek options:\n"
-+                     "  --peek-profile <off|close|idr|refpred|idr+refpred>  arm NAL-aware peek (default off)\n"
-+                     "       close = per-frame FEC close only (loss isolation, no key-frame MCS shift)\n"
-+                     "  --peek-rule <spec>                            add/override one granular peek rule\n"
-+                     "  --peek-short-tail                             close each frame's block with\n"
-+                     "       proportional parity + no on-air zero-padding (SHORT_TAIL marker).  Needs a\n"
-+                     "       SHORT_TAIL-aware RX.  Default off => threshold-gated full-padding close.\n");
++                     "  --peek-profile <off|close>   per-frame FEC close (default off)\n"
++                     "       close = close each video frame's FEC block at the RTP marker for\n"
++                     "       per-frame loss isolation + tighter delivery timing\n");
              WFB_INFO("Default: K='%s', k=%d, n=%d, fec_delay=%u [us], udp_port=%d, link_id=0x%06x, radio_port=%u, epoch=%" PRIu64 ", bandwidth=%d guard_interval=%s stbc=%d ldpc=%d mcs_index=%d vht_nss=%d, vht_mode=%d, fec_timeout=%d, log_interval=%d, rcv_buf=system_default, snd_buf=system_default, frame_type=data, mirror=false, use_qdisc=false, fwmark=%u, control_port=%d, inject_retries=%u, inject_retry_delay=%u, aead=%s\n",
                       keypair.c_str(), k, n, fec_delay, udp_port, link_id, radio_port, epoch, bandwidth, short_gi ? "short" : "long", stbc, ldpc, mcs_index, vht_nss, vht_mode, fec_timeout, log_interval, fwmark, control_port, inject_retries, inject_retry_delay, encrypt_data ? "on" : "off");
              WFB_INFO("Radio MTU: %lu\n", (unsigned long)MAX_PAYLOAD_SIZE);
 diff --git a/src/tx.hpp b/src/tx.hpp
-index e7a2cdc..92303a4 100644
+index e7a2cdc..7f3af5c 100644
 --- a/src/tx.hpp
 +++ b/src/tx.hpp
-@@ -77,6 +77,15 @@ public:
-     bool send_packet(const uint8_t *buf, size_t size, uint8_t flags);
-     void send_session_key(void);
-     void init_session(int k, int n);
-+    // Close the currently-open block as a SHORT block: transmit one boundary
-+    // marker fragment (FEC_ONLY, SHORT_TAIL nonce bit, fragment_idx == j) plus
-+    // p = round(j*(n-k)/k) proportional parity, WITHOUT zero-padding slots
-+    // [j+1, k) on-air.  RX reads j from the marker and synthesizes [j+1, k)
-+    // locally.  This is the airtime-cheap replacement for the peek per-frame
-+    // FEC_CLOSE (which pads to k on-air + full n-k parity).  No-op + returns
-+    // false if no block is open (fragment_idx == 0) or it is already full
-+    // (fragment_idx == fec_k).  Returns true if a short block was emitted.
-+    bool close_block_short(void);
-     // Per-fragment AEAD is toggled via the -x CLI flag at startup (there is
-     // no wfb_cmd for this — switching mid-session would invalidate the RX's
-     // current session state and require a re-handshake the protocol doesn't
-@@ -90,14 +99,35 @@ public:
+@@ -90,6 +90,13 @@ public:
      virtual void dump_stats(uint64_t ts, uint32_t &injected_packets, uint32_t &dropped_packets, uint32_t &injected_bytes) = 0;
      virtual void update_radiotap_header(radiotap_header_t &radiotap_header) = 0;
      virtual radiotap_header_t get_radiotap_header(void) = 0;
-+    // NAL-aware PROTECT: set the per-packet MCS-reduction level for the NEXT
-+    // send_packet (0 = base MCS). Consumed and reset to 0 each send_packet, so
-+    // a caller that never sets it gets base-rate transmission unchanged.
-+    void set_tx_level(uint8_t level) { tx_level = level; }
 +    // Current open-block fill (data fragments enqueued this block, 0..fec_k) and
 +    // the live RS k.  peek_emit reads these to threshold-gate the per-frame
 +    // FEC_CLOSE: closing a near-empty block zero-pads it to k on-air + full
@@ -1279,79 +462,8 @@ index e7a2cdc..92303a4 100644
  protected:
      virtual void inject_packet(const uint8_t *buf, size_t size) = 0;
      virtual void set_mark(uint32_t idx) = 0;
-+    // Select the radiotap level for the fragment about to be injected. Default
-+    // no-op (UDP/distributor transmitters have no radiotap); RawSocketTransmitter
-+    // overrides to pick a prebuilt header. For data fragments level is the
-+    // packet's PROTECT depth and block_start flags the first fragment of a block
-+    // (resets the running block max); for parity, level is ignored and the block
-+    // max is used so parity survives at least as well as the toughest fragment.
-+    virtual void apply_tx_level(uint8_t level, bool parity, bool block_start)
-+    { (void)level; (void)parity; (void)block_start; }
- 
- private:
-     Transmitter(const Transmitter&);
-     Transmitter& operator=(const Transmitter&);
--    void send_block_fragment(size_t packet_size);
-+    // short_tail sets the WFB_NONCE_SHORT_TAIL bit on the data_nonce (used only
-+    // by close_block_short for the boundary marker fragment).
-+    void send_block_fragment(size_t packet_size, bool short_tail = false);
-     void deinit_session(void);
- 
-     fec_t* fec_p;
-@@ -107,6 +137,7 @@ private:
-     uint8_t fragment_idx;
-     uint8_t** block;
-     size_t max_packet_size;
-+    uint8_t tx_level;   // PROTECT depth for the next send_packet (see set_tx_level)
-     // Per-fragment AEAD (startup-only, no runtime command).  True = ChaCha20-
-     // Poly1305 on each data fragment; false = plaintext with a
-     // WFB_PACKET_DATA_PLAIN header (skips encrypt + 16 B tag on wire).
-@@ -182,6 +213,7 @@ public:
-     virtual void update_radiotap_header(radiotap_header_t &radiotap_header)
-     {
-         this->radiotap_header = radiotap_header;
-+        rebuild_protect_headers();
-     }
- 
-     virtual radiotap_header_t get_radiotap_header(void)
-@@ -197,6 +229,23 @@ private:
-         fwmark = fwmark_base + idx;
-     }
- 
-+    // PROTECT: rebuild the per-level radiotap cache from the current header,
-+    // varying only mcs_index (base .. base-PEEK_MAX_DELTA, clamped at 0). Cheap;
-+    // called at construction and on every update_radiotap_header (CMD_SET_RADIO).
-+    void rebuild_protect_headers(void);
-+
-+    // Pick the radiotap level for the fragment about to be injected (see the
-+    // base-class doc). data fragments use their own level and bump the block
-+    // max; parity uses the block max so it survives the toughest fragment.
-+    virtual void apply_tx_level(uint8_t level, bool parity, bool block_start)
-+    {
-+        if (protect_hdr.empty()) { cur_level = 0; return; }
-+        if (parity) { cur_level = block_max_level; return; }
-+        if (block_start) block_max_level = 0;
-+        if (level > block_max_level) block_max_level = level;
-+        cur_level = level;
-+    }
-+
-     const uint32_t channel_id;
-     int current_output;
-     uint16_t ieee80211_seq;
-@@ -204,6 +253,11 @@ private:
-     std::map<int, uint32_t> fd_fwmarks;
-     tx_antenna_stat_t antenna_stat;
-     radiotap_header_t radiotap_header;
-+    // PROTECT header cache, index = mcs_delta. protect_hdr[0] mirrors
-+    // radiotap_header (base MCS), so cur_level==0 is byte-identical to no-peek.
-+    std::vector<radiotap_header_t> protect_hdr;
-+    uint8_t cur_level;        // level inject_packet uses for the current fragment
-+    uint8_t block_max_level;  // running max PROTECT depth over the open block
-     const uint8_t frame_type;
-     const bool use_qdisc;
-     const uint32_t fwmark_base;
 diff --git a/src/tx_cmd.c b/src/tx_cmd.c
-index d963aeb..d6dbd89 100644
+index d963aeb..72623f3 100644
 --- a/src/tx_cmd.c
 +++ b/src/tx_cmd.c
 @@ -79,6 +79,7 @@ int send_command(int port, cmd_req_t req, size_t req_size, cmd_resp_t *resp)
@@ -1373,14 +485,14 @@ index d963aeb..d6dbd89 100644
      default:
          assert(0);
      }
-@@ -297,6 +302,71 @@ int get_radio(char *progname, int port, int argc, char **argv)
+@@ -297,6 +302,44 @@ int get_radio(char *progname, int port, int argc, char **argv)
      return rc;
  }
  
-+/* peek {on|off|drop on|drop off|status}
++/* peek {on|off|status}
 + *
-+ * Two independent live toggles ride CMD_SET_PEEK; WFB_PEEK_KEEP leaves a
-+ * toggle untouched.  status issues CMD_GET_PEEK and prints state + rule counts.
++ * The live enable toggle rides CMD_SET_PEEK; status issues CMD_GET_PEEK.
++ * Peek = per-frame FEC close at the RTP frame boundary (nothing else).
 + */
 +int peek_cmd(char *progname, int port, int argc, char **argv)
 +{
@@ -1394,37 +506,11 @@ index d963aeb..d6dbd89 100644
 +        cmd_req_t greq = { .req_id = htonl(rand()), .cmd_id = CMD_GET_PEEK };
 +        rc = send_command(port, greq, offsetof(cmd_req_t, u), &resp);
 +        if (rc == 0)
-+        {
-+            int floor = (int)resp.u.cmd_get_peek.base_mcs - (int)resp.u.cmd_get_peek.max_delta;
-+            if (floor < 0) floor = 0;
-+            printf("enabled=%d\n"
-+                   "drop_enabled=%d\n"
-+                   "n_rules=%d\n"
-+                   "n_sig_rules=%d\n"
-+                   "base_mcs=%d\n"
-+                   "max_delta=%d\n"
-+                   "protect_floor_mcs=%d\n",
-+                   resp.u.cmd_get_peek.enabled,
-+                   resp.u.cmd_get_peek.drop_enabled,
-+                   resp.u.cmd_get_peek.n_rules,
-+                   resp.u.cmd_get_peek.n_sig_rules,
-+                   resp.u.cmd_get_peek.base_mcs,
-+                   resp.u.cmd_get_peek.max_delta,
-+                   floor);
-+        }
++            printf("enabled=%d\n", resp.u.cmd_get_peek.enabled);
 +        return rc;
 +    }
 +
-+    req.u.cmd_set_peek.enabled      = WFB_PEEK_KEEP;
-+    req.u.cmd_set_peek.drop_enabled = WFB_PEEK_KEEP;
-+
-+    if (argc >= 3 && strcmp(argv[1], "drop") == 0)
-+    {
-+        if      (strcmp(argv[2], "on")  == 0) req.u.cmd_set_peek.drop_enabled = 1;
-+        else if (strcmp(argv[2], "off") == 0) req.u.cmd_set_peek.drop_enabled = 0;
-+        else goto usage;
-+    }
-+    else if (argc >= 2 && strcmp(argv[1], "on") == 0)
++    if (argc >= 2 && strcmp(argv[1], "on") == 0)
 +    {
 +        req.u.cmd_set_peek.enabled = 1;
 +    }
@@ -1434,8 +520,7 @@ index d963aeb..d6dbd89 100644
 +    }
 +    else
 +    {
-+    usage:
-+        fprintf(stderr, "Usage: %s <port> peek {on | off | drop on | drop off | status}\n", progname);
++        fprintf(stderr, "Usage: %s <port> peek {on | off | status}\n", progname);
 +        return 1;
 +    }
 +
@@ -1445,7 +530,7 @@ index d963aeb..d6dbd89 100644
  int main(int argc, char **argv)
  {
      int port;
-@@ -313,7 +383,7 @@ int main(int argc, char **argv)
+@@ -313,7 +356,7 @@ int main(int argc, char **argv)
  
      if (argc < 3)
      {
@@ -1454,7 +539,7 @@ index d963aeb..d6dbd89 100644
          fprintf(stderr, "WFB-ng version %s\n", WFB_VERSION);
          fprintf(stderr, "WFB-ng home page: <http://wfb-ng.org>\n");
          return 1;
-@@ -339,6 +409,10 @@ int main(int argc, char **argv)
+@@ -339,6 +382,10 @@ int main(int argc, char **argv)
      {
          return get_radio(argv[0], port, argc - 2, argv + 2);
      }
@@ -1466,7 +551,7 @@ index d963aeb..d6dbd89 100644
      {
          fprintf(stderr, "Unknown command: %s\n", command);
 diff --git a/src/tx_cmd.h b/src/tx_cmd.h
-index a992d0d..f78e155 100644
+index a992d0d..b73cfd6 100644
 --- a/src/tx_cmd.h
 +++ b/src/tx_cmd.h
 @@ -5,6 +5,12 @@
@@ -1482,7 +567,7 @@ index a992d0d..f78e155 100644
  
  /* Sentinel passed in cmd_set_fec.fec_timeout_ms (after ntohs) to mean
   * "leave the running fec_timeout unchanged".  Lets controllers push k/n
-@@ -33,6 +39,12 @@ typedef struct {
+@@ -33,6 +39,11 @@ typedef struct {
              bool vht_mode;
              uint8_t vht_nss;
          } __attribute__ ((packed)) cmd_set_radio;
@@ -1490,46 +575,18 @@ index a992d0d..f78e155 100644
 +        struct
 +        {
 +            uint8_t enabled;       /* 0/1, WFB_PEEK_KEEP = leave unchanged */
-+            uint8_t drop_enabled;  /* 0/1, WFB_PEEK_KEEP = leave unchanged */
 +        } __attribute__ ((packed)) cmd_set_peek;
      } __attribute__ ((packed)) u;
  } __attribute__ ((packed)) cmd_req_t;
  
-@@ -58,5 +70,16 @@ typedef struct {
+@@ -58,5 +69,10 @@ typedef struct {
              bool vht_mode;
              uint8_t vht_nss;
          } __attribute__ ((packed)) cmd_get_radio;
 +
 +        struct
 +        {
-+            uint8_t enabled;
-+            uint8_t drop_enabled;
-+            uint8_t n_rules;       /* action rules */
-+            uint8_t n_sig_rules;   /* signal rules (>=1: mandatory FEC_CLOSE) */
-+            uint8_t base_mcs;      /* live base MCS (radiotap mcs_index) */
-+            uint8_t max_delta;     /* largest PROTECT mcs_delta in the table; 0 if none.
-+                                    * protect floor = max(0, base_mcs - max_delta). */
++            uint8_t enabled;       /* peek (per-frame FEC close) armed: 0/1 */
 +        } __attribute__ ((packed)) cmd_get_peek;
      } __attribute__ ((packed)) u;
  } __attribute__ ((packed)) cmd_resp_t;
-diff --git a/src/wifibroadcast.hpp b/src/wifibroadcast.hpp
-index 0d746d3..b341a60 100644
---- a/src/wifibroadcast.hpp
-+++ b/src/wifibroadcast.hpp
-@@ -185,6 +185,16 @@ static const uint8_t ieee80211_header[] __attribute__((unused)) = {
- #define BLOCK_IDX_MASK ((1LLU << 56) - 1)
- #define MAX_BLOCK_IDX ((1LLU << 55) - 1)
- 
-+// data_nonce SHORT_TAIL marker (top bit, bit 63).  block_idx <= MAX_BLOCK_IDX
-+// (2^55-1) so (block_idx << 8) never reaches bit 63 -- it is always 0 on the
-+// wire today, which makes it a safe, backward-distinguishable flag.  Set by the
-+// TX peek short-close on the single boundary fragment at index j (the first pad
-+// slot) to tell the RX "real data ends here; synthesize slots [j+1, k) as
-+// canonical FEC_ONLY zero-pad" instead of receiving them on-air.  The bit is
-+// part of the AEAD AAD (the whole nonce), so it is authenticated for free.
-+// RX must mask it off before computing block_idx.
-+#define WFB_NONCE_SHORT_TAIL (1ULL << 63)
-+
- // packet types
- #define WFB_PACKET_DATA          0x1
- #define WFB_PACKET_SESSION       0x2

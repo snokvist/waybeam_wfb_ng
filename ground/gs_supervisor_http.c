@@ -150,8 +150,8 @@ int json_emit_tunnel(char *buf, size_t cap, const Tunnel *t, bool full)
 			    t->st_pkt_outgoing, t->st_pkt_dec_err, t->st_pkt_uniq,
 			    t->st_pkt_bytes, t->st_ant_count);
 			if (t->st_rssi_best != INT_MIN) APP(",\"rssi_best\":%d", t->st_rssi_best);
-			/* Received-MCS histogram over the last 10 s (peek PROTECT /
-			 * adaptive-MCS visibility). Sum the ring slots stamped
+			/* Received-MCS histogram over the last 10 s (adaptive-MCS
+			 * visibility). Sum the ring slots stamped
 			 * within the window; only non-zero rungs; object omitted
 			 * when there is no per-MCS data. */
 			{
