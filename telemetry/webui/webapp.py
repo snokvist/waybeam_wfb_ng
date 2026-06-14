@@ -15,10 +15,13 @@ The store layer (wfb_store) is stdlib; only this presentation layer needs Flask.
 from __future__ import annotations
 
 import argparse
+import atexit
 import json
 import os
+import signal
 import subprocess
 import sys
+import threading
 import urllib.request
 from datetime import datetime
 
@@ -26,11 +29,19 @@ from datetime import datetime
 # capture session starts (both run on the GS host). Override via env if needed.
 GS_SUPERVISOR_URL = os.environ.get("GS_SUPERVISOR_URL", "http://127.0.0.1:80")
 
-# wfb_store lives one dir up (telemetry/); make it importable when run directly.
+# wfb_store / wfb_capture live one dir up (telemetry/); make them importable
+# when this file is run directly.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import wfb_store as store  # noqa: E402
+import wfb_capture  # noqa: E402
 
 from flask import Flask, abort, jsonify, render_template, request  # noqa: E402
+
+# In-process capturer for the consolidated one-app deploy: the UDP→SQLite
+# ingester runs in a background thread of THIS process. None when run UI-only
+# (--no-capture) or before main() starts it; the capture routes fall back to the
+# external capture_session.sh path in that case.
+_CAPTURER: "wfb_capture.Capture | None" = None
 
 app = Flask(__name__)
 app.config["DB"] = store.DEFAULT_DB
@@ -74,34 +85,64 @@ def index():
     return render_template("index.html", sessions=sessions)
 
 
-@app.route("/api/capture/new", methods=["POST"])
-def capture_new():
-    """Roll a fresh GS capture session for a clean break: close the current
-    ingester (stamps ended_at) and start a new one (new `sessions` row).
-    `capture_session.sh start` reclaims the UDP port and re-launches, so it IS
-    the roll. The ingester runs as root (launched by gs_supervisor), so we go
-    through `sudo -n`.
+def _roll_vehicle_log():
+    """Best-effort: poke gs_supervisor to roll a matching vehicle SD log
+    (WCMD_KEY_LOG_CONTROL) so it aligns with a new GS session. Returns a short
+    status string; never raises."""
+    try:
+        with urllib.request.urlopen(
+                GS_SUPERVISOR_URL + "/api/v1/logctl?value=1", timeout=2) as resp:
+            return "rolled" if resp.status == 200 else f"http {resp.status}"
+    except Exception as e:   # noqa: BLE001 — best-effort; surface, don't fail
+        return f"skipped ({type(e).__name__})"
 
-    Optional `duration` (seconds, JSON body or query) caps the new session — the
-    ingester rolls itself again at that age. We also poke gs_supervisor to roll a
-    matching vehicle SD log (WCMD_KEY_LOG_CONTROL) so the two stay time-aligned;
-    with LOG_SYNC the importer attributes vehicle records to whichever GS session
-    was live, so the boundary carries either way."""
-    if not os.path.exists(CAPTURE_SH):
-        return jsonify(ok=False, error="capture_session.sh not found"), 500
 
-    # Optional session cap. Parse from JSON body or query/form; clamp to a sane
-    # window so a fat-fingered value can't disable the cap or spin sub-second.
-    duration = None
+def _parse_duration():
+    """Optional session cap from JSON body or query/form; clamped to a sane
+    window so a fat-fingered value can't disable the cap or spin sub-second.
+    Returns (seconds|None, error|None)."""
     body = request.get_json(silent=True) or {}
     raw = body.get("duration", request.values.get("duration"))
-    if raw is not None and raw != "":
-        try:
-            duration = int(float(raw))
-        except (TypeError, ValueError):
-            return jsonify(ok=False, error="duration must be a number (seconds)"), 400
-        duration = max(30, min(duration, 7200))
+    if raw is None or raw == "":
+        return None, None
+    try:
+        return max(30, min(int(float(raw)), 7200)), None
+    except (TypeError, ValueError):
+        return None, "duration must be a number (seconds)"
 
+
+@app.route("/api/capture/new", methods=["POST"])
+def capture_new():
+    """Roll a fresh GS capture session for a clean break (close the current
+    session → stamp ended_at → open a new one). Two paths:
+
+    - **in-process** (the one-app deploy): capture runs in a background thread of
+      this process, so we just call capturer.roll(duration) — no subprocess, no
+      sudo, no port reclaim.
+    - **external** (--no-capture / a separate ingester): fall back to
+      `sudo -n capture_session.sh start [duration]`.
+
+    Either way we poke gs_supervisor to roll a matching vehicle SD log
+    (WCMD_KEY_LOG_CONTROL) so the two stay time-aligned; with LOG_SYNC the
+    importer attributes vehicle records to whichever GS session was live, so the
+    boundary carries even if that poke is missed."""
+    duration, err = _parse_duration()
+    if err:
+        return jsonify(ok=False, error=err), 400
+
+    if _CAPTURER is not None and _CAPTURER.running:
+        _CAPTURER.roll(duration)
+        vehicle = _roll_vehicle_log()
+        cap = "in-process"
+        msg = ("new session rolling" +
+               (f" (max {duration}s)" if duration is not None else ""))
+        return jsonify(ok=True, message=msg, mode=cap,
+                       duration=duration, vehicle_log=vehicle)
+
+    # External ingester fallback.
+    if not os.path.exists(CAPTURE_SH):
+        return jsonify(ok=False, error="capture not in-process and "
+                       "capture_session.sh not found"), 500
     argv = ["sudo", "-n", "bash", CAPTURE_SH, "start"]
     if duration is not None:
         argv.append(str(duration))   # a validated int — argv (no shell), no injection
@@ -114,20 +155,18 @@ def capture_new():
     msg = (r.stdout or "").strip()
     if r.stderr.strip():
         msg = (msg + "  " + r.stderr.strip()).strip()
-
-    # Best-effort: roll a matching vehicle SD log so it aligns with this new GS
-    # session. Never fail the GS roll if the vehicle/uplink is unreachable.
-    vehicle = None
-    if r.returncode == 0:
-        try:
-            with urllib.request.urlopen(
-                    GS_SUPERVISOR_URL + "/api/v1/logctl?value=1", timeout=2) as resp:
-                vehicle = "rolled" if resp.status == 200 else f"http {resp.status}"
-        except Exception as e:   # noqa: BLE001 — best-effort; surface, don't fail
-            vehicle = f"skipped ({type(e).__name__})"
-
+    vehicle = _roll_vehicle_log() if r.returncode == 0 else None
     return jsonify(ok=(r.returncode == 0), message=msg, code=r.returncode,
-                   duration=duration, vehicle_log=vehicle)
+                   mode="external", duration=duration, vehicle_log=vehicle)
+
+
+@app.route("/api/capture/status")
+def capture_status():
+    """In-process capture state (session id, records, age, max-duration), or a
+    marker that capture is external/off."""
+    if _CAPTURER is not None:
+        return jsonify(mode="in-process", **_CAPTURER.status())
+    return jsonify(mode="external", running=False)
 
 
 @app.route("/api/vehicle/fetch", methods=["POST"])
@@ -532,12 +571,24 @@ def api_meta(sid: int):
 
 
 def main() -> None:
+    global _CAPTURER
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--db", default=store.DEFAULT_DB)
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8080)
     ap.add_argument("--debug", action="store_true")
+    # In-process capture (the one-app deploy). Defaults on; pass --no-capture to
+    # serve UI-only (e.g. when a standalone wfb_ingest.py owns the UDP port).
+    ap.add_argument("--no-capture", action="store_true",
+                    help="don't capture in-process; serve UI only (external ingester)")
+    ap.add_argument("--listen", type=int, default=6700, help="UDP port to capture on")
+    ap.add_argument("--bind", default="127.0.0.1", help="address to bind --listen")
+    ap.add_argument("--source", default="live-gs", help="sessions.source tag")
+    ap.add_argument("--max-duration", type=float, default=1200.0,
+                    help="roll a fresh session at this age (default 1200 = 20 min; 0 = unbounded)")
+    for f in wfb_capture.META_FIELDS:
+        ap.add_argument(f"--{f.replace('_', '-')}", dest=f, default=None)
     args = ap.parse_args()
     app.config["DB"] = args.db
     # Ensure the DB exists with schema before serving. sqlite creates an empty
@@ -551,7 +602,42 @@ def main() -> None:
         store.init_db(_seed)
     finally:
         _seed.close()
-    app.run(host=args.host, port=args.port, debug=args.debug)
+
+    # Start in-process capture in a background thread (one-app deploy). If the
+    # UDP port is held by another ingester, Capture logs and self-disables — the
+    # UI still serves read-only.
+    if not args.no_capture:
+        cfg = wfb_capture.CaptureConfig(
+            db=args.db, listen=args.listen, bind=args.bind, source=args.source,
+            max_duration=args.max_duration,
+            meta={f: getattr(args, f) for f in wfb_capture.META_FIELDS},
+        )
+        _CAPTURER = wfb_capture.Capture(cfg)
+        _CAPTURER.start()
+        atexit.register(_CAPTURER.stop)
+
+    # Embed the WSGI server so we own the shutdown lifecycle. app.run()'s signal
+    # handling doesn't reliably unwind to our cleanup under SIGTERM (systemd/init
+    # stop), which would leave the live session open (ended_at NULL) and lose its
+    # last uncommitted window. Instead: serve in a daemon thread, park the MAIN
+    # thread on a stop event, and let SIGTERM/SIGINT set it → finally closes both
+    # the server and the capturer (the latter commits + stamps ended_at).
+    # threaded=True so a slow reader never blocks the writer.
+    from werkzeug.serving import make_server   # noqa: E402 (lazy: only the app path needs it)
+    srv = make_server(args.host, args.port, app, threaded=True)
+    _stop_evt = threading.Event()
+    signal.signal(signal.SIGTERM, lambda *_: _stop_evt.set())
+    signal.signal(signal.SIGINT, lambda *_: _stop_evt.set())
+    serve_thread = threading.Thread(target=srv.serve_forever, name="wsgi", daemon=True)
+    serve_thread.start()
+    print(f" * wfb telemetry: capture {'on' if _CAPTURER else 'off (UI only)'}, "
+          f"UI on http://{args.host}:{args.port}", file=sys.stderr, flush=True)
+    try:
+        _stop_evt.wait()
+    finally:
+        srv.shutdown()
+        if _CAPTURER is not None:
+            _CAPTURER.stop()
 
 
 if __name__ == "__main__":
