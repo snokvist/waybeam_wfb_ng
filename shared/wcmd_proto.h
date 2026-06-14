@@ -136,6 +136,19 @@
  */
 #define WCMD_KEY_LOG_SYNC       18   /* value = gs_unix_seconds; seq = marker id */
 
+/*
+ * SD-card logger control — GS → vehicle, infrastructure (like LOG_SYNC, NOT an
+ * operator command).  Lets the GS "New capture session" button roll a fresh,
+ * time-aligned vehicle log to match the new GS session instead of relying on a
+ * mid-walk LOG_SYNC re-attribution.  `value`: 1 = start/roll a new SD session,
+ * 0 = stop the current one.  link_controller's in-process logger handles it.
+ * Same dispatch rules as LOG_SYNC: bypasses cmd.allow_keys_mask (infrastructure),
+ * still honours cmd.enabled; no clamp window, no venc/wfb side effect.  Like
+ * LOG_SYNC it sits above WCMD_KEY_MAX (the highest operator key) so the operator
+ * /api/v1/cmd path neither lists nor gates it.
+ */
+#define WCMD_KEY_LOG_CONTROL    19   /* value: 1=start/roll new SD log, 0=stop */
+
 /* Status codes returned in CMD_RESP */
 #define WCMD_STATUS_OK           0
 #define WCMD_STATUS_DISABLED     1   /* cmd subsystem off (cmd.enabled=false) */

@@ -1,0 +1,27 @@
+# Waybeam wfb telemetry — consolidated capture + web UI (one process).
+# Example systemd unit. `deploy/install.sh` generates a host-specific copy with
+# absolute paths; this committed file is the reference / for manual installs.
+#
+#   cp this to /etc/systemd/system/wfb-telemetry.service, fix the paths, then:
+#   systemctl daemon-reload && systemctl enable --now wfb-telemetry
+#
+[Unit]
+Description=Waybeam wfb telemetry capture + web UI
+After=network.target
+
+[Service]
+Type=simple
+# Edit to your checkout. The app captures udp:6700 into wfb.sqlite AND serves
+# the UI on :8080 — no separate ingester, no sudo.
+WorkingDirectory=/opt/waybeam/telemetry
+ExecStart=/opt/waybeam/telemetry/.venv/bin/python webui/webapp.py \
+    --host 0.0.0.0 --port 8080 --db wfb.sqlite --listen 6700
+Restart=on-failure
+RestartSec=2
+# SIGTERM is the clean-stop path in webapp.py: it closes the live session
+# (stamps ended_at, commits the final window) before exiting.
+KillSignal=SIGTERM
+TimeoutStopSec=12
+
+[Install]
+WantedBy=multi-user.target

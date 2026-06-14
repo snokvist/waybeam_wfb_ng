@@ -25,6 +25,10 @@ PY="${PY:-python3}"
 DB="${WFB_DB:-$HERE/wfb.sqlite}"
 LISTEN="${INGEST_LISTEN:-6700}"
 SOURCE="${INGEST_SOURCE:-live-gs}"
+# Hard session cap (s): the ingester rolls a fresh session at this age so files
+# stay bounded. Default 20 min (a typical max flight). Per-start override:
+# `INGEST_MAX_DURATION=600 capture_session.sh start`, or the web UI passes it.
+MAX_DURATION="${INGEST_MAX_DURATION:-1200}"
 # Objective metadata stamped on every session so it's self-describing (the GS
 # config is the source of truth for these). Subjective fields (scenario /
 # location / weather / notes) stay manual via the web UI editor.
@@ -79,6 +83,15 @@ kill_ingesters() {
 
 case "${1:-start}" in
     start)
+        # Optional positional arg: per-start max-duration override (seconds).
+        # The web UI passes a validated integer here; falls back to the env /
+        # 1200 s default otherwise. Accept only all-digit values.
+        if [ -n "${2:-}" ]; then
+            case "$2" in
+                ''|*[!0-9]*) echo "capture(gs): ignoring non-numeric duration '$2'" >&2 ;;
+                *)           MAX_DURATION="$2" ;;
+            esac
+        fi
         # Always reclaim the port and roll a FRESH session per bring-up: an
         # orphan from a prior run would otherwise hold udp:$LISTEN and keep one
         # sessions row open across multiple walks. (Per-walk keying is Phase 2c.)
@@ -86,9 +99,10 @@ case "${1:-start}" in
         # Daemonize; the ingester opens a sessions row on the first datagram.
         "$PY" "$HERE/wfb_ingest.py" --listen "$LISTEN" --db "$DB" \
             --source "$SOURCE" --channel "$CHANNEL" --tx-power "$TXPOWER" \
-            --antenna-cfg "$ANTENNA" </dev/null >>"$LOG_DIR/ingest.log" 2>&1 &
+            --antenna-cfg "$ANTENNA" --max-duration "$MAX_DURATION" \
+            </dev/null >>"$LOG_DIR/ingest.log" 2>&1 &
         echo $! > "$PIDFILE"
-        echo "capture(gs): ingester $(cat "$PIDFILE") on udp:$LISTEN -> $DB"
+        echo "capture(gs): ingester $(cat "$PIDFILE") on udp:$LISTEN -> $DB (max ${MAX_DURATION}s)"
         ;;
     stop)
         kill_ingesters

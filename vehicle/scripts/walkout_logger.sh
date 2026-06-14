@@ -2,7 +2,13 @@
 # walkout_logger — persist link_controller telemetry to SD for post-walkout
 # analysis (RSSI noise amplitude, guard calibration, flap inspection).
 #
-# Started by S99wfb when wfbmode=1 (disable with: fw_setenv wfblog 0).
+# SUPERSEDED: this logic now runs IN-PROCESS inside link_controller (gated by
+# the same `wfblog` env via --no-log; rollable via GET /log/start or WCMD 19).
+# S99wfb no longer launches this script. Kept in-tree as a standalone fallback
+# (e.g. to log an older link_controller build that predates the in-process
+# logger) — run it by hand: `walkout_logger.sh &`.
+#
+# Historically started by S99wfb when wfbmode=1 (disable with: fw_setenv wfblog 0).
 # REFUSES to run without the SD card mounted — logs must never land on the
 # overlay (/root, /) per the platform rule; /tmp is tmpfs and lost on boot.
 #

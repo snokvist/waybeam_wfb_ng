@@ -108,6 +108,11 @@ extern const int GS_BACKOFF_MS[7];
  * NOT through the operator /api/v1/cmd path, so it lives above WCMD_KEY_MAX
  * and never indexes the per-operator-key rate-limit array. */
 #define WCMD_KEY_LOG_SYNC       18
+/* SD-logger control (infra, like LOG_SYNC — see shared/wcmd_proto.h). Emitted
+ * via /api/v1/logctl, NOT the operator /api/v1/cmd path, so it lives above
+ * WCMD_KEY_MAX and never indexes the per-operator-key rate-limit array.
+ * value: 1=start/roll a fresh vehicle SD log session, 0=stop. */
+#define WCMD_KEY_LOG_CONTROL    19
 #define WCMD_BURST_FRAMES        3
 
 /* ---------- log helpers --------------------------------------------- */

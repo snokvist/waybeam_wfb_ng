@@ -62,18 +62,17 @@ PID_TX="/var/run/wfb_tx.pid"
 PID_RX="/var/run/wfb_rx.pid"
 PID_LC="/var/run/link_controller.pid"
 PID_PTX="/var/run/wfb_probe_tx.pid"
-PID_WALK="/var/run/walkout_logger.pid"
 LOG="/tmp/wfb.log"
-# Walkout telemetry logger: mirrors the wfb log + samples /status at 1 Hz
-# to the SD card (sessions under /mnt/mmcblk0p1/walkout/, newest 10 kept).
-# Default ON; it exits silently when no SD card is mounted, so it is safe
-# to leave enabled. Disable entirely: fw_setenv wfblog 0.
-WALKOUT_BIN="/usr/sbin/walkout_logger.sh"
+# SD telemetry logging is now IN-PROCESS in link_controller (it replaced the
+# separate walkout_logger.sh): per-boot sessions under /mnt/mmcblk0p1/walkout/,
+# 1 Hz status.jsonl + an lc.log decision mirror, newest 10 kept, inactive when
+# no SD is mounted (logs never land on the overlay). The GS "New capture"
+# button can also roll a fresh, time-aligned session via WCMD_KEY_LOG_CONTROL.
+# Default ON; disable entirely with: fw_setenv wfblog 0  (passes --no-log).
 
 fw_get() { fw_printenv -n "$1" 2>/dev/null || echo "$2"; }
 is_enabled() { [ "$(fw_get wfbmode 0)" = "1" ]; }
 probe_enabled() { [ "$(fw_get wfbprobe 1)" = "1" ]; }
-walkout_enabled() { [ "$(fw_get wfblog 1)" = "1" ] && [ -x "$WALKOUT_BIN" ]; }
 log() { echo "[wfb] $*" | tee -a "$LOG"; }
 
 start_wfb() {
@@ -160,6 +159,10 @@ start_wfb() {
     # $PROBE_ARGS is intentionally unquoted (--csa-iface + --probe +
     # --probe-feed when wfbprobe=1, --no-mcs otherwise — CSA rides the
     # MCS rx_ant listener so it is gated together with the probe).
+    # $LOG_ARGS gates the in-process SD telemetry logger (default on; --no-log
+    # when wfblog=0). It logs to /mnt/mmcblk0p1 and self-disables if absent.
+    LOG_ARGS=""
+    [ "$(fw_get wfblog 1)" = "1" ] || LOG_ARGS="--no-log"
     link_controller \
         --wfb 127.0.0.1:$WFB_CTRL \
         --venc 127.0.0.1:80 \
@@ -168,22 +171,16 @@ start_wfb() {
         --uplink-stats $WFB_UPLINK_RX_PORT \
         --failsafe $WFB_FAILSAFE_S \
         --wfb-iface wlan0 \
-        $PROBE_ARGS \
+        $PROBE_ARGS $LOG_ARGS \
         >> "$LOG" 2>&1 &
     echo $! > "$PID_LC"
 
-    # Walkout telemetry logger (SD card only; see WALKOUT_BIN above).
-    if walkout_enabled; then
-        "$WALKOUT_BIN" >> "$LOG" 2>&1 &
-        echo $! > "$PID_WALK"
-    fi
-
-    log "started (tx=$(cat $PID_TX) rx=$(cat $PID_RX) lc=$(cat $PID_LC)$(probe_enabled && echo " ptx=$(cat $PID_PTX)")$(walkout_enabled && echo " walk=$(cat $PID_WALK)"))"
+    log "started (tx=$(cat $PID_TX) rx=$(cat $PID_RX) lc=$(cat $PID_LC)$(probe_enabled && echo " ptx=$(cat $PID_PTX)"))"
 }
 
 stop_wfb() {
     log "stopping"
-    for f in "$PID_WALK" "$PID_LC" "$PID_PTX" "$PID_RX" "$PID_TX"; do
+    for f in "$PID_LC" "$PID_PTX" "$PID_RX" "$PID_TX"; do
         [ -f "$f" ] && { kill "$(cat $f)" 2>/dev/null; rm -f "$f"; }
     done
     sleep 0.5
@@ -207,14 +204,9 @@ status_wfb() {
             && echo "  probe wfb_tx: $ppid" \
             || echo "  probe wfb_tx: stale pidfile ($ppid)"
     fi
-    if [ -f "$PID_WALK" ]; then
-        wpid=$(cat "$PID_WALK")
-        kill -0 "$wpid" 2>/dev/null \
-            && echo "  walkout logger: $wpid ($(ls -1d /mnt/mmcblk0p1/walkout/*/ 2>/dev/null | sort | tail -1))" \
-            || echo "  walkout logger: stale pidfile ($wpid)"
-    else
-        echo "  walkout logger: off (wfblog env: $(fw_get wfblog 1), SD: $(grep -q ' /mnt/mmcblk0p1 ' /proc/mounts && echo present || echo absent))"
-    fi
+    echo "  sd logger: in-process in link_controller (wfblog env: $(fw_get wfblog 1), SD: $(grep -q ' /mnt/mmcblk0p1 ' /proc/mounts && echo present || echo absent), latest: $(ls -1d /mnt/mmcblk0p1/walkout/*/ 2>/dev/null | sort | tail -1 || echo none))"
+    [ "$(fw_get wfbmode 0)" = "1" ] && command -v curl >/dev/null 2>&1 && \
+        echo "  sd logger live: $(curl -s -m 2 http://127.0.0.1:8765/log/status 2>/dev/null || echo '(link_controller /log/status unreachable)')"
     echo "wlan0:"
     iw dev wlan0 info 2>/dev/null | grep -E "type|channel|txpower" | sed 's/^/  /'
 }

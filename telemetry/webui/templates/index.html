@@ -26,7 +26,8 @@
   </tr></thead>
   <tbody>
   {% for s in sessions %}
-    <tr onclick="location.href='{{ url_for('session', sid=s.id) }}'">
+    <tr onclick="location.href='{{ url_for('session', sid=s.id) }}'"
+        class="{% if not s.ended_at %}live-session{% endif %}">
       <td>{{ s.id }}</td>
       <td>{{ s.source or '—' }}</td>
       <td>{{ s.scenario or '—' }}</td>
@@ -56,7 +57,8 @@
     const tb = document.querySelector("table.sessions tbody");
     if (!tb) { if (rows.length) location.reload(); return; }  // 0 → N: build the table
     tb.innerHTML = rows.map(s =>
-      `<tr onclick="location.href='/session/${s.id}'">` +
+      `<tr onclick="location.href='/session/${s.id}'"` +
+      `${s.ended_at == null ? ' class="live-session"' : ''}>` +
       `<td>${s.id}</td><td>${esc(s.source)}</td><td>${esc(s.scenario)}</td>` +
       `<td class="num">${s.n_records}</td><td class="num">${span(s.first_ts, s.last_ts)}</td>` +
       `<td>${esc(s.started_at)}</td><td>${esc(s.location)}</td>` +
@@ -91,14 +93,23 @@
   const btn = document.getElementById("new-capture");
   const st = document.getElementById("capture-status");
   if (btn) btn.addEventListener("click", async () => {
-    if (!confirm("Close the current GS capture and start a new session?\n" +
-                 "The vehicle keeps logging; LOG_SYNC re-attributes it to the new session.")) return;
+    const mins = prompt("New capture session — max length in minutes.\n" +
+                        "The session rolls itself at this age; the vehicle SD log " +
+                        "rolls too so the two stay aligned.", "20");
+    if (mins === null) return;                       // cancelled
+    const dur = Math.round(parseFloat(mins) * 60);
+    if (!isFinite(dur) || dur <= 0) { alert("Enter a positive number of minutes."); return; }
     btn.disabled = true; st.textContent = " rolling…";
     try {
-      const r = await fetch("/api/capture/new", { method: "POST" });
+      const r = await fetch("/api/capture/new", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ duration: dur }),
+      });
       const j = await r.json();
-      st.textContent = j.ok ? " ✓ " + (j.message || "new session started")
-                            : " ✗ " + (j.error || j.message || "failed");
+      st.textContent = j.ok
+        ? " ✓ " + (j.message || "new session started") +
+          (j.vehicle_log ? ` · vehicle ${j.vehicle_log}` : "")
+        : " ✗ " + (j.error || j.message || "failed");
       if (j.ok) setTimeout(tick, 1500);  // let the fresh ingester open its row
     } catch (e) {
       st.textContent = " ✗ request failed";

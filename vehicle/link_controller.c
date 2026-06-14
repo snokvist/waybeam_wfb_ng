@@ -37,6 +37,7 @@
 
 #define _GNU_SOURCE
 #include <arpa/inet.h>
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <getopt.h>
@@ -391,6 +392,18 @@ typedef struct {
 		 * instead of promote_dwell_s. */
 		float    reentry_backoff_s; /* flap-guard window (0 = off)          */
 		float    reentry_dwell_s;   /* dwell for re-entry into failed rung  */
+		/* Hard flap-freeze (promote-side backstop on top of the soft
+		 * reentry dwell above). When a rung is re-demoted from
+		 * flap_freeze_count times in a row, each within flap_freeze_window_s
+		 * of the last, the controller PINS the rung below and refuses to
+		 * re-promote into the offending rung for flap_freeze_s. Unlike the
+		 * reentry dwell (which only stretches the period), this stops the
+		 * oscillation outright — for the 2-rung [min,min+1] trap where every
+		 * promote triggers a probe-retune burst that re-trips the demote.
+		 * flap_freeze_count == 0 disables it. */
+		int      flap_freeze_count;    /* fast re-demotes to trip (0 = off)  */
+		float    flap_freeze_window_s; /* max spacing between counted demotes*/
+		float    flap_freeze_s;        /* how long to pin the lower rung     */
 		/* Probe producer (Phase 4). Feeder pacing; gated by mcs.enabled
 		 * (probe is mandatory for MCS — no separate live switch) and the
 		 * endpoints themselves are startup-only (--probe/--probe-feed). */
@@ -527,6 +540,33 @@ static double log_rel_s(void)
 	return (double)(now_us() - g_log_start_us) / 1e6;
 }
 
+/* ── SD-card telemetry logger (folded in from walkout_logger.sh) ───────────
+ * Persists per-boot sessions under <sd_dir>/walkout/NNNNNN_<stamp>_<pid>/ :
+ *   status.jsonl  1 Hz /status samples, {"ts":,"up":,"status":{…}}
+ *   lc.log        link_controller's own decision/hb/probe lines (mirrored
+ *                 in-process from log_emit — the analytically useful subset
+ *                 of what the old tail-of-/tmp/wfb.log captured)
+ * Single-threaded: every field is touched only on the main poll thread
+ * (logger_tick at 1 Hz, the /log routes, the LOG_CONTROL WCMD, this
+ * log_emit mirror), so a plain global needs no lock — same rationale as
+ * g_logsync.  Definition lives here, ABOVE log_emit, so the mirror below can
+ * see it; the session-management functions are defined later. */
+#define LOGGER_KEEP_SESSIONS 10
+#define LOGGER_MAX_MB        100
+static struct {
+	bool     enabled;        /* configured on (default; --no-log clears)     */
+	bool     active;         /* a session dir + file handles are open        */
+	bool     sampling;       /* status.jsonl sampling on (false past the cap)*/
+	char     sd_dir[256];    /* SD mount (--log-dir); sessions under /walkout */
+	char     session_dir[512];
+	FILE    *jsonl;
+	FILE    *lclog;
+	uint64_t records;        /* status.jsonl samples this session            */
+	uint64_t bytes;          /* approx status.jsonl bytes this session       */
+	int      seq;            /* monotonic session counter                    */
+	uint64_t start_us;
+} g_logger = { .enabled = true, .sd_dir = "/mnt/mmcblk0p1" };
+
 /* Forward decl — broadcasts to SSE subscribers. */
 static void sse_broadcast_log(double t_s, Subsys subsys, const char *line);
 
@@ -544,6 +584,8 @@ static void log_emit(Subsys subsys, const char *fmt, ...)
 	if (n >= (int)sizeof(body)) n = sizeof(body) - 1;
 	double t = log_rel_s();
 	fprintf(stderr, "[%s t=%8.3f] %s\n", subsys_tag(subsys), t, body);
+	if (g_logger.active && g_logger.lclog)
+		fprintf(g_logger.lclog, "[%s t=%8.3f] %s\n", subsys_tag(subsys), t, body);
 	sse_broadcast_log(t, subsys, body);
 }
 
@@ -1525,7 +1567,7 @@ static int wfb_run_ip_link_mtu(const char *iface, int mtu)
 	return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
 }
 
-#define WCMD_NUM_KEYS 18   /* highest defined WCMD_KEY_* value (incl. peek 16/17, log_sync 18) */
+#define WCMD_NUM_KEYS 19   /* highest defined WCMD_KEY_* value (incl. peek 16/17, log_sync 18, log_control 19) */
 
 /* Burst-dedup window: GS may send 3 redundant copies of the same WCMD
  * with the same seq to ride out single-FEC-block losses on the uplink.
@@ -1585,6 +1627,215 @@ static struct {
 	double   recv_uptime_s;
 	uint64_t count;
 } g_logsync = { 0 };
+
+/* ── SD telemetry logger: session management (g_logger declared near log_emit) ──
+ * Mirrors the field-tested walkout_logger.sh: monotonic RTC-reset-robust
+ * session index, newest-10 prune, SD-mount guard so logs never land on the
+ * overlay.  All called on the main poll thread only. */
+
+/* Recursively remove a dir's contents + the dir. Session dirs hold only
+ * lc.log + status.jsonl, but stay generic so a stray file can't wedge prune. */
+static void logger_rm_rf(const char *path)
+{
+	DIR *d = opendir(path);
+	if (d) {
+		struct dirent *e;
+		while ((e = readdir(d)) != NULL) {
+			if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+			char child[PATH_MAX];
+			int cn = snprintf(child, sizeof(child), "%s/%s", path, e->d_name);
+			if (cn < 0 || cn >= (int)sizeof(child)) continue;   /* never act on a truncated path */
+			struct stat st;
+			if (lstat(child, &st) == 0 && S_ISDIR(st.st_mode)) logger_rm_rf(child);
+			else                                               unlink(child);
+		}
+		closedir(d);
+	}
+	rmdir(path);
+}
+
+/* SD-mount guard: persisted logs must never land on the overlay (/, /root)
+ * per the platform rule.  For the production /mnt path REQUIRE a real mount
+ * (matches the script's `grep " $SD " /proc/mounts`); a non-/mnt --log-dir
+ * (host testing) only needs to be a writable directory. */
+static bool logger_sd_ready(const char *dir)
+{
+	if (strncmp(dir, "/mnt/", 5) == 0) {
+		FILE *m = fopen("/proc/mounts", "r");
+		if (!m) return false;
+		char line[600];
+		size_t dl = strlen(dir);
+		bool mounted = false;
+		while (fgets(line, sizeof(line), m)) {
+			char *p = strchr(line, ' ');             /* dev<sp>MOUNTPOINT<sp>… */
+			if (!p) continue;
+			char *mp = p + 1, *e = strchr(mp, ' ');
+			if (!e) continue;
+			if ((size_t)(e - mp) == dl && strncmp(mp, dir, dl) == 0) { mounted = true; break; }
+		}
+		fclose(m);
+		return mounted;
+	}
+	struct stat st;
+	return (stat(dir, &st) == 0 && S_ISDIR(st.st_mode));
+}
+
+/* Is name an indexed session dir (NNNNNN_…)? */
+static bool logger_is_indexed(const char *name)
+{
+	if (strlen(name) < 7 || name[6] != '_') return false;
+	for (int i = 0; i < 6; i++) if (name[i] < '0' || name[i] > '9') return false;
+	return true;
+}
+
+/* Monotonic session index, robust to the device's RTC resetting BACKWARDS on a
+ * cold field boot: max(persisted .seq, highest existing NNNNNN_ dir) + 1.
+ * Fixed 6-digit width => lexical sort == creation order. Persists before any
+ * prune can drop the dir it was derived from. */
+static int logger_next_seq(const char *base)
+{
+	int hi = 0;
+	char seqf[600];
+	snprintf(seqf, sizeof(seqf), "%s/.seq", base);
+	FILE *f = fopen(seqf, "r");
+	if (f) { int v = 0; if (fscanf(f, "%d", &v) == 1 && v > hi) hi = v; fclose(f); }
+	DIR *d = opendir(base);
+	if (d) {
+		struct dirent *e;
+		while ((e = readdir(d)) != NULL)
+			if (logger_is_indexed(e->d_name)) { int v = atoi(e->d_name); if (v > hi) hi = v; }
+		closedir(d);
+	}
+	int next = hi + 1;
+	f = fopen(seqf, "w");
+	if (f) { fprintf(f, "%06d\n", next); fclose(f); }
+	return next;
+}
+
+/* Keep the newest LOGGER_KEEP_SESSIONS-1; drop legacy (non-indexed, RTC-named)
+ * dirs first — they sort unpredictably against the counter — then the lowest
+ * index (the genuine oldest). */
+static void logger_prune(const char *base)
+{
+	/* Bounded + no-progress guard: if a victim won't delete (immutable file,
+	 * vfat IO error), bail instead of re-selecting it forever — this runs on
+	 * the single poll thread and a spin would wedge the control loop. */
+	char last_victim[256] = "";
+	for (int guard = 0; guard < LOGGER_KEEP_SESSIONS + 4; guard++) {
+		DIR *d = opendir(base);
+		if (!d) return;
+		int count = 0;
+		char oldest_idx[256] = "", legacy[256] = "";
+		struct dirent *e;
+		while ((e = readdir(d)) != NULL) {
+			if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+			char p[600];
+			struct stat st;
+			snprintf(p, sizeof(p), "%s/%s", base, e->d_name);
+			if (lstat(p, &st) != 0 || !S_ISDIR(st.st_mode)) continue;
+			count++;
+			if (!logger_is_indexed(e->d_name)) {
+				if (!legacy[0]) snprintf(legacy, sizeof(legacy), "%s", e->d_name);
+			} else if (!oldest_idx[0] || strcmp(e->d_name, oldest_idx) < 0) {
+				snprintf(oldest_idx, sizeof(oldest_idx), "%s", e->d_name);
+			}
+		}
+		closedir(d);
+		if (count < LOGGER_KEEP_SESSIONS) return;
+		const char *victim = legacy[0] ? legacy : oldest_idx;
+		if (!victim[0]) return;
+		if (strcmp(victim, last_victim) == 0) {        /* no progress */
+			LOG_COMMON("logger: prune stuck on %s — giving up (SD write error?)", victim);
+			return;
+		}
+		snprintf(last_victim, sizeof(last_victim), "%s", victim);
+		char vp[600];
+		snprintf(vp, sizeof(vp), "%s/%s", base, victim);
+		logger_rm_rf(vp);
+	}
+}
+
+static void logger_close_session(void)
+{
+	if (g_logger.jsonl) { fflush(g_logger.jsonl); fclose(g_logger.jsonl); g_logger.jsonl = NULL; }
+	if (g_logger.lclog) { fflush(g_logger.lclog); fclose(g_logger.lclog); g_logger.lclog = NULL; }
+	g_logger.active = false;
+}
+
+/* Roll a fresh session (closing any current one). Returns 0 on success; non-0
+ * (logging stays inactive) on disabled / SD-absent / open failure — the link
+ * is never gated on the logger. */
+static int logger_open_session(void)
+{
+	logger_close_session();
+	if (!g_logger.enabled) return -1;
+	if (!logger_sd_ready(g_logger.sd_dir)) {
+		LOG_COMMON("logger: SD not ready at %s — logging disabled", g_logger.sd_dir);
+		return -1;
+	}
+	char base[320];
+	snprintf(base, sizeof(base), "%s/walkout", g_logger.sd_dir);
+	if (mkdir(base, 0755) != 0 && errno != EEXIST) {
+		LOG_COMMON("logger: mkdir %s failed (%s)", base, strerror(errno));
+		return -1;
+	}
+	int seq = logger_next_seq(base);
+	logger_prune(base);
+	time_t now = time(NULL);
+	struct tm tm;
+	char stamp[32] = "00000000_000000";
+	if (localtime_r(&now, &tm)) strftime(stamp, sizeof(stamp), "%Y%m%d_%H%M%S", &tm);
+	snprintf(g_logger.session_dir, sizeof(g_logger.session_dir),
+	         "%s/%06d_%s_%d", base, seq, stamp, (int)getpid());
+	if (mkdir(g_logger.session_dir, 0755) != 0 && errno != EEXIST) {
+		LOG_COMMON("logger: mkdir %s failed (%s)", g_logger.session_dir, strerror(errno));
+		return -1;
+	}
+	char path[600];
+	snprintf(path, sizeof(path), "%s/status.jsonl", g_logger.session_dir);
+	g_logger.jsonl = fopen(path, "a");
+	snprintf(path, sizeof(path), "%s/lc.log", g_logger.session_dir);
+	g_logger.lclog = fopen(path, "a");
+	if (!g_logger.jsonl) {
+		LOG_COMMON("logger: open status.jsonl failed (%s)", strerror(errno));
+		logger_close_session();
+		return -1;
+	}
+	g_logger.seq      = seq;
+	g_logger.records  = 0;
+	g_logger.bytes    = 0;
+	g_logger.sampling = true;
+	g_logger.active   = true;
+	g_logger.start_us = now_us();
+	LOG_COMMON("logger: session #%06d -> %s", seq, g_logger.session_dir);
+	return 0;
+}
+
+static int  logger_start(void) { return logger_open_session(); }   /* roll new */
+static void logger_stop(void)
+{
+	if (g_logger.active)
+		LOG_COMMON("logger: session #%06d stopped (%llu samples)",
+		    g_logger.seq, (unsigned long long)g_logger.records);
+	logger_close_session();
+}
+
+static int logger_status_to_json(char *buf, size_t cap)
+{
+	double age = g_logger.active ? (double)(now_us() - g_logger.start_us) / 1e6 : 0.0;
+	return snprintf(buf, cap,
+		"{\"enabled\":%s,\"active\":%s,\"sampling\":%s,\"sd_dir\":\"%s\","
+		"\"session_dir\":\"%s\",\"seq\":%d,\"records\":%llu,\"bytes\":%llu,"
+		"\"age_s\":%.1f}",
+		g_logger.enabled ? "true" : "false",
+		g_logger.active ? "true" : "false",
+		g_logger.sampling ? "true" : "false",
+		g_logger.sd_dir,
+		g_logger.active ? g_logger.session_dir : "",
+		g_logger.seq,
+		(unsigned long long)g_logger.records,
+		(unsigned long long)g_logger.bytes, age);
+}
 
 /* Build the venc /api/v1 path for a given (key, value). path must be
  * sized for at least 80 bytes. Returns 0 on success, -1 if key is not
@@ -1788,6 +2039,34 @@ static int wcmd_dispatch(Config *cfg, const WcmdReq *req,
 		resp->applied_value = htonl((uint32_t)gs_unix_s);
 		st->last_status      = WCMD_STATUS_OK;
 		st->last_value       = gs_unix_s;
+		st->last_http_status = 0;
+		return 0;
+	}
+
+	/* SD-logger control — infrastructure (like LOG_SYNC): bypasses
+	 * allow_keys_mask, no clamp, no venc/wfb side effect.  value 1 rolls a
+	 * fresh SD session (so a GS "new capture" gives a matching vehicle log);
+	 * 0 stops.  MUST honour the 3-frame burst dedup or one button press would
+	 * roll three sessions. */
+	if (key == WCMD_KEY_LOG_CONTROL) {
+		uint16_t req_seq = ntohs(req->seq);
+		int32_t  val     = (int32_t)ntohl((uint32_t)req->value);
+		bool dup = (st->last_seq_us[key] != 0 &&
+		            st->last_seq[key] == req_seq &&
+		            now - st->last_seq_us[key] < WCMD_BURST_DEDUP_US);
+		if (dup) {
+			st->coalesced_burst++;
+		} else {
+			if (val == 0) logger_stop();
+			else          (void)logger_start();
+			wcmd_mark_applied(st, key, req_seq, now);
+			st->accepted++;
+		}
+		resp->status        = WCMD_STATUS_OK;
+		resp->http_status   = htons(0);
+		resp->applied_value = htonl((uint32_t)(val ? 1 : 0));
+		st->last_status      = WCMD_STATUS_OK;
+		st->last_value       = val ? 1 : 0;
 		st->last_http_status = 0;
 		return 0;
 	}
@@ -2694,6 +2973,17 @@ typedef struct {
 	 * Demotes are never delayed by this. */
 	int       flap_guard_mcs;
 	uint64_t  flap_guard_us;
+	/* Hard flap-freeze ("hold the lower rung"). flap_demote_streak counts
+	 * consecutive fast re-demotes from the SAME rung (each within
+	 * flap_freeze_window_s of the last); flap_last_demote_us spaces them.
+	 * Once the streak reaches flap_freeze_count, flap_freeze_mcs latches the
+	 * offending rung and flap_freeze_until_us holds for flap_freeze_s, during
+	 * which any promote that would step into/above flap_freeze_mcs is
+	 * refused — pinning the controller on the rung below. */
+	int       flap_demote_streak;
+	uint64_t  flap_last_demote_us;
+	int       flap_freeze_mcs;
+	uint64_t  flap_freeze_until_us;
 	/* Transport backpressure tracking (anti death-spiral). pressure_since_us
 	 * is the timestamp of the first datagram in the current contiguous
 	 * in_pressure run (0 = not under pressure); the escape fires once it has
@@ -2765,6 +3055,10 @@ static void selector_init(Selector *s)
 	s->fade_streak = 0;
 	s->flap_guard_mcs = -1;
 	s->flap_guard_us = 0;
+	s->flap_demote_streak = 0;
+	s->flap_last_demote_us = 0;
+	s->flap_freeze_mcs = -1;
+	s->flap_freeze_until_us = 0;
 	s->pressure_since_us = 0;
 	s->pressure_escape_count = 0;
 }
@@ -2818,10 +3112,40 @@ static SelectDecision selector_commit(Selector *s, const Config *cfg,
 		if (prev >= 0 && s->current_mcs < prev) {
 			uint64_t backoff_us =
 			    (uint64_t)(cfg->mcs.reentry_backoff_s * 1e6f);
+			int old_guard = s->flap_guard_mcs;
 			if (s->flap_guard_mcs < prev ||
 			    now - s->flap_guard_us > backoff_us)
 				s->flap_guard_mcs = prev;
 			s->flap_guard_us = now;
+
+			/* Hard flap-freeze detection: a demote FROM the same rung
+			 * we already flagged, spaced within flap_freeze_window_s of
+			 * the previous such demote, is one oscillation cycle. A
+			 * wider-spaced or different-rung demote opens a fresh episode
+			 * (streak=1) — this is what separates a fast flap from a slow
+			 * walk-away degrade (whose demotes step through ever-lower
+			 * rungs, many seconds apart). Once the streak reaches
+			 * flap_freeze_count, latch the rung and start the hold. */
+			if (cfg->mcs.flap_freeze_count > 0) {
+				uint64_t win_us =
+				    (uint64_t)(cfg->mcs.flap_freeze_window_s * 1e6f);
+				bool same_rung_fast = (prev == old_guard) &&
+				    s->flap_last_demote_us != 0 &&
+				    now - s->flap_last_demote_us <= win_us;
+				s->flap_demote_streak =
+				    same_rung_fast ? s->flap_demote_streak + 1 : 1;
+				s->flap_last_demote_us = now;
+				if (s->flap_demote_streak >= cfg->mcs.flap_freeze_count) {
+					if (s->flap_freeze_mcs != prev)
+						LOG_MCS("flap-freeze: rung %d re-demoted %dx in a row "
+						    "-> pin MCS %d for %.1fs",
+						    prev, s->flap_demote_streak, prev - 1,
+						    (double)cfg->mcs.flap_freeze_s);
+					s->flap_freeze_mcs = prev;
+					s->flap_freeze_until_us = now +
+					    (uint64_t)(cfg->mcs.flap_freeze_s * 1e6f);
+				}
+			}
 		}
 	}
 	*out_mcs = s->current_mcs;
@@ -2869,7 +3193,10 @@ static SelectDecision selector_tick_no_data(Selector *s, const Config *cfg,
  *                          rssi_floor_hyst_db of hysteresis so promotes
  *                          don't resume on the knife-edge), and promotes
  *                          back into a recently-failed rung wait
- *                          reentry_dwell_s (flap guard).
+ *                          reentry_dwell_s (soft flap guard). A rung
+ *                          re-demoted flap_freeze_count times fast is
+ *                          PINNED out for flap_freeze_s (hard flap-freeze),
+ *                          holding the rung below outright.
  *   5. hold
  * Demotes are FAST (down_cooldown_s, cascade allowed, never delayed by the
  * flap guard); promotes are SLOW (probe-verified per rung, dwell, guards).
@@ -2887,6 +3214,14 @@ static SelectDecision selector_update(Selector *s, const Config *cfg,
 	/* Data is flowing again — clear any watchdog failsafe; the probe will
 	 * climb back up from mcs_min. */
 	if (s->in_failsafe) s->in_failsafe = false;
+
+	/* Lift an expired flap-freeze so the probe may attempt the rung again
+	 * (it re-freezes if it flaps anew). Done here, not in the promote path,
+	 * so the freeze still clears even if probe records stop arriving. */
+	if (s->flap_freeze_mcs >= 0 && now >= s->flap_freeze_until_us) {
+		s->flap_freeze_mcs = -1;
+		s->flap_demote_streak = 0;
+	}
 
 	/* Transport backpressure persistence: track the start of the current
 	 * contiguous in_pressure run (the escape rule keys on how long it has
@@ -2999,6 +3334,15 @@ static SelectDecision selector_update(Selector *s, const Config *cfg,
 				bool promote_guard = fade_sample ||
 				    score->smoothed_rssi <= cfg->mcs.rssi_floor_dbm +
 				                            cfg->mcs.rssi_floor_hyst_db;
+				/* Hard flap-freeze: a rung that oscillated too fast is
+				 * pinned out — refuse to step into/above it until the
+				 * hold expires (held on the rung below). Stronger than
+				 * the reentry-dwell soft guard, which only stretches the
+				 * period. Expiry is handled at the top of selector_update. */
+				if (s->flap_freeze_mcs >= 0 &&
+				    now < s->flap_freeze_until_us &&
+				    s->current_mcs + 1 >= s->flap_freeze_mcs)
+					promote_guard = true;
 				/* Flap guard: re-promoting into/above the rung that
 				 * failed this episode needs the longer re-entry dwell. */
 				float need_dwell = cfg->mcs.promote_dwell_s;
@@ -3108,6 +3452,9 @@ static const TunableDesc TUNABLES[] = {
 	{"mcs.pressure_escape_s",             SUB_MCS, TF_FLOAT, OFF_MCS(pressure_escape_s),             0.0, 30.0,  "backpressure: in_pressure held >= this with clean RF -> promote to drain ring (0 = off)", 1},
 	{"mcs.reentry_backoff_s",             SUB_MCS, TF_FLOAT, OFF_MCS(reentry_backoff_s),             0.0, 120.0, "flap guard: window after a demote during which re-entry needs the longer dwell (0 = off)"},
 	{"mcs.reentry_dwell_s",               SUB_MCS, TF_FLOAT, OFF_MCS(reentry_dwell_s),               0.0, 30.0,  "flap guard: dwell for promoting back into the rung that just failed"},
+	{"mcs.flap_freeze_count",             SUB_MCS, TF_INT,   OFF_MCS(flap_freeze_count),             0, 50,      "flap freeze: fast re-demotes from one rung that pin the rung below (0 = off)", 1},
+	{"mcs.flap_freeze_window_s",          SUB_MCS, TF_FLOAT, OFF_MCS(flap_freeze_window_s),          0.5, 30.0,  "flap freeze: max spacing between counted re-demotes", 1},
+	{"mcs.flap_freeze_s",                 SUB_MCS, TF_FLOAT, OFF_MCS(flap_freeze_s),                 0.0, 120.0, "flap freeze: how long to hold the lower rung once tripped", 1},
 	{"mcs.probe_clean_milli",             SUB_MCS, TF_INT,   OFF_MCS(probe_clean_milli),             0, 1000,    "probe: V+2 PER <= this permille -> promote-eligible"},
 	{"mcs.probe_fail_milli",              SUB_MCS, TF_INT,   OFF_MCS(probe_fail_milli),              0, 1000,    "probe: V+2 PER >= this permille -> pre-emptive demote"},
 	{"mcs.demote_per_milli",              SUB_MCS, TF_INT,   OFF_MCS(demote_per_milli),              0, 1000,    "probe: live video PER >= this permille -> reactive demote"},
@@ -3591,7 +3938,7 @@ static int append_mcs_json(char *buf, size_t cap, size_t pos,
 		"\"in_failsafe\":%s,"
 		"\"rssi_guard\":{\"floor_active\":%s,\"fade_active\":%s},"
 		"\"pressure\":{\"active\":%s,\"held_s\":%.2f,\"escapes\":%u},"
-		"\"flap_guard\":{\"mcs\":%d,\"active\":%s},"
+		"\"flap_guard\":{\"mcs\":%d,\"active\":%s,\"freeze_mcs\":%d,\"frozen\":%s},"
 		"\"commit_count\":%u,\"changes_in_window\":%d,"
 		"\"last_emit_mcs\":%d,\"rx_ant_age_s\":%.3f,"
 		"\"bitrate_lead_s\":%.3f,"
@@ -3614,6 +3961,9 @@ static int append_mcs_json(char *buf, size_t cap, size_t pos,
 		(s->sel->flap_guard_mcs >= 0 && s->sel->flap_guard_us != 0 &&
 		 (double)(now - s->sel->flap_guard_us) / 1e6 <
 		     (double)s->cfg->mcs.reentry_backoff_s) ? "true" : "false",
+		s->sel->flap_freeze_mcs,
+		(s->sel->flap_freeze_mcs >= 0 &&
+		 now < s->sel->flap_freeze_until_us) ? "true" : "false",
 		s->sel->commit_count, s->sel->changes_count,
 		s->last_emit_mcs, rx_age_s,
 		(double)s->cfg->fec.bitrate_lead_s,
@@ -3703,10 +4053,55 @@ static int status_to_json(const ApiSnapshot *s, char *buf, size_t cap)
 		pos += w;
 	}
 
+	/* In-process SD telemetry logger state (was a separate walkout_logger.sh). */
+	if (g_logger.enabled) {
+		w = snprintf(buf + pos, cap - pos,
+			",\"logger\":{\"active\":%s,\"sampling\":%s,\"seq\":%d,"
+			"\"records\":%llu,\"bytes\":%llu}",
+			g_logger.active ? "true" : "false",
+			g_logger.sampling ? "true" : "false",
+			g_logger.seq, (unsigned long long)g_logger.records,
+			(unsigned long long)g_logger.bytes);
+		if (w < 0 || (size_t)w >= cap - pos) return -1;
+		pos += w;
+	}
+
 	w = snprintf(buf + pos, cap - pos, "}");
 	if (w < 0 || (size_t)w >= cap - pos) return -1;
 	pos += w;
 	return (int)pos;
+}
+
+/* 1 Hz SD sample: wrap the same /status JSON the WebUI serves as
+ * {"ts":<unix>,"up":<sys_uptime>,"status":{…}} into status.jsonl, then fsync
+ * (vfat has no journal — bound worst-case loss on a battery yank to one
+ * sample).  Past LOGGER_MAX_MB we stop sampling but keep flushing lc.log (the
+ * decision log is the cheap, valuable part). Called only from the poll loop. */
+static void logger_tick(const ApiSnapshot *snap)
+{
+	if (!g_logger.active) return;
+	if (g_logger.sampling && g_logger.jsonl) {
+		static char sbuf[16384];          /* single-threaded — static is fine */
+		int n = status_to_json(snap, sbuf, sizeof(sbuf));
+		if (n > 0) {
+			long up = 0;
+			FILE *u = fopen("/proc/uptime", "r");
+			if (u) { double d; if (fscanf(u, "%lf", &d) == 1) up = (long)d; fclose(u); }
+			int w = fprintf(g_logger.jsonl,
+			                "{\"ts\":%ld,\"up\":%ld,\"status\":%.*s}\n",
+			                (long)time(NULL), up, n, sbuf);
+			if (w > 0) g_logger.bytes += (uint64_t)w;
+			g_logger.records++;
+			if ((g_logger.records % 120) == 0 &&
+			    g_logger.bytes >= (uint64_t)LOGGER_MAX_MB * 1024ULL * 1024ULL) {
+				LOG_COMMON("logger: session #%06d hit %d MB — sampling stopped (lc.log continues)",
+				    g_logger.seq, LOGGER_MAX_MB);
+				g_logger.sampling = false;
+			}
+		}
+	}
+	if (g_logger.jsonl) { fflush(g_logger.jsonl); fsync(fileno(g_logger.jsonl)); }
+	if (g_logger.lclog) { fflush(g_logger.lclog); fsync(fileno(g_logger.lclog)); }
 }
 
 static int fec_status_to_json(const ApiSnapshot *s, char *buf, size_t cap)
@@ -4347,6 +4742,23 @@ static void api_handle_request(ApiClient *c, Config *cfg, ApiSnapshot *snap)
 		if (n > 0) api_send(c->fd, 200, "application/json", body, n);
 		else       api_send(c->fd, 500, "text/plain", "json overflow\n", 14);
 	}
+	else if (strcmp(path, "/log/status") == 0) {
+		n = logger_status_to_json(body, sizeof(body));
+		if (n > 0 && n < (int)sizeof(body)) api_send(c->fd, 200, "application/json", body, n);
+		else api_send(c->fd, 500, "text/plain", "json overflow\n", 14);
+	}
+	else if (strcmp(path, "/log/start") == 0) {
+		int rc = logger_start();            /* rolls a fresh SD session */
+		n = logger_status_to_json(body, sizeof(body));
+		if (n > 0 && n < (int)sizeof(body)) api_send(c->fd, rc == 0 ? 200 : 503, "application/json", body, n);
+		else api_send(c->fd, 500, "text/plain", "json overflow\n", 14);
+	}
+	else if (strcmp(path, "/log/stop") == 0) {
+		logger_stop();
+		n = logger_status_to_json(body, sizeof(body));
+		if (n > 0 && n < (int)sizeof(body)) api_send(c->fd, 200, "application/json", body, n);
+		else api_send(c->fd, 500, "text/plain", "json overflow\n", 14);
+	}
 	else if (strcmp(path, "/health") == 0) {
 		api_send(c->fd, 200, "text/plain", "ok\n", 3);
 	}
@@ -4452,6 +4864,14 @@ static void usage(const char *prog)
 		"\n"
 		"WCMD proxy:\n"
 		"  --wfb-iface NAME         iface for wfb_txpower writes\n"
+		"\n"
+		"SD telemetry logger (in-process; replaces walkout_logger.sh):\n"
+		"  --log-dir PATH           SD mount for sessions (default /mnt/mmcblk0p1);\n"
+		"                           writes <PATH>/walkout/NNNNNN_<stamp>/{status.jsonl,\n"
+		"                           lc.log}, newest 10 kept. Inactive if PATH (under\n"
+		"                           /mnt) is not a real mount — never logs to overlay.\n"
+		"                           Roll a fresh session: GET /log/start (or WCMD 19).\n"
+		"  --no-log                 disable the SD telemetry logger entirely\n"
 		"\n"
 		"  -h, --help               this message\n",
 		prog);
@@ -4653,6 +5073,19 @@ static void config_defaults(Config *c)
 	c->mcs.rssi_floor_hyst_db = 6.0f;
 	c->mcs.reentry_backoff_s  = 5.0f;
 	c->mcs.reentry_dwell_s    = 2.0f;
+	/* Hard flap-freeze: 3 re-demotes from the SAME rung (≈2 full oscillation
+	 * cycles), each within 10 s of the last, pins the rung below for 10 s.
+	 * Sized to catch the 2-rung trap (mcs_max one step above mcs_min, where
+	 * every promote re-fails on its own probe-retune burst). The window is
+	 * deliberately wider than the observed flap period (~6.5 s on-device,
+	 * since the soft reentry dwell already stretches each cycle to ~2 s+) so
+	 * the streak actually chains. A real walk-away degrade does NOT trip it:
+	 * those demotes step through DIFFERENT descending rungs, so the
+	 * same-rung requirement resets the streak; a healthy link never
+	 * re-fails a rung at all. */
+	c->mcs.flap_freeze_count    = 3;
+	c->mcs.flap_freeze_window_s = 10.0f;
+	c->mcs.flap_freeze_s        = 10.0f;
 
 	/* CSA: off until --csa-iface is set. */
 	c->csa.enabled = false;
@@ -4720,6 +5153,8 @@ int main(int argc, char **argv)
 		OPT_WFB_IFACE,
 		/* system */
 		OPT_IFACE_MTU,
+		/* sd logger */
+		OPT_LOG_DIR, OPT_NO_LOG,
 	};
 	static const struct option longopts[] = {
 		{"wfb",            required_argument, 0, OPT_WFB},
@@ -4738,6 +5173,8 @@ int main(int argc, char **argv)
 		{"csa-iface",      required_argument, 0, OPT_CSA_IFACE},
 		{"wfb-iface",      required_argument, 0, OPT_WFB_IFACE},
 		{"iface-mtu",      required_argument, 0, OPT_IFACE_MTU},
+		{"log-dir",        required_argument, 0, OPT_LOG_DIR},
+		{"no-log",         no_argument,       0, OPT_NO_LOG},
 		{"verbose",        no_argument,       0, 'v'},
 		{"help",           no_argument,       0, 'h'},
 		{0, 0, 0, 0},
@@ -4831,6 +5268,10 @@ int main(int argc, char **argv)
 			cfg.iface_mtu = m;
 			break;
 		}
+		case OPT_LOG_DIR:
+			snprintf(g_logger.sd_dir, sizeof(g_logger.sd_dir), "%s", optarg);
+			break;
+		case OPT_NO_LOG: g_logger.enabled = false; break;
 		case 'v':                cfg.verbose = 1; break;
 		case 'h': default: usage(argv[0]); return (ch == 'h') ? 0 : 1;
 		}
@@ -5212,10 +5653,19 @@ int main(int argc, char **argv)
 		LOG_FEC("safe-startup: disabled (--no-safe-startup) — venc state inherited as-is");
 	}
 
+	/* ── SD telemetry logger ── */
+	if (g_logger.enabled) {
+		if (logger_open_session() != 0)
+			LOG_COMMON("logger: not active (disabled, no SD, or open failed) — link unaffected");
+	} else {
+		LOG_COMMON("logger: disabled (--no-log)");
+	}
+
 	/* ── Timers ── */
 
 	uint64_t next_subscribe_us = 0;
 	uint64_t next_radio_us     = 0;     /* fec polling fallback */
+	uint64_t next_log_write_us = now_us() + 1000000ULL;   /* 1 Hz SD sample */
 	uint64_t next_heartbeat_us = now_us() + 5000000ULL;
 	uint64_t next_watchdog_us = now_us() +
 	    (uint64_t)((cfg.mcs.failsafe_timeout_s / 4.0f) * 1e6f);
@@ -5725,6 +6175,13 @@ int main(int argc, char **argv)
 			if (now2 >= next_sse_ping_us) {
 				sse_heartbeat_all();
 				next_sse_ping_us = now2 + 15000000ULL;
+			}
+			/* 1 Hz SD telemetry sample — reuses this poll's ApiSnapshot.
+			 * Poll wakes at least every 100 ms (timeout cap), so this fires
+			 * on time without joining the deadline min-calc. */
+			if (g_logger.active && now2 >= next_log_write_us) {
+				logger_tick(&snap);
+				next_log_write_us = now2 + 1000000ULL;
 			}
 		}
 
@@ -6270,6 +6727,7 @@ int main(int argc, char **argv)
 		}
 	}
 
+	logger_stop();
 	if (sidecar_fd >= 0) close(sidecar_fd);
 	if (wfb_stats_fd >= 0) close(wfb_stats_fd);
 	if (rx_ant_fd >= 0) close(rx_ant_fd);

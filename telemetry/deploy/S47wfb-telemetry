@@ -1,0 +1,50 @@
+#!/bin/sh
+#
+# S47wfb-telemetry — Waybeam wfb telemetry capture + web UI (Buildroot/BusyBox).
+#
+# The consolidated one-app deploy: webapp.py captures the gs_supervisor
+# stats_tap (udp:6700) into wfb.sqlite AND serves the web UI (:8080) from one
+# process — no separate ingester, no sudo. SIGTERM closes the live session
+# cleanly (see webapp.py). Mirrors S46gs_supervisor's conventions.
+#
+# `deploy/install.sh` fills @HERE@/@RUN@ and installs this to
+# /etc/init.d/S47wfb-telemetry. Numbered S47 so it starts AFTER gs_supervisor
+# (S46), which produces the stats_tap this consumes.
+
+# BusyBox init runs with a minimal PATH; pin a full one so python/venv resolve.
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+
+HERE="@HERE@"                 # telemetry/ checkout dir
+RUN="@RUN@"                   # full python webapp.py invocation
+PIDFILE=/var/run/wfb-telemetry.pid
+LOG=/var/log/wfb-telemetry.log
+
+start() {
+    echo "wfb-telemetry: starting (capture udp:6700 + UI :8080)"
+    cd "$HERE" || exit 1
+    # start-stop-daemon backgrounds it; SIGTERM on stop runs the clean close.
+    start-stop-daemon -S -b -m -p "$PIDFILE" -d "$HERE" \
+        -x /bin/sh -- -c "exec $RUN >> $LOG 2>&1"
+}
+
+stop() {
+    echo "wfb-telemetry: stopping"
+    # TERM (not KILL) so webapp.py closes the live session + commits.
+    start-stop-daemon -K -p "$PIDFILE" -s TERM 2>/dev/null
+    rm -f "$PIDFILE"
+}
+
+case "$1" in
+    start)   start ;;
+    stop)    stop ;;
+    restart) stop; sleep 1; start ;;
+    status)
+        if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+            echo "wfb-telemetry: running ($(cat "$PIDFILE"))"
+        else
+            echo "wfb-telemetry: not running"
+        fi
+        ;;
+    *) echo "Usage: $0 {start|stop|restart|status}"; exit 1 ;;
+esac

@@ -49,6 +49,10 @@ table.sessions th, table.sessions td { text-align: left; padding: .45rem .6rem;
 table.sessions th { color: var(--muted); font-weight: 500; }
 table.sessions tbody tr { cursor: pointer; }
 table.sessions tbody tr:hover { background: #1b222c; }
+/* live (open) capture session — ended_at IS NULL */
+table.sessions tbody tr.live-session { background: rgba(63, 185, 80, .12);
+  box-shadow: inset 3px 0 0 #3fb950; }
+table.sessions tbody tr.live-session:hover { background: rgba(63, 185, 80, .18); }
 td.num { text-align: right; font-variant-numeric: tabular-nums; }
 
 dl.meta { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));

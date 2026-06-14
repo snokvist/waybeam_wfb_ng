@@ -511,6 +511,36 @@ void api_handle(ApiClient *cli, Config *c, uint64_t startup_us)
 		api_send(cli->fd, 200, "application/json", body, p);
 		return;
 	}
+	/* Roll the vehicle's SD telemetry log (WCMD_KEY_LOG_CONTROL=19, infra key
+	 * like LOG_SYNC).  value=1 (default) starts/rolls a fresh session, 0 stops.
+	 * Fired by the telemetry "New capture" button so a fresh GS session gets a
+	 * matching, time-aligned vehicle log.  Bypasses the operator rate-limit/name
+	 * table (the key sits above WCMD_KEY_MAX). */
+	if (!strcmp(path, "/api/v1/logctl")) {
+		int v = 1;
+		(void)qs_get_int(qstr, "value", &v);
+		int32_t value = (v != 0) ? 1 : 0;
+		uint16_t seq = 0;
+		int rc = wcmd_emit(c, WCMD_KEY_LOG_CONTROL, value, &seq);
+		if (rc == -1) {
+			api_send(cli->fd, 503, "application/json",
+			         "{\"ok\":false,\"error\":\"venc_cmd disabled or uplink missing\"}", -1);
+			return;
+		}
+		if (rc != 0) {
+			char body[128];
+			int p = snprintf(body, sizeof(body),
+			                 "{\"ok\":false,\"error\":\"sendto: %s\"}", strerror(rc));
+			api_send(cli->fd, 502, "application/json", body, p);
+			return;
+		}
+		char body[96];
+		int p = snprintf(body, sizeof(body),
+		                 "{\"ok\":true,\"seq\":%u,\"key\":\"log_control\",\"value\":%d}",
+		                 (unsigned)seq, (int)value);
+		api_send(cli->fd, 200, "application/json", body, p);
+		return;
+	}
 	if (!strcmp(path, "/api/v1/system/scan")) {
 		/* Required: iface (comma-sep), chans (comma-sep). Optional: ht /
 		 * hts (single HT for all steps, or comma-sep per step), dwell_ms

@@ -34,19 +34,40 @@ it.
 A single SQLite file is trivially copied/backed up. Flask deps live in
 `requirements-webui.txt` (training-box only; the SSC338Q never runs this).
 
-## Quick start
+## Deploy — one app (capture + DB + web UI)
+
+The web UI captures the live stats_tap into SQLite **in-process** (a background
+thread) and serves the UI from the same process, so a normal deploy is one
+service. No separate ingester, no `sudo`, no shell glue. SIGTERM closes the
+live session cleanly (stamps `ended_at`, commits the final window).
+
+```bash
+# one command: venv + Flask + a systemd unit (x86) or BusyBox init (aarch64)
+telemetry/deploy/install.sh                  # UI :8080, capture udp:6700
+#   -> http://<host>:8080
+
+# or run it directly (capture is on by default):
+pip install -r telemetry/requirements-webui.txt
+python3 telemetry/webui/webapp.py --db telemetry/wfb.sqlite --port 8080 --listen 6700
+```
+
+The app **owns udp:6700**. If you keep gs_supervisor's `system.up` running
+`capture_session.sh start`, the two fight for the port — drop that hook for the
+one-app deploy, or run the app `--no-capture` to keep the legacy split below.
+
+## Quick start (legacy split / imports)
 
 ```bash
 # 1. import an existing capture (creates the DB on first run)
 python3 telemetry/wfb_store.py import telemetry/real_wfb.jsonl --scenario range-walk
 
-# 2. (live) ingest off a tee --tap instead of/alongside imports
-python3 telemetry/wfb_stats_tee.py --listen 6650 --forward 127.0.0.1:6600 --tap 127.0.0.1:6700
+# 2. (live, split) standalone ingester — same capture core as the one-app path,
+#    for deployments that want capture decoupled from the UI process
 python3 telemetry/wfb_ingest.py --listen 6700 --scenario flight
 
-# 3. browse (read-only; runs while the ingester writes, thanks to WAL)
+# 3. browse UI-only against a DB someone else is writing (WAL read)
 pip install -r telemetry/requirements-webui.txt
-python3 telemetry/webui/webapp.py --db telemetry/wfb.sqlite --port 8080
+python3 telemetry/webui/webapp.py --db telemetry/wfb.sqlite --port 8080 --no-capture
 #   -> http://127.0.0.1:8080
 ```
 

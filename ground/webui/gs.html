@@ -221,6 +221,15 @@ select{cursor:pointer;-webkit-appearance:none;appearance:none;background-image:u
 ::-webkit-scrollbar-thumb:hover{background:var(--text-dim)}
 
 .muted{color:var(--text-dim)}
+.ep-list{list-style:none;margin:.2rem 0 0;padding:0}
+.ep-list li{padding:.35rem 0;border-bottom:1px solid var(--border);font-size:.8rem}
+.ep-list li:last-child{border-bottom:none}
+.ep-list a{color:var(--accent);text-decoration:none;font-family:'JetBrains Mono',monospace}
+.ep-list a:hover{text-decoration:underline}
+.ep-ports{border-collapse:collapse;font-size:.78rem;width:100%}
+.ep-ports th,.ep-ports td{text-align:left;padding:.3rem .6rem;border-bottom:1px solid var(--border)}
+.ep-ports th{color:var(--text-dim);font-weight:500}
+.ep-ports td:first-child{font-family:'JetBrains Mono',monospace;color:var(--accent)}
 .empty{color:var(--text-dim);text-align:center;padding:2rem;font-size:.85rem;border:1px dashed var(--border);border-radius:6px}
 .hidden{display:none !important}
 </style>
@@ -248,6 +257,7 @@ select{cursor:pointer;-webkit-appearance:none;appearance:none;background-image:u
   <div class="tab" data-tab="channel">Channel</div>
   <div class="tab" data-tab="link">Link</div>
   <div class="tab" data-tab="encoder">Encoder</div>
+  <div class="tab" data-tab="endpoints">Endpoints</div>
 </div>
 
 <div class="toast-container" id="toasts"></div>
@@ -482,6 +492,57 @@ select{cursor:pointer;-webkit-appearance:none;appearance:none;background-image:u
         <button class="btn btn-fire" onclick="cmdFire()">Send</button>
       </div>
       <div class="reply" id="reply-cmd"></div>
+    </div>
+  </div>
+</div>
+
+<!-- ──────────────────────── ENDPOINTS ──────────────────────── -->
+<!-- Quick links + port cheat-sheet for forgetful humans. Vehicle links
+     follow the IP box (persisted in localStorage); GS links are relative
+     to whatever host is serving this page. Nothing here calls an API —
+     they just open in a new tab. -->
+<div class="tab-content" id="tab-endpoints">
+
+  <div class="section">
+    <div class="section-header"><h3>Vehicle</h3>
+      <span class="help">link_controller WebUI + API on the craft. Set the craft IP once — it's remembered in this browser.</span></div>
+    <div class="section-body">
+      <div class="field">
+        <div class="field-label">vehicle IP</div>
+        <input type="text" id="ep-vehicle-ip" placeholder="192.168.1.13" style="font-family:'JetBrains Mono',monospace">
+        <span></span>
+      </div>
+      <ul class="ep-list">
+        <li><a id="ep-lc-ui"     target="_blank" rel="noopener">link_controller WebUI</a> <span class="muted">:8765 · adaptive FEC/MCS status + tuning</span></li>
+        <li><a id="ep-lc-status" target="_blank" rel="noopener">/status</a> <span class="muted">live JSON (score, mcs, fec, logsync, uplink_rx)</span></li>
+        <li><a id="ep-lc-schema" target="_blank" rel="noopener">/schema</a> <span class="muted">tunable registry — GET /set?key=val to change</span></li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="section">
+    <div class="section-header"><h3>Ground station</h3>
+      <span class="help">This host — supervisor API and the SQLite telemetry UI.</span></div>
+    <div class="section-body">
+      <ul class="ep-list">
+        <li><a href="/api/v1/status"  target="_blank" rel="noopener">gs_supervisor /api/v1/status</a> <span class="muted">:80 · tunnels, packet counts, RSSI</span></li>
+        <li><a href="/api/v1/tunnels" target="_blank" rel="noopener">gs_supervisor /api/v1/tunnels</a> <span class="muted">full per-tunnel detail</span></li>
+        <li><a id="ep-telemetry" target="_blank" rel="noopener">Telemetry / SQLite WebUI</a> <span class="muted">:8080 · capture sessions, RSSI/SNR/FEC charts</span></li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="section">
+    <div class="section-header"><h3>Port cheat-sheet</h3>
+      <span class="help">Who listens where.</span></div>
+    <div class="section-body">
+      <table class="ep-ports">
+        <tr><th>Port</th><th>Host</th><th>Service</th></tr>
+        <tr><td>8765</td><td>vehicle</td><td>link_controller WebUI / API</td></tr>
+        <tr><td>80</td><td>ground</td><td>gs_supervisor WebUI / API (this page)</td></tr>
+        <tr><td>8080</td><td>ground</td><td>telemetry SQLite WebUI (Flask)</td></tr>
+        <tr><td>5600</td><td>ground</td><td>decoded video RTP out (wfb_rx)</td></tr>
+      </table>
     </div>
   </div>
 </div>
@@ -1169,9 +1230,27 @@ $$('.tab').forEach(t=>{
   });
 });
 
+function epApplyVehicleIp(){
+  const box=$('#ep-vehicle-ip'); if(!box) return;
+  const ip=(box.value||'192.168.1.13').trim();
+  const base='http://'+ip+':8765';
+  $('#ep-lc-ui').href     = base+'/';
+  $('#ep-lc-status').href = base+'/status';
+  $('#ep-lc-schema').href = base+'/schema';
+}
+function initEndpoints(){
+  const box=$('#ep-vehicle-ip'); if(!box) return;
+  box.value = localStorage.getItem('wbVehicleIp') || '192.168.1.13';
+  box.addEventListener('input', ()=>{ localStorage.setItem('wbVehicleIp', box.value.trim()); epApplyVehicleIp(); });
+  epApplyVehicleIp();
+  const tel=$('#ep-telemetry');
+  if(tel) tel.href = 'http://'+location.hostname+':8080/';
+}
+
 document.addEventListener('DOMContentLoaded', ()=>{
   const cmdKey=$('#cmd-key');
   if(cmdKey){ cmdKey.addEventListener('change', updateCmdValueRow); updateCmdValueRow(); }
+  initEndpoints();
 });
 
 renderPresetRows();

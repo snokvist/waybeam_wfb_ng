@@ -27,10 +27,10 @@
       "sleep 0.5",
       "iw dev wlx40a5ef2f2308 set txpower fixed 2000",
       "/home/snokvist/dev/waybeam-coordination/waybeam_wfb_ng/ground/scripts/walkout_logger.sh start",
-      "/home/snokvist/dev/waybeam-coordination/waybeam_wfb_ng/telemetry/capture_session.sh start"
+      "/home/snokvist/dev/waybeam-coordination/waybeam_wfb_ng/telemetry/webui_session.sh start 8088"
     ],
     "down": [
-      "/home/snokvist/dev/waybeam-coordination/waybeam_wfb_ng/telemetry/capture_session.sh stop",
+      "/home/snokvist/dev/waybeam-coordination/waybeam_wfb_ng/telemetry/webui_session.sh stop",
       "/home/snokvist/dev/waybeam-coordination/waybeam_wfb_ng/ground/scripts/walkout_logger.sh stop",
       "ip link set wlx40a5ef2f229b down",
       "ip link set wlx40a5ef2f2308 down"
