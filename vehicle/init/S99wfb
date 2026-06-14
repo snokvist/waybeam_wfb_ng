@@ -115,17 +115,17 @@ start_wfb() {
     # Override: fw_setenv wfbpeek off|close|idr|refpred|idr+refpred.
     WFB_PEEK_PROFILE=$(fw_get wfbpeek close)
 
-    # Short-tail peek close (proportional parity, no on-air zero-padding).
-    # When on, every frame's FEC block closes via close_block_short(): one
-    # boundary marker fragment + p~proportional parity instead of padding to k
-    # on-air + full n-k parity.  Restores full per-frame loss isolation at a
-    # fraction of the airtime the gate gave up.  REQUIRES a SHORT_TAIL-aware RX
-    # (gs_supervisor wfb_rx built from peek.patch >= 2026-06-14); an old RX would
-    # stall short blocks -- so every fielded GS must run a peek.patch RX before
-    # this default takes effect.  Default ON (the efficient per-frame close);
-    # the threshold-gated full-padding close is the fallback for legacy RX.
-    # Override: fw_setenv wfbshorttail 0   (revert to the gate close).
-    WFB_SHORT_TAIL=$(fw_get wfbshorttail 1)
+    # Short-tail peek close (proportional parity, no on-air zero-padding):
+    # close_block_short() emits one boundary marker fragment + ~proportional
+    # parity instead of padding to k on-air + full n-k parity. More airtime-
+    # efficient than the gate close, BUT device-verified to perturb the FEC+MCS
+    # control loop -- it brings back the MCS flap + fps drops with peek on (the
+    # gate close is rock-solid; see memory wfb_ng_peek_idr_profile_airtime_spike).
+    # So Default OFF = the threshold-gated full-padding close. Short-tail is an
+    # opt-in for airtime-constrained links that can tolerate the flap, and still
+    # REQUIRES a SHORT_TAIL-aware RX (gs_supervisor wfb_rx from peek.patch).
+    # Override: fw_setenv wfbshorttail 1   (enable the short-tail close).
+    WFB_SHORT_TAIL=$(fw_get wfbshorttail 0)
     WFB_SHORT_TAIL_ARG=""
     case "$WFB_SHORT_TAIL" in 1|on|yes) WFB_SHORT_TAIL_ARG="--peek-short-tail" ;; esac
 
