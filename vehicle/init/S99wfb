@@ -116,9 +116,11 @@ start_wfb() {
     # on-air + full n-k parity.  Restores full per-frame loss isolation at a
     # fraction of the airtime the gate gave up.  REQUIRES a SHORT_TAIL-aware RX
     # (gs_supervisor wfb_rx built from peek.patch >= 2026-06-14); an old RX would
-    # stall short blocks.  Default off => threshold-gated full-padding close.
-    # Override: fw_setenv wfbshorttail 1.
-    WFB_SHORT_TAIL=$(fw_get wfbshorttail 0)
+    # stall short blocks -- so every fielded GS must run a peek.patch RX before
+    # this default takes effect.  Default ON (the efficient per-frame close);
+    # the threshold-gated full-padding close is the fallback for legacy RX.
+    # Override: fw_setenv wfbshorttail 0   (revert to the gate close).
+    WFB_SHORT_TAIL=$(fw_get wfbshorttail 1)
     WFB_SHORT_TAIL_ARG=""
     case "$WFB_SHORT_TAIL" in 1|on|yes) WFB_SHORT_TAIL_ARG="--peek-short-tail" ;; esac
 
