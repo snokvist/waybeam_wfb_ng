@@ -189,7 +189,8 @@ main{padding:1.2rem;overflow:auto;height:calc(100vh - 86px);max-width:1100px;mar
       <div class="card"><h3>Uptime</h3><div class="v" id="c-uptime">—</div></div>
       <div class="card"><h3>FEC k / n</h3><div class="v" id="c-fec">—</div><div class="sub" id="c-fec-sub">—</div></div>
       <div class="card"><h3>MCS · V+2 probe</h3><div class="v" id="c-mcs">—</div><div class="sub" id="c-mcs-sub">—</div></div>
-      <div class="card"><h3>RSSI</h3><div class="v" id="c-rssi">—</div><div class="sub" id="c-rssi-sub">—</div></div>
+      <div class="card"><h3>RSSI (downlink)</h3><div class="v" id="c-rssi">—</div><div class="sub" id="c-rssi-sub">—</div></div>
+      <div class="card" title="The vehicle's own reception of the GS uplink (GS→vehicle), from a diagnostic wfb_rx -Y listener. Independent of the downlink RSSI the control loop adapts on; proves WCMD/CSA reaches the vehicle."><h3>Uplink RX (GS→veh)</h3><div class="v" id="c-uplink">—</div><div class="sub" id="c-uplink-sub">—</div></div>
       <div class="card"><h3>Loss</h3><div class="v" id="c-loss">—</div><div class="sub" id="c-loss-sub">—</div></div>
       <div class="card"><h3>Diversity</h3><div class="v" id="c-div">—</div><div class="sub" id="c-div-sub">—</div></div>
       <div class="card"><h3>Headroom</h3><div class="v" id="c-headroom">—</div><div class="sub" id="c-headroom-sub">—</div></div>
@@ -434,6 +435,28 @@ function renderStatus(s) {
     if (guard.floor_active) sub += " · FLOOR";
     if (guard.fade_active)  sub += " · FADE";
     $("#c-rssi-sub").textContent = sub;
+  }
+
+  // Uplink RX — the vehicle's OWN reception of the GS uplink (GS→vehicle),
+  // from the diagnostic wfb_rx -Y listener. Wholly independent of the RSSI
+  // card above (which is the GS-relayed DOWNLINK score the control loop
+  // adapts on); this never feeds the law. pkt_total/lost are lifetime
+  // counters — a non-zero rx count proves WCMD/CSA actionable data lands.
+  const up = s.uplink_rx || {};
+  if (up.present) {
+    const ur = up.smoothed_rssi;
+    $("#c-uplink").textContent = ur.toFixed(1) + " dBm";
+    $("#c-uplink").className = "v " + (ur < -82 ? "bad" : ur < -72 ? "warn" : "ok");
+    const tot = (up.pkt_total || 0) + (up.lost_total || 0);
+    const per = tot > 0 ? (up.lost_total / tot * 100) : 0;
+    let usub = "rx " + (up.pkt_total || 0) + " · loss " + per.toFixed(1) + "%";
+    if (typeof up.age_s === "number" && up.age_s >= 0)
+      usub += " · age " + up.age_s.toFixed(1) + "s";
+    $("#c-uplink-sub").textContent = usub;
+  } else {
+    $("#c-uplink").textContent = "—";
+    $("#c-uplink").className = "v muted";
+    $("#c-uplink-sub").textContent = "no rx_ant yet";
   }
 
   // Loss (smoothed/EWMA — the values the law evaluates)
