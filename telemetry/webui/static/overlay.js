@@ -17,11 +17,28 @@
             xs.map(x => (m2.has(x) ? m2.get(x) : null))];
   }
 
+  // The uplink (1 Hz) and downlink (10 Hz) streams sample at different rates
+  // and never share an x, so on the union x-axis each series is null at the
+  // other's points. uPlot's legend reads the value AT the cursor index, so it
+  // would read null ~91% of the time for the sparse uplink (and on downlink at
+  // uplink-x). Snap each series independently to its nearest non-null sample so
+  // both legend values are always populated wherever you hover.
+  function nearestNonNull(self, seriesIdx, hoveredIdx) {
+    const ys = self.data[seriesIdx];
+    if (ys[hoveredIdx] != null) return hoveredIdx;
+    const n = ys.length;
+    for (let lo = hoveredIdx - 1, hi = hoveredIdx + 1; lo >= 0 || hi < n; lo--, hi++) {
+      if (hi < n && ys[hi] != null) return hi;
+      if (lo >= 0 && ys[lo] != null) return lo;
+    }
+    return hoveredIdx;
+  }
+
   function chart(el, title, scaleKey, unit, range, upT, upY, dnT, dnY) {
     const [xs, a, b] = mergeXY(upT, upY, dnT, dnY);
     return new uPlot({
       title, width: el.clientWidth, height: 220,
-      cursor: { sync: { key: "overlay" } },
+      cursor: { sync: { key: "overlay" }, dataIdx: nearestNonNull },
       scales: { x: { time: true }, [scaleKey]: range ? { range } : {} },
       axes: [
         { stroke: axisColor, grid: { stroke: "#21262d" }, ticks: { stroke: "#21262d" } },
@@ -30,7 +47,9 @@
       series: [
         {},
         { label: "uplink " + unit, scale: scaleKey, stroke: UP, spanGaps: true, width: 1.5,
-          points: { show: false } },
+          // sparse 1 Hz stream — show each real sample so the line isn't mistaken
+          // for missing data, and the cursor lands on visible points.
+          points: { show: true, size: 4 } },
         { label: "downlink " + unit, scale: scaleKey, stroke: DN, spanGaps: true, width: 1.5,
           points: { show: false } },
       ],

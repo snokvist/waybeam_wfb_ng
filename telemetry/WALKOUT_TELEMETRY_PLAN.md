@@ -41,6 +41,19 @@ items as they land; fold finished design into memory/specs.
         "New capture session" press. Overlay should key on `gs_unix_ms`; the
         single-GS-session label is just the midpoint's. For the cleanest 1:1
         label, press "New capture session" BEFORE starting a walk.
+- [x] **Genuine UPLINK reception (GS→vehicle) captured.** The "uplink" series
+      used to be `rssi_comb` — but on a vehicle session that is the GS-relayed
+      DOWNLINK score (the rx_ant the vehicle adapts on), so the uplink/downlink
+      overlay was downlink-vs-downlink and overlaid near-identically. Fixed: the
+      vehicle's own `wfb_rx` now runs `-Y 127.0.0.1:5811` (S99wfb), feeding an
+      isolated, diagnostic-only listener in `link_controller` (`--uplink-stats`)
+      that surfaces `uplink_rx` under `/status`. The walkout logger captures it
+      for free (it mirrors `/status`); the importer maps it into new
+      `uplink_rssi/uplink_pkt/uplink_lost` columns; the session chart + the
+      uplink↔downlink overlay plot the genuine uplink. Device-validated on a
+      real walk (session 25): downlink −11.7 vs uplink −47.3 dBm — a 35.6 dB
+      asymmetry the old overlay could never show; 1201 uplink pkts received /
+      193 lost proves WCMD/CSA actionable data reaches the vehicle.
 - [ ] **Capture the probe (downlink PER) into the DB too?** Only the video
       tunnel raw rx_ant is tapped today. The probe stream is `{type:probe}` —
       decide: ingest as its own session/source, or leave to the back-channel.

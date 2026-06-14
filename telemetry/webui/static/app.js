@@ -342,11 +342,18 @@ async function main() {
     // current_mcs as a step line alongside the fade-rate it demotes on.
     const EX = j.vehicle_extra || {};
     CHARTS = [
-      makeChart(mk(), "RSSI (smoothed) / diversity",
-        [{}, { label: "rssi (dBm)", scale: "rssi", stroke: C.rssi },
+      // "downlink" = rssi_comb = the GS-relayed downlink score the vehicle
+      // adapts on. "uplink" = uplink_rssi = the vehicle's OWN reception of the
+      // GS (independent antenna data; null on sessions captured before the
+      // uplink_rx feature). When both are present they should diverge.
+      makeChart(mk(), "RSSI — downlink (GS-relayed) vs uplink (vehicle rx)",
+        [{}, { label: "downlink (dBm)", scale: "rssi", stroke: C.rssi },
+             { label: "uplink (dBm)", scale: "rssi", stroke: "#58a6ff",
+               spanGaps: true },
              { label: "adapters", scale: "adapters", stroke: C.snr,
                paths: stepped, points: { show: false } }],
-        [t, S.rssi_comb, EX.adapter_count], { rssi: {}, adapters: { range: [0, 4] } },
+        [t, S.rssi_comb, S.uplink_rssi, EX.adapter_count],
+        { rssi: {}, adapters: { range: [0, 4] } },
         [{ scale: "rssi", stroke: axisColor, grid: { stroke: "#21262d" } },
          { scale: "adapters", side: 1, stroke: axisColor, grid: { show: false } }]),
       makeChart(mk(), "PER (smoothed loss ratio)",

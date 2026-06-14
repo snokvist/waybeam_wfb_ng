@@ -87,9 +87,23 @@ CREATE TABLE records (
     fec_rec     INTEGER,
     dec_err     INTEGER,
     per         REAL,                   -- derived packet error rate
+    uplink_rssi REAL,                   -- vehicle's OWN reception of the GS
+    uplink_pkt  INTEGER,                --   (GS->vehicle uplink), from the
+    uplink_lost INTEGER,                --   vehicle wfb_rx -Y via uplink_rx
     raw_json    TEXT NOT NULL
 );
 CREATE INDEX idx_records_session_ts ON records(session_id, ts_ms);
+
+-- DOWNLINK vs UPLINK on a vehicle session. For an imported vehicle session,
+-- rssi_comb is the GS-relayed DOWNLINK score (how the GS hears the vehicle —
+-- the rx_ant the vehicle adapts its FEC/MCS on, which arrives via the uplink
+-- tunnel). The uplink_* columns are the genuinely INDEPENDENT measurement:
+-- how the vehicle hears the GS, from the vehicle's own wfb_rx -Y, surfaced by
+-- link_controller under /status "uplink_rx" (S99wfb wires wfb_rx -Y →
+-- --uplink-stats 5811). Plotting both shows the link asymmetry (commonly tens
+-- of dB) and proves WCMD/CSA actionable data reaches the vehicle. NULL on
+-- GS-side (live-*) rows and on legacy sessions captured before uplink_rx.
+-- The columns are added additively by wfb_store.init_db on existing stores.
 
 -- ML predictions, kept separate so re-scoring a session with a new model
 -- version doesn't touch the raw records.

@@ -181,6 +181,16 @@ def import_vehicle_jsonl(conn, path: str, vehicle_session: str, **meta) -> tuple
         spread = abs(rssi - raw) if isinstance(rssi, (int, float)) and isinstance(raw, (int, float)) else None
         per = _g(d, "status", "score", "smoothed_lost_ratio")
         mcs = _g(d, "status", "mcs", "current_mcs")
+        # Vehicle-side UPLINK reception (GS->vehicle) — genuinely independent
+        # antenna data from rssi_comb above (which is the GS-relayed DOWNLINK
+        # score). present=false until the vehicle's wfb_rx -Y has been seen.
+        up = _g(d, "status", "uplink_rx")
+        if isinstance(up, dict) and up.get("present"):
+            uplink_rssi = up.get("smoothed_rssi")
+            uplink_pkt = up.get("pkt_last")
+            uplink_lost = up.get("lost_last")
+        else:
+            uplink_rssi = uplink_pkt = uplink_lost = None
         # Stamp the GS wall-clock estimate into raw_json (no schema change) so a
         # future overlay can place vehicle + GS records on one epoch axis.
         if fit:
@@ -189,10 +199,12 @@ def import_vehicle_jsonl(conn, path: str, vehicle_session: str, **meta) -> tuple
         conn.execute(
             """INSERT INTO records
                (session_id, ts_ms, seq, mcs, rssi_comb, rssi_spread, snr_avg,
-                pkt_all, pkt_uniq, pkt_lost, fec_rec, dec_err, per, raw_json)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                pkt_all, pkt_uniq, pkt_lost, fec_rec, dec_err, per,
+                uplink_rssi, uplink_pkt, uplink_lost, raw_json)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (sid, ts_ms, None, mcs, rssi, spread, None,
              None, None, None, None, None, per,
+             uplink_rssi, uplink_pkt, uplink_lost,
              json.dumps(d, separators=(",", ":"))))
     store.close_session(conn, sid)
     if bad:

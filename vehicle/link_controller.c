@@ -391,6 +391,18 @@ typedef struct {
 		 * instead of promote_dwell_s. */
 		float    reentry_backoff_s; /* flap-guard window (0 = off)          */
 		float    reentry_dwell_s;   /* dwell for re-entry into failed rung  */
+		/* Hard flap-freeze (promote-side backstop on top of the soft
+		 * reentry dwell above). When a rung is re-demoted from
+		 * flap_freeze_count times in a row, each within flap_freeze_window_s
+		 * of the last, the controller PINS the rung below and refuses to
+		 * re-promote into the offending rung for flap_freeze_s. Unlike the
+		 * reentry dwell (which only stretches the period), this stops the
+		 * oscillation outright — for the 2-rung [min,min+1] trap where every
+		 * promote triggers a probe-retune burst that re-trips the demote.
+		 * flap_freeze_count == 0 disables it. */
+		int      flap_freeze_count;    /* fast re-demotes to trip (0 = off)  */
+		float    flap_freeze_window_s; /* max spacing between counted demotes*/
+		float    flap_freeze_s;        /* how long to pin the lower rung     */
 		/* Probe producer (Phase 4). Feeder pacing; gated by mcs.enabled
 		 * (probe is mandatory for MCS — no separate live switch) and the
 		 * endpoints themselves are startup-only (--probe/--probe-feed). */
@@ -479,6 +491,11 @@ typedef struct {
 	uint16_t probe_port;
 	char     probe_feed_host[64];    /* probe wfb_tx udp_in (feeder)   */
 	uint16_t probe_feed_port;
+	/* Vehicle-side uplink rx_ant listener: the uplink wfb_rx's own -Y stats
+	 * (GS->vehicle reception). DIAGNOSTIC ONLY — fed through an isolated
+	 * scorer and surfaced under "uplink_rx" in /status; it never influences
+	 * the downlink MCS/FEC control loop. 0 = off. */
+	uint16_t uplink_stats_port;
 	int      api_port;               /* HTTP API on 127.0.0.1:N (0 disables) */
 	int      iface_mtu;              /* startup-only: ip link set dev <iface> mtu N
 	                                  * across {csa.iface, cmd.wfb_iface}. 0 = off.
@@ -2689,6 +2706,17 @@ typedef struct {
 	 * Demotes are never delayed by this. */
 	int       flap_guard_mcs;
 	uint64_t  flap_guard_us;
+	/* Hard flap-freeze ("hold the lower rung"). flap_demote_streak counts
+	 * consecutive fast re-demotes from the SAME rung (each within
+	 * flap_freeze_window_s of the last); flap_last_demote_us spaces them.
+	 * Once the streak reaches flap_freeze_count, flap_freeze_mcs latches the
+	 * offending rung and flap_freeze_until_us holds for flap_freeze_s, during
+	 * which any promote that would step into/above flap_freeze_mcs is
+	 * refused — pinning the controller on the rung below. */
+	int       flap_demote_streak;
+	uint64_t  flap_last_demote_us;
+	int       flap_freeze_mcs;
+	uint64_t  flap_freeze_until_us;
 	/* Transport backpressure tracking (anti death-spiral). pressure_since_us
 	 * is the timestamp of the first datagram in the current contiguous
 	 * in_pressure run (0 = not under pressure); the escape fires once it has
@@ -2760,6 +2788,10 @@ static void selector_init(Selector *s)
 	s->fade_streak = 0;
 	s->flap_guard_mcs = -1;
 	s->flap_guard_us = 0;
+	s->flap_demote_streak = 0;
+	s->flap_last_demote_us = 0;
+	s->flap_freeze_mcs = -1;
+	s->flap_freeze_until_us = 0;
 	s->pressure_since_us = 0;
 	s->pressure_escape_count = 0;
 }
@@ -2813,10 +2845,40 @@ static SelectDecision selector_commit(Selector *s, const Config *cfg,
 		if (prev >= 0 && s->current_mcs < prev) {
 			uint64_t backoff_us =
 			    (uint64_t)(cfg->mcs.reentry_backoff_s * 1e6f);
+			int old_guard = s->flap_guard_mcs;
 			if (s->flap_guard_mcs < prev ||
 			    now - s->flap_guard_us > backoff_us)
 				s->flap_guard_mcs = prev;
 			s->flap_guard_us = now;
+
+			/* Hard flap-freeze detection: a demote FROM the same rung
+			 * we already flagged, spaced within flap_freeze_window_s of
+			 * the previous such demote, is one oscillation cycle. A
+			 * wider-spaced or different-rung demote opens a fresh episode
+			 * (streak=1) — this is what separates a fast flap from a slow
+			 * walk-away degrade (whose demotes step through ever-lower
+			 * rungs, many seconds apart). Once the streak reaches
+			 * flap_freeze_count, latch the rung and start the hold. */
+			if (cfg->mcs.flap_freeze_count > 0) {
+				uint64_t win_us =
+				    (uint64_t)(cfg->mcs.flap_freeze_window_s * 1e6f);
+				bool same_rung_fast = (prev == old_guard) &&
+				    s->flap_last_demote_us != 0 &&
+				    now - s->flap_last_demote_us <= win_us;
+				s->flap_demote_streak =
+				    same_rung_fast ? s->flap_demote_streak + 1 : 1;
+				s->flap_last_demote_us = now;
+				if (s->flap_demote_streak >= cfg->mcs.flap_freeze_count) {
+					if (s->flap_freeze_mcs != prev)
+						LOG_MCS("flap-freeze: rung %d re-demoted %dx in a row "
+						    "-> pin MCS %d for %.1fs",
+						    prev, s->flap_demote_streak, prev - 1,
+						    (double)cfg->mcs.flap_freeze_s);
+					s->flap_freeze_mcs = prev;
+					s->flap_freeze_until_us = now +
+					    (uint64_t)(cfg->mcs.flap_freeze_s * 1e6f);
+				}
+			}
 		}
 	}
 	*out_mcs = s->current_mcs;
@@ -2864,7 +2926,10 @@ static SelectDecision selector_tick_no_data(Selector *s, const Config *cfg,
  *                          rssi_floor_hyst_db of hysteresis so promotes
  *                          don't resume on the knife-edge), and promotes
  *                          back into a recently-failed rung wait
- *                          reentry_dwell_s (flap guard).
+ *                          reentry_dwell_s (soft flap guard). A rung
+ *                          re-demoted flap_freeze_count times fast is
+ *                          PINNED out for flap_freeze_s (hard flap-freeze),
+ *                          holding the rung below outright.
  *   5. hold
  * Demotes are FAST (down_cooldown_s, cascade allowed, never delayed by the
  * flap guard); promotes are SLOW (probe-verified per rung, dwell, guards).
@@ -2882,6 +2947,14 @@ static SelectDecision selector_update(Selector *s, const Config *cfg,
 	/* Data is flowing again — clear any watchdog failsafe; the probe will
 	 * climb back up from mcs_min. */
 	if (s->in_failsafe) s->in_failsafe = false;
+
+	/* Lift an expired flap-freeze so the probe may attempt the rung again
+	 * (it re-freezes if it flaps anew). Done here, not in the promote path,
+	 * so the freeze still clears even if probe records stop arriving. */
+	if (s->flap_freeze_mcs >= 0 && now >= s->flap_freeze_until_us) {
+		s->flap_freeze_mcs = -1;
+		s->flap_demote_streak = 0;
+	}
 
 	/* Transport backpressure persistence: track the start of the current
 	 * contiguous in_pressure run (the escape rule keys on how long it has
@@ -2994,6 +3067,15 @@ static SelectDecision selector_update(Selector *s, const Config *cfg,
 				bool promote_guard = fade_sample ||
 				    score->smoothed_rssi <= cfg->mcs.rssi_floor_dbm +
 				                            cfg->mcs.rssi_floor_hyst_db;
+				/* Hard flap-freeze: a rung that oscillated too fast is
+				 * pinned out — refuse to step into/above it until the
+				 * hold expires (held on the rung below). Stronger than
+				 * the reentry-dwell soft guard, which only stretches the
+				 * period. Expiry is handled at the top of selector_update. */
+				if (s->flap_freeze_mcs >= 0 &&
+				    now < s->flap_freeze_until_us &&
+				    s->current_mcs + 1 >= s->flap_freeze_mcs)
+					promote_guard = true;
 				/* Flap guard: re-promoting into/above the rung that
 				 * failed this episode needs the longer re-entry dwell. */
 				float need_dwell = cfg->mcs.promote_dwell_s;
@@ -3103,6 +3185,9 @@ static const TunableDesc TUNABLES[] = {
 	{"mcs.pressure_escape_s",             SUB_MCS, TF_FLOAT, OFF_MCS(pressure_escape_s),             0.0, 30.0,  "backpressure: in_pressure held >= this with clean RF -> promote to drain ring (0 = off)", 1},
 	{"mcs.reentry_backoff_s",             SUB_MCS, TF_FLOAT, OFF_MCS(reentry_backoff_s),             0.0, 120.0, "flap guard: window after a demote during which re-entry needs the longer dwell (0 = off)"},
 	{"mcs.reentry_dwell_s",               SUB_MCS, TF_FLOAT, OFF_MCS(reentry_dwell_s),               0.0, 30.0,  "flap guard: dwell for promoting back into the rung that just failed"},
+	{"mcs.flap_freeze_count",             SUB_MCS, TF_INT,   OFF_MCS(flap_freeze_count),             0, 50,      "flap freeze: fast re-demotes from one rung that pin the rung below (0 = off)", 1},
+	{"mcs.flap_freeze_window_s",          SUB_MCS, TF_FLOAT, OFF_MCS(flap_freeze_window_s),          0.5, 30.0,  "flap freeze: max spacing between counted re-demotes", 1},
+	{"mcs.flap_freeze_s",                 SUB_MCS, TF_FLOAT, OFF_MCS(flap_freeze_s),                 0.0, 120.0, "flap freeze: how long to hold the lower rung once tripped", 1},
 	{"mcs.probe_clean_milli",             SUB_MCS, TF_INT,   OFF_MCS(probe_clean_milli),             0, 1000,    "probe: V+2 PER <= this permille -> promote-eligible"},
 	{"mcs.probe_fail_milli",              SUB_MCS, TF_INT,   OFF_MCS(probe_fail_milli),              0, 1000,    "probe: V+2 PER >= this permille -> pre-emptive demote"},
 	{"mcs.demote_per_milli",              SUB_MCS, TF_INT,   OFF_MCS(demote_per_milli),              0, 1000,    "probe: live video PER >= this permille -> reactive demote"},
@@ -3358,6 +3443,20 @@ typedef struct {
 	uint32_t probe_feed_seq;
 	int      probe_tuned_mcs;
 	uint32_t probe_retune_fails;
+	/* Vehicle-side uplink reception (GS->vehicle), from a 2nd wfb_rx -Y fed
+	 * through an isolated scorer. Diagnostic only — independent antenna data
+	 * from the GS-relayed downlink score above. present=false until the
+	 * first datagram (renders with present=false so a UI can grey it out). */
+	bool                uplink_present;
+	uint64_t            uplink_last_us;
+	float               uplink_raw_rssi;
+	float               uplink_smoothed_rssi;
+	int                 uplink_ant_count;
+	float               uplink_ant_avg[ANT_MAX];
+	unsigned long long  uplink_pkt_total;
+	unsigned long long  uplink_lost_total;
+	long                uplink_pkt_last;
+	long                uplink_lost_last;
 } ApiSnapshot;
 
 static int append_score_json(char *buf, size_t cap, size_t pos,
@@ -3392,6 +3491,41 @@ static int append_score_json(char *buf, size_t cap, size_t pos,
 		if (n < 0 || (size_t)n >= cap - pos) return -1;
 		pos += n;
 	}
+	return (int)(pos - start);
+}
+
+/* "uplink_rx": vehicle-side reception of the GS->vehicle uplink (how the
+ * vehicle hears the GS), from a 2nd wfb_rx -Y fed through an isolated scorer.
+ * DIAGNOSTIC — never consumed by the control law. Independent antenna data
+ * from the downlink "score" block; pkt_total / lost_total prove actionable
+ * uplink traffic (WCMD/CSA + the rx_ant relay) is landing on the vehicle. */
+static int append_uplink_rx_json(char *buf, size_t cap, size_t pos,
+                                 const ApiSnapshot *s)
+{
+	size_t start = pos;
+	double age_s = s->uplink_last_us == 0
+		? -1.0
+		: (double)(now_us() - s->uplink_last_us) / 1e6;
+	int n = snprintf(buf + pos, cap - pos,
+		"\"uplink_rx\":{\"present\":%s,\"age_s\":%.2f,"
+		"\"raw_rssi\":%.2f,\"smoothed_rssi\":%.2f,"
+		"\"pkt_total\":%llu,\"lost_total\":%llu,"
+		"\"pkt_last\":%ld,\"lost_last\":%ld,\"ants\":[",
+		s->uplink_present ? "true" : "false", age_s,
+		(double)s->uplink_raw_rssi, (double)s->uplink_smoothed_rssi,
+		s->uplink_pkt_total, s->uplink_lost_total,
+		s->uplink_pkt_last, s->uplink_lost_last);
+	if (n < 0 || (size_t)n >= cap - pos) return -1;
+	pos += n;
+	for (int i = 0; i < s->uplink_ant_count; i++) {
+		n = snprintf(buf + pos, cap - pos, "%s%.1f",
+		             i ? "," : "", (double)s->uplink_ant_avg[i]);
+		if (n < 0 || (size_t)n >= cap - pos) return -1;
+		pos += n;
+	}
+	n = snprintf(buf + pos, cap - pos, "]}");
+	if (n < 0 || (size_t)n >= cap - pos) return -1;
+	pos += n;
 	return (int)(pos - start);
 }
 
@@ -3537,7 +3671,7 @@ static int append_mcs_json(char *buf, size_t cap, size_t pos,
 		"\"in_failsafe\":%s,"
 		"\"rssi_guard\":{\"floor_active\":%s,\"fade_active\":%s},"
 		"\"pressure\":{\"active\":%s,\"held_s\":%.2f,\"escapes\":%u},"
-		"\"flap_guard\":{\"mcs\":%d,\"active\":%s},"
+		"\"flap_guard\":{\"mcs\":%d,\"active\":%s,\"freeze_mcs\":%d,\"frozen\":%s},"
 		"\"commit_count\":%u,\"changes_in_window\":%d,"
 		"\"last_emit_mcs\":%d,\"rx_ant_age_s\":%.3f,"
 		"\"bitrate_lead_s\":%.3f,"
@@ -3560,6 +3694,9 @@ static int append_mcs_json(char *buf, size_t cap, size_t pos,
 		(s->sel->flap_guard_mcs >= 0 && s->sel->flap_guard_us != 0 &&
 		 (double)(now - s->sel->flap_guard_us) / 1e6 <
 		     (double)s->cfg->mcs.reentry_backoff_s) ? "true" : "false",
+		s->sel->flap_freeze_mcs,
+		(s->sel->flap_freeze_mcs >= 0 &&
+		 now < s->sel->flap_freeze_until_us) ? "true" : "false",
 		s->sel->commit_count, s->sel->changes_count,
 		s->last_emit_mcs, rx_age_s,
 		(double)s->cfg->fec.bitrate_lead_s,
@@ -3624,6 +3761,14 @@ static int status_to_json(const ApiSnapshot *s, char *buf, size_t cap)
 	pos += w;
 
 	w = append_score_json(buf, cap, pos, s, true);
+	if (w < 0) return -1;
+	pos += w;
+
+	w = snprintf(buf + pos, cap - pos, ",");
+	if (w < 0 || (size_t)w >= cap - pos) return -1;
+	pos += w;
+
+	w = append_uplink_rx_json(buf, cap, pos, s);
 	if (w < 0) return -1;
 	pos += w;
 
@@ -3845,6 +3990,7 @@ static int help_to_text(char *buf, size_t cap)
 		"  GET /params            JSON of all tunable Config fields\n"
 		"  GET /schema            JSON array of tunable metadata\n"
 		"  GET /set?k=v&k=v...    apply changes; returns JSON\n"
+		"  GET /cmd?key=N&value=V local WCMD apply (peek/idr/record/…); returns JSON\n"
 		"  GET /status            unified JSON snapshot\n"
 		"  GET /fec/status        FEC subset\n"
 		"  GET /mcs/status        MCS subset\n"
@@ -4102,6 +4248,25 @@ static bool request_wants_html(const char *req)
 /* Forward decl — defined alongside config_defaults further below. */
 static int cfg_validate_warnings(const Config *c);
 
+/* Parse one integer query param `name=<int>` out of a query string. Returns
+ * true and sets *out on success; false if absent or non-numeric. Matches only
+ * at a key boundary (start or after '&') so "key" can't match "fec_key". */
+static bool qparam_long(const char *qs, const char *name, long *out)
+{
+	if (!qs) return false;
+	size_t nl = strlen(name);
+	for (const char *p = qs; (p = strstr(p, name)) != NULL; p += nl) {
+		bool at_bound = (p == qs) || (p[-1] == '&');
+		if (at_bound && p[nl] == '=') {
+			char *end;
+			long v = strtol(p + nl + 1, &end, 10);
+			if (end != p + nl + 1) { *out = v; return true; }
+			return false;
+		}
+	}
+	return false;
+}
+
 static void api_handle_request(ApiClient *c, Config *cfg, ApiSnapshot *snap)
 {
 	c->buf[c->pos < API_BUF_BYTES ? c->pos : API_BUF_BYTES - 1] = '\0';
@@ -4203,6 +4368,47 @@ static void api_handle_request(ApiClient *c, Config *cfg, ApiSnapshot *snap)
 		if (an > 0)
 			LOGV_COMMON(cfg, "api: applied %d key(s) via /set", an);
 		(void)cfg_validate_warnings(cfg);
+	}
+	else if (strcmp(path, "/cmd") == 0) {
+		/* Local WCMD console — apply a WCMD key from the device's own WebUI
+		 * (e.g. peek on/off, force_idr, record), reusing the exact
+		 * wcmd_dispatch path (clamp + per-key apply + /cmd/status counters)
+		 * as a ground WCMD, with a synthetic loopback peer + unique seq.
+		 * Same cmd.* policy applies (cmd.enabled / allow_keys_mask /
+		 * rate-limit), so a locked-down vehicle stays locked down here too.
+		 * No new trust surface: anyone who can reach :8765 can already /set
+		 * every tunable. snap->wcmd is the live &wcmd_state (rebuilt each
+		 * poll); the const is only for the read-only JSON builders. */
+		long key = 0, value = 0;
+		if (!qparam_long(qs, "key", &key) || key < 1 || key > WCMD_NUM_KEYS) {
+			api_send(c->fd, 400, "text/plain", "bad or missing key\n", 19);
+		} else {
+			(void)qparam_long(qs, "value", &value);   /* default 0 (force_idr) */
+			static uint16_t local_cmd_seq = 0;
+			WcmdReq req;
+			memset(&req, 0, sizeof(req));
+			req.magic    = htonl(WCMD_MAGIC);
+			req.version  = WCMD_VERSION;
+			req.msg_type = WCMD_MSG_REQ;
+			req.seq      = htons(++local_cmd_seq);
+			req.key      = (uint8_t)key;
+			req.value    = (int32_t)htonl((uint32_t)(int32_t)value);
+			struct sockaddr_in loop;
+			memset(&loop, 0, sizeof(loop));
+			loop.sin_family      = AF_INET;
+			loop.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+			WcmdResp resp;
+			(void)wcmd_dispatch(cfg, &req, &loop,
+			                    (WcmdState *)snap->wcmd, now_us(), &resp);
+			n = snprintf(body, sizeof(body),
+				"{\"key\":%u,\"value\":%ld,\"status\":%u,"
+				"\"http_status\":%u,\"applied_value\":%d}",
+				(unsigned)resp.key, value, (unsigned)resp.status,
+				(unsigned)ntohs(resp.http_status),
+				(int)ntohl((uint32_t)resp.applied_value));
+			if (n > 0) api_send(c->fd, 200, "application/json", body, n);
+			else       api_send(c->fd, 500, "text/plain", "json overflow\n", 14);
+		}
 	}
 	else if (strcmp(path, "/status") == 0) {
 		n = status_to_json(snap, body, sizeof(body));
@@ -4319,6 +4525,11 @@ static void usage(const char *prog)
 		"  --failsafe F             watchdog gap before forcing mcs_min (default 0.5;\n"
 		"                           deployment-dependent — raise for lossy uplinks)\n"
 		"\n"
+		"Uplink reception telemetry (diagnostic; independent of --no-mcs):\n"
+		"  --uplink-stats PORT      UDP listener for the vehicle's OWN wfb_rx -Y\n"
+		"                           (GS->vehicle rx_ant). Surfaced under \"uplink_rx\"\n"
+		"                           in /status; never feeds the control loop. 0=off.\n"
+		"\n"
 		"CSA receiver (off unless --csa-iface set; reuses --stats listener):\n"
 		"  --csa-iface NAME         enable CSA receiver on iface (e.g. wlan0)\n"
 		"\n"
@@ -4415,6 +4626,8 @@ static void config_defaults(Config *c)
 	/* Probe wfb_tx endpoints: off (port 0) until --probe / --probe-feed. */
 	strcpy(c->probe_host, "127.0.0.1");      c->probe_port = 0;
 	strcpy(c->probe_feed_host, "127.0.0.1"); c->probe_feed_port = 0;
+	/* Uplink rx_ant diagnostic listener: off until --uplink-stats. */
+	c->uplink_stats_port = 0;
 	c->api_port = 8765;
 	c->dry_run = false;
 	c->verbose = 0;
@@ -4523,6 +4736,19 @@ static void config_defaults(Config *c)
 	c->mcs.rssi_floor_hyst_db = 6.0f;
 	c->mcs.reentry_backoff_s  = 5.0f;
 	c->mcs.reentry_dwell_s    = 2.0f;
+	/* Hard flap-freeze: 3 re-demotes from the SAME rung (≈2 full oscillation
+	 * cycles), each within 10 s of the last, pins the rung below for 10 s.
+	 * Sized to catch the 2-rung trap (mcs_max one step above mcs_min, where
+	 * every promote re-fails on its own probe-retune burst). The window is
+	 * deliberately wider than the observed flap period (~6.5 s on-device,
+	 * since the soft reentry dwell already stretches each cycle to ~2 s+) so
+	 * the streak actually chains. A real walk-away degrade does NOT trip it:
+	 * those demotes step through DIFFERENT descending rungs, so the
+	 * same-rung requirement resets the streak; a healthy link never
+	 * re-fails a rung at all. */
+	c->mcs.flap_freeze_count    = 3;
+	c->mcs.flap_freeze_window_s = 10.0f;
+	c->mcs.flap_freeze_s        = 10.0f;
 
 	/* CSA: off until --csa-iface is set. */
 	c->csa.enabled = false;
@@ -4583,7 +4809,7 @@ int main(int argc, char **argv)
 		/* fec */
 		OPT_NO_FEC, OPT_SIDECAR, OPT_VENC, OPT_SAFE_STARTUP_BITRATE,
 		/* mcs */
-		OPT_NO_MCS, OPT_STATS, OPT_FAILSAFE, OPT_PROBE, OPT_PROBE_FEED,
+		OPT_NO_MCS, OPT_STATS, OPT_UPLINK_STATS, OPT_FAILSAFE, OPT_PROBE, OPT_PROBE_FEED,
 		/* csa */
 		OPT_CSA_IFACE,
 		/* cmd */
@@ -4601,6 +4827,7 @@ int main(int argc, char **argv)
 		{"safe-startup-bitrate", required_argument, 0, OPT_SAFE_STARTUP_BITRATE},
 		{"no-mcs",         no_argument,       0, OPT_NO_MCS},
 		{"stats",          required_argument, 0, OPT_STATS},
+		{"uplink-stats",   required_argument, 0, OPT_UPLINK_STATS},
 		{"failsafe",       required_argument, 0, OPT_FAILSAFE},
 		{"probe",          required_argument, 0, OPT_PROBE},
 		{"probe-feed",     required_argument, 0, OPT_PROBE_FEED},
@@ -4660,6 +4887,14 @@ int main(int argc, char **argv)
 				fprintf(stderr, "invalid --stats\n"); return 1;
 			}
 			break;
+		case OPT_UPLINK_STATS: {
+			int p = atoi(optarg);
+			if (p < 0 || p > 65535) {
+				fprintf(stderr, "invalid --uplink-stats (0..65535)\n"); return 1;
+			}
+			cfg.uplink_stats_port = (uint16_t)p;
+			break;
+		}
 		case OPT_FAILSAFE:       cfg.mcs.failsafe_timeout_s = (float)atof(optarg); break;
 		case OPT_PROBE:
 			if (parse_hostport(optarg, cfg.probe_host,
@@ -4826,6 +5061,22 @@ int main(int argc, char **argv)
 		    cfg.mcs.stats_port);
 	}
 
+	/* Vehicle-side uplink rx_ant listener (--uplink-stats). Independent of
+	 * the MCS subsystem — works even with --no-mcs — so the GS->vehicle
+	 * reception is observable in FEC-only deployments too. Diagnostic: a
+	 * bind failure is non-fatal (just no uplink_rx block in /status). */
+	int uplink_rx_fd = -1;
+	if (cfg.uplink_stats_port != 0) {
+		uplink_rx_fd = udp_listen_open(cfg.uplink_stats_port);
+		if (uplink_rx_fd < 0) {
+			LOG_COMMON("uplink-rx: bind on udp:%u failed (%s) — uplink reception telemetry disabled",
+			    cfg.uplink_stats_port, strerror(errno));
+		} else {
+			LOG_COMMON("uplink-rx: listening on udp:%u for vehicle wfb_rx -Y (GS->vehicle reception; diagnostic only)",
+			    cfg.uplink_stats_port);
+		}
+	}
+
 	/* ── CSA bring-up ──
 	 * Multiplexed onto the rx_ant listener: csa_feed handles "csa_*"
 	 * frames inside the rx_ant handler, falling through to the existing
@@ -4970,6 +5221,21 @@ int main(int argc, char **argv)
 	sel.last_datagram_us = now_us();
 	Scorer scorer;
 	scorer_reset(&scorer);
+	/* Isolated scorer for the vehicle-side uplink rx_ant (--uplink-stats).
+	 * Diagnostic only: it gives the uplink stream its own RSSI EWMA/slope
+	 * without ever touching the downlink `scorer` or the selector. */
+	Scorer uplink_scorer;
+	scorer_reset(&uplink_scorer);
+	bool     uplink_present       = false;
+	uint64_t last_uplink_rx_us    = 0;
+	float    last_uplink_raw_rssi = 0.0f;
+	float    last_uplink_smooth_rssi = 0.0f;
+	int      last_uplink_ant_count = 0;
+	float    last_uplink_ant_avg[ANT_MAX] = {0};
+	unsigned long long uplink_pkt_total  = 0;
+	unsigned long long uplink_lost_total = 0;
+	long     last_uplink_pkt      = 0;
+	long     last_uplink_lost     = 0;
 	ProbeState probe;
 	probe_state_init(&probe);
 	/* Probe producer: paced PRB feeder + V+2 retune reconciler.
@@ -5396,9 +5662,10 @@ int main(int argc, char **argv)
 		}
 
 		/* --- Build pollfd set --- */
-		struct pollfd pfds[3 + API_MAX_CLIENTS];
+		struct pollfd pfds[4 + API_MAX_CLIENTS];
 		int npfds = 0;
 		int sidecar_idx = -1, wfb_stats_idx = -1, rx_ant_idx = -1;
+		int uplink_rx_idx = -1;
 		int api_listen_idx = -1;
 		int api_client_idx[API_MAX_CLIENTS];
 		for (int i = 0; i < API_MAX_CLIENTS; i++) api_client_idx[i] = -1;
@@ -5417,6 +5684,11 @@ int main(int argc, char **argv)
 			pfds[npfds].fd = rx_ant_fd;
 			pfds[npfds].events = POLLIN;
 			rx_ant_idx = npfds++;
+		}
+		if (uplink_rx_fd >= 0) {
+			pfds[npfds].fd = uplink_rx_fd;
+			pfds[npfds].events = POLLIN;
+			uplink_rx_idx = npfds++;
 		}
 		if (api_fd >= 0) {
 			pfds[npfds].fd = api_fd;
@@ -5515,8 +5787,19 @@ int main(int argc, char **argv)
 				.probe_feed_seq = probe_feed_seq,
 				.probe_tuned_mcs = probe_tuned_mcs,
 				.probe_retune_fails = probe_retune_fails,
+				.uplink_present       = uplink_present,
+				.uplink_last_us       = last_uplink_rx_us,
+				.uplink_raw_rssi      = last_uplink_raw_rssi,
+				.uplink_smoothed_rssi = last_uplink_smooth_rssi,
+				.uplink_ant_count     = last_uplink_ant_count,
+				.uplink_pkt_total     = uplink_pkt_total,
+				.uplink_lost_total    = uplink_lost_total,
+				.uplink_pkt_last      = last_uplink_pkt,
+				.uplink_lost_last     = last_uplink_lost,
 			};
 			memcpy(snap.ant_avg, last_ant_avg, sizeof(snap.ant_avg));
+			memcpy(snap.uplink_ant_avg, last_uplink_ant_avg,
+			       sizeof(snap.uplink_ant_avg));
 			for (int i = 0; i < API_MAX_CLIENTS; i++) {
 				if (api_client_idx[i] < 0) continue;
 				if (api_clients[i].fd < 0) continue;
@@ -5595,6 +5878,55 @@ int main(int argc, char **argv)
 		}
 
 		/* --- Drain MCS rx_ant datagrams --- */
+		/* --- Drain vehicle-side uplink rx_ant (GS->vehicle reception) ---
+		 * DIAGNOSTIC ONLY. The vehicle's own wfb_rx -Y reports how the
+		 * vehicle hears the GS uplink; we run it through an isolated scorer
+		 * and surface it under "uplink_rx" in /status. It NEVER feeds the
+		 * selector or FEC — that stays driven by the GS-relayed downlink
+		 * rx_ant on rx_ant_fd. Only rx_ant frames are expected here. */
+		if (uplink_rx_idx >= 0 && (pfds[uplink_rx_idx].revents & POLLIN)) {
+			char dgram[2048];
+			for (int drained = 0; drained < 32; drained++) {
+				ssize_t n = recvfrom(uplink_rx_fd, dgram, sizeof(dgram) - 1,
+				                     MSG_TRUNC, NULL, NULL);
+				if (n <= 0) break;
+				if ((size_t)n >= sizeof(dgram)) continue;  /* drop oversized */
+				dgram[n] = '\0';
+				if (!strstr(dgram, "\"type\":\"rx_ant\"")) continue;
+				if (!strstr(dgram, "\"ver\":1")) continue;
+				const char *pkt_block = strstr(dgram, "\"pkt\":");
+				if (!pkt_block) continue;
+				long u_uniq = -1, u_data = -1, u_lost = 0, u_fec = 0, u_div = 0;
+				(void)json_get_int_in(pkt_block, "uniq", &u_uniq);
+				(void)json_get_int_in(pkt_block, "data", &u_data);
+				if (u_uniq < 0) u_uniq = u_data;
+				if (u_uniq < 0) continue;
+				(void)json_get_int_in(pkt_block, "lost", &u_lost);
+				(void)json_get_int_in(pkt_block, "fec_recovered", &u_fec);
+				(void)json_get_int_in(pkt_block, "diversity", &u_div);
+				long u_adapters = -1;
+				(void)json_get_int_in(pkt_block, "adapters", &u_adapters);
+				Score uscore;
+				if (!scorer_update(&uplink_scorer, &cfg, dgram,
+				                   u_uniq, u_lost, u_fec, u_div,
+				                   (u_adapters >= 0) ? (int)u_adapters : -1,
+				                   now_us(), &uscore))
+					continue;
+				uplink_present          = true;
+				last_uplink_rx_us       = now_us();
+				last_uplink_raw_rssi    = uscore.raw_rssi;
+				last_uplink_smooth_rssi = uscore.smoothed_rssi;
+				last_uplink_ant_count   = uscore.ant_count;
+				memcpy(last_uplink_ant_avg, uscore.ant_avg,
+				       sizeof(last_uplink_ant_avg));
+				last_uplink_pkt   = u_uniq;
+				last_uplink_lost  = u_lost;
+				uplink_pkt_total += (unsigned long long)u_uniq;
+				if (u_lost > 0)
+					uplink_lost_total += (unsigned long long)u_lost;
+			}
+		}
+
 		if (rx_ant_idx >= 0 && (pfds[rx_ant_idx].revents & POLLIN)) {
 			char dgram[2048];
 			/* Same 32-datagram cap as wfb_stats above. */
@@ -6037,6 +6369,7 @@ int main(int argc, char **argv)
 	if (sidecar_fd >= 0) close(sidecar_fd);
 	if (wfb_stats_fd >= 0) close(wfb_stats_fd);
 	if (rx_ant_fd >= 0) close(rx_ant_fd);
+	if (uplink_rx_fd >= 0) close(uplink_rx_fd);
 	if (probe_feed_fd >= 0) close(probe_feed_fd);
 	if (api_fd >= 0) close(api_fd);
 	g_api_clients = NULL;

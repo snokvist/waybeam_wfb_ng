@@ -45,9 +45,23 @@ def connect(db_path: str = DEFAULT_DB) -> sqlite3.Connection:
     return conn
 
 
+# Columns added to `records` after the store first shipped. CREATE TABLE
+# IF NOT EXISTS can't add a column to an existing table, so init_db applies
+# these additively to a pre-existing store (idempotent — skips ones present).
+_RECORD_ADDED_COLUMNS = (
+    ("uplink_rssi", "REAL"),
+    ("uplink_pkt", "INTEGER"),
+    ("uplink_lost", "INTEGER"),
+)
+
+
 def init_db(conn: sqlite3.Connection) -> None:
     with open(SCHEMA_PATH) as fh:
         conn.executescript(fh.read())
+    have = {row[1] for row in conn.execute("PRAGMA table_info(records)")}
+    for name, decl in _RECORD_ADDED_COLUMNS:
+        if name not in have:
+            conn.execute(f"ALTER TABLE records ADD COLUMN {name} {decl}")
     conn.commit()
 
 
@@ -88,6 +102,17 @@ def derive_columns(rec: dict) -> dict:
         denom = uniq + lost
         per = (lost / denom) if denom > 0 else 0.0
 
+    # Vehicle-side uplink reception, present only when a record carries the
+    # link_controller /status "uplink_rx" block (the importer path). Raw GS-side
+    # rx_ant datagrams have no such block, so these stay None on the live path.
+    up = rec.get("uplink_rx")
+    if isinstance(up, dict) and up.get("present"):
+        uplink_rssi = _num(up.get("smoothed_rssi"))
+        uplink_pkt = _num(up.get("pkt_last"))
+        uplink_lost = _num(up.get("lost_last"))
+    else:
+        uplink_rssi = uplink_pkt = uplink_lost = None
+
     return {
         "ts_ms": _num(rec.get("ts_ms")),
         "seq": _num(rec.get("seq")),
@@ -102,6 +127,9 @@ def derive_columns(rec: dict) -> dict:
         "fec_rec": _num(pkt.get("fec_recovered")),
         "dec_err": _num(pkt.get("dec_err")),
         "per": per,
+        "uplink_rssi": uplink_rssi,
+        "uplink_pkt": uplink_pkt,
+        "uplink_lost": uplink_lost,
     }
 
 
@@ -127,11 +155,13 @@ def insert_record(conn: sqlite3.Connection, session_id: int, rec: dict) -> int:
     cur = conn.execute(
         """INSERT INTO records
            (session_id, ts_ms, seq, mcs, rssi_comb, rssi_spread, snr_avg,
-            pkt_all, pkt_uniq, pkt_lost, fec_rec, dec_err, per, raw_json)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            pkt_all, pkt_uniq, pkt_lost, fec_rec, dec_err, per,
+            uplink_rssi, uplink_pkt, uplink_lost, raw_json)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (session_id, d["ts_ms"] or 0, d["seq"], d["mcs"], d["rssi_comb"],
          d["rssi_spread"], d["snr_avg"], d["pkt_all"], d["pkt_uniq"],
          d["pkt_lost"], d["fec_rec"], d["dec_err"], d["per"],
+         d["uplink_rssi"], d["uplink_pkt"], d["uplink_lost"],
          json.dumps(rec, separators=(",", ":"))))
     return int(cur.lastrowid)
 
