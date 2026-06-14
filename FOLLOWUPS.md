@@ -48,14 +48,9 @@ four units (`_csa.c` / `_scan.c` / `_http.c` + a slimmer main file plus
 
 ## Notes for next session
 
-- **peek `--peek-short-tail` under real RF loss (supervised).** PR #64 shipped
-  the proportional-parity SHORT_TAIL close, host-verified (6700/6700) and
-  device-verified on a clean bench link (`dec_err=0`). The bench is too clean
-  (−15 dBm) to exercise proportional-parity *recovery* on the short-closed blocks
-  or the marker-loss degradation path. Run a walk-out / stepped TX-power test
-  with `wfbshorttail=1` until `fec_recovered > 0` on the GS and confirm: parity
-  recovers short blocks, and a lost marker degrades to a single-frame drop (not a
-  stall cascade). 192.168.2.20 already covers the *non-short* loss case.
+  (The peek `--peek-short-tail` proportional-parity follow-up was retired: that
+  mode, plus the NAL-aware idr/refpred profiles, was removed in PR #76. Peek now
+  ships gate-close only.)
 
 The first batch (everything ticked below) shipped in PR #47
 (`feature/followups-batch-1`); the descriptive lists below are kept

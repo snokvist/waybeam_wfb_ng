@@ -1,8 +1,11 @@
 # Design note: peek FEC_CLOSE without padding + proportional parity
 
-Status: **IMPLEMENTED + device-verified** (2026-06-14, bench 192.168.1.13 + dev-host
-`wfb_rx_native` over real RF). Gated behind `wfb_tx --peek-short-tail` (S99wfb env
-`wfbshorttail=1`); default off = the PR #64 gate. In `wfb-ng/peek.patch`.
+Status: **SUPERSEDED — REMOVED in PR #76** (2026-06-14). The short-tail
+proportional-parity close was device-verified (bench 192.168.1.13 + dev-host
+`wfb_rx_native`) but found to re-introduce MCS-loop flap + fps drops on this
+system, so it was removed; peek now ships the **gate close only**
+(`--peek-profile off|close`). The `--peek-short-tail` flag and
+`WFB_NONCE_SHORT_TAIL` no longer exist. Retained as design history.
 
 Two corrections to this note's original assumptions, found in-tree during
 implementation (the goal — proportional parity, no on-air padding — was

@@ -2137,7 +2137,7 @@ static int wcmd_dispatch(Config *cfg, const WcmdReq *req,
 		return 0;
 	}
 
-	/* NAL-aware peek toggles — local wfb_cmd round-trip (CMD_SET_PEEK).
+	/* Peek enable toggle — local wfb_cmd round-trip (CMD_SET_PEEK).
 	 * Unlike the radio/FEC keys, peek is never overwritten by the adaptive
 	 * subsystems, so the toggle sticks until the next WCMD or restart.
 	 * Peek = per-frame FEC close; this is its on/off master switch. */

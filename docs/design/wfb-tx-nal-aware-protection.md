@@ -1,5 +1,11 @@
 # wfb_tx NAL-Aware Link Protection — Implementation Plan (waybeam_wfb_ng)
 
+> **⚠ SUPERSEDED (PR #76, 2026-06-14).** The NAL-aware PROTECT/DROP machinery
+> and the idr/refpred profiles described here were removed: on this system the
+> key-frame MCS down-shift caused periodic GOP-cadence airtime spikes →
+> `fec_skip` bursts → MCS flap. Peek now ships **gate-close only**
+> (`--peek-profile off|close`). This document is retained as design history.
+
 **Status:** Phase 1 plan, adapted for this repo.
 **Upstream spec:** `waybeam_venc#143` —
 `documentation/WFB_TX_NAL_AWARE_PROTECTION_SPEC.md`. That document is the

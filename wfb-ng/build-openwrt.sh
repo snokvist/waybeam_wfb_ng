@@ -105,7 +105,7 @@ else
     exit 1
 fi
 
-# peek.patch (NAL-aware link protection) on top of shm-input.patch. Idempotent.
+# peek.patch (per-frame FEC close) on top of shm-input.patch. Idempotent.
 if git -C "$WFB_DIR" apply --reverse --check "$SCRIPT_DIR/peek.patch" 2>/dev/null; then
     echo "=== peek.patch already applied ==="
 elif git -C "$WFB_DIR" apply --check "$SCRIPT_DIR/peek.patch" 2>/dev/null; then
