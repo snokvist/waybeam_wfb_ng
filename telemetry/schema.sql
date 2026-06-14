@@ -39,6 +39,14 @@ CREATE TABLE IF NOT EXISTS records (
     fec_rec     INTEGER,
     dec_err     INTEGER,
     per         REAL,                   -- derived packet error rate
+    -- Vehicle-side UPLINK reception (GS->vehicle), from the vehicle's own
+    -- wfb_rx -Y surfaced via link_controller /status "uplink_rx". Genuinely
+    -- independent antenna data from rssi_comb (which, on an imported vehicle
+    -- session, is the GS-relayed DOWNLINK score). NULL on GS-side (live-*)
+    -- rows and any pre-uplink legacy row. Additive migration in wfb_store.
+    uplink_rssi REAL,                   -- smoothed RSSI the vehicle hears the GS at
+    uplink_pkt  INTEGER,                -- uplink pkts received in the sample
+    uplink_lost INTEGER,                -- uplink pkts lost in the sample
     raw_json    TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_records_session_ts ON records(session_id, ts_ms);

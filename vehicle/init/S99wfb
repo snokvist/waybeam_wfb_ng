@@ -35,6 +35,13 @@ WFB_TX_LINK=207
 WFB_RX_LINK=208
 WFB_CTRL=8000
 WFB_RX_FWD_PORT=5801
+# Vehicle-side uplink rx_ant: the uplink wfb_rx pushes its OWN reception stats
+# (GS->vehicle RSSI, how the vehicle hears the GS) here via -Y. link_controller
+# ingests it on a separate, diagnostic-only listener (never feeds MCS/FEC) and
+# surfaces it under "uplink_rx" in /status. This is genuinely independent
+# antenna data from the GS-relayed downlink rx_ant on WFB_RX_FWD_PORT, and
+# proves WCMD/CSA actionable data actually reaches the vehicle.
+WFB_UPLINK_RX_PORT=5811
 SAFE_BITRATE=4096
 SHM_RING="local_shm"
 
@@ -116,8 +123,11 @@ start_wfb() {
     echo $! > "$PID_TX"
     log "video wfb_tx up (peek-profile=$WFB_PEEK_PROFILE short_tail=$WFB_SHORT_TAIL)"
 
-    # wfb_rx (uplink data forwarder - decoded packets to 127.0.0.1:5801)
-    wfb_rx -K "$KEY" -i $WFB_RX_LINK -u $WFB_RX_FWD_PORT -p 0 wlan0 \
+    # wfb_rx (uplink data forwarder - decoded packets to 127.0.0.1:5801).
+    # -Y pushes this RX's own rx_ant stats (the GS->vehicle uplink as the
+    # vehicle hears it) to link_controller's diagnostic uplink listener.
+    wfb_rx -K "$KEY" -i $WFB_RX_LINK -u $WFB_RX_FWD_PORT -p 0 \
+           -Y 127.0.0.1:$WFB_UPLINK_RX_PORT wlan0 \
            >> "$LOG" 2>&1 &
     echo $! > "$PID_RX"
 
@@ -155,6 +165,7 @@ start_wfb() {
         --venc 127.0.0.1:80 \
         --safe-startup-bitrate $SAFE_BITRATE \
         --stats 0.0.0.0:$WFB_RX_FWD_PORT \
+        --uplink-stats $WFB_UPLINK_RX_PORT \
         --failsafe $WFB_FAILSAFE_S \
         --wfb-iface wlan0 \
         $PROBE_ARGS \

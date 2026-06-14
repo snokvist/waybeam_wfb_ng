@@ -479,6 +479,11 @@ typedef struct {
 	uint16_t probe_port;
 	char     probe_feed_host[64];    /* probe wfb_tx udp_in (feeder)   */
 	uint16_t probe_feed_port;
+	/* Vehicle-side uplink rx_ant listener: the uplink wfb_rx's own -Y stats
+	 * (GS->vehicle reception). DIAGNOSTIC ONLY — fed through an isolated
+	 * scorer and surfaced under "uplink_rx" in /status; it never influences
+	 * the downlink MCS/FEC control loop. 0 = off. */
+	uint16_t uplink_stats_port;
 	int      api_port;               /* HTTP API on 127.0.0.1:N (0 disables) */
 	int      iface_mtu;              /* startup-only: ip link set dev <iface> mtu N
 	                                  * across {csa.iface, cmd.wfb_iface}. 0 = off.
@@ -3358,6 +3363,20 @@ typedef struct {
 	uint32_t probe_feed_seq;
 	int      probe_tuned_mcs;
 	uint32_t probe_retune_fails;
+	/* Vehicle-side uplink reception (GS->vehicle), from a 2nd wfb_rx -Y fed
+	 * through an isolated scorer. Diagnostic only — independent antenna data
+	 * from the GS-relayed downlink score above. present=false until the
+	 * first datagram (renders with present=false so a UI can grey it out). */
+	bool                uplink_present;
+	uint64_t            uplink_last_us;
+	float               uplink_raw_rssi;
+	float               uplink_smoothed_rssi;
+	int                 uplink_ant_count;
+	float               uplink_ant_avg[ANT_MAX];
+	unsigned long long  uplink_pkt_total;
+	unsigned long long  uplink_lost_total;
+	long                uplink_pkt_last;
+	long                uplink_lost_last;
 } ApiSnapshot;
 
 static int append_score_json(char *buf, size_t cap, size_t pos,
@@ -3392,6 +3411,41 @@ static int append_score_json(char *buf, size_t cap, size_t pos,
 		if (n < 0 || (size_t)n >= cap - pos) return -1;
 		pos += n;
 	}
+	return (int)(pos - start);
+}
+
+/* "uplink_rx": vehicle-side reception of the GS->vehicle uplink (how the
+ * vehicle hears the GS), from a 2nd wfb_rx -Y fed through an isolated scorer.
+ * DIAGNOSTIC — never consumed by the control law. Independent antenna data
+ * from the downlink "score" block; pkt_total / lost_total prove actionable
+ * uplink traffic (WCMD/CSA + the rx_ant relay) is landing on the vehicle. */
+static int append_uplink_rx_json(char *buf, size_t cap, size_t pos,
+                                 const ApiSnapshot *s)
+{
+	size_t start = pos;
+	double age_s = s->uplink_last_us == 0
+		? -1.0
+		: (double)(now_us() - s->uplink_last_us) / 1e6;
+	int n = snprintf(buf + pos, cap - pos,
+		"\"uplink_rx\":{\"present\":%s,\"age_s\":%.2f,"
+		"\"raw_rssi\":%.2f,\"smoothed_rssi\":%.2f,"
+		"\"pkt_total\":%llu,\"lost_total\":%llu,"
+		"\"pkt_last\":%ld,\"lost_last\":%ld,\"ants\":[",
+		s->uplink_present ? "true" : "false", age_s,
+		(double)s->uplink_raw_rssi, (double)s->uplink_smoothed_rssi,
+		s->uplink_pkt_total, s->uplink_lost_total,
+		s->uplink_pkt_last, s->uplink_lost_last);
+	if (n < 0 || (size_t)n >= cap - pos) return -1;
+	pos += n;
+	for (int i = 0; i < s->uplink_ant_count; i++) {
+		n = snprintf(buf + pos, cap - pos, "%s%.1f",
+		             i ? "," : "", (double)s->uplink_ant_avg[i]);
+		if (n < 0 || (size_t)n >= cap - pos) return -1;
+		pos += n;
+	}
+	n = snprintf(buf + pos, cap - pos, "]}");
+	if (n < 0 || (size_t)n >= cap - pos) return -1;
+	pos += n;
 	return (int)(pos - start);
 }
 
@@ -3624,6 +3678,14 @@ static int status_to_json(const ApiSnapshot *s, char *buf, size_t cap)
 	pos += w;
 
 	w = append_score_json(buf, cap, pos, s, true);
+	if (w < 0) return -1;
+	pos += w;
+
+	w = snprintf(buf + pos, cap - pos, ",");
+	if (w < 0 || (size_t)w >= cap - pos) return -1;
+	pos += w;
+
+	w = append_uplink_rx_json(buf, cap, pos, s);
 	if (w < 0) return -1;
 	pos += w;
 
@@ -4319,6 +4381,11 @@ static void usage(const char *prog)
 		"  --failsafe F             watchdog gap before forcing mcs_min (default 0.5;\n"
 		"                           deployment-dependent — raise for lossy uplinks)\n"
 		"\n"
+		"Uplink reception telemetry (diagnostic; independent of --no-mcs):\n"
+		"  --uplink-stats PORT      UDP listener for the vehicle's OWN wfb_rx -Y\n"
+		"                           (GS->vehicle rx_ant). Surfaced under \"uplink_rx\"\n"
+		"                           in /status; never feeds the control loop. 0=off.\n"
+		"\n"
 		"CSA receiver (off unless --csa-iface set; reuses --stats listener):\n"
 		"  --csa-iface NAME         enable CSA receiver on iface (e.g. wlan0)\n"
 		"\n"
@@ -4415,6 +4482,8 @@ static void config_defaults(Config *c)
 	/* Probe wfb_tx endpoints: off (port 0) until --probe / --probe-feed. */
 	strcpy(c->probe_host, "127.0.0.1");      c->probe_port = 0;
 	strcpy(c->probe_feed_host, "127.0.0.1"); c->probe_feed_port = 0;
+	/* Uplink rx_ant diagnostic listener: off until --uplink-stats. */
+	c->uplink_stats_port = 0;
 	c->api_port = 8765;
 	c->dry_run = false;
 	c->verbose = 0;
@@ -4583,7 +4652,7 @@ int main(int argc, char **argv)
 		/* fec */
 		OPT_NO_FEC, OPT_SIDECAR, OPT_VENC, OPT_SAFE_STARTUP_BITRATE,
 		/* mcs */
-		OPT_NO_MCS, OPT_STATS, OPT_FAILSAFE, OPT_PROBE, OPT_PROBE_FEED,
+		OPT_NO_MCS, OPT_STATS, OPT_UPLINK_STATS, OPT_FAILSAFE, OPT_PROBE, OPT_PROBE_FEED,
 		/* csa */
 		OPT_CSA_IFACE,
 		/* cmd */
@@ -4601,6 +4670,7 @@ int main(int argc, char **argv)
 		{"safe-startup-bitrate", required_argument, 0, OPT_SAFE_STARTUP_BITRATE},
 		{"no-mcs",         no_argument,       0, OPT_NO_MCS},
 		{"stats",          required_argument, 0, OPT_STATS},
+		{"uplink-stats",   required_argument, 0, OPT_UPLINK_STATS},
 		{"failsafe",       required_argument, 0, OPT_FAILSAFE},
 		{"probe",          required_argument, 0, OPT_PROBE},
 		{"probe-feed",     required_argument, 0, OPT_PROBE_FEED},
@@ -4660,6 +4730,14 @@ int main(int argc, char **argv)
 				fprintf(stderr, "invalid --stats\n"); return 1;
 			}
 			break;
+		case OPT_UPLINK_STATS: {
+			int p = atoi(optarg);
+			if (p < 0 || p > 65535) {
+				fprintf(stderr, "invalid --uplink-stats (0..65535)\n"); return 1;
+			}
+			cfg.uplink_stats_port = (uint16_t)p;
+			break;
+		}
 		case OPT_FAILSAFE:       cfg.mcs.failsafe_timeout_s = (float)atof(optarg); break;
 		case OPT_PROBE:
 			if (parse_hostport(optarg, cfg.probe_host,
@@ -4826,6 +4904,22 @@ int main(int argc, char **argv)
 		    cfg.mcs.stats_port);
 	}
 
+	/* Vehicle-side uplink rx_ant listener (--uplink-stats). Independent of
+	 * the MCS subsystem — works even with --no-mcs — so the GS->vehicle
+	 * reception is observable in FEC-only deployments too. Diagnostic: a
+	 * bind failure is non-fatal (just no uplink_rx block in /status). */
+	int uplink_rx_fd = -1;
+	if (cfg.uplink_stats_port != 0) {
+		uplink_rx_fd = udp_listen_open(cfg.uplink_stats_port);
+		if (uplink_rx_fd < 0) {
+			LOG_COMMON("uplink-rx: bind on udp:%u failed (%s) — uplink reception telemetry disabled",
+			    cfg.uplink_stats_port, strerror(errno));
+		} else {
+			LOG_COMMON("uplink-rx: listening on udp:%u for vehicle wfb_rx -Y (GS->vehicle reception; diagnostic only)",
+			    cfg.uplink_stats_port);
+		}
+	}
+
 	/* ── CSA bring-up ──
 	 * Multiplexed onto the rx_ant listener: csa_feed handles "csa_*"
 	 * frames inside the rx_ant handler, falling through to the existing
@@ -4970,6 +5064,21 @@ int main(int argc, char **argv)
 	sel.last_datagram_us = now_us();
 	Scorer scorer;
 	scorer_reset(&scorer);
+	/* Isolated scorer for the vehicle-side uplink rx_ant (--uplink-stats).
+	 * Diagnostic only: it gives the uplink stream its own RSSI EWMA/slope
+	 * without ever touching the downlink `scorer` or the selector. */
+	Scorer uplink_scorer;
+	scorer_reset(&uplink_scorer);
+	bool     uplink_present       = false;
+	uint64_t last_uplink_rx_us    = 0;
+	float    last_uplink_raw_rssi = 0.0f;
+	float    last_uplink_smooth_rssi = 0.0f;
+	int      last_uplink_ant_count = 0;
+	float    last_uplink_ant_avg[ANT_MAX] = {0};
+	unsigned long long uplink_pkt_total  = 0;
+	unsigned long long uplink_lost_total = 0;
+	long     last_uplink_pkt      = 0;
+	long     last_uplink_lost     = 0;
 	ProbeState probe;
 	probe_state_init(&probe);
 	/* Probe producer: paced PRB feeder + V+2 retune reconciler.
@@ -5396,9 +5505,10 @@ int main(int argc, char **argv)
 		}
 
 		/* --- Build pollfd set --- */
-		struct pollfd pfds[3 + API_MAX_CLIENTS];
+		struct pollfd pfds[4 + API_MAX_CLIENTS];
 		int npfds = 0;
 		int sidecar_idx = -1, wfb_stats_idx = -1, rx_ant_idx = -1;
+		int uplink_rx_idx = -1;
 		int api_listen_idx = -1;
 		int api_client_idx[API_MAX_CLIENTS];
 		for (int i = 0; i < API_MAX_CLIENTS; i++) api_client_idx[i] = -1;
@@ -5417,6 +5527,11 @@ int main(int argc, char **argv)
 			pfds[npfds].fd = rx_ant_fd;
 			pfds[npfds].events = POLLIN;
 			rx_ant_idx = npfds++;
+		}
+		if (uplink_rx_fd >= 0) {
+			pfds[npfds].fd = uplink_rx_fd;
+			pfds[npfds].events = POLLIN;
+			uplink_rx_idx = npfds++;
 		}
 		if (api_fd >= 0) {
 			pfds[npfds].fd = api_fd;
@@ -5515,8 +5630,19 @@ int main(int argc, char **argv)
 				.probe_feed_seq = probe_feed_seq,
 				.probe_tuned_mcs = probe_tuned_mcs,
 				.probe_retune_fails = probe_retune_fails,
+				.uplink_present       = uplink_present,
+				.uplink_last_us       = last_uplink_rx_us,
+				.uplink_raw_rssi      = last_uplink_raw_rssi,
+				.uplink_smoothed_rssi = last_uplink_smooth_rssi,
+				.uplink_ant_count     = last_uplink_ant_count,
+				.uplink_pkt_total     = uplink_pkt_total,
+				.uplink_lost_total    = uplink_lost_total,
+				.uplink_pkt_last      = last_uplink_pkt,
+				.uplink_lost_last     = last_uplink_lost,
 			};
 			memcpy(snap.ant_avg, last_ant_avg, sizeof(snap.ant_avg));
+			memcpy(snap.uplink_ant_avg, last_uplink_ant_avg,
+			       sizeof(snap.uplink_ant_avg));
 			for (int i = 0; i < API_MAX_CLIENTS; i++) {
 				if (api_client_idx[i] < 0) continue;
 				if (api_clients[i].fd < 0) continue;
@@ -5595,6 +5721,55 @@ int main(int argc, char **argv)
 		}
 
 		/* --- Drain MCS rx_ant datagrams --- */
+		/* --- Drain vehicle-side uplink rx_ant (GS->vehicle reception) ---
+		 * DIAGNOSTIC ONLY. The vehicle's own wfb_rx -Y reports how the
+		 * vehicle hears the GS uplink; we run it through an isolated scorer
+		 * and surface it under "uplink_rx" in /status. It NEVER feeds the
+		 * selector or FEC — that stays driven by the GS-relayed downlink
+		 * rx_ant on rx_ant_fd. Only rx_ant frames are expected here. */
+		if (uplink_rx_idx >= 0 && (pfds[uplink_rx_idx].revents & POLLIN)) {
+			char dgram[2048];
+			for (int drained = 0; drained < 32; drained++) {
+				ssize_t n = recvfrom(uplink_rx_fd, dgram, sizeof(dgram) - 1,
+				                     MSG_TRUNC, NULL, NULL);
+				if (n <= 0) break;
+				if ((size_t)n >= sizeof(dgram)) continue;  /* drop oversized */
+				dgram[n] = '\0';
+				if (!strstr(dgram, "\"type\":\"rx_ant\"")) continue;
+				if (!strstr(dgram, "\"ver\":1")) continue;
+				const char *pkt_block = strstr(dgram, "\"pkt\":");
+				if (!pkt_block) continue;
+				long u_uniq = -1, u_data = -1, u_lost = 0, u_fec = 0, u_div = 0;
+				(void)json_get_int_in(pkt_block, "uniq", &u_uniq);
+				(void)json_get_int_in(pkt_block, "data", &u_data);
+				if (u_uniq < 0) u_uniq = u_data;
+				if (u_uniq < 0) continue;
+				(void)json_get_int_in(pkt_block, "lost", &u_lost);
+				(void)json_get_int_in(pkt_block, "fec_recovered", &u_fec);
+				(void)json_get_int_in(pkt_block, "diversity", &u_div);
+				long u_adapters = -1;
+				(void)json_get_int_in(pkt_block, "adapters", &u_adapters);
+				Score uscore;
+				if (!scorer_update(&uplink_scorer, &cfg, dgram,
+				                   u_uniq, u_lost, u_fec, u_div,
+				                   (u_adapters >= 0) ? (int)u_adapters : -1,
+				                   now_us(), &uscore))
+					continue;
+				uplink_present          = true;
+				last_uplink_rx_us       = now_us();
+				last_uplink_raw_rssi    = uscore.raw_rssi;
+				last_uplink_smooth_rssi = uscore.smoothed_rssi;
+				last_uplink_ant_count   = uscore.ant_count;
+				memcpy(last_uplink_ant_avg, uscore.ant_avg,
+				       sizeof(last_uplink_ant_avg));
+				last_uplink_pkt   = u_uniq;
+				last_uplink_lost  = u_lost;
+				uplink_pkt_total += (unsigned long long)u_uniq;
+				if (u_lost > 0)
+					uplink_lost_total += (unsigned long long)u_lost;
+			}
+		}
+
 		if (rx_ant_idx >= 0 && (pfds[rx_ant_idx].revents & POLLIN)) {
 			char dgram[2048];
 			/* Same 32-datagram cap as wfb_stats above. */
@@ -6037,6 +6212,7 @@ int main(int argc, char **argv)
 	if (sidecar_fd >= 0) close(sidecar_fd);
 	if (wfb_stats_fd >= 0) close(wfb_stats_fd);
 	if (rx_ant_fd >= 0) close(rx_ant_fd);
+	if (uplink_rx_fd >= 0) close(uplink_rx_fd);
 	if (probe_feed_fd >= 0) close(probe_feed_fd);
 	if (api_fd >= 0) close(api_fd);
 	g_api_clients = NULL;

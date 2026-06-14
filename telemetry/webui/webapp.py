@@ -30,8 +30,11 @@ from flask import Flask, abort, jsonify, render_template, request  # noqa: E402
 app = Flask(__name__)
 app.config["DB"] = store.DEFAULT_DB
 
-# series columns surfaced to the chart (record column -> JSON key)
-SERIES_COLS = ("rssi_comb", "rssi_spread", "snr_avg", "per",
+# series columns surfaced to the chart (record column -> JSON key).
+# uplink_rssi is the vehicle-side GS->vehicle reception (imported vehicle
+# sessions only); on those it diverges from rssi_comb, which is the
+# GS-relayed downlink score — the whole reason the two are plotted together.
+SERIES_COLS = ("rssi_comb", "uplink_rssi", "rssi_spread", "snr_avg", "per",
                "mcs", "pkt_lost", "fec_rec")
 
 
@@ -172,8 +175,8 @@ def _uplink_in_window(conn, lo, hi):
     logging across GS `new capture` breaks) still slices to the right walk."""
     t, rssi, per, mcs = [], [], [], []
     for r in conn.execute(
-            "SELECT r.rssi_comb, r.per, r.mcs, r.raw_json FROM records r "
-            "JOIN sessions s ON s.id = r.session_id "
+            "SELECT r.uplink_rssi, r.uplink_pkt, r.uplink_lost, r.mcs, r.raw_json "
+            "FROM records r JOIN sessions s ON s.id = r.session_id "
             "WHERE s.source = 'vehicle-uplink' ORDER BY r.ts_ms"):
         try:
             g = json.loads(r["raw_json"]).get("gs_unix_ms")
@@ -185,8 +188,17 @@ def _uplink_in_window(conn, lo, hi):
         if lo is not None and (gs < lo or gs > hi):
             continue
         t.append(gs)
-        rssi.append(r["rssi_comb"])
-        per.append(r["per"])
+        # The "uplink" line is the vehicle's OWN reception of the GS (uplink_rssi
+        # / uplink_lost), NOT rssi_comb — rssi_comb on a vehicle session is the
+        # GS-relayed DOWNLINK score, which is why it used to overlay the downlink
+        # near-identically. NULL on legacy sessions captured before uplink_rx.
+        rssi.append(r["uplink_rssi"])
+        up_pkt, up_lost = r["uplink_pkt"], r["uplink_lost"]
+        if isinstance(up_pkt, (int, float)) and isinstance(up_lost, (int, float)) \
+                and (up_pkt + up_lost) > 0:
+            per.append(up_lost / (up_pkt + up_lost))
+        else:
+            per.append(None)
         mcs.append(r["mcs"])
     return t, rssi, per, mcs
 
