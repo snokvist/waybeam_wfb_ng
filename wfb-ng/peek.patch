@@ -1,9 +1,9 @@
 diff --git a/src/peek.cpp b/src/peek.cpp
 new file mode 100644
-index 0000000..6891eb2
+index 0000000..47108a1
 --- /dev/null
 +++ b/src/peek.cpp
-@@ -0,0 +1,294 @@
+@@ -0,0 +1,303 @@
 +// wfb_tx NAL-aware link protection — classification engine (peek).
 +// See peek.hpp for the contract and docs/design/wfb-tx-nal-aware-protection.md.
 +
@@ -131,6 +131,15 @@ index 0000000..6891eb2
 +    peek_cfg_init(cfg);
 +    if (!profile || strcmp(profile, "off") == 0) {
 +        cfg->enabled = false;
++        return true;
++    }
++    if (strcmp(profile, "close") == 0) {
++        // Armed, frame-boundary FEC close ONLY: peek_cfg_init() already installed
++        // the mandatory FEC_CLOSE sig rule, and we add no NAL action rules -- so
++        // every frame's block is closed for per-frame loss isolation with NO
++        // key-frame MCS down-shift (unlike "idr"). The jitter/isolation upside
++        // without the GOP-cadence airtime spike that flaps the MCS loop.
++        cfg->enabled = true;
 +        return true;
 +    }
 +    if (strcmp(profile, "idr") == 0) {
@@ -699,7 +708,7 @@ index 0000000..38c2c21
 +    return g_fail ? 1 : 0;
 +}
 diff --git a/src/tx.cpp b/src/tx.cpp
-index 2dc86ea..72a4316 100644
+index 2dc86ea..6643c25 100644
 --- a/src/tx.cpp
 +++ b/src/tx.cpp
 @@ -22,6 +22,7 @@
@@ -1195,7 +1204,7 @@ index 2dc86ea..72a4316 100644
 +        case OPT_PEEK_PROFILE:
 +            if (!peek_cfg_set_profile(&g_peek_cfg, optarg))
 +            {
-+                WFB_ERR("Unknown --peek-profile '%s' (off|idr|refpred|idr+refpred)\n", optarg);
++                WFB_ERR("Unknown --peek-profile '%s' (off|close|idr|refpred|idr+refpred)\n", optarg);
 +                exit(1);
 +            }
 +            break;
@@ -1218,12 +1227,13 @@ index 2dc86ea..72a4316 100644
          case 'I':
              tx_mode = INJECTOR;
              srv_port = atoi(optarg);
-@@ -2337,6 +2651,12 @@ int main(int argc, char * const *argv)
+@@ -2337,6 +2651,13 @@ int main(int argc, char * const *argv)
              WFB_INFO("\nAEAD option:\n"
                       "  -x   disable per-fragment AEAD (emit WFB_PACKET_DATA_PLAIN; session still signed).\n"
                       "       RX must run with -x too or DATA_PLAIN packets are dropped.\n");
 +            WFB_INFO("\nPeek options:\n"
-+                     "  --peek-profile <off|idr|refpred|idr+refpred>  arm NAL-aware peek (default off)\n"
++                     "  --peek-profile <off|close|idr|refpred|idr+refpred>  arm NAL-aware peek (default off)\n"
++                     "       close = per-frame FEC close only (loss isolation, no key-frame MCS shift)\n"
 +                     "  --peek-rule <spec>                            add/override one granular peek rule\n"
 +                     "  --peek-short-tail                             close each frame's block with\n"
 +                     "       proportional parity + no on-air zero-padding (SHORT_TAIL marker).  Needs a\n"
@@ -1341,10 +1351,29 @@ index e7a2cdc..92303a4 100644
      const bool use_qdisc;
      const uint32_t fwmark_base;
 diff --git a/src/tx_cmd.c b/src/tx_cmd.c
-index d963aeb..61906c0 100644
+index d963aeb..d6dbd89 100644
 --- a/src/tx_cmd.c
 +++ b/src/tx_cmd.c
-@@ -297,6 +297,71 @@ int get_radio(char *progname, int port, int argc, char **argv)
+@@ -79,6 +79,7 @@ int send_command(int port, cmd_req_t req, size_t req_size, cmd_resp_t *resp)
+     {
+     case CMD_SET_FEC:
+     case CMD_SET_RADIO:
++    case CMD_SET_PEEK:
+         resp_payload_size = 0;
+         break;
+ 
+@@ -90,6 +91,10 @@ int send_command(int port, cmd_req_t req, size_t req_size, cmd_resp_t *resp)
+         resp_payload_size = sizeof(resp->u.cmd_get_radio);
+         break;
+ 
++    case CMD_GET_PEEK:
++        resp_payload_size = sizeof(resp->u.cmd_get_peek);
++        break;
++
+     default:
+         assert(0);
+     }
+@@ -297,6 +302,71 @@ int get_radio(char *progname, int port, int argc, char **argv)
      return rc;
  }
  
@@ -1416,7 +1445,7 @@ index d963aeb..61906c0 100644
  int main(int argc, char **argv)
  {
      int port;
-@@ -313,7 +378,7 @@ int main(int argc, char **argv)
+@@ -313,7 +383,7 @@ int main(int argc, char **argv)
  
      if (argc < 3)
      {
@@ -1425,7 +1454,7 @@ index d963aeb..61906c0 100644
          fprintf(stderr, "WFB-ng version %s\n", WFB_VERSION);
          fprintf(stderr, "WFB-ng home page: <http://wfb-ng.org>\n");
          return 1;
-@@ -339,6 +404,10 @@ int main(int argc, char **argv)
+@@ -339,6 +409,10 @@ int main(int argc, char **argv)
      {
          return get_radio(argv[0], port, argc - 2, argv + 2);
      }

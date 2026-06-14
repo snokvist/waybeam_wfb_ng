@@ -102,13 +102,18 @@ start_wfb() {
 
     # NAL-aware peek protection. The --peek-profile loads the PROTECT/DROP
     # action-rule table at launch; the WCMD/WebUI toggle only arms/disarms
-    # the pipeline and cannot load rules. "idr" (default) protects param-sets
-    # (base MCS-2) + IDR/CRA key frames (base MCS-1) relative to the live
-    # adaptive MCS — the safe choice. "off" = frame-boundary FEC close only.
-    # refpred/idr+refpred add trail_n DROP and are UNSAFE unless the encoder
-    # emits true disposable frames (Star6E HEVC refPred no-ops — see memory).
-    # Override: fw_setenv wfbpeek off|idr|refpred|idr+refpred.
-    WFB_PEEK_PROFILE=$(fw_get wfbpeek idr)
+    # the pipeline and cannot load rules.
+    #   close (default) — armed, per-frame FEC close ONLY: full per-frame loss
+    #     isolation + tighter RTP timing, with NO key-frame MCS down-shift.
+    #   idr — additionally protects param-sets (base MCS-2) + IDR/CRA key frames
+    #     (base MCS-1) vs the live adaptive MCS. Robust on a marginal link, but
+    #     the key-frame MCS down-shift is a periodic airtime spike that can flap
+    #     the MCS loop on a strong link (memory: wfb_ng_peek_idr_profile_airtime_spike).
+    #   off — peek fully disabled (no per-frame close).
+    #   refpred/idr+refpred add trail_n DROP and are UNSAFE unless the encoder
+    #     emits true disposable frames (Star6E HEVC refPred no-ops — see memory).
+    # Override: fw_setenv wfbpeek off|close|idr|refpred|idr+refpred.
+    WFB_PEEK_PROFILE=$(fw_get wfbpeek close)
 
     # Short-tail peek close (proportional parity, no on-air zero-padding).
     # When on, every frame's FEC block closes via close_block_short(): one
