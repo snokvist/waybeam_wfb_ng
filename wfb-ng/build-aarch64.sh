@@ -114,7 +114,7 @@ fi
 # peek.patch may not be part of build_wfb_tx.sh's pipeline; apply it here if the
 # prepared tree predates it (idempotent — skips if already applied).
 if [ ! -f "$WFB_DIR/src/peek.cpp" ]; then
-    echo "=== Applying peek.patch (NAL-aware link protection) ==="
+    echo "=== Applying peek.patch (per-frame FEC close) ==="
     git -C "$WFB_DIR" apply "$SCRIPT_DIR/peek.patch"
 fi
 

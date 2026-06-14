@@ -230,7 +230,7 @@ else
     exit 1
 fi
 
-# ── Step 4b: Apply peek.patch (NAL-aware link protection) ────────────
+# ── Step 4b: Apply peek.patch (per-frame FEC close) ──────────────────
 # Applies on top of shm-input.patch; adds src/peek.{hpp,cpp} + the wfb_tx
 # PROTECT/DROP/FEC-close hooks and CMD_SET_PEEK/CMD_GET_PEEK.
 

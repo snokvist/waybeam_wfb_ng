@@ -348,16 +348,16 @@ Both sides must match or packets are silently dropped. The
   `(block_idx, fragment_idx)` nonce, so exact replays are still
   rejected.
 
-> **Reserved nonce bit (SHORT_TAIL, PR #64).** The 64-bit `data_nonce` is
-> `(block_idx << 8) | fragment_idx` with `block_idx ≤ 2^55−1`, so bit 63 is
-> always 0 on the wire. `--peek-short-tail` (peek proportional-parity close)
-> uses it as `WFB_NONCE_SHORT_TAIL`: set on a single boundary marker fragment to
-> tell the RX to synthesize the block's `[j+1, k)` tail locally instead of
-> receiving it on-air. The bit is part of the AEAD AAD (authenticated in encrypt
-> mode); the RX masks it off before deriving `block_idx`. In `-x` plaintext mode
-> the RX validates the marker (FEC_ONLY, size 0, `1 ≤ j < fec_k`) before acting.
-> Full spec: `docs/design/peek-proportional-parity.md`. Default off — only set
-> when both ends run a SHORT_TAIL-aware build.
+> **Reserved nonce bit (formerly SHORT_TAIL, PR #64; removed PR #76).** The
+> 64-bit `data_nonce` is `(block_idx << 8) | fragment_idx` with
+> `block_idx ≤ 2^55−1`, so bit 63 is always 0 on the wire and is currently
+> unused. PR #64's `--peek-short-tail` (proportional-parity close) once set it
+> as `WFB_NONCE_SHORT_TAIL` to have the RX synthesize a block's tail locally;
+> that mode — along with the NAL-aware idr/refpred profiles — was removed in
+> PR #76, so the TX never sets bit 63 and the RX no longer tests it. Peek now
+> does only the per-frame gate close (`--peek-profile off|close`). The bit
+> stays reserved (do not repurpose without a both-ends build bump). Historical
+> spec: `docs/design/peek-proportional-parity.md`.
 
 ### What `-x` removes
 
@@ -469,9 +469,7 @@ line-oriented tools:
 | `tx.fec_timeouts` | Empty packets sent to close FEC blocks on `-T fec_timeout`. |
 | `tx.fec_k` / `fec_n` | Current FEC sizes (tracks `wfb_tx_cmd set_fec` writes). |
 | `radio.*` | Current radiotap state. `short_gi`/`ldpc`/`vht_mode` are 0/1. |
-| `peek.enabled` / `drop` | NAL-aware peek master switch and drop-shedding toggle (0/1). |
-| `peek.rules` | Number of active action rules (profile + `--peek-rule`). |
-| `peek.pkts_dropped` | Datagrams shed by an armed DROP rule this interval. |
+| `peek.enabled` | Peek master switch (0/1). When on, `wfb_tx` does the per-frame gate close at the RTP marker. |
 | `peek.fec_closes` | Frame-boundary FEC blocks closed on the RTP marker this interval. |
 
 `fec_k` / `fec_n` and the entire `radio` block let consumers track

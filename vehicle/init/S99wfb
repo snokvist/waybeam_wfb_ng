@@ -120,7 +120,7 @@ start_wfb() {
            -l 1000 -i $WFB_TX_LINK -p 0 -x wlan0 \
            >> "$LOG" 2>&1 &
     echo $! > "$PID_TX"
-    log "video wfb_tx up (peek-profile=$WFB_PEEK_PROFILE short_tail=$WFB_SHORT_TAIL)"
+    log "video wfb_tx up (peek-profile=$WFB_PEEK_PROFILE)"
 
     # wfb_rx (uplink data forwarder - decoded packets to 127.0.0.1:5801).
     # -Y pushes this RX's own rx_ant stats (the GS->vehicle uplink as the
