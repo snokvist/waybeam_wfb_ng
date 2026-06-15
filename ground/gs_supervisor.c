@@ -956,7 +956,17 @@ int tunnel_spawn(Tunnel *t, const char *key_file)
 				close(devnull);
 			}
 		}
+#ifdef WFB_MULTICALL
+		/* Mega binary: re-exec ourselves as the rx/tx applet instead of
+		 * relying on separate wfb_rx/wfb_tx binaries on PATH.  Override
+		 * argv[0] with the applet alias so the dispatcher's basename match
+		 * routes correctly (any configured t->binary is ignored — we are
+		 * the binary).  See docs/design/mega-binary.md. */
+		ab.argv[0] = (char *)(!strcmp(t->role, "rx") ? "wfb_rx" : "wfb_tx");
+		execv("/proc/self/exe", ab.argv);
+#else
 		execvp(ab.argv[0], ab.argv);
+#endif
 		/* exec failed — best-effort error to whatever fd 2 points to. */
 		fprintf(stderr, "[gs] exec %s: %s\n", ab.argv[0], strerror(errno));
 		_exit(127);

@@ -156,6 +156,26 @@ Acceptance: `wfb-gs supervisor -c config.json` brings up tunnels that exec
 `wfb-gs rx` / `wfb-gs tx`; REST API + stats fan-out identical to today;
 `make test` (wire-format conformance) green. Fully validatable on x86 host.
 
+**Status: integration code done; full link pending a box with deps.**
+- `ground/gs_supervisor.c` `tunnel_spawn` — under `WFB_MULTICALL`, the child
+  re-execs `/proc/self/exe` with argv[0] forced to `wfb_rx`/`wfb_tx` so the
+  dispatcher routes by basename (any configured `t->binary` is ignored).
+  Default builds keep `execvp`. Compiles clean in both modes.
+- `ground/Makefile` `make mega` — links dispatcher + `gs_supervisor*.o` +
+  wfb-ng objects (`rx/tx/tx_cmd/keygen` renamed via `-Dmain=`, plus
+  `peek/zfex/wifibroadcast/radiotap/venc_ring`) into `wfb-gs` with `g++`,
+  `-DWFB_MULTICALL -DWFB_WITH_WFBNG`, libsodium + libpcap. `make -n` confirms
+  the rename flags and link line.
+- The single binary uses real libpcap throughout (rx needs it; tx never calls
+  pcap, so the stub header is unnecessary in the merged build).
+
+The final link could not be exercised in the dev container: the wfb-ng C++
+tools need the upstream clone (network OK; pinned SHA `af6ba85…` == current
+HEAD), `libsodium`/`libpcap` dev libs (the build scripts compile these from
+source), and `venc_ring.{c,h}` from the sibling `waybeam_venc` repo (absent
+here). On a normal dev box — run `wfb-ng/build-aarch64.sh` once to prepare the
+patched tree, then `make mega WFBNG_SRC=…` — these are present.
+
 ### Phase 3 — Vehicle binary (`wfb-air`)
 
 - New `vehicle/Makefile` target linking dispatcher + `link_controller.c
