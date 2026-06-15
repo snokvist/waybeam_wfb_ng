@@ -53,7 +53,7 @@ artifact cannot span both architectures. So the deliverable is:
 | Binary    | Target              | Applets                                    |
 |-----------|---------------------|--------------------------------------------|
 | `wfb-gs`  | ground x86 / aarch64| `supervisor`, `rx`, `tx`, `tx_cmd`, `keygen` |
-| `wfb-air` | vehicle armv7l      | `link`, `tx`, `rx`, `keygen`               |
+| `wfb-air` | vehicle armv7l      | `link`, `tx`, `rx`, `tx_cmd`, `keygen`     |
 
 ## How dispatch works
 
@@ -126,8 +126,10 @@ Acceptance: `wfb-gs supervisor -c config.json` brings up tunnels that exec
 ### Phase 3 — Vehicle binary (`wfb-air`)
 
 - New `vehicle/Makefile` target linking dispatcher + `link_controller.c
-  csa/csa.c` + cross `rx/tx/…` objects, `-DWFB_MULTICALL`, `-lm` + libsodium +
-  cross libpcap, via cross `g++`.
+  csa/csa.c` + cross `rx/tx/tx_cmd/keygen/…` objects, `-DWFB_MULTICALL`,
+  `-lm` + libsodium + cross libpcap, via cross `g++`. `tx_cmd` (the runtime
+  control client) is included so on-device FEC/radio commands stay available
+  without a second binary.
 - Update `vehicle/init/S99wfb` to call `wfb-air tx …`, `wfb-air rx …`,
   `wfb-air link …`.
 - Note: vehicle `tx` uses the stub pcap (inject-only) but `rx` (uplink) needs
