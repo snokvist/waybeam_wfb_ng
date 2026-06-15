@@ -123,7 +123,7 @@ $(MEGA_OBJ)/csa.o: csa/csa.c $(CSA_HDR) | $(MEGA_OBJ)
 	$(CROSS_CC) $(CFLAGS_COMMON) $(MEGA_DEFS) $(MEGA_CFLAGS) $(SHARED_INC) -I. -Icsa -c -o $@ $<
 
 # --- air applet table (C++) ---
-$(MEGA_OBJ)/air_applets.o: air_applets.cpp $(MULTICALL)/wfb_multicall.h | $(MEGA_OBJ)
+$(MEGA_OBJ)/air_applets.o: air_applets.cpp $(MULTICALL)/wfb_multicall.h $(MULTICALL)/wfb_applets_common.h | $(MEGA_OBJ)
 	$(CROSS_CXX) -std=gnu++11 -O2 -Wall $(MEGA_DEFS) $(MEGA_CFLAGS) -I$(MULTICALL) -c -o $@ $<
 
 $(MEGA_OUT): $(MEGA_LC_OBJ) $(MEGA_DISP_OBJ) $(MEGA_WFBNG_OBJ)

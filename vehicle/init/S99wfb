@@ -99,6 +99,16 @@ fi
 fw_get() { fw_printenv -n "$1" 2>/dev/null || echo "$2"; }
 is_enabled() { [ "$(fw_get wfbmode 0)" = "1" ]; }
 probe_enabled() { [ "$WFB_PROBE" = "1" ]; }
+# True if any tracked applet (by pidfile) is still alive. Precise on purpose:
+# in mega mode all applets share comm 'wfb-air', so `pidof wfb-air` can't tell
+# our daemons from an unrelated/manual wfb-air invocation (e.g. a debug
+# tx_cmd/keygen) — which would make the double-start guard over-reach.
+wfb_running() {
+    for f in "$PID_LC" "$PID_TX" "$PID_RX" "$PID_PTX"; do
+        [ -f "$f" ] && kill -0 "$(cat "$f")" 2>/dev/null && return 0
+    done
+    return 1
+}
 log() { echo "[wfb] $*" | tee -a "$LOG"; }
 
 start_wfb() {
@@ -110,7 +120,7 @@ start_wfb() {
     # over the wfb_tx control socket (-C) and the venc HTTP API, which surfaces
     # as link / MCS flapping. If anything from a prior run is still alive, clear
     # it first so `start` is idempotent (behaves like `restart`).
-    if pidof $WFB_PROCS >/dev/null 2>&1; then
+    if wfb_running; then
         log "start: existing wfb instance detected — clearing it first (no double-start)"
         stop_wfb
         sleep 0.5
@@ -225,19 +235,29 @@ stop_wfb() {
 status_wfb() {
     echo "wfbmode env: $(fw_get wfbmode 0)  probe: $WFB_PROBE  peek: $WFB_PEEK_PROFILE  (script-fixed)"
     if command -v wfb-air >/dev/null 2>&1; then
-        pids=$(pidof wfb-air 2>/dev/null)
-        echo "  wfb-air (link/tx/rx/probe applets): ${pids:-not running}"
+        # All applets share comm 'wfb-air'; report per-role from the pid files
+        # so a single dead applet is still visible (pidof wfb-air can't tell
+        # them apart).
+        echo "  (mega: applets share comm 'wfb-air' — per-role from pidfiles)"
+        for rolepid in "video-tx:$PID_TX" "uplink-rx:$PID_RX" "link:$PID_LC" "probe-tx:$PID_PTX"; do
+            role=${rolepid%%:*}; f=${rolepid#*:}
+            if [ -f "$f" ] && kill -0 "$(cat "$f")" 2>/dev/null; then
+                echo "  $role (wfb-air): $(cat "$f")"
+            else
+                echo "  $role (wfb-air): not running"
+            fi
+        done
     else
         for name in wfb_tx wfb_rx link_controller; do
             pid=$(pidof "$name" 2>/dev/null)
             echo "  $name: ${pid:-not running}"
         done
-    fi
-    if [ -f "$PID_PTX" ]; then
-        ppid=$(cat "$PID_PTX")
-        kill -0 "$ppid" 2>/dev/null \
-            && echo "  probe wfb_tx: $ppid" \
-            || echo "  probe wfb_tx: stale pidfile ($ppid)"
+        if [ -f "$PID_PTX" ]; then
+            ppid=$(cat "$PID_PTX")
+            kill -0 "$ppid" 2>/dev/null \
+                && echo "  probe wfb_tx: $ppid" \
+                || echo "  probe wfb_tx: stale pidfile ($ppid)"
+        fi
     fi
     echo "  sd logger: in-process in link_controller (log: $WFB_LOG (script), SD: $(grep -q ' /mnt/mmcblk0p1 ' /proc/mounts && echo present || echo absent), latest: $(ls -1d /mnt/mmcblk0p1/walkout/*/ 2>/dev/null | sort | tail -1 || echo none))"
     [ "$(fw_get wfbmode 0)" = "1" ] && command -v curl >/dev/null 2>&1 && \

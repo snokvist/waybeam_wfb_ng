@@ -92,6 +92,9 @@ deploy: $(OUT_CROSS)
 #     MEGA_CFLAGS="--sysroot=$$SYSROOT -I$$SODIUM/include" \
 #     MEGA_LDFLAGS="--sysroot=$$SYSROOT -lpcap -lsodium -lrt -lpthread"
 CXX          ?= g++
+# C++ cross compiler for the mega build. Derived from CROSS_CC if not given
+# (the gcc->g++ swap covers the usual toolchain names); override if it doesn't fit.
+CROSS_CXX    ?= $(CROSS_CC:gcc=g++)
 WFBNG_SRC    ?= ../wfb-ng/build/wfb-ng/src
 MEGA_OUT     ?= $(BUILD_DIR)/wfb-gs
 MEGA_OBJ      = $(BUILD_DIR)/mega
@@ -105,10 +108,17 @@ MULTICALL    = ../multicall
 MEGA_WFB_VERSION ?= shm-patched-mega
 MEGA_WFB_DEFS     = -DWFB_VERSION=\"$(MEGA_WFB_VERSION)\"
 
-# Host compilers drive the mega rules in wfb-ng/mega.mk (cross overrides
-# CC/CXX as usual; aarch64 ground passes its cross pair).
+# Mega build compilers: use the cross pair when CROSS_CC is set (matching the
+# `make cross` convention), else host CC/CXX. Without this, `make cross
+# CROSS_CC=aarch64-…` followed by `make mega` would silently link a host-arch
+# wfb-gs. Drives both wfb-ng/mega.mk and the ground-local rules below.
+ifeq ($(strip $(CROSS_CC)),)
 MEGA_CC  := $(CC)
 MEGA_CXX := $(CXX)
+else
+MEGA_CC  := $(CROSS_CC)
+MEGA_CXX := $(CROSS_CXX)
+endif
 # C daemon objects (supervisor) — built as C with the multicall guard.
 MEGA_GS_OBJ = $(MEGA_OBJ)/gs_supervisor.o $(MEGA_OBJ)/gs_supervisor_csa.o \
               $(MEGA_OBJ)/gs_supervisor_scan.o $(MEGA_OBJ)/gs_supervisor_http.o
@@ -122,15 +132,15 @@ mega: $(MEGA_OUT)
 
 # --- supervisor (C, multicall) ---
 $(MEGA_OBJ)/%.o: %.c $(HDRS) $(WEBUI_HDR) | $(MEGA_OBJ)
-	$(CC) $(CFLAGS_COMMON) $(MEGA_DEFS) $(MEGA_CFLAGS) $(SHARED_INC) -I. -Iwebui -c -o $@ $<
+	$(MEGA_CC) $(CFLAGS_COMMON) $(MEGA_DEFS) $(MEGA_CFLAGS) $(SHARED_INC) -I. -Iwebui -c -o $@ $<
 
 # --- ground applet table (C++) ---
-$(MEGA_OBJ)/gs_applets.o: gs_applets.cpp $(MULTICALL)/wfb_multicall.h | $(MEGA_OBJ)
-	$(CXX) -std=gnu++11 -O2 -Wall $(MEGA_DEFS) $(MEGA_CFLAGS) -I$(MULTICALL) -c -o $@ $<
+$(MEGA_OBJ)/gs_applets.o: gs_applets.cpp $(MULTICALL)/wfb_multicall.h $(MULTICALL)/wfb_applets_common.h | $(MEGA_OBJ)
+	$(MEGA_CXX) -std=gnu++11 -O2 -Wall $(MEGA_DEFS) $(MEGA_CFLAGS) -I$(MULTICALL) -c -o $@ $<
 
 $(MEGA_OUT): $(MEGA_GS_OBJ) $(MEGA_DISP_OBJ) $(MEGA_WFBNG_OBJ)
 	@echo "[wfb-gs] linking mega binary -> $@"
-	$(CXX) $(MEGA_CFLAGS) -o $@ $^ $(MEGA_LDFLAGS) $(LDFLAGS_COMMON)
+	$(MEGA_CXX) $(MEGA_CFLAGS) -o $@ $^ $(MEGA_LDFLAGS) $(LDFLAGS_COMMON)
 	@echo "[wfb-gs] done: applets = supervisor rx tx tx_cmd keygen"
 
 clean:

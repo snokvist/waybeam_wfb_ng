@@ -961,8 +961,17 @@ int tunnel_spawn(Tunnel *t, const char *key_file)
 		 * relying on separate wfb_rx/wfb_tx binaries on PATH.  Override
 		 * argv[0] with the applet alias so the dispatcher's basename match
 		 * routes correctly (any configured t->binary is ignored — we are
-		 * the binary).  See docs/design/mega-binary.md. */
-		ab.argv[0] = (char *)(!strcmp(t->role, "rx") ? "wfb_rx" : "wfb_tx");
+		 * the binary).  See docs/design/mega-binary.md.
+		 * Map the validated role explicitly — roles are constrained to
+		 * "rx"/"tx" at config parse, so an unrecognized one means a new role
+		 * slipped through; fail loudly rather than silently launching tx. */
+		const char *applet = !strcmp(t->role, "rx") ? "wfb_rx"
+		                   : !strcmp(t->role, "tx") ? "wfb_tx" : NULL;
+		if (!applet) {
+			fprintf(stderr, "[gs] mega: no applet for tunnel role '%s'\n", t->role);
+			_exit(127);
+		}
+		ab.argv[0] = (char *)applet;
 		execv("/proc/self/exe", ab.argv);
 #else
 		execvp(ab.argv[0], ab.argv);

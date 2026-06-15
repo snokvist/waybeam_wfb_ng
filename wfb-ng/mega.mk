@@ -24,29 +24,38 @@ MEGA_WFBNG_OBJ = $(MEGA_OBJ)/rx.o $(MEGA_OBJ)/tx.o $(MEGA_OBJ)/tx_cmd.o \
                  $(MEGA_OBJ)/wifibroadcast.o $(MEGA_OBJ)/radiotap.o \
                  $(MEGA_OBJ)/venc_ring.o
 
+# Auto-generate header dependencies (-MMD -MP) so editing a vendored wfb-ng
+# header rebuilds the objects that include it; the rules below list only the
+# source as an explicit prerequisite. -include the .d files emitted alongside
+# each .o (absent on the first build, which compiles everything anyway).
+MEGA_DEP = -MMD -MP
+
 $(MEGA_OBJ):
 	@mkdir -p $@
 
 # --- dispatcher (C++, identical on both sides) ---
 $(MEGA_OBJ)/wfb_multicall.o: $(MULTICALL)/wfb_multicall.cpp $(MULTICALL)/wfb_multicall.h | $(MEGA_OBJ)
-	$(MEGA_CXX) -std=gnu++11 -O2 -Wall $(MEGA_DEFS) $(MEGA_CFLAGS) -I$(MULTICALL) -c -o $@ $<
+	$(MEGA_CXX) -std=gnu++11 -O2 -Wall $(MEGA_DEP) $(MEGA_DEFS) $(MEGA_CFLAGS) -I$(MULTICALL) -c -o $@ $<
 
 # --- wfb-ng tools (main() renamed to applet entry via -Dmain=) ---
 $(MEGA_OBJ)/rx.o:     $(WFBNG_SRC)/rx.cpp           | $(MEGA_OBJ)
-	$(MEGA_CXX) -std=gnu++11 -O2 -Wall -fno-strict-aliasing $(MEGA_WFB_DEFS) -Dmain=wfb_rx_main     $(MEGA_CFLAGS) -c -o $@ $<
+	$(MEGA_CXX) -std=gnu++11 -O2 -Wall -fno-strict-aliasing $(MEGA_DEP) $(MEGA_WFB_DEFS) -Dmain=wfb_rx_main     $(MEGA_CFLAGS) -c -o $@ $<
 $(MEGA_OBJ)/tx.o:     $(WFBNG_SRC)/tx.cpp           | $(MEGA_OBJ)
-	$(MEGA_CXX) -std=gnu++11 -O2 -Wall -fno-strict-aliasing $(MEGA_WFB_DEFS) -Dmain=wfb_tx_main     $(MEGA_CFLAGS) -c -o $@ $<
+	$(MEGA_CXX) -std=gnu++11 -O2 -Wall -fno-strict-aliasing $(MEGA_DEP) $(MEGA_WFB_DEFS) -Dmain=wfb_tx_main     $(MEGA_CFLAGS) -c -o $@ $<
 $(MEGA_OBJ)/tx_cmd.o: $(WFBNG_SRC)/tx_cmd.c         | $(MEGA_OBJ)
-	$(MEGA_CC)  -std=gnu99   -O2 -Wall -fno-strict-aliasing $(MEGA_WFB_DEFS) -Dmain=wfb_tx_cmd_main $(MEGA_CFLAGS) -c -o $@ $<
+	$(MEGA_CC)  -std=gnu99   -O2 -Wall -fno-strict-aliasing $(MEGA_DEP) $(MEGA_WFB_DEFS) -Dmain=wfb_tx_cmd_main $(MEGA_CFLAGS) -c -o $@ $<
 $(MEGA_OBJ)/keygen.o: $(WFBNG_SRC)/keygen.c         | $(MEGA_OBJ)
-	$(MEGA_CC)  -std=gnu99   -O2 -Wall -fno-strict-aliasing $(MEGA_WFB_DEFS) -Dmain=wfb_keygen_main $(MEGA_CFLAGS) -c -o $@ $<
+	$(MEGA_CC)  -std=gnu99   -O2 -Wall -fno-strict-aliasing $(MEGA_DEP) $(MEGA_WFB_DEFS) -Dmain=wfb_keygen_main $(MEGA_CFLAGS) -c -o $@ $<
 $(MEGA_OBJ)/peek.o:           $(WFBNG_SRC)/peek.cpp          | $(MEGA_OBJ)
-	$(MEGA_CXX) -std=gnu++11 -O2 -Wall -fno-strict-aliasing $(MEGA_WFB_DEFS) $(MEGA_CFLAGS) -c -o $@ $<
+	$(MEGA_CXX) -std=gnu++11 -O2 -Wall -fno-strict-aliasing $(MEGA_DEP) $(MEGA_WFB_DEFS) $(MEGA_CFLAGS) -c -o $@ $<
 $(MEGA_OBJ)/wifibroadcast.o:  $(WFBNG_SRC)/wifibroadcast.cpp | $(MEGA_OBJ)
-	$(MEGA_CXX) -std=gnu++11 -O2 -Wall -fno-strict-aliasing $(MEGA_WFB_DEFS) $(MEGA_CFLAGS) -c -o $@ $<
+	$(MEGA_CXX) -std=gnu++11 -O2 -Wall -fno-strict-aliasing $(MEGA_DEP) $(MEGA_WFB_DEFS) $(MEGA_CFLAGS) -c -o $@ $<
 $(MEGA_OBJ)/zfex.o:           $(WFBNG_SRC)/zfex.c            | $(MEGA_OBJ)
-	$(MEGA_CC)  -std=gnu99   -O2 -Wall -fno-strict-aliasing $(MEGA_WFB_DEFS) $(MEGA_CFLAGS) -c -o $@ $<
+	$(MEGA_CC)  -std=gnu99   -O2 -Wall -fno-strict-aliasing $(MEGA_DEP) $(MEGA_WFB_DEFS) $(MEGA_CFLAGS) -c -o $@ $<
 $(MEGA_OBJ)/radiotap.o:       $(WFBNG_SRC)/radiotap.c        | $(MEGA_OBJ)
-	$(MEGA_CC)  -std=gnu99   -O2 -Wall -fno-strict-aliasing $(MEGA_WFB_DEFS) $(MEGA_CFLAGS) -c -o $@ $<
+	$(MEGA_CC)  -std=gnu99   -O2 -Wall -fno-strict-aliasing $(MEGA_DEP) $(MEGA_WFB_DEFS) $(MEGA_CFLAGS) -c -o $@ $<
 $(MEGA_OBJ)/venc_ring.o:      $(WFBNG_SRC)/venc_ring.c       | $(MEGA_OBJ)
-	$(MEGA_CC)  -std=gnu99   -O2 -Wall -fno-strict-aliasing $(MEGA_WFB_DEFS) $(MEGA_CFLAGS) -c -o $@ $<
+	$(MEGA_CC)  -std=gnu99   -O2 -Wall -fno-strict-aliasing $(MEGA_DEP) $(MEGA_WFB_DEFS) $(MEGA_CFLAGS) -c -o $@ $<
+
+# Pull in the auto-generated header deps (no-op until the .d files exist).
+-include $(MEGA_WFBNG_OBJ:.o=.d) $(MEGA_OBJ)/wfb_multicall.d
