@@ -89,6 +89,39 @@ static void sb_jstr(SB *s, const char *v)
 	}
 	sb_putc(s, '"');
 }
+/* ---- query-param URL-decode (mutations carry label/notes text) ----------- */
+static int hexv(char c)
+{
+	if (c >= '0' && c <= '9') return c - '0';
+	if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+	if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+	return -1;
+}
+/* application/x-www-form-urlencoded decode of one value into out (NUL-term). */
+static void url_decode(const char *s, size_t n, char *out, size_t cap)
+{
+	size_t o = 0;
+	for (size_t i = 0; i < n && o + 1 < cap; i++) {
+		char c = s[i];
+		if (c == '+') { out[o++] = ' '; }
+		else if (c == '%' && i + 2 < n) {
+			int hi = hexv(s[i + 1]), lo = hexv(s[i + 2]);
+			if (hi >= 0 && lo >= 0) { out[o++] = (char)(hi * 16 + lo); i += 2; }
+			else out[o++] = c;
+		} else out[o++] = c;
+	}
+	out[o] = 0;
+}
+/* Decode query param `key` into out; returns 1 if present, 0 if absent. */
+static int qparam_dec(const char *qstr, const char *key, char *out, size_t cap)
+{
+	size_t vl = 0;
+	const char *v = qs_get(qstr, key, &vl);
+	if (!v) { if (cap) out[0] = 0; return 0; }
+	url_decode(v, vl, out, cap);
+	return 1;
+}
+
 /* column emitters (value or JSON null), reading by sqlite column type. */
 static void sb_col_text(SB *s, sqlite3_stmt *st, int col)
 {
@@ -387,6 +420,179 @@ static void tele_capture_status(ApiClient *cli)
 	api_send(cli->fd, 200, "application/json", body, n);
 }
 
+/* ---- write endpoints (GET + ?action=, matching the GET-only API) ---------- */
+static long tele_first_ts(sqlite3 *db, long sid)
+{
+	long t0 = 0;
+	sqlite3_stmt *q = NULL;
+	if (sqlite3_prepare_v2(db, "SELECT MIN(ts_ms) FROM records WHERE session_id=?", -1, &q, NULL) == SQLITE_OK) {
+		sqlite3_bind_int64(q, 1, sid);
+		if (sqlite3_step(q) == SQLITE_ROW && sqlite3_column_type(q, 0) != SQLITE_NULL)
+			t0 = (long)sqlite3_column_int64(q, 0);
+	}
+	sqlite3_finalize(q);
+	return t0;
+}
+
+static void tele_label_add(ApiClient *cli, long sid, const char *qstr)
+{
+	char t0s[32] = "", t1s[32] = "", kind[24] = "event", value[256] = "", author[64] = "human:web";
+	qparam_dec(qstr, "t0", t0s, sizeof(t0s));
+	qparam_dec(qstr, "t1", t1s, sizeof(t1s));
+	qparam_dec(qstr, "kind", kind, sizeof(kind));
+	qparam_dec(qstr, "value", value, sizeof(value));
+	qparam_dec(qstr, "author", author, sizeof(author));
+	if (!kind[0]) snprintf(kind, sizeof(kind), "event");
+	if (!author[0]) snprintf(author, sizeof(author), "human:web");
+
+	sqlite3 *db = NULL;
+	if (wfb_logger_open(&db) != 0) { api_send(cli->fd, 500, "application/json", "{\"ok\":false}", -1); return; }
+	long t0 = tele_first_ts(db, sid);
+	long long t0_ms = (long long)(strtod(t0s, NULL) * 1000.0 + 0.5) + t0;
+	long long t1_ms = (long long)(strtod(t1s, NULL) * 1000.0 + 0.5) + t0;
+	if (t1_ms < t0_ms) { long long tmp = t0_ms; t0_ms = t1_ms; t1_ms = tmp; }
+
+	char now[40]; { time_t tt = time(NULL); struct tm tm; gmtime_r(&tt, &tm); strftime(now, sizeof(now), "%Y-%m-%dT%H:%M:%S+00:00", &tm); }
+	sqlite3_stmt *st = NULL;
+	long long lid = -1;
+	if (sqlite3_prepare_v2(db,
+	        "INSERT INTO labels (session_id,t0_ms,t1_ms,kind,value,author,created_at)"
+	        " VALUES (?,?,?,?,?,?,?)", -1, &st, NULL) == SQLITE_OK) {
+		sqlite3_bind_int64(st, 1, sid);
+		sqlite3_bind_int64(st, 2, t0_ms);
+		sqlite3_bind_int64(st, 3, t1_ms);
+		sqlite3_bind_text(st, 4, kind, -1, SQLITE_TRANSIENT);
+		sqlite3_bind_text(st, 5, value, -1, SQLITE_TRANSIENT);
+		sqlite3_bind_text(st, 6, author, -1, SQLITE_TRANSIENT);
+		sqlite3_bind_text(st, 7, now, -1, SQLITE_TRANSIENT);
+		if (sqlite3_step(st) == SQLITE_DONE) lid = sqlite3_last_insert_rowid(db);
+	}
+	sqlite3_finalize(st);
+	sqlite3_close(db);
+	char body[64];
+	if (lid >= 0) { int n = snprintf(body, sizeof(body), "{\"id\":%lld}", lid); api_send(cli->fd, 200, "application/json", body, n); }
+	else api_send(cli->fd, 500, "application/json", "{\"ok\":false,\"error\":\"insert failed\"}", -1);
+}
+
+static void tele_label_del(ApiClient *cli, const char *qstr)
+{
+	int lid = 0;
+	if (qs_get_int(qstr, "label_id", &lid) != 0 || lid <= 0) {
+		api_send(cli->fd, 400, "application/json", "{\"ok\":false,\"error\":\"missing label_id\"}", -1); return;
+	}
+	sqlite3 *db = NULL;
+	if (wfb_logger_open(&db) != 0) { api_send(cli->fd, 500, "application/json", "{\"ok\":false}", -1); return; }
+	sqlite3_stmt *st = NULL;
+	if (sqlite3_prepare_v2(db, "DELETE FROM labels WHERE id=?", -1, &st, NULL) == SQLITE_OK) {
+		sqlite3_bind_int64(st, 1, lid);
+		sqlite3_step(st);
+	}
+	sqlite3_finalize(st);
+	sqlite3_close(db);
+	api_send(cli->fd, 200, "application/json", "{\"ok\":true}", -1);
+}
+
+static void tele_meta(ApiClient *cli, long sid, const char *qstr)
+{
+	/* the 7 META_FIELDS; channel is INTEGER, the rest TEXT. Present-and-empty
+	 * clears to NULL (matches webapp). */
+	static const char *F[] = { "location", "antenna_cfg", "tx_power", "channel",
+	                           "scenario", "weather", "notes" };
+	char vals[7][256];
+	int present[7], np = 0;
+	for (int i = 0; i < 7; i++) {
+		present[i] = qparam_dec(qstr, F[i], vals[i], sizeof(vals[i]));
+		if (present[i]) np++;
+	}
+	if (!np) { api_send(cli->fd, 200, "application/json", "{\"ok\":true,\"changed\":0}", -1); return; }
+
+	char sql[512];
+	int p = snprintf(sql, sizeof(sql), "UPDATE sessions SET ");
+	int first = 1;
+	for (int i = 0; i < 7; i++) {
+		if (!present[i]) continue;
+		p += snprintf(sql + p, sizeof(sql) - p, "%s%s=?", first ? "" : ", ", F[i]);
+		first = 0;
+	}
+	snprintf(sql + p, sizeof(sql) - p, " WHERE id=?");
+
+	sqlite3 *db = NULL;
+	if (wfb_logger_open(&db) != 0) { api_send(cli->fd, 500, "application/json", "{\"ok\":false}", -1); return; }
+	sqlite3_stmt *st = NULL;
+	int ok = 0;
+	if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) == SQLITE_OK) {
+		int b = 1;
+		for (int i = 0; i < 7; i++) {
+			if (!present[i]) continue;
+			if (!vals[i][0]) sqlite3_bind_null(st, b);
+			else if (i == 3) sqlite3_bind_int(st, b, atoi(vals[i]));   /* channel */
+			else sqlite3_bind_text(st, b, vals[i], -1, SQLITE_TRANSIENT);
+			b++;
+		}
+		sqlite3_bind_int64(st, b, sid);
+		ok = (sqlite3_step(st) == SQLITE_DONE);
+	}
+	sqlite3_finalize(st);
+	sqlite3_close(db);
+	api_send(cli->fd, ok ? 200 : 500, "application/json",
+	         ok ? "{\"ok\":true}" : "{\"ok\":false}", -1);
+}
+
+static void tele_session_delete(ApiClient *cli, long sid)
+{
+	sqlite3 *db = NULL;
+	if (wfb_logger_open(&db) != 0) { api_send(cli->fd, 500, "application/json", "{\"ok\":false}", -1); return; }
+
+	/* refuse the ACTIVE capture: an open live-* session the logger is still
+	 * writing — deleting it would fail every subsequent insert's FK. */
+	sqlite3_stmt *st = NULL;
+	int active = 0, found = 0;
+	if (sqlite3_prepare_v2(db, "SELECT source, ended_at FROM sessions WHERE id=?", -1, &st, NULL) == SQLITE_OK) {
+		sqlite3_bind_int64(st, 1, sid);
+		if (sqlite3_step(st) == SQLITE_ROW) {
+			found = 1;
+			const char *src = (const char *)sqlite3_column_text(st, 0);
+			int ended_null = (sqlite3_column_type(st, 1) == SQLITE_NULL);
+			if (src && !strncmp(src, "live", 4) && ended_null) active = 1;
+		}
+	}
+	sqlite3_finalize(st);
+	if (!found) { sqlite3_close(db); api_send(cli->fd, 404, "application/json", "{\"ok\":false,\"error\":\"no session\"}", -1); return; }
+	if (active) {
+		sqlite3_close(db);
+		api_send(cli->fd, 409, "application/json",
+		         "{\"ok\":false,\"error\":\"refusing to delete the active capture — roll a new session first\"}", -1);
+		return;
+	}
+
+	char *err = NULL;
+	int ok = 1;
+	sqlite3_exec(db, "BEGIN", NULL, NULL, NULL);
+	static const char *DELS[] = {
+		"DELETE FROM predictions WHERE record_id IN (SELECT id FROM records WHERE session_id=%ld)",
+		"DELETE FROM records WHERE session_id=%ld",
+		"DELETE FROM labels WHERE session_id=%ld",
+		"DELETE FROM sessions WHERE id=%ld",
+	};
+	for (size_t i = 0; i < sizeof(DELS) / sizeof(DELS[0]) && ok; i++) {
+		char q[160]; snprintf(q, sizeof(q), DELS[i], sid);
+		if (sqlite3_exec(db, q, NULL, NULL, &err) != SQLITE_OK) { ok = 0; sqlite3_free(err); err = NULL; }
+	}
+	sqlite3_exec(db, ok ? "COMMIT" : "ROLLBACK", NULL, NULL, NULL);
+	sqlite3_close(db);
+	char body[96];
+	if (ok) { int n = snprintf(body, sizeof(body), "{\"ok\":true,\"deleted\":%ld}", sid); api_send(cli->fd, 200, "application/json", body, n); }
+	else api_send(cli->fd, 500, "application/json", "{\"ok\":false,\"error\":\"delete failed\"}", -1);
+}
+
+static void tele_capture_roll(ApiClient *cli, const char *qstr)
+{
+	int dur = -1;
+	(void)qs_get_int(qstr, "duration", &dur);   /* optional; <0 keeps current */
+	wfb_logger_roll(dur);
+	api_send(cli->fd, 200, "application/json", "{\"ok\":true}", -1);
+}
+
 /* ---- dispatcher ----------------------------------------------------------- */
 int tele_route(ApiClient *cli, const char *path, const char *qstr)
 {
@@ -411,14 +617,22 @@ int tele_route(ApiClient *cli, const char *path, const char *qstr)
 
 	/* JSON API */
 	if (!strcmp(path, "/api/v1/telemetry/sessions")) { tele_sessions(cli); return 1; }
-	if (!strcmp(path, "/api/v1/telemetry/capture"))  { tele_capture_status(cli); return 1; }
+
+	if (!strcmp(path, "/api/v1/telemetry/capture")) {
+		size_t al = 0; const char *act = qs_get(qstr, "action", &al);
+		if (act && al == 4 && !strncmp(act, "roll", 4)) tele_capture_roll(cli, qstr);
+		else tele_capture_status(cli);
+		return 1;
+	}
 
 	if (!strcmp(path, "/api/v1/telemetry/session")) {
 		int sid = 0;
 		if (qs_get_int(qstr, "id", &sid) != 0 || sid <= 0) {
 			api_send(cli->fd, 400, "application/json", "{\"error\":\"missing id\"}", -1); return 1;
 		}
-		tele_session_one(cli, sid);
+		size_t al = 0; const char *act = qs_get(qstr, "action", &al);
+		if (act && al == 6 && !strncmp(act, "delete", 6)) tele_session_delete(cli, sid);
+		else tele_session_one(cli, sid);
 		return 1;
 	}
 	if (!strcmp(path, "/api/v1/telemetry/series")) {
@@ -429,12 +643,31 @@ int tele_route(ApiClient *cli, const char *path, const char *qstr)
 		tele_series(cli, sid);
 		return 1;
 	}
-	if (!strcmp(path, "/api/v1/telemetry/labels")) {
+	if (!strcmp(path, "/api/v1/telemetry/meta")) {
 		int sid = 0;
 		if (qs_get_int(qstr, "id", &sid) != 0 || sid <= 0) {
-			api_send(cli->fd, 400, "application/json", "{\"error\":\"missing id\"}", -1); return 1;
+			api_send(cli->fd, 400, "application/json", "{\"ok\":false,\"error\":\"missing id\"}", -1); return 1;
 		}
-		tele_labels(cli, sid);
+		tele_meta(cli, sid, qstr);
+		return 1;
+	}
+	if (!strcmp(path, "/api/v1/telemetry/labels")) {
+		size_t al = 0; const char *act = qs_get(qstr, "action", &al);
+		if (act && al == 3 && !strncmp(act, "add", 3)) {
+			int sid = 0;
+			if (qs_get_int(qstr, "id", &sid) != 0 || sid <= 0) {
+				api_send(cli->fd, 400, "application/json", "{\"ok\":false,\"error\":\"missing id\"}", -1); return 1;
+			}
+			tele_label_add(cli, sid, qstr);
+		} else if (act && al == 3 && !strncmp(act, "del", 3)) {
+			tele_label_del(cli, qstr);
+		} else {
+			int sid = 0;
+			if (qs_get_int(qstr, "id", &sid) != 0 || sid <= 0) {
+				api_send(cli->fd, 400, "application/json", "{\"error\":\"missing id\"}", -1); return 1;
+			}
+			tele_labels(cli, sid);
+		}
 		return 1;
 	}
 
