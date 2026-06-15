@@ -4,6 +4,19 @@
 # Disable: fw_setenv wfbmode 0 ; reboot
 # Manual:  /etc/init.d/S99wfb {start|stop|restart|status}
 
+# Shared helpers (PATH pin, log, mega detection, venc-shm wiring) — see
+# init/wfb-common.sh. Fall back to inline definitions if the image predates it.
+WFB_COMMON=/etc/wfb-common.sh
+if [ -r "$WFB_COMMON" ]; then
+    . "$WFB_COMMON"
+else
+    PATH=/usr/sbin:/usr/bin:/sbin:/bin; export PATH
+    WFB_LOG_FILE="/tmp/wfb.log"
+    log() { echo "[wfb] $*" | tee -a "$WFB_LOG_FILE"; }
+    wfb_detect_mega() { command -v "wfb-$1" >/dev/null 2>&1 && WFB_MEGA="wfb-$1" || WFB_MEGA=""; }
+    wfb_ensure_venc_shm() { :; }   # no shared fragment: assume encoder pre-wired
+fi
+
 # ── Operator settings ────────────────────────────────────────────────
 # Everything else in this script is fixed wiring; live tuning happens
 # via the link_controller HTTP API (port 8765, GET /schema).
@@ -50,14 +63,15 @@ SHM_RING="local_shm"
 # below is fixed policy for this build — edit it here and redeploy the
 # script; there are no fw_setenv overrides for these.
 WFB_PEEK_PROFILE=close   # per-frame FEC close: off | close (gate close only)
-WFB_PROBE=1              # V+2 boundary probe: 1=on (required for MCS adaptation)
+WFB_PROBE=               # V+2 boundary probe: default ON; set WFB_PROBE=0 to disable
 WFB_LOG=1                # in-process SD telemetry logger: 1=on
 
 # V+2 boundary-probe producer: one extra wfb_tx at V+2, fed and retuned
-# by link_controller. Default ON — it is REQUIRED for MCS adaptation
-# (the unified PER-probe law promotes on probe data only). Opt out by
-# setting WFB_PROBE=0 (script constant above), which starts link_controller
-# with --no-mcs (FEC-only; MCS stays at the static WFB_MCS set on wfb_tx above).
+# by link_controller. Default ON (enabled unless WFB_PROBE=0) — it is REQUIRED
+# for MCS adaptation (the unified PER-probe law promotes on probe data only).
+# Leaving WFB_PROBE empty/unset keeps it on; only an explicit WFB_PROBE=0 opts
+# out, which starts link_controller with --no-mcs (FEC-only; MCS stays at the
+# static WFB_MCS set on wfb_tx above).
 # Probe stream mirrors the video PHY (-B/-S/-L), FEC 1/1, AEAD off (-x),
 # on its own link_id so it can never collide with video (207) / uplink (208).
 # See telemetry/PROBE_PER_SPEC.md.
@@ -84,11 +98,12 @@ LOG="/tmp/wfb.log"
 # it (busybox-style); otherwise fall back to the standalone binaries. The
 # rest of this script is unchanged — only the launch tokens and the
 # pidof/killall process-name list differ. See docs/design/mega-binary.md.
-if command -v wfb-air >/dev/null 2>&1; then
-    WFB_TX="wfb-air tx"
-    WFB_RX="wfb-air rx"
-    LINK_CONTROLLER="wfb-air link"
-    WFB_PROCS="wfb-air"            # all applets share this comm name
+wfb_detect_mega air
+if [ -n "$WFB_MEGA" ]; then
+    WFB_TX="$WFB_MEGA tx"
+    WFB_RX="$WFB_MEGA rx"
+    LINK_CONTROLLER="$WFB_MEGA link"
+    WFB_PROCS="$WFB_MEGA"          # all applets share this comm name
 else
     WFB_TX="wfb_tx"
     WFB_RX="wfb_rx"
@@ -98,7 +113,7 @@ fi
 
 fw_get() { fw_printenv -n "$1" 2>/dev/null || echo "$2"; }
 is_enabled() { [ "$(fw_get wfbmode 0)" = "1" ]; }
-probe_enabled() { [ "$WFB_PROBE" = "1" ]; }
+probe_enabled() { [ "$WFB_PROBE" != "0" ]; }   # default ON; only WFB_PROBE=0 disables
 # True if any tracked applet (by pidfile) is still alive. Precise on purpose:
 # in mega mode all applets share comm 'wfb-air', so `pidof wfb-air` can't tell
 # our daemons from an unrelated/manual wfb-air invocation (e.g. a debug
@@ -109,7 +124,7 @@ wfb_running() {
     done
     return 1
 }
-log() { echo "[wfb] $*" | tee -a "$LOG"; }
+# log() is provided by wfb-common.sh (writes to $WFB_LOG_FILE == $LOG).
 
 start_wfb() {
     log "starting WFB-NG broadcaster"
@@ -135,6 +150,12 @@ start_wfb() {
     ip link set wlan0 up
     iw dev wlan0 set channel $WFB_CHANNEL $WFB_HTMODE >> "$LOG" 2>&1
     iw dev wlan0 set txpower fixed $WFB_TXPOWER >> "$LOG" 2>&1
+
+    # Make the encoder publish into the SHM ring our video wfb_tx reads from.
+    # Only rewires + SIGHUPs the encoder if it isn't already on shm://$SHM_RING
+    # (so a correctly-configured, fragile SoC encoder is never reinited for
+    # nothing). See wfb_ensure_venc_shm in wfb-common.sh.
+    wfb_ensure_venc_shm "$SHM_RING"
 
     # Peek = per-frame FEC close. --peek-profile selects the startup state; the
     # WCMD/WebUI peek toggle arms/disarms it live.
@@ -233,7 +254,7 @@ stop_wfb() {
 }
 
 status_wfb() {
-    echo "wfbmode env: $(fw_get wfbmode 0)  probe: $WFB_PROBE  peek: $WFB_PEEK_PROFILE  (script-fixed)"
+    echo "wfbmode env: $(fw_get wfbmode 0)  probe: $(probe_enabled && echo on || echo off)  peek: $WFB_PEEK_PROFILE  (script-fixed)"
     if command -v wfb-air >/dev/null 2>&1; then
         # All applets share comm 'wfb-air'; report per-role from the pid files
         # so a single dead applet is still visible (pidof wfb-air can't tell

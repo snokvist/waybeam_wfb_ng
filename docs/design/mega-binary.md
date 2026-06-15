@@ -357,3 +357,14 @@ binaries, which remain in place) + restoring the `S99wfb` backup.
 
 Remaining (cosmetic, not blocking): strip parity — `vehicle/make mega` strips,
 ground does not (risk #4).
+
+### Shared init fragment — `init/wfb-common.sh` (2026-06-15, autonomous Phase 1)
+Both startup scripts (`vehicle/init/S99wfb`, `ground/init/S46gs_supervisor`) now
+source `/etc/wfb-common.sh` for the common bits: PATH pin, `log()`, mega
+detection (`wfb_detect_mega <air|gs>` → `$WFB_MEGA`), and the air-only
+`wfb_ensure_venc_shm` (sets venc `outgoing.server=shm://local_shm` only when it
+differs, then SIGHUPs — device-verified to apply via a clean venc respawn).
+**Install the fragment to `/etc/wfb-common.sh` on both images** alongside the
+mega binary. Each script falls back to inline definitions if it is absent, so an
+older image without the fragment still boots. The air script also defaults the
+V+2 probe ON unless `WFB_PROBE=0` (was: required `WFB_PROBE=1`).
