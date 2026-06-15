@@ -493,6 +493,7 @@ int cfg_load(const char *path, Config *c)
 	snprintf(c->http_bind, sizeof(c->http_bind), "0.0.0.0");
 	c->http_port = GS_DEFAULT_HTTP_PORT;
 	c->venc_cmd_rate_limit_ms = 50;
+	wfb_logger_defaults(&c->telemetry);   /* enabled, 127.0.0.1:6700, wfb.sqlite, 1200 s */
 
 	int fd = open(path, O_RDONLY);
 	if (fd < 0) { LOG_ERR("config open(%s): %s", path, strerror(errno)); return -1; }
@@ -572,6 +573,32 @@ int cfg_load(const char *path, Config *c)
 		if ((v = jfind(buf, toks, n, vc_idx, "rate_limit_ms")) >= 0 &&
 		    jint(buf, &toks[v], &lv) == 0)
 			c->venc_cmd_rate_limit_ms = (int)lv;
+	}
+
+	/* telemetry logger (Phase 5): in-process udp->sqlite capture. Defaults
+	 * (set above) reproduce the retired Python ingester; any present field
+	 * overrides. */
+	int tel_idx = jfind(buf, toks, n, 0, "telemetry");
+	if (tel_idx >= 0 && toks[tel_idx].type == JT_OBJ) {
+		bool bv;
+		if ((v = jfind(buf, toks, n, tel_idx, "enabled")) >= 0 && jbool(buf, &toks[v], &bv) == 0)
+			c->telemetry.enabled = bv;
+		if ((v = jfind(buf, toks, n, tel_idx, "db")) >= 0)
+			jstr(buf, &toks[v], c->telemetry.db, sizeof(c->telemetry.db));
+		if ((v = jfind(buf, toks, n, tel_idx, "bind")) >= 0)
+			jstr(buf, &toks[v], c->telemetry.bind, sizeof(c->telemetry.bind));
+		if ((v = jfind(buf, toks, n, tel_idx, "listen")) >= 0 && jint(buf, &toks[v], &lv) == 0)
+			c->telemetry.listen_port = (int)lv;
+		if ((v = jfind(buf, toks, n, tel_idx, "max_duration")) >= 0 && jint(buf, &toks[v], &lv) == 0)
+			c->telemetry.max_duration = (int)lv;
+		if ((v = jfind(buf, toks, n, tel_idx, "source")) >= 0)
+			jstr(buf, &toks[v], c->telemetry.source, sizeof(c->telemetry.source));
+		if ((v = jfind(buf, toks, n, tel_idx, "channel")) >= 0 && jint(buf, &toks[v], &lv) == 0)
+			c->telemetry.channel = (int)lv;
+		if ((v = jfind(buf, toks, n, tel_idx, "tx_power")) >= 0)
+			jstr(buf, &toks[v], c->telemetry.tx_power, sizeof(c->telemetry.tx_power));
+		if ((v = jfind(buf, toks, n, tel_idx, "antenna_cfg")) >= 0)
+			jstr(buf, &toks[v], c->telemetry.antenna_cfg, sizeof(c->telemetry.antenna_cfg));
 	}
 
 	int prof_idx = jfind(buf, toks, n, 0, "profile");
@@ -722,6 +749,16 @@ void cfg_apply_wfb_link_overlay(Config *c, const char *path)
 			if (bw    >= 0) t->bandwidth_mhz = bw;
 			LOG_INFO("wfb-link overlay: tx tunnel '%s' fec=%d/%d mcs=%d bw=%d",
 			         t->name, t->fec_k, t->fec_n, t->mcs_index, t->bandwidth_mhz);
+			applied++;
+		}
+	}
+
+	/* log.enabled -> telemetry.enabled (parity with the air-side WFB_LOG env). */
+	if ((sec = jfind(buf, toks, n, 0, "log")) >= 0 && toks[sec].type == JT_OBJ) {
+		bool bv;
+		if ((v = jfind(buf, toks, n, sec, "enabled")) >= 0 && jbool(buf, &toks[v], &bv) == 0) {
+			c->telemetry.enabled = bv;
+			LOG_INFO("wfb-link overlay: telemetry.enabled -> %s", bv ? "true" : "false");
 			applied++;
 		}
 	}
@@ -2576,6 +2613,12 @@ int main(int argc, char **argv)
 	}
 	LOG_INFO("REST API listening on http://%s:%u", cfg.http_bind, cfg.http_port);
 
+	/* Telemetry logger (Phase 5): the in-process udp:6700 -> sqlite capture
+	 * that replaced the Python ingester. No-op when telemetry.enabled is
+	 * false. The rx tunnel's stats_tap must point at telemetry.listen. */
+	if (wfb_logger_start(&cfg.telemetry) < 0)
+		LOG_WARN("telemetry logger failed to start — continuing without it");
+
 	ApiClient clients[API_MAX_CLIENTS];
 	for (int i = 0; i < API_MAX_CLIENTS; i++) clients[i].fd = -1;
 
@@ -2735,6 +2778,7 @@ int main(int argc, char **argv)
 	}
 
 	LOG_INFO("shutdown signal received");
+	wfb_logger_stop();   /* clean flag+join: final commit + ended_at */
 	for (int i = 0; i < API_MAX_CLIENTS; i++)
 		if (clients[i].fd >= 0) close(clients[i].fd);
 	close(api_fd);

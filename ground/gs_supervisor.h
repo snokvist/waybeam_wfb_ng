@@ -35,6 +35,8 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "wfb_logger.h"   /* WfbLogConfig (telemetry logger, Phase 5) */
+
 /* ---------- compile-time limits (small, predictable) ----------------- */
 
 #define GS_MAX_TUNNELS       8
@@ -301,6 +303,8 @@ typedef struct {
 	bool     venc_cmd_enabled;
 	char     venc_cmd_uplink[GS_NAME_MAX];
 	int      venc_cmd_rate_limit_ms;
+
+	WfbLogConfig telemetry;   /* in-process udp->sqlite logger (Phase 5) */
 
 	SystemState system_state;
 } Config;
