@@ -531,3 +531,87 @@ void wfb_logger_status(WfbLogStatus *out)
 	out->listen_port = L.cfg.listen_port;
 	pthread_mutex_unlock(&L.lock);
 }
+
+/* ---- one-shot JSONL import (offline; replaces telemetry/wfb_store.py import) - */
+long wfb_logger_import_jsonl(const char *db_path, const char *jsonl_path, const char *source)
+{
+	char src[32];   /* matches WfbLogConfig.source — create_session copies into it */
+	if (source && source[0]) snprintf(src, sizeof(src), "%s", source);
+	else {
+		const char *base = strrchr(jsonl_path, '/');
+		base = base ? base + 1 : jsonl_path;
+		snprintf(src, sizeof(src), "import:%s", base);
+	}
+
+	FILE *fp = fopen(jsonl_path, "r");
+	if (!fp) { fprintf(stderr, "telemetry-import: open %s: %s\n", jsonl_path, strerror(errno)); return -1; }
+
+	sqlite3 *db = NULL;
+	if (sqlite3_open_v2(db_path, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, NULL) != SQLITE_OK) {
+		fprintf(stderr, "telemetry-import: open db %s: %s\n", db_path, db ? sqlite3_errmsg(db) : "?");
+		if (db) sqlite3_close(db);
+		fclose(fp);
+		return -1;
+	}
+	conn_tune(db);
+	if (store_init(db) < 0) { sqlite3_close(db); fclose(fp); return -1; }
+
+	sqlite3_stmt *ins = NULL;
+	if (sqlite3_prepare_v2(db,
+	        "INSERT INTO records (session_id, ts_ms, seq, mcs, rssi_comb, rssi_spread,"
+	        " snr_avg, pkt_all, pkt_uniq, pkt_lost, fec_rec, dec_err, per,"
+	        " uplink_rssi, uplink_pkt, uplink_lost, raw_json)"
+	        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", -1, &ins, NULL) != SQLITE_OK) {
+		fprintf(stderr, "telemetry-import: prepare: %s\n", sqlite3_errmsg(db));
+		sqlite3_close(db); fclose(fp); return -1;
+	}
+
+	WfbLogConfig cfg;
+	memset(&cfg, 0, sizeof(cfg));
+	snprintf(cfg.source, sizeof(cfg.source), "%s", src);
+
+	sqlite3_exec(db, "BEGIN", NULL, NULL, NULL);
+	long sid = store_create_session(db, &cfg);
+	if (sid < 0) { sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL); sqlite3_finalize(ins); sqlite3_close(db); fclose(fp); return -1; }
+
+	char  *line = NULL;
+	size_t lcap = 0;
+	ssize_t llen;
+	long n = 0, bad = 0;
+	JTok toks[WFB_LOG_MAX_TOKS];
+	while ((llen = getline(&line, &lcap, fp)) != -1) {
+		while (llen > 0 && (line[llen - 1] == '\n' || line[llen - 1] == '\r')) line[--llen] = 0;
+		if (llen == 0) continue;
+		int nt = json_parse(line, (int)llen, toks, WFB_LOG_MAX_TOKS);
+		if (nt < 1 || toks[0].type != JT_OBJ) { bad++; continue; }
+		Derived d;
+		derive(line, toks, nt, &d);
+		store_insert(ins, sid, &d, line, (int)llen);
+		n++;
+	}
+	free(line);
+	sqlite3_exec(db, "COMMIT", NULL, NULL, NULL);
+	store_close_session(db, sid);
+	sqlite3_finalize(ins);
+	sqlite3_close(db);
+	fclose(fp);
+	fprintf(stderr, "telemetry-import: %ld records (%ld bad) from %s -> session %ld in %s\n",
+	        n, bad, jsonl_path, sid, db_path);
+	return n;
+}
+
+int wfb_telemetry_import_main(int argc, char **argv)
+{
+	const char *jsonl = NULL, *db = "wfb.sqlite", *source = NULL;
+	for (int i = 1; i < argc; i++) {
+		if (!strcmp(argv[i], "--db") && i + 1 < argc) db = argv[++i];
+		else if (!strcmp(argv[i], "--source") && i + 1 < argc) source = argv[++i];
+		else if (argv[i][0] == '-') { fprintf(stderr, "telemetry-import: unknown option %s\n", argv[i]); return 2; }
+		else jsonl = argv[i];
+	}
+	if (!jsonl) {
+		fprintf(stderr, "usage: telemetry-import <file.jsonl> [--db PATH] [--source TAG]\n");
+		return 2;
+	}
+	return wfb_logger_import_jsonl(db, jsonl, source) < 0 ? 1 : 0;
+}

@@ -1,5 +1,18 @@
 # Data-session store + web UI — architecture
 
+> **Phase 5 update (2026-06-15):** the **live** capture + dashboard are now
+> in-process C inside `wfb-gs` — the udp:6700 → SQLite logger is
+> `ground/wfb_logger.c` (a background thread of `gs_supervisor`) and the
+> dashboard is `ground/gs_supervisor_telemetry.c`, served at `/telemetry` on the
+> supervisor's HTTP port. The schema + `derive_columns` were ported bit-for-bit,
+> so this `wfb.sqlite` is unchanged. The Python capture/UI
+> (`wfb_capture.py`/`wfb_ingest.py`/`webui/`/`webui_session.sh`/`capture_session.sh`)
+> is retired to `archive/python-telemetry/`. `wfb_store.py` and the offline
+> ML/import tools below remain for workstation use. Import old logs without
+> Python via `wfb-gs telemetry-import <file.jsonl>`. Deferred to the archived
+> Python (offline): the uplink↔downlink overlay, ML `tier1_state` bands, and the
+> SCP vehicle-fetch import.
+
 A single store for **all wfb telemetry data sessions** (live and historical),
 with a small web UI to browse/replay them, label metadata and events by hand,
 and **see the ML labels** (Tier-1 state, MCS recommendation, Tier-2 notes)

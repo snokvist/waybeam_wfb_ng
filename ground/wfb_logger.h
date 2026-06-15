@@ -80,6 +80,14 @@ void wfb_logger_status(WfbLogStatus *out);
  * Returns "" when the logger was never configured. */
 const char *wfb_logger_db_path(void);
 
+/* One-shot import of a JSONL capture (one wfb_rx -Y record per line) as a single
+ * session, for migrating old logs without the retired Python tools. source tags
+ * sessions.source (NULL -> "import:<basename>"). Returns #records, -1 on error. */
+long wfb_logger_import_jsonl(const char *db_path, const char *jsonl_path, const char *source);
+
+/* `telemetry-import <file.jsonl> [--db PATH]` applet entry (mega binary). */
+int  wfb_telemetry_import_main(int argc, char **argv);
+
 /* Open a fresh SQLite connection on the configured db (WAL, busy_timeout set),
  * for use by an HTTP request handler on its own thread. The schema is assumed
  * already initialised by the capture thread; on a logger-disabled build the

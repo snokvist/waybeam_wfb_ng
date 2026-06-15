@@ -211,18 +211,49 @@ Scope:
 Verify: from air WebUI generate random pair; mirror to ground via upload (or
 same seed); link re-establishes; fingerprints match across both UIs.
 
-### Phase 5 — Fold SQLite logger into `wfb-gs` (C + static libsqlite3)
-Scope:
-- Cross-build `libsqlite3.a` (add to `wfb-ng/build-*.sh`).
-- Port `wfb_capture`/`wfb_store` to a C logger module: udp:6700 listener
-  thread, same schema + WAL, commit cadence (20 rec / 2 s), session rollover,
-  `max_duration` 1200 s. Link into `wfb-gs`; gate on `log.enabled`.
-- Integrate the telemetry dashboard as a tab/`/telemetry` route in
-  `gs_supervisor_http.c`; unify look with the supervisor UI.
-- Retire the Python files (keep a one-shot JSONL→sqlite import for old logs).
+### Phase 5 — Fold SQLite logger into `wfb-gs` (C + static libsqlite3) — ✅ DONE 2026-06-15 (host)
+Built in four device-verifiable sub-phases:
+- **5a — logger core.** `ground/wfb_logger.{c,h}`: udp:6700 listener pthread,
+  schema + WAL, 20 rec / 2 s commit cadence, `max_duration` 1200 s rollover,
+  clean flag+join stop (final commit + `ended_at`). `derive_columns` ported
+  **bit-identical** to `wfb_store.py` (device-checked against a Python-written
+  row). SQLite shipped as the **vendored 3.48.0 amalgamation**
+  (`ground/vendor/sqlite`, version-matched to the RK3566 buildroot) compiled to
+  `sqlite3.o` (`THREADSAFE=2` + size omits) and linked into both standalone +
+  mega (+`pthread`+`m`) — *not* a separate `libsqlite3.a` (simpler, no
+  host/sysroot dep; same static-link outcome). NOT sodium-gated. New
+  `telemetry` config block + `log.enabled` overlay; started after API bind,
+  stopped cleanly on shutdown.
+- **5b — read API + dashboard.** `ground/gs_supervisor_telemetry.c` serves the
+  dashboard (embedded `ground/webui/telemetry/*` via the `webui` xxd target) at
+  `/telemetry[/static/*]` and GET JSON under `/api/v1/telemetry/`
+  (`sessions`, `session?id`, `series?id`, `labels?id`, `capture`). Read handlers
+  use their own short-lived WAL connection (`wfb_logger_open`). `series`
+  reproduces `webapp.py` byte-for-byte (t + 8 cols + per-rung `mcs_dist` from
+  `raw_json`, label overlays, `tier1_state` all-null). GS-side charts only;
+  2 s polling; dark palette unified with `gs.html`.
+- **5c — write API.** GET+query mutations (matching the GET-only supervisor
+  API), x-www-form-urlencoded decode for text: `labels?action=add|del`,
+  `meta`, `session?action=delete` (refuses the active live capture, 409),
+  `capture?action=roll`. Label/meta via short-lived WAL conns; roll signals the
+  capture thread.
+- **5d — retire Python + wiring.** `wfb-gs telemetry-import <file.jsonl>` applet
+  (reuses the logger insert path) for old logs. Replaced runtime Python
+  (`wfb_capture.py`, `wfb_ingest.py`, `webui/`, `webui_session.sh`,
+  `capture_session.sh`) moved to `archive/python-telemetry/`; `webui_session.sh`
+  dropped from `host_x86.json` `system.up`/`down` (+ a `telemetry` block added).
+  `wfb_store.py` + the offline ML/import tools stay in `telemetry/` (still
+  imported by `import_vehicle_session.py`/`wfb_active.py`). `walkout_logger.sh`
+  (bash/jq, separate concern) left untouched. **Deferred** (offline Python in
+  `archive/`): the vehicle-uplink overlay page, ML `tier1_state` bands, and the
+  SCP `vehicle/fetch` import.
 
-Verify: ground live link → `wfb.sqlite` accrues `records`; dashboard renders
-live; `python` absent from the runtime path.
+Verified (host, 0 warnings on host standalone + host mega + aarch64 cross): a
+300-record real capture → `wfb.sqlite` accrues with a schema + derived row
+matching Python; all read endpoints serve correct JSON; label add/del + meta +
+roll work; active-session delete → 409; SIGTERM seals the session; the import
+applet ingests `real_wfb.jsonl` (325 rec). Live dual-adapter browser render +
+RK3566 deploy = the remaining on-device gate.
 
 ### Phase 6 — Autonomy hardening + ship — ✅ DONE 2026-06-15
 - **Parser dedup**: `gs_supervisor`'s in-file jsmn parser removed; both sides now

@@ -16,6 +16,7 @@ wfb-ng/install/
 # xxd-generated WebUI asset headers (regenerate via the per-component
 # `make webui` target).
 ground/webui/gs_assets.h
+ground/webui/telemetry_assets.h
 vehicle/webui/index_assets.h
 
 # Developer-machine convenience symlinks that some local workflows expect at
