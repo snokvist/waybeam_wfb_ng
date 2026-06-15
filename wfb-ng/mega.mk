@@ -22,7 +22,7 @@
 MEGA_WFBNG_OBJ = $(MEGA_OBJ)/rx.o $(MEGA_OBJ)/tx.o $(MEGA_OBJ)/tx_cmd.o \
                  $(MEGA_OBJ)/keygen.o $(MEGA_OBJ)/peek.o $(MEGA_OBJ)/zfex.o \
                  $(MEGA_OBJ)/wifibroadcast.o $(MEGA_OBJ)/radiotap.o \
-                 $(MEGA_OBJ)/venc_ring.o
+                 $(MEGA_OBJ)/venc_ring.o $(MEGA_OBJ)/wfb_keyseed.o
 
 # Auto-generate header dependencies (-MMD -MP) so editing a vendored wfb-ng
 # header rebuilds the objects that include it; the rules below list only the
@@ -36,6 +36,10 @@ $(MEGA_OBJ):
 # --- dispatcher (C++, identical on both sides) ---
 $(MEGA_OBJ)/wfb_multicall.o: $(MULTICALL)/wfb_multicall.cpp $(MULTICALL)/wfb_multicall.h | $(MEGA_OBJ)
 	$(MEGA_CXX) -std=gnu++11 -O2 -Wall $(MEGA_DEP) $(MEGA_DEFS) $(MEGA_CFLAGS) -I$(MULTICALL) -c -o $@ $<
+
+# --- deterministic bring-up key derivation (C, links libsodium) ---
+$(MEGA_OBJ)/wfb_keyseed.o: $(MULTICALL)/wfb_keyseed.c $(MULTICALL)/wfb_keyseed.h | $(MEGA_OBJ)
+	$(MEGA_CC) -std=gnu99 -O2 -Wall $(MEGA_DEP) $(MEGA_DEFS) $(MEGA_CFLAGS) -I$(MULTICALL) -c -o $@ $<
 
 # --- wfb-ng tools (main() renamed to applet entry via -Dmain=) ---
 $(MEGA_OBJ)/rx.o:     $(WFBNG_SRC)/rx.cpp           | $(MEGA_OBJ)

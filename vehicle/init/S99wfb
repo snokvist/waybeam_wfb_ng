@@ -15,6 +15,7 @@ else
     log() { echo "[wfb] $*" | tee -a "$WFB_LOG_FILE"; }
     wfb_detect_mega() { command -v "wfb-$1" >/dev/null 2>&1 && WFB_MEGA="wfb-$1" || WFB_MEGA=""; }
     wfb_ensure_venc_shm() { :; }   # no shared fragment: assume encoder pre-wired
+    wfb_seed_key() { [ -f "$2" ] || { [ -n "$WFB_MEGA" ] && "$WFB_MEGA" keygen-ensure --role "$1" "$2"; }; }
 fi
 
 # ── Operator settings ────────────────────────────────────────────────
@@ -140,6 +141,11 @@ start_wfb() {
         stop_wfb
         sleep 0.5
     fi
+
+    # First-boot key: seed a shared bring-up drone.key from the built-in
+    # "Waybeam" passphrase if none exists, so an unconfigured pair still links
+    # (INSECURE shared default — replace for production). No-op if $KEY exists.
+    wfb_seed_key drone "$KEY"
 
     # Tear down AP (kills hostapd + adapter monitor + flushes wlan0)
     /usr/bin/adapter stop >> "$LOG" 2>&1

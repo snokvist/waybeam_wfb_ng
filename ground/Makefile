@@ -135,7 +135,7 @@ $(MEGA_OBJ)/%.o: %.c $(HDRS) $(WEBUI_HDR) | $(MEGA_OBJ)
 	$(MEGA_CC) $(CFLAGS_COMMON) $(MEGA_DEFS) $(MEGA_CFLAGS) $(SHARED_INC) -I. -Iwebui -c -o $@ $<
 
 # --- ground applet table (C++) ---
-$(MEGA_OBJ)/gs_applets.o: gs_applets.cpp $(MULTICALL)/wfb_multicall.h $(MULTICALL)/wfb_applets_common.h | $(MEGA_OBJ)
+$(MEGA_OBJ)/gs_applets.o: gs_applets.cpp $(MULTICALL)/wfb_multicall.h $(MULTICALL)/wfb_applets_common.h $(MULTICALL)/wfb_keyseed.h | $(MEGA_OBJ)
 	$(MEGA_CXX) -std=gnu++11 -O2 -Wall $(MEGA_DEFS) $(MEGA_CFLAGS) -I$(MULTICALL) -c -o $@ $<
 
 $(MEGA_OUT): $(MEGA_GS_OBJ) $(MEGA_DISP_OBJ) $(MEGA_WFBNG_OBJ)

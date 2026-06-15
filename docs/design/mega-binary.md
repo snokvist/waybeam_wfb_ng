@@ -368,3 +368,16 @@ differs, then SIGHUPs — device-verified to apply via a clean venc respawn).
 mega binary. Each script falls back to inline definitions if it is absent, so an
 older image without the fragment still boots. The air script also defaults the
 V+2 probe ON unless `WFB_PROBE=0` (was: required `WFB_PROBE=1`).
+
+### Auto-keygen (2026-06-15, autonomous Phase 2)
+New `multicall/wfb_keyseed.{c,h}` + a `keygen-ensure` applet on both sides:
+when the `-K` key file is absent, derive a deterministic pair from a built-in
+passphrase (default `Waybeam`) — **bit-identical to `wfb_keygen Waybeam`**
+(Argon2i salt `wifibroadcastkey` → `crypto_box_seed_keypair`) — and write the
+role-correct 64-byte file (`drone.key` on air, `gs.key` on ground; atomic
+temp+rename, 0600). The role is fixed by the binary side (`WFB_SIDE_ROLE`:
+wfb-air→drone, wfb-gs→gs), so it's correct regardless of filename. This is an
+**INSECURE shared default** (every same-firmware unit shares it) — a loud
+warning is logged; replace with a unique key for production. It NEVER overwrites
+an existing key. `S99wfb` calls `wfb_seed_key drone "$KEY"` before launch (single
+writer); the `rx`/`tx` thunks also seed-if-missing as a backstop.

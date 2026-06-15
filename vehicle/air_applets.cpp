@@ -1,6 +1,10 @@
 /* air_applets.cpp — wfb-air (vehicle) applet table for the multi-call binary.
  * See docs/design/mega-binary.md. */
 #include "wfb_multicall.h"
+#ifdef WFB_WITH_WFBNG
+#include "wfb_keyseed.h"
+#define WFB_SIDE_ROLE WFB_ROLE_DRONE   /* wfb-air is always the drone */
+#endif
 #include "wfb_applets_common.h"   /* wfb-ng entry decls + rx_applet/tx_applet thunks */
 
 /* C daemon entry — C linkage (link_controller.c built as C with -DWFB_MULTICALL). */
@@ -14,6 +18,7 @@ const struct wfb_applet wfb_applets[] = {
 	{ "rx",     "wfb_rx",     rx_applet,       "wfb-ng receiver (uplink)" },
 	{ "tx_cmd", "wfb_tx_cmd", wfb_tx_cmd_main, "wfb_tx runtime control client" },
 	{ "keygen", "wfb_keygen", wfb_keygen_main, "generate wfb-ng keypair" },
+	{ "keygen-ensure", 0, keygen_ensure_applet, "seed drone.key from passphrase if absent" },
 #endif
 	{ 0, 0, 0, 0 },
 };

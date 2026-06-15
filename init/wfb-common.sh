@@ -32,6 +32,23 @@ wfb_detect_mega() {
     fi
 }
 
+# wfb_seed_key <drone|gs> <keyfile> — first-boot bring-up key. If <keyfile> is
+# absent and the mega binary is present, derive a deterministic shared key from
+# the built-in "Waybeam" passphrase via `keygen-ensure` (bit-identical to
+# `wfb_keygen Waybeam`). This is an INSECURE shared default — replace it for
+# production. No-op when the key already exists (never overwrites). In standalone
+# (non-mega) mode the key must be provisioned out of band, as before.
+wfb_seed_key() {
+    _role="$1"; _kf="$2"
+    [ -f "$_kf" ] && return 0
+    if [ -n "$WFB_MEGA" ]; then
+        log "key: $_kf missing — seeding shared bring-up key (role=$_role, INSECURE default)"
+        "$WFB_MEGA" keygen-ensure --role "$_role" "$_kf"
+    else
+        log "key: $_kf missing and no mega binary — provide $_kf (wfb tools will abort otherwise)"
+    fi
+}
+
 # wfb_ensure_venc_shm [ring] — make the video encoder publish into the SHM ring
 # the local wfb_tx consumes from (air side only; the GS has no encoder).
 #

@@ -112,7 +112,21 @@ Verify: air `.13` cold-boots → link up, probe active by default, venc auto-set
 to shm (`json_cli -g`); ground boots from the unified script → passive RX
 decodes video; both `status` actions report per-role pidfiles.
 
-### Phase 2 — Auto-keygen from seed `Waybeam`
+### Phase 2 — Auto-keygen from seed `Waybeam` — ✅ VERIFIED 2026-06-15 (.13 + host)
+Device-verified: deleting `/etc/drone.key` and restarting auto-seeded a key
+**bit-identical** to `wfb-air keygen Waybeam` (sha `35c7d9c0…`); all 4 applets
+started clean; the bench's real custom key was backed up and restored. Host:
+both roles match the `wfb_keygen Waybeam` reference, deterministic under
+`--force`, never overwrites an existing file, writes 0600.
+
+Implemented as `multicall/wfb_keyseed.{c,h}` (Argon2i salt `wifibroadcastkey`
+→ `crypto_box_seed_keypair`, atomic temp+rename), a `keygen-ensure` applet on
+both sides (role defaulted by binary side via `WFB_SIDE_ROLE`), a backstop in
+the `rx`/`tx` applet thunks, and `wfb_seed_key` in the fragment called by
+`S99wfb` before launch (single writer). Ground relies on the thunk backstop
+(role GS) — safe under the supervisor's concurrent spawns because the content
+is deterministic and the write is atomic.
+
 Scope:
 - Shared `wfb_ensure_key(path, role, seed)` (port `keygen.c` Argon2i→seed_keypair):
   when the `-K` file is absent, derive the pair from `key.seed` (default
