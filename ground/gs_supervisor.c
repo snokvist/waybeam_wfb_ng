@@ -815,6 +815,96 @@ int cfg_load(const char *path, Config *c)
 	return 0;
 }
 
+/* ---------- /etc/wfb-link.json overlay (Phase 3b) --------------------- *
+ *
+ * Sparse overlay of the unified link preset onto the already-loaded
+ * gs_supervisor.json: ONLY fields present in wfb-link.json override; absent
+ * fields keep their gs_supervisor.json value. This lets one file tune the
+ * cross-cutting, must-match-both-ends identifiers (key, link ids) plus the
+ * tx-side fec/mcs/bw, while the GS keeps its richer tunnel + system.up model.
+ * No-op (logged) when the file is absent or unparseable. Same parser cfg_load
+ * uses — no libsodium, so this is unconditional (standalone + mega).
+ *
+ * Mapping: key.file -> key_file (global); links.{video,uplink,probe} -> the
+ * link_id of the tunnel named video/uplink/probe; fec.k/n, mcs.boot, radio.bw
+ * -> every tx-role tunnel. */
+static Tunnel *cfg_tunnel_by_name(Config *c, const char *name)
+{
+	for (int i = 0; i < c->tunnel_count; i++)
+		if (!strcmp(c->tunnels[i].name, name)) return &c->tunnels[i];
+	return NULL;
+}
+
+void cfg_apply_wfb_link_overlay(Config *c, const char *path)
+{
+	int fd = open(path, O_RDONLY);
+	if (fd < 0) { LOG_INFO("wfb-link overlay: %s absent — using gs_supervisor.json as-is", path); return; }
+	struct stat st;
+	if (fstat(fd, &st) < 0 || st.st_size <= 0 || st.st_size > 256 * 1024) { close(fd); return; }
+	char *buf = malloc((size_t)st.st_size + 1);
+	if (!buf) { close(fd); return; }
+	ssize_t r = read(fd, buf, (size_t)st.st_size);
+	close(fd);
+	if (r != st.st_size) { free(buf); return; }
+	buf[r] = 0;
+
+	JTok toks[JSON_MAX_TOKS];
+	int n = json_parse(buf, (int)r, toks, JSON_MAX_TOKS);
+	if (n < 1 || toks[0].type != JT_OBJ) {
+		LOG_WARN("wfb-link overlay: %s not a valid JSON object — ignored", path);
+		free(buf); return;
+	}
+
+	int v, sec, applied = 0;
+	long lv;
+
+	/* key.file -> global key_file */
+	if ((sec = jfind(buf, toks, n, 0, "key")) >= 0 && toks[sec].type == JT_OBJ) {
+		if ((v = jfind(buf, toks, n, sec, "file")) >= 0 && toks[v].type == JT_STR) {
+			jstr(buf, &toks[v], c->key_file, sizeof(c->key_file));
+			LOG_INFO("wfb-link overlay: key_file -> %s", c->key_file); applied++;
+		}
+	}
+
+	/* links.{video,uplink,probe} -> link_id of the same-named tunnel */
+	if ((sec = jfind(buf, toks, n, 0, "links")) >= 0 && toks[sec].type == JT_OBJ) {
+		static const char *names[] = { "video", "uplink", "probe" };
+		for (int k = 0; k < 3; k++) {
+			if ((v = jfind(buf, toks, n, sec, names[k])) >= 0 && jint(buf, &toks[v], &lv) == 0) {
+				Tunnel *t = cfg_tunnel_by_name(c, names[k]);
+				if (t) { t->link_id = (int)lv; LOG_INFO("wfb-link overlay: tunnel '%s' link_id -> %d", names[k], (int)lv); applied++; }
+			}
+		}
+	}
+
+	/* fec.k/n, mcs.boot, radio.bw -> every tx-role tunnel */
+	int fec_k = -1, fec_n = -1, mcs = -1, bw = -1;
+	if ((sec = jfind(buf, toks, n, 0, "fec")) >= 0 && toks[sec].type == JT_OBJ) {
+		if ((v = jfind(buf, toks, n, sec, "k")) >= 0 && jint(buf, &toks[v], &lv) == 0) fec_k = (int)lv;
+		if ((v = jfind(buf, toks, n, sec, "n")) >= 0 && jint(buf, &toks[v], &lv) == 0) fec_n = (int)lv;
+	}
+	if ((sec = jfind(buf, toks, n, 0, "mcs")) >= 0 && toks[sec].type == JT_OBJ &&
+	    (v = jfind(buf, toks, n, sec, "boot")) >= 0 && jint(buf, &toks[v], &lv) == 0) mcs = (int)lv;
+	if ((sec = jfind(buf, toks, n, 0, "radio")) >= 0 && toks[sec].type == JT_OBJ &&
+	    (v = jfind(buf, toks, n, sec, "bw")) >= 0 && jint(buf, &toks[v], &lv) == 0) bw = (int)lv;
+	if (fec_k >= 0 || fec_n >= 0 || mcs >= 0 || bw >= 0) {
+		for (int i = 0; i < c->tunnel_count; i++) {
+			Tunnel *t = &c->tunnels[i];
+			if (strcmp(t->role, "tx") != 0) continue;
+			if (fec_k >= 0) t->fec_k = fec_k;
+			if (fec_n >= 0) t->fec_n = fec_n;
+			if (mcs   >= 0) t->mcs_index = mcs;
+			if (bw    >= 0) t->bandwidth_mhz = bw;
+			LOG_INFO("wfb-link overlay: tx tunnel '%s' fec=%d/%d mcs=%d bw=%d",
+			         t->name, t->fec_k, t->fec_n, t->mcs_index, t->bandwidth_mhz);
+			applied++;
+		}
+	}
+
+	LOG_INFO("wfb-link overlay: %d field group(s) applied from %s", applied, path);
+	free(buf);
+}
+
 /* ---------- argv composition ----------------------------------------- */
 
 int ab_push(ArgvBuilder *ab, const char *fmt, ...)
@@ -2615,6 +2705,10 @@ int main(int argc, char **argv)
 
 	Config cfg;
 	if (cfg_load(cfg_path, &cfg) < 0) return 1;
+	{
+		const char *wfb_link = getenv("WFB_LINK_CONF");
+		cfg_apply_wfb_link_overlay(&cfg, (wfb_link && *wfb_link) ? wfb_link : "/etc/wfb-link.json");
+	}
 	if (port_override > 0 && port_override < 65536) cfg.http_port = (uint16_t)port_override;
 
 	LOG_INFO("loaded config: %d tunnel(s), http=%s:%u",

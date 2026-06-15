@@ -393,8 +393,18 @@ exactly the shipped preset (link unchanged) and the scripts stay thin; standalon
 (non-mega) mode falls back to the script constants. String values are
 single-quoted (eval-injection-safe). Schema + defaults: `init/wfb-link.example.json`.
 Device-verified on `.13`: overrides for txpower/probe/peek/fec/mcs propagate;
-malformed file falls back to defaults with a warning. Ground consumption of the
-same file (supervisor-side override) is a follow-up (Phase 3b).
+malformed file falls back to defaults with a warning. Ground consumption of the same file is **Phase 3b** (below).
+
+### Ground wfb-link overlay (2026-06-15, Phase 3b)
+`gs_supervisor` applies a **sparse** `/etc/wfb-link.json` overlay onto the loaded
+`gs_supervisor.json` right after `cfg_load` (`cfg_apply_wfb_link_overlay`; in-file
+JSON parser, no sodium → unconditional; path via `WFB_LINK_CONF` env, default
+`/etc/wfb-link.json`). Only present fields override (absent/missing = logged
+no-op): `key.file`→`key_file`; `links.{video,uplink,probe}`→the `link_id` of the
+same-named tunnel; `fec.k/n`+`mcs.boot`+`radio.bw`→every tx tunnel. Channel and
+`system.up` stay in `gs_supervisor.json` (the GS's richer native model). So one
+`/etc/wfb-link.json` can pin the must-match-both-ends identifiers (key + link
+ids) and tx fec/mcs/bw on both air and ground. Host-verified via `/api/v1/tunnels`.
 
 ### Key-management WebUI (2026-06-15, Phase 4)
 Both daemons gain a key page + backend (gated on `WFB_WITH_WFBNG`; standalone

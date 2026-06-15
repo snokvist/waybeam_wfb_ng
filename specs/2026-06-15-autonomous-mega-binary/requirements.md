@@ -163,11 +163,18 @@ probe off, peek off) → all applied (15 dBm, probe-tx gone, `link_controller
 mcs.enabled=false`); remove ⇒ preset restored; malformed `{ broken ]` ⇒ defaults
 + warning, link still up; injection probe (`'`-laden seed) neutralized.
 
-**Phase 3b (deferred — needs a ground bench):** have `gs_supervisor` apply
-`/etc/wfb-link.json` link-layer overrides (channel/key/link-ids/fec/mcs) onto
-its loaded `gs_supervisor.json` tunnels. Different mechanism (C-side; channel
-lives in `system.up` shell strings, not a field) — the `config-env` applet is
-already built into `wfb-gs`, just not yet consumed by the supervisor.
+**Phase 3b — ✅ VERIFIED 2026-06-15 (host).** `gs_supervisor` applies a SPARSE
+`/etc/wfb-link.json` overlay onto the loaded `gs_supervisor.json` right after
+`cfg_load` (`cfg_apply_wfb_link_overlay`, uses the in-file JSON parser — no
+sodium, so unconditional in standalone + mega; path overridable via
+`WFB_LINK_CONF` env, default `/etc/wfb-link.json`). Only fields present
+override; absent/missing-file is a logged no-op. Mapping: `key.file`→`key_file`;
+`links.{video,uplink,probe}`→the `link_id` of the same-named tunnel;
+`fec.k/n`+`mcs.boot`+`radio.bw`→every tx-role tunnel. Channel/system.up stay in
+`gs_supervisor.json` (the GS's richer native model). Host-verified via
+`/api/v1/tunnels` + `/api/v1/keys`: overlay file changed link_id 207→199 /
+208→218, tx fec 8/12→4/6, mcs 2→5, bw 20→40, key→over.key; no file ⇒ base
+unchanged.
 
 Original scope:
 

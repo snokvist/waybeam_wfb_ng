@@ -379,6 +379,9 @@ int build_argv_tx(const Tunnel *t, const char *key_file, ArgvBuilder *ab);
 const char *tunnel_state_name(TunnelState s);
 int  cfg_parse_tunnel(const char *js, JTok *toks, int n, int t_idx, Tunnel *t);
 int  cfg_load(const char *path, Config *c);
+/* Sparse overlay of /etc/wfb-link.json onto a loaded Config (Phase 3b). Only
+ * fields present in the overlay override; absent/missing-file is a no-op. */
+void cfg_apply_wfb_link_overlay(Config *c, const char *path);
 Tunnel *cfg_find_tunnel(Config *c, const char *name);
 
 int  tunnel_spawn(Tunnel *t, const char *key_file);
