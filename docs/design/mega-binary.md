@@ -1,7 +1,9 @@
 # Mega binary — single-file deployment (busybox model)
 
-Status: **design / not yet implemented**. This document is the plan; no code
-in the tree implements it yet.
+Status: **implemented; both binaries link, on-hardware run pending**. Phases
+0–3 are in-tree. `wfb-gs` (x86) links + dispatches and `wfb-air` cross-links to
+a device-compatible armv7 binary (2026-06-15); only the on-vehicle run remains.
+See the handoff section at the end.
 
 ## Motivation
 
@@ -156,7 +158,7 @@ Acceptance: `wfb-gs supervisor -c config.json` brings up tunnels that exec
 `wfb-gs rx` / `wfb-gs tx`; REST API + stats fan-out identical to today;
 `make test` (wire-format conformance) green. Fully validatable on x86 host.
 
-**Status: integration code done; full link pending a box with deps.**
+**Status: DONE — full link + dispatch validated on the x86 dev host (2026-06-15).**
 - `ground/gs_supervisor.c` `tunnel_spawn` — under `WFB_MULTICALL`, the child
   re-execs `/proc/self/exe` with argv[0] forced to `wfb_rx`/`wfb_tx` so the
   dispatcher routes by basename (any configured `t->binary` is ignored).
@@ -164,17 +166,19 @@ Acceptance: `wfb-gs supervisor -c config.json` brings up tunnels that exec
 - `ground/Makefile` `make mega` — links dispatcher + `gs_supervisor*.o` +
   wfb-ng objects (`rx/tx/tx_cmd/keygen` renamed via `-Dmain=`, plus
   `peek/zfex/wifibroadcast/radiotap/venc_ring`) into `wfb-gs` with `g++`,
-  `-DWFB_MULTICALL -DWFB_WITH_WFBNG`, libsodium + libpcap. `make -n` confirms
-  the rename flags and link line.
+  `-DWFB_MULTICALL -DWFB_WITH_WFBNG`, libsodium + libpcap.
 - The single binary uses real libpcap throughout (rx needs it; tx never calls
   pcap, so the stub header is unnecessary in the merged build).
 
-The final link could not be exercised in the dev container: the wfb-ng C++
-tools need the upstream clone (network OK; pinned SHA `af6ba85…` == current
-HEAD), `libsodium`/`libpcap` dev libs (the build scripts compile these from
-source), and `venc_ring.{c,h}` from the sibling `waybeam_venc` repo (absent
-here). On a normal dev box — run `wfb-ng/build-aarch64.sh` once to prepare the
-patched tree, then `make mega WFBNG_SRC=…` — these are present.
+**Validated:** the host had `libsodium` 1.0.18, `libpcap`, and a patched wfb-ng
+tree already at `wfb-ng/build/wfb-ng/src` (`venc_ring.{c,h}` present via sibling
+`waybeam_venc`), so `make -C ground mega` linked `wfb-gs` (331 KB) directly.
+The GATE (risk #1) passed with **no** `multiple definition` — the shm/peek
+patch globals are correctly `static`. The one real failure was risk #2: see
+below (fixed). Dispatch verified for all five applets: bare usage list,
+`supervisor -h`, `rx`/`tx` usage (shows patched `-H` shm flag), `keygen`
+(wrote drone.key/gs.key), and basename symlink (`wfb_tx_cmd` → version
+`shm-patched-mega`).
 
 ### Phase 3 — Vehicle binary (`wfb-air`)
 
@@ -192,11 +196,30 @@ patched tree, then `make mega WFBNG_SRC=…` — these are present.
 Acceptance: cross-build succeeds; `S99wfb` launches all four roles from one
 binary; `make test` + `vehicle` host build + `test_selector_law` pass.
 
-**Status: integration code done; full link pending a box with deps.**
+**Status: DONE — armv7 cross-link produced + device-compatible (2026-06-15); on-hardware run pending.**
 - `vehicle/Makefile` `make mega` — mirrors ground: dispatcher + `link_controller.o`
   + `csa.o` + wfb-ng objects (renamed via `-Dmain=`) → `wfb-air`, linked with
-  the cross `g++` (`CROSS_CXX`), `-lpcap -lsodium -lm`. `make -n` confirms the
-  rename flags and link line; the daemon-only `wfb-air` links and routes.
+  the cross `g++` (`CROSS_CXX`), `-lpcap -lsodium -lm`. The Makefile default
+  `TOOLCHAIN ?= ../toolchain/toolchain.sigmastar-infinity6e` already resolves
+  (through the `toolchain` symlink → sibling `waybeam_venc`) to the OpenIPC
+  Buildroot gcc 13.3.0 `arm-openipc-linux-gnueabihf-g++` — no override needed.
+- The cross libs that `build-armv7.sh` prepares are reused as-is:
+  `wfb-ng/build/sodium-install` (libsodium 1.0.18, SONAME `.so.23`) and
+  `wfb-ng/build/pcap-install` (libpcap 1.10.5, linked **static** — so `wfb-air`
+  has no `libpcap` runtime dep).
+- The cross link command (run from the repo root):
+  ```bash
+  make -C vehicle mega \
+    MEGA_CFLAGS="-I../wfb-ng/build/sodium-install/include -I../wfb-ng/build/pcap-install/include" \
+    MEGA_LDFLAGS="-L../wfb-ng/build/sodium-install/lib -L../wfb-ng/build/pcap-install/lib -lpcap -lsodium -lm"
+  ```
+  produced `vehicle/build/wfb-air` — ELF 32-bit ARM EABI5, stripped, 397 KB.
+  `readelf -d` NEEDED = `libsodium.so.23, libstdc++.so.6, libm.so.6,
+  libgcc_s.so.1, libc.so.6` — a **superset of the proven standalone `wfb_tx`**
+  (adds only `libm`, which `link_controller` already links), so it runs
+  wherever `wfb_tx`/`link_controller` already do. (A host-arch sanity build
+  `CROSS_CC=gcc CROSS_CXX=g++` also links + routes all five applets, useful for
+  testing dispatch logic off-target.)
 - `vehicle/init/S99wfb` — adds a mega-detection block: when `wfb-air` is on
   PATH the launch tokens become `wfb-air tx|rx|link` and the `pidof`/`killall`
   process-name list collapses to `wfb-air` (all applets share that comm name);
@@ -249,44 +272,59 @@ Branch: `claude/hopeful-fermat-2rtbfd`.
 - **Phase 2/3** — `make mega` in `ground/Makefile` and `vehicle/Makefile`;
   `ground/gs_supervisor.c` `tunnel_spawn` self-execs `/proc/self/exe` under
   `WFB_MULTICALL`; `vehicle/init/S99wfb` routes through `wfb-air` when present.
-  `make -n` confirms the rename flags and link lines.
+- **Full link validated (2026-06-15, x86 dev host).** `make -C ground mega`
+  linked `wfb-gs` and `make -C vehicle mega CROSS_CC=gcc CROSS_CXX=g++` linked
+  a host-arch `wfb-air`; both route all five applets. Default (non-mega) builds
+  unchanged and `make test` green. The only fix needed was the rx/tx `-Dmain=`
+  mangling mismatch (risk #2 below). Reproduce on this host:
 
-### NOT yet validated (needs a box with deps — the remaining work)
-The dev container had no `libsodium`/`libpcap` dev libs, no `xxd`/`pytest`, and
-no sibling `waybeam_venc` (source of `venc_ring.{c,h}`), so the **full C++ link
-was never exercised**. To finish:
+  ```bash
+  make -C ground  mega                                          # wfb-gs (x86)
+  make -C vehicle mega CROSS_CC=gcc CROSS_CXX=g++ CROSS_STRIP=strip  # wfb-air (host-arch)
+  ./ground/build/wfb-gs                # → usage listing applets
+  ./ground/build/wfb-gs supervisor -h
+  ```
+
+### Remaining work (on-hardware run)
+Both binaries link; `wfb-air` is a device-compatible armv7 ELF. What's left is
+the actual on-vehicle run — verify `S99wfb` brings up all four roles from the
+one binary and that process management (risk #3) behaves with every applet
+sharing the `wfb-air` comm name.
 
 ```bash
-# 1. Prepare the patched wfb-ng tree + deps (fetches upstream, builds libs).
-./wfb-ng/build-aarch64.sh        # ground; or build-armv7.sh for vehicle
+# Cross libs are already prepared under wfb-ng/build by build-armv7.sh; if
+# absent on a fresh checkout, run it once first.
+make -C vehicle mega \
+  MEGA_CFLAGS="-I../wfb-ng/build/sodium-install/include -I../wfb-ng/build/pcap-install/include" \
+  MEGA_LDFLAGS="-L../wfb-ng/build/sodium-install/lib -L../wfb-ng/build/pcap-install/lib -lpcap -lsodium -lm"
 
-# 2. Build the mega binary (point WFBNG_SRC at the patched src/).
-make -C ground  mega WFBNG_SRC=../wfb-ng/build/wfb-ng/src \
-     CC=<gcc> CXX=<g++> MEGA_CFLAGS="--sysroot=… -I<sodium>/include" \
-     MEGA_LDFLAGS="--sysroot=… -lpcap -lsodium -lrt -lpthread"
-make -C vehicle mega WFBNG_SRC=../wfb-ng/build/wfb-ng/src \
-     MEGA_CFLAGS="-I<sodium>/include" \
-     MEGA_LDFLAGS="-L<sodium>/lib -lpcap -lsodium -lrt -lpthread -lm"
-
-# 3. Smoke-test dispatch, then deploy + run S99wfb (vehicle) / supervisor (gs).
-./ground/build/wfb-gs            # → usage listing applets
-./ground/build/wfb-gs supervisor -h
+# Deploy wfb-air to the vehicle PATH; S99wfb auto-routes to it when present.
+# Confirm: ps shows video-tx + uplink-rx + probe-tx + link all named wfb-air,
+# and stop/status/the double-start guard still work.
 ```
 
 ### Review risk checklist (verify in this order)
-1. **(GATE) Link-time symbol collisions across `rx.o`/`tx.o`/tools.** Merging
-   two `main()`-bearing C++ programs into one binary fails to link if any
-   **non-`static`** global or free function shares a name between `rx.cpp` and
-   `tx.cpp` (the shm/peek patches add `g_stats_udp_fd`, `g_stats_seq`,
-   `g_stats_udp_dst`, `g_stats_udp_enabled` to *both* — confirm they are
-   `static`). If `make mega` reports "multiple definition", fix by marking the
-   offending symbols `static` / anonymous-namespace **in the patch chain**
-   (`wfb-ng/shm-input.patch` / `peek.patch`), not in the Makefile, then bump the
-   vendored patch. This is the one thing most likely to bite.
-2. **`-Dmain=` mangling contract.** The dispatcher declares `wfb_rx_main` /
-   `wfb_tx_main` as plain C++; the `-Dmain=`-renamed `main` in `rx.cpp`/`tx.cpp`
-   must mangle to match (it will for `int(int,char**)`). An undefined-reference
-   to `wfb_rx_main`/`wfb_tx_main` at link means the signature/mangling drifted.
+1. **(GATE) Link-time symbol collisions across `rx.o`/`tx.o`/tools.** ✅
+   **PASSED (2026-06-15).** Merging two `main()`-bearing C++ programs into one
+   binary fails to link if any **non-`static`** global or free function shares a
+   name between `rx.cpp` and `tx.cpp` (the shm/peek patches add `g_stats_udp_fd`,
+   `g_stats_seq`, `g_stats_udp_dst`, `g_stats_udp_enabled` to *both*). The
+   ground+vehicle mega links produced **no** `multiple definition` — those
+   globals are already `static` in the patch chain. No fix needed. If a future
+   patch reintroduces a clash, mark the offending symbol `static` /
+   anonymous-namespace **in the patch chain** (`shm-input.patch` / `peek.patch`),
+   not the Makefile, then bump the vendored patch.
+2. **`-Dmain=` mangling contract.** ⚠️ **HIT and FIXED (2026-06-15).** The
+   pinned upstream declares `int main(int argc, char *const argv[])`, so the
+   `-Dmain=`-renamed symbol mangles as `wfb_rx_main(int, char* const*)`
+   (`_Z…iPKPc`) — **not** the `(int, char**)` (`…iPPc`) the dispatcher first
+   assumed, giving `undefined reference to wfb_rx_main(int, char**)`. Fixed in
+   `ground/gs_applets.cpp` / `vehicle/air_applets.cpp`: declare the rx/tx entries
+   with their true `(int, char *const *)` signature and forward through a small
+   thunk (`char** → char* const*` converts implicitly at the call) so they still
+   fit the table's `(int, char**)` fn type — no upstream patch, no
+   function-pointer cast/UB. The C tools (`tx_cmd`/`keygen`) are `extern "C"`, so
+   their `char**` vs `char* const*` difference is irrelevant (no mangling).
 3. **`S99wfb` process management under mega.** All applets share comm name
    `wfb-air`; confirm `stop`/`status`/the double-start guard behave with
    video-tx + uplink-rx + probe-tx + link all named `wfb-air` (busybox
