@@ -113,11 +113,13 @@ MEGA_WFB_DEFS     = -DWFB_VERSION=\"$(MEGA_WFB_VERSION)\"
 # CROSS_CC=aarch64-…` followed by `make mega` would silently link a host-arch
 # wfb-gs. Drives both wfb-ng/mega.mk and the ground-local rules below.
 ifeq ($(strip $(CROSS_CC)),)
-MEGA_CC  := $(CC)
-MEGA_CXX := $(CXX)
+MEGA_CC    := $(CC)
+MEGA_CXX   := $(CXX)
+MEGA_STRIP ?= strip
 else
-MEGA_CC  := $(CROSS_CC)
-MEGA_CXX := $(CROSS_CXX)
+MEGA_CC    := $(CROSS_CC)
+MEGA_CXX   := $(CROSS_CXX)
+MEGA_STRIP ?= $(CROSS_CC:gcc=strip)
 endif
 # C daemon objects (supervisor) — built as C with the multicall guard.
 MEGA_GS_OBJ = $(MEGA_OBJ)/gs_supervisor.o $(MEGA_OBJ)/gs_supervisor_csa.o \
@@ -131,17 +133,19 @@ include ../wfb-ng/mega.mk
 mega: $(MEGA_OUT)
 
 # --- supervisor (C, multicall) ---
+# -I$(MULTICALL) lets the WFB_WITH_WFBNG key-management endpoint reach wfb_keyseed.h.
 $(MEGA_OBJ)/%.o: %.c $(HDRS) $(WEBUI_HDR) | $(MEGA_OBJ)
-	$(MEGA_CC) $(CFLAGS_COMMON) $(MEGA_DEFS) $(MEGA_CFLAGS) $(SHARED_INC) -I. -Iwebui -c -o $@ $<
+	$(MEGA_CC) $(CFLAGS_COMMON) $(MEGA_DEFS) $(MEGA_CFLAGS) $(SHARED_INC) -I$(MULTICALL) -I. -Iwebui -c -o $@ $<
 
 # --- ground applet table (C++) ---
-$(MEGA_OBJ)/gs_applets.o: gs_applets.cpp $(MULTICALL)/wfb_multicall.h $(MULTICALL)/wfb_applets_common.h | $(MEGA_OBJ)
+$(MEGA_OBJ)/gs_applets.o: gs_applets.cpp $(MULTICALL)/wfb_multicall.h $(MULTICALL)/wfb_applets_common.h $(MULTICALL)/wfb_keyseed.h $(MULTICALL)/wfb_configenv.h | $(MEGA_OBJ)
 	$(MEGA_CXX) -std=gnu++11 -O2 -Wall $(MEGA_DEFS) $(MEGA_CFLAGS) -I$(MULTICALL) -c -o $@ $<
 
 $(MEGA_OUT): $(MEGA_GS_OBJ) $(MEGA_DISP_OBJ) $(MEGA_WFBNG_OBJ)
 	@echo "[wfb-gs] linking mega binary -> $@"
 	$(MEGA_CXX) $(MEGA_CFLAGS) -o $@ $^ $(MEGA_LDFLAGS) $(LDFLAGS_COMMON)
-	@echo "[wfb-gs] done: applets = supervisor rx tx tx_cmd keygen"
+	$(MEGA_STRIP) $@
+	@echo "[wfb-gs] done (stripped): applets = supervisor rx tx tx_cmd keygen"
 
 clean:
 	rm -f $(OUT_HOST) $(OUT_CROSS) $(WEBUI_HDR)

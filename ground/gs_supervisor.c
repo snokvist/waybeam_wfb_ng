@@ -78,183 +78,8 @@ int write_all(int fd, const void *buf, size_t len)
 	return 0;
 }
 
-/* ---------- minimal JSON parser (jsmn-shaped) ------------------------ *
- *
- * One-shot tokenizer. Produces a flat array of tokens with parent links;
- * traversal helpers walk the array. Zero allocations, no recursion in the
- * parser (state machine + stack-of-containers stored in token parent
- * field). Just enough for our config schema.
- *
- * Strings are NOT unescaped — we only use plain ASCII keys/values. If we
- * ever need full string handling we'll vendor jsmn properly.
- */
-
-typedef struct {
-	const char *js;
-	int         len;
-	int         pos;
-	JTok       *toks;
-	int         tok_max;
-	int         tok_count;
-	int         super;   /* index of current container */
-} JParser;
-
-static JTok *json_alloc(JParser *p)
-{
-	if (p->tok_count >= p->tok_max) return NULL;
-	JTok *t = &p->toks[p->tok_count++];
-	t->type = JT_NONE; t->start = -1; t->end = -1; t->size = 0; t->parent = -1;
-	return t;
-}
-
-static int json_parse_prim(JParser *p)
-{
-	int start = p->pos;
-	for (; p->pos < p->len; p->pos++) {
-		char c = p->js[p->pos];
-		if (c == ',' || c == '}' || c == ']' ||
-		    c == ' ' || c == '\t' || c == '\n' || c == '\r')
-			break;
-	}
-	JTok *t = json_alloc(p);
-	if (!t) return -1;
-	t->type = JT_PRIM; t->start = start; t->end = p->pos; t->parent = p->super;
-	if (p->super >= 0) p->toks[p->super].size++;
-	p->pos--;
-	return 0;
-}
-
-static int json_parse_str(JParser *p)
-{
-	int start = ++p->pos;  /* skip opening quote */
-	for (; p->pos < p->len; p->pos++) {
-		char c = p->js[p->pos];
-		if (c == '"') {
-			JTok *t = json_alloc(p);
-			if (!t) return -1;
-			t->type = JT_STR; t->start = start; t->end = p->pos; t->parent = p->super;
-			if (p->super >= 0) p->toks[p->super].size++;
-			return 0;
-		}
-		if (c == '\\' && p->pos + 1 < p->len) p->pos++;  /* skip escape */
-	}
-	return -1;
-}
-
-int json_parse(const char *js, int len, JTok *toks, int max)
-{
-	JParser p = { .js = js, .len = len, .pos = 0,
-	              .toks = toks, .tok_max = max, .tok_count = 0, .super = -1 };
-	for (; p.pos < p.len; p.pos++) {
-		char c = p.js[p.pos];
-		if (c == '{' || c == '[') {
-			JTok *t = json_alloc(&p);
-			if (!t) return -1;
-			t->type = (c == '{') ? JT_OBJ : JT_ARR;
-			t->start = p.pos; t->end = -1; t->parent = p.super;
-			if (p.super >= 0) p.toks[p.super].size++;
-			p.super = p.tok_count - 1;
-		} else if (c == '}' || c == ']') {
-			JTokType expect = (c == '}') ? JT_OBJ : JT_ARR;
-			if (p.super < 0) return -1;
-			if (p.toks[p.super].type != expect) return -1;
-			p.toks[p.super].end = p.pos + 1;
-			/* unwind */
-			int s = p.super;
-			p.super = p.toks[s].parent;
-			while (p.super >= 0 && p.toks[p.super].end != -1)
-				p.super = p.toks[p.super].parent;
-		} else if (c == '"') {
-			if (json_parse_str(&p) < 0) return -1;
-		} else if (c == ' ' || c == '\t' || c == '\n' || c == '\r' ||
-		           c == ':' || c == ',') {
-			/* skip */
-		} else {
-			if (json_parse_prim(&p) < 0) return -1;
-		}
-	}
-	if (p.super != -1) return -1;
-	return p.tok_count;
-}
-
-bool jeq(const char *js, const JTok *t, const char *s)
-{
-	if (t->type != JT_STR) return false;
-	int slen = (int)strlen(s);
-	return (t->end - t->start) == slen && strncmp(js + t->start, s, (size_t)slen) == 0;
-}
-
-/* Advance past a token + all its descendants. Returns next index.
- * NOTE: token .size counts each direct child token. For OBJ that means
- * 2 × pair_count (one for the key string, one for the value). */
-int jskip(const JTok *toks, int n, int i)
-{
-	if (i >= n) return n;
-	if (toks[i].type == JT_OBJ) {
-		int pairs = toks[i].size / 2;
-		int j = i + 1;
-		while (pairs-- > 0) {
-			j = jskip(toks, n, j);     /* key */
-			j = jskip(toks, n, j);     /* value */
-		}
-		return j;
-	}
-	if (toks[i].type == JT_ARR) {
-		int kids = toks[i].size;
-		int j = i + 1;
-		while (kids-- > 0) j = jskip(toks, n, j);
-		return j;
-	}
-	return i + 1;
-}
-
-/* Find a child of object `obj_idx` by key. Returns idx of value, or -1. */
-int jfind(const char *js, const JTok *toks, int n, int obj_idx, const char *key)
-{
-	if (obj_idx < 0 || obj_idx >= n || toks[obj_idx].type != JT_OBJ) return -1;
-	int pairs = toks[obj_idx].size / 2;
-	int i = obj_idx + 1;
-	for (int k = 0; k < pairs; k++) {
-		if (jeq(js, &toks[i], key)) return i + 1;
-		i = jskip(toks, n, i);     /* key */
-		i = jskip(toks, n, i);     /* value */
-	}
-	return -1;
-}
-
-int jstr(const char *js, const JTok *t, char *out, size_t cap)
-{
-	if (!t || t->type != JT_STR) { out[0] = 0; return -1; }
-	int slen = t->end - t->start;
-	if (slen < 0 || (size_t)slen >= cap) slen = (int)cap - 1;
-	memcpy(out, js + t->start, (size_t)slen);
-	out[slen] = 0;
-	return slen;
-}
-
-int jint(const char *js, const JTok *t, long *out)
-{
-	if (!t || t->type != JT_PRIM) return -1;
-	char buf[32];
-	int slen = t->end - t->start;
-	if (slen <= 0 || slen >= (int)sizeof(buf)) return -1;
-	memcpy(buf, js + t->start, (size_t)slen);
-	buf[slen] = 0;
-	char *end = NULL;
-	long v = strtol(buf, &end, 10);
-	if (!end || *end) return -1;
-	*out = v;
-	return 0;
-}
-
-int jbool(const char *js, const JTok *t, bool *out)
-{
-	if (!t || t->type != JT_PRIM) return -1;
-	int slen = t->end - t->start;
-	if (slen == 4 && !strncmp(js + t->start, "true",  4)) { *out = true;  return 0; }
-	if (slen == 5 && !strncmp(js + t->start, "false", 5)) { *out = false; return 0; }
-	return -1;
-}
+/* JSON parser (json_parse/jeq/jskip/jfind/jstr/jint/jbool) now lives in the
+ * shared header-only shared/wfb_json.h, included via gs_supervisor.h. */
 
 /* ---------- config + tunnel model -----------------------------------
  *
@@ -813,6 +638,96 @@ int cfg_load(const char *path, Config *c)
 	}
 
 	return 0;
+}
+
+/* ---------- /etc/wfb-link.json overlay (Phase 3b) --------------------- *
+ *
+ * Sparse overlay of the unified link preset onto the already-loaded
+ * gs_supervisor.json: ONLY fields present in wfb-link.json override; absent
+ * fields keep their gs_supervisor.json value. This lets one file tune the
+ * cross-cutting, must-match-both-ends identifiers (key, link ids) plus the
+ * tx-side fec/mcs/bw, while the GS keeps its richer tunnel + system.up model.
+ * No-op (logged) when the file is absent or unparseable. Same parser cfg_load
+ * uses — no libsodium, so this is unconditional (standalone + mega).
+ *
+ * Mapping: key.file -> key_file (global); links.{video,uplink,probe} -> the
+ * link_id of the tunnel named video/uplink/probe; fec.k/n, mcs.boot, radio.bw
+ * -> every tx-role tunnel. */
+static Tunnel *cfg_tunnel_by_name(Config *c, const char *name)
+{
+	for (int i = 0; i < c->tunnel_count; i++)
+		if (!strcmp(c->tunnels[i].name, name)) return &c->tunnels[i];
+	return NULL;
+}
+
+void cfg_apply_wfb_link_overlay(Config *c, const char *path)
+{
+	int fd = open(path, O_RDONLY);
+	if (fd < 0) { LOG_INFO("wfb-link overlay: %s absent — using gs_supervisor.json as-is", path); return; }
+	struct stat st;
+	if (fstat(fd, &st) < 0 || st.st_size <= 0 || st.st_size > 256 * 1024) { close(fd); return; }
+	char *buf = malloc((size_t)st.st_size + 1);
+	if (!buf) { close(fd); return; }
+	ssize_t r = read(fd, buf, (size_t)st.st_size);
+	close(fd);
+	if (r != st.st_size) { free(buf); return; }
+	buf[r] = 0;
+
+	JTok toks[JSON_MAX_TOKS];
+	int n = json_parse(buf, (int)r, toks, JSON_MAX_TOKS);
+	if (n < 1 || toks[0].type != JT_OBJ) {
+		LOG_WARN("wfb-link overlay: %s not a valid JSON object — ignored", path);
+		free(buf); return;
+	}
+
+	int v, sec, applied = 0;
+	long lv;
+
+	/* key.file -> global key_file */
+	if ((sec = jfind(buf, toks, n, 0, "key")) >= 0 && toks[sec].type == JT_OBJ) {
+		if ((v = jfind(buf, toks, n, sec, "file")) >= 0 && toks[v].type == JT_STR) {
+			jstr(buf, &toks[v], c->key_file, sizeof(c->key_file));
+			LOG_INFO("wfb-link overlay: key_file -> %s", c->key_file); applied++;
+		}
+	}
+
+	/* links.{video,uplink,probe} -> link_id of the same-named tunnel */
+	if ((sec = jfind(buf, toks, n, 0, "links")) >= 0 && toks[sec].type == JT_OBJ) {
+		static const char *names[] = { "video", "uplink", "probe" };
+		for (int k = 0; k < 3; k++) {
+			if ((v = jfind(buf, toks, n, sec, names[k])) >= 0 && jint(buf, &toks[v], &lv) == 0) {
+				Tunnel *t = cfg_tunnel_by_name(c, names[k]);
+				if (t) { t->link_id = (int)lv; LOG_INFO("wfb-link overlay: tunnel '%s' link_id -> %d", names[k], (int)lv); applied++; }
+			}
+		}
+	}
+
+	/* fec.k/n, mcs.boot, radio.bw -> every tx-role tunnel */
+	int fec_k = -1, fec_n = -1, mcs = -1, bw = -1;
+	if ((sec = jfind(buf, toks, n, 0, "fec")) >= 0 && toks[sec].type == JT_OBJ) {
+		if ((v = jfind(buf, toks, n, sec, "k")) >= 0 && jint(buf, &toks[v], &lv) == 0) fec_k = (int)lv;
+		if ((v = jfind(buf, toks, n, sec, "n")) >= 0 && jint(buf, &toks[v], &lv) == 0) fec_n = (int)lv;
+	}
+	if ((sec = jfind(buf, toks, n, 0, "mcs")) >= 0 && toks[sec].type == JT_OBJ &&
+	    (v = jfind(buf, toks, n, sec, "boot")) >= 0 && jint(buf, &toks[v], &lv) == 0) mcs = (int)lv;
+	if ((sec = jfind(buf, toks, n, 0, "radio")) >= 0 && toks[sec].type == JT_OBJ &&
+	    (v = jfind(buf, toks, n, sec, "bw")) >= 0 && jint(buf, &toks[v], &lv) == 0) bw = (int)lv;
+	if (fec_k >= 0 || fec_n >= 0 || mcs >= 0 || bw >= 0) {
+		for (int i = 0; i < c->tunnel_count; i++) {
+			Tunnel *t = &c->tunnels[i];
+			if (strcmp(t->role, "tx") != 0) continue;
+			if (fec_k >= 0) t->fec_k = fec_k;
+			if (fec_n >= 0) t->fec_n = fec_n;
+			if (mcs   >= 0) t->mcs_index = mcs;
+			if (bw    >= 0) t->bandwidth_mhz = bw;
+			LOG_INFO("wfb-link overlay: tx tunnel '%s' fec=%d/%d mcs=%d bw=%d",
+			         t->name, t->fec_k, t->fec_n, t->mcs_index, t->bandwidth_mhz);
+			applied++;
+		}
+	}
+
+	LOG_INFO("wfb-link overlay: %d field group(s) applied from %s", applied, path);
+	free(buf);
 }
 
 /* ---------- argv composition ----------------------------------------- */
@@ -2615,6 +2530,10 @@ int main(int argc, char **argv)
 
 	Config cfg;
 	if (cfg_load(cfg_path, &cfg) < 0) return 1;
+	{
+		const char *wfb_link = getenv("WFB_LINK_CONF");
+		cfg_apply_wfb_link_overlay(&cfg, (wfb_link && *wfb_link) ? wfb_link : "/etc/wfb-link.json");
+	}
 	if (port_override > 0 && port_override < 65536) cfg.http_port = (uint16_t)port_override;
 
 	LOG_INFO("loaded config: %d tunnel(s), http=%s:%u",

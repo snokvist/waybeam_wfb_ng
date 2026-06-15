@@ -357,3 +357,66 @@ binaries, which remain in place) + restoring the `S99wfb` backup.
 
 Remaining (cosmetic, not blocking): strip parity — `vehicle/make mega` strips,
 ground does not (risk #4).
+
+### Shared init fragment — `init/wfb-common.sh` (2026-06-15, autonomous Phase 1)
+Both startup scripts (`vehicle/init/S99wfb`, `ground/init/S46gs_supervisor`) now
+source `/etc/wfb-common.sh` for the common bits: PATH pin, `log()`, mega
+detection (`wfb_detect_mega <air|gs>` → `$WFB_MEGA`), and the air-only
+`wfb_ensure_venc_shm` (sets venc `outgoing.server=shm://local_shm` only when it
+differs, then SIGHUPs — device-verified to apply via a clean venc respawn).
+**Install the fragment to `/etc/wfb-common.sh` on both images** alongside the
+mega binary. Each script falls back to inline definitions if it is absent, so an
+older image without the fragment still boots. The air script also defaults the
+V+2 probe ON unless `WFB_PROBE=0` (was: required `WFB_PROBE=1`).
+
+### Auto-keygen (2026-06-15, autonomous Phase 2)
+New `multicall/wfb_keyseed.{c,h}` + a `keygen-ensure` applet on both sides:
+when the `-K` key file is absent, derive a deterministic pair from a built-in
+passphrase (default `Waybeam`) — **bit-identical to `wfb_keygen Waybeam`**
+(Argon2i salt `wifibroadcastkey` → `crypto_box_seed_keypair`) — and write the
+role-correct 64-byte file (`drone.key` on air, `gs.key` on ground; atomic
+temp+rename, 0600). The role is fixed by the binary side (`WFB_SIDE_ROLE`:
+wfb-air→drone, wfb-gs→gs), so it's correct regardless of filename. This is an
+**INSECURE shared default** (every same-firmware unit shares it) — a loud
+warning is logged; replace with a unique key for production. It NEVER overwrites
+an existing key. `S99wfb` calls `wfb_seed_key drone "$KEY"` before launch (single
+writer); the `rx`/`tx` thunks also seed-if-missing as a backstop.
+
+### Unified config `/etc/wfb-link.json` + `config-env` (2026-06-15, Phase 3, air)
+A single optional preset file drives the link. New `config-env` applet
+(`multicall/wfb_configenv.c`) parses it with the shared header-only tokenizer
+`shared/wfb_json.h` (extracted from gs_supervisor's parser) and prints shell
+`NAME=value` lines; the air `S99wfb` does `eval "$(wfb-air config-env
+/etc/wfb-link.json)"` after its static-constant fallback block. **Every field's
+default is baked into the applet**, so a missing/empty/invalid file yields
+exactly the shipped preset (link unchanged) and the scripts stay thin; standalone
+(non-mega) mode falls back to the script constants. String values are
+single-quoted (eval-injection-safe). Schema + defaults: `init/wfb-link.example.json`.
+Device-verified on `.13`: overrides for txpower/probe/peek/fec/mcs propagate;
+malformed file falls back to defaults with a warning. Ground consumption of the same file is **Phase 3b** (below).
+
+### Ground wfb-link overlay (2026-06-15, Phase 3b)
+`gs_supervisor` applies a **sparse** `/etc/wfb-link.json` overlay onto the loaded
+`gs_supervisor.json` right after `cfg_load` (`cfg_apply_wfb_link_overlay`; in-file
+JSON parser, no sodium → unconditional; path via `WFB_LINK_CONF` env, default
+`/etc/wfb-link.json`). Only present fields override (absent/missing = logged
+no-op): `key.file`→`key_file`; `links.{video,uplink,probe}`→the `link_id` of the
+same-named tunnel; `fec.k/n`+`mcs.boot`+`radio.bw`→every tx tunnel. Channel and
+`system.up` stay in `gs_supervisor.json` (the GS's richer native model). So one
+`/etc/wfb-link.json` can pin the must-match-both-ends identifiers (key + link
+ids) and tx fec/mcs/bw on both air and ground. Host-verified via `/api/v1/tunnels`.
+
+### Key-management WebUI (2026-06-15, Phase 4)
+Both daemons gain a key page + backend (gated on `WFB_WITH_WFBNG`; standalone
+builds stay sodium-free). Shared C in `wfb_keyseed.{c,h}`: `wfb_key_fingerprint`
+(8-hex BLAKE2b of the canonical `drone_pk‖gs_pk`, recovered from either side's
+key file via `crypto_scalarmult_base` — a matched air/ground pair shows the
+**same** fingerprint), plus seed/random/raw key writers and a hex parser.
+- Air `link_controller`: `--key-file` flag (default `/etc/drone.key`, passed by
+  `S99wfb`) + GET `/keys?action=seed|random|upload|restart`. Apply does a
+  detached `S99wfb restart` that **closes all inherited fds before exec** (else
+  the `:8765` listen socket leaks into the respawned applets).
+- Ground `gs_supervisor`: GET `/api/v1/keys?action=seed|random|upload`; apply
+  reuses `/api/v1/system/reinit`.
+- WebUI Key tab on both (`index.html`, `gs.html`), shared dark palette.
+Device + host verified; Waybeam fingerprint `000f5280` matches on both ends.

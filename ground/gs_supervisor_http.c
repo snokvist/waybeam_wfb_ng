@@ -11,6 +11,10 @@
  */
 
 #include "gs_supervisor.h"
+#ifdef WFB_WITH_WFBNG
+#include <unistd.h>
+#include "wfb_keyseed.h"   /* key-management endpoint — mega build only (needs libsodium) */
+#endif
 
 /* ---------- Embedded WebUI ------------------------------------------- *
  *
@@ -1295,6 +1299,58 @@ void api_handle(ApiClient *cli, Config *c, uint64_t startup_us)
 			return;
 		}
 		api_send(cli->fd, 404, "text/plain", "unknown action\n", -1);
+		return;
+	}
+
+	if (!strcmp(path, "/api/v1/keys")) {
+#ifdef WFB_WITH_WFBNG
+		/* GET /api/v1/keys                       -> status (role gs, fingerprint)
+		 * GET /api/v1/keys?action=seed&seed=...  -> deterministic re-key
+		 * GET /api/v1/keys?action=random         -> fresh random pair
+		 * GET /api/v1/keys?action=upload&hex=...  -> verbatim 64-byte (128 hex) key
+		 * Apply a change by calling /api/v1/system/reinit (restarts tunnels). */
+		char action[32] = "";
+		size_t al; const char *as = qs_get(qstr, "action", &al);
+		if (as && al < sizeof(action)) { memcpy(action, as, al); action[al] = 0; }
+		int rc = 0; const char *errmsg = NULL;
+		if (action[0] == 0) {
+			/* status only */
+		} else if (!strcmp(action, "seed")) {
+			char seed[128] = "Waybeam";
+			size_t sl; const char *ss = qs_get(qstr, "seed", &sl);
+			if (ss && sl && sl < sizeof(seed)) { memcpy(seed, ss, sl); seed[sl] = 0; }
+			rc = wfb_write_key_seed(c->key_file, WFB_ROLE_GS, seed);
+			if (rc) errmsg = "write failed";
+		} else if (!strcmp(action, "random")) {
+			rc = wfb_write_key_random(c->key_file, WFB_ROLE_GS);
+			if (rc) errmsg = "write failed";
+		} else if (!strcmp(action, "upload")) {
+			char hex[160] = ""; unsigned char kb[64];
+			size_t hl; const char *hs = qs_get(qstr, "hex", &hl);
+			if (!hs || hl >= sizeof(hex)) { rc = -1; errmsg = "missing/long hex"; }
+			else {
+				memcpy(hex, hs, hl); hex[hl] = 0;
+				if (wfb_hex_to_key(hex, kb) != 0) { rc = -1; errmsg = "bad key (need 128 hex chars)"; }
+				else { rc = wfb_write_key_raw(c->key_file, kb); if (rc) errmsg = "write failed"; }
+			}
+		} else {
+			rc = -1; errmsg = "unknown action";
+		}
+		char fp[16]; wfb_key_fingerprint(c->key_file, WFB_ROLE_GS, fp, sizeof(fp));
+		int exists = (access(c->key_file, F_OK) == 0);
+		char body[640]; char errbuf[80] = "";
+		if (errmsg) snprintf(errbuf, sizeof(errbuf), "\"error\":\"%s\",", errmsg);
+		int n = snprintf(body, sizeof(body),
+			"{\"ok\":%s,%s\"role\":\"gs\",\"path\":\"%s\",\"exists\":%s,"
+			"\"fingerprint\":\"%s\",\"changed\":%s,\"seed_default\":\"Waybeam\","
+			"\"apply_hint\":\"/api/v1/system/reinit\"}",
+			rc == 0 ? "true" : "false", errbuf, c->key_file,
+			exists ? "true" : "false", fp, (rc == 0 && action[0]) ? "true" : "false");
+		api_send(cli->fd, rc == 0 ? 200 : 400, "application/json", body, n);
+#else
+		api_send(cli->fd, 501, "application/json",
+		         "{\"ok\":false,\"error\":\"key management requires the mega binary\"}", -1);
+#endif
 		return;
 	}
 

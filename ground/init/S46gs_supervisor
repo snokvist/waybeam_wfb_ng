@@ -15,18 +15,26 @@
 #
 # Install: cp to /etc/init.d/S46gs_supervisor ; chmod +x ; disable S45.
 
+# Shared helpers (PATH pin, log, mega detection) — see init/wfb-common.sh.
 # gs_supervisor shells out (execvp) to iw/ip with the *inherited* PATH, which
-# is minimal under init — pin a full PATH so monitor bring-up resolves them.
-PATH=/usr/sbin:/usr/bin:/sbin:/bin
-export PATH
+# is minimal under init; the fragment pins a full one. Fall back to inline
+# definitions if the image predates the shared fragment.
+WFB_COMMON=/etc/wfb-common.sh
+if [ -r "$WFB_COMMON" ]; then
+	. "$WFB_COMMON"
+else
+	PATH=/usr/sbin:/usr/bin:/sbin:/bin; export PATH
+	wfb_detect_mega() { command -v "wfb-$1" >/dev/null 2>&1 && WFB_MEGA="wfb-$1" || WFB_MEGA=""; }
+fi
 
 DAEMON="gs_supervisor"
 # Mega binary (single wfb-gs) support: if the multi-call wfb-gs binary is on
 # PATH, run it as the `supervisor` applet (it re-execs itself as wfb_rx for the
 # RX tunnel); otherwise fall back to the standalone gs_supervisor. Mirrors the
 # vehicle's S99wfb. See docs/design/mega-binary.md.
-if command -v wfb-gs >/dev/null 2>&1; then
-	DAEMON_BIN="$(command -v wfb-gs)"
+wfb_detect_mega gs
+if [ -n "$WFB_MEGA" ]; then
+	DAEMON_BIN="$(command -v "$WFB_MEGA")"
 	DAEMON_ARGS="supervisor --config /etc/gs_supervisor.json"
 else
 	DAEMON_BIN="/usr/bin/gs_supervisor"

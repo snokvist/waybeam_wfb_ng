@@ -258,6 +258,7 @@ select{cursor:pointer;-webkit-appearance:none;appearance:none;background-image:u
   <div class="tab" data-tab="link">Link</div>
   <div class="tab" data-tab="encoder">Encoder</div>
   <div class="tab" data-tab="endpoints">Endpoints</div>
+  <div class="tab" data-tab="keys">Key</div>
 </div>
 
 <div class="toast-container" id="toasts"></div>
@@ -539,6 +540,55 @@ select{cursor:pointer;-webkit-appearance:none;appearance:none;background-image:u
         <tr><td>5600</td><td>ground</td><td>decoded video RTP out (wfb_rx)</td></tr>
       </table>
     </div>
+  </div>
+</div>
+
+<div class="tab-content" id="tab-keys">
+  <div class="section">
+    <div class="section-header"><h3>Pair fingerprint — role: ground</h3>
+      <span class="help">Air and ground must show the <b>same</b> fingerprint to link. After a change, hit Apply to restart tunnels.</span></div>
+    <div class="section-body">
+      <div style="display:flex;align-items:center;gap:1rem">
+        <div style="font-family:'JetBrains Mono',monospace;font-size:1.6rem;font-weight:600;color:var(--text-bright)" id="key-fp">…</div>
+        <button class="btn" id="key-refresh" title="refresh">↻</button>
+      </div>
+      <div class="muted mono" id="key-path" style="font-size:.72rem;margin-top:.3rem"></div>
+      <div id="key-msg" style="margin-top:.5rem;font-size:.8rem;min-height:1.1em"></div>
+    </div>
+  </div>
+
+  <div class="section">
+    <div class="section-header"><h3>Regenerate from passphrase</h3>
+      <span class="help">Deterministic — set the same passphrase on both ends. “Waybeam” is an insecure shared default.</span></div>
+    <div class="section-body">
+      <div class="field">
+        <div class="field-label">passphrase</div>
+        <input type="text" id="key-seed" value="Waybeam" spellcheck="false">
+        <button class="btn" id="key-seed-btn">Regenerate</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="section">
+    <div class="section-header"><h3>Generate random pair</h3>
+      <span class="help">Fresh unique key — copy the matching key to the craft (or confirm fingerprints match).</span></div>
+    <div class="section-body"><button class="btn" id="key-random-btn">Generate random</button></div>
+  </div>
+
+  <div class="section">
+    <div class="section-header"><h3>Upload key</h3>
+      <span class="help">Paste a 64-byte key as 128 hex chars (<span class="mono">xxd -p -c256 gs.key</span>).</span></div>
+    <div class="section-body">
+      <textarea id="key-hex" placeholder="128 hex chars" spellcheck="false"
+        style="width:100%;min-height:3em;background:var(--bg2);border:1px solid var(--border);color:var(--text);border-radius:5px;font-family:'JetBrains Mono',monospace;font-size:.72rem;padding:.45rem"></textarea>
+      <div style="margin-top:.5rem"><button class="btn" id="key-upload-btn">Upload</button></div>
+    </div>
+  </div>
+
+  <div class="section">
+    <div class="section-header"><h3>Apply</h3>
+      <span class="help">Restarts the tunnels (via /api/v1/system/reinit) so the new key takes effect.</span></div>
+    <div class="section-body"><button class="btn" id="key-apply-btn">Apply (restart tunnels)</button></div>
   </div>
 </div>
 
@@ -1222,7 +1272,41 @@ $$('.tab').forEach(t=>{
     $$('.tab-content').forEach(x=>x.classList.remove('active'));
     t.classList.add('active');
     document.getElementById('tab-'+t.dataset.tab).classList.add('active');
+    if(t.dataset.tab==='keys') keyRefresh();
   });
+});
+
+// ── Key management ───────────────────────────────────────────────────
+function keyMsg(text, ok){ const e=$('#key-msg'); e.textContent=text||''; e.style.color = ok===undefined?'' : (ok?'var(--live)':'var(--bad)'); }
+function keyShow(j){ $('#key-fp').textContent=j.fingerprint||'?'; $('#key-path').textContent=(j.path||'')+(j.exists?'':' (missing)'); }
+async function keyCall(qs, note){
+  try{
+    const r=await fetchT('/api/v1/keys'+(qs?'?'+qs:''), {timeout_ms:4000});
+    const j=await r.json(); keyShow(j);
+    if(j.error){ keyMsg('error: '+j.error,false); }
+    else if(note){ keyMsg(note+(j.changed?' — hit Apply to restart tunnels':''),true); }
+    return j;
+  }catch(e){ keyMsg('request failed: '+(e.message||e),false); return null; }
+}
+function keyRefresh(){ keyCall('', null); }
+$('#key-refresh').addEventListener('click', ()=>keyCall('',null));
+$('#key-seed-btn').addEventListener('click', ()=>{
+  const s=$('#key-seed').value.trim();
+  if(!s){ keyMsg('passphrase is empty',false); return; }
+  keyCall('action=seed&seed='+encodeURIComponent(s),'regenerated from passphrase');
+});
+$('#key-random-btn').addEventListener('click', ()=>keyCall('action=random','generated a random pair'));
+$('#key-upload-btn').addEventListener('click', ()=>{
+  const h=$('#key-hex').value.replace(/\s+/g,'');
+  if(h.length!==128){ keyMsg('need exactly 128 hex chars (got '+h.length+')',false); return; }
+  keyCall('action=upload&hex='+encodeURIComponent(h),'key uploaded');
+});
+$('#key-apply-btn').addEventListener('click', async ()=>{
+  if(!confirm('Restart tunnels to apply the key?')) return;
+  keyMsg('restarting tunnels…',true);
+  try{ await fetchT('/api/v1/system/reinit',{timeout_ms:8000}); toast('tunnels reinitialised','ok'); }
+  catch(e){ toast('reinit failed: '+(e.message||e),'err'); }
+  setTimeout(keyRefresh, 1500);
 });
 
 function epApplyVehicleIp(){

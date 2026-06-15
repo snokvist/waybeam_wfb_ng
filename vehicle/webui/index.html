@@ -182,6 +182,7 @@ main{padding:1.2rem;overflow:auto;height:calc(100vh - 86px);max-width:1100px;mar
   <button data-tab="live" class="active">Live</button>
   <button data-tab="tune">Tune</button>
   <button data-tab="timeline">Timeline</button>
+  <button data-tab="keys">Key</button>
 </nav>
 <main>
   <section id="tab-live" class="tab active">
@@ -229,6 +230,65 @@ main{padding:1.2rem;overflow:auto;height:calc(100vh - 86px);max-width:1100px;mar
       <div class="events" id="events"><div class="empty">waiting for events…</div></div>
     </div>
   </section>
+
+  <section id="tab-keys" class="tab">
+    <style>
+      #tab-keys .kwrap{max-width:660px}
+      #tab-keys .kcard{background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:1rem 1.2rem;margin-bottom:1rem}
+      #tab-keys h3{margin:0 0 .5rem;font-size:.8rem;font-weight:600;color:var(--text-bright);text-transform:uppercase;letter-spacing:.04em}
+      #tab-keys p{margin:.5rem 0 0;font-size:.74rem;color:var(--mute);line-height:1.45}
+      #tab-keys .fp{font-family:'JetBrains Mono',monospace;font-size:1.6rem;font-weight:600;color:var(--text-bright);letter-spacing:.04em}
+      #tab-keys .lbl{font-size:.68rem;color:var(--mute);text-transform:uppercase;letter-spacing:.06em}
+      #tab-keys .mono{font-family:'JetBrains Mono',monospace}
+      #tab-keys input,#tab-keys textarea{background:var(--bg2);border:1px solid var(--border);color:var(--text);border-radius:5px;padding:.45rem .55rem;font:inherit;font-size:.82rem;width:100%}
+      #tab-keys textarea{font-family:'JetBrains Mono',monospace;font-size:.72rem;resize:vertical;min-height:3.2em}
+      #tab-keys button.kbtn{background:var(--panel2);border:1px solid var(--border-hi);color:var(--text-bright);border-radius:5px;padding:.45rem .9rem;font:inherit;font-size:.8rem;font-weight:500;cursor:pointer;white-space:nowrap}
+      #tab-keys button.kbtn:hover{border-color:var(--accent);color:var(--accent)}
+      #tab-keys button.kbtn.warn:hover{border-color:var(--warn);color:var(--warn)}
+      #tab-keys .row{display:flex;gap:.5rem;align-items:flex-start}
+      #tab-keys #key-msg{margin-top:.6rem;font-size:.78rem;min-height:1.1em}
+      #tab-keys #key-msg.ok{color:var(--ok)} #tab-keys #key-msg.bad{color:var(--bad)}
+    </style>
+    <div class="kwrap">
+      <div class="kcard">
+        <div class="row" style="justify-content:space-between;align-items:center">
+          <div>
+            <div class="lbl">Pair fingerprint — role: drone</div>
+            <div class="fp" id="key-fp">…</div>
+            <div class="mono" id="key-path" style="font-size:.72rem;color:var(--mute)"></div>
+          </div>
+          <button class="kbtn" id="key-refresh" title="refresh">↻</button>
+        </div>
+        <div id="key-msg"></div>
+        <p>Air and ground must show the <b>same</b> fingerprint to link. After any change below, hit <b>Apply</b> to restart the link.</p>
+      </div>
+
+      <div class="kcard">
+        <h3>Regenerate from passphrase</h3>
+        <div class="row"><input id="key-seed" value="Waybeam" spellcheck="false"><button class="kbtn" id="key-seed-btn">Regenerate</button></div>
+        <p>Deterministic: set the <b>same</b> passphrase on both ends. The default “Waybeam” is an <b>insecure shared default</b> — change it for production.</p>
+      </div>
+
+      <div class="kcard">
+        <h3>Generate random pair</h3>
+        <button class="kbtn" id="key-random-btn">Generate random</button>
+        <p>Fresh unique key. The other end won’t match until you copy it over — read the 128-hex value back with <span class="mono">xxd -p -c256 /etc/drone.key</span> and upload it on the ground side (or just confirm fingerprints match).</p>
+      </div>
+
+      <div class="kcard">
+        <h3>Upload key</h3>
+        <textarea id="key-hex" placeholder="128 hex chars (64-byte key)" spellcheck="false"></textarea>
+        <div class="row" style="margin-top:.5rem"><button class="kbtn" id="key-upload-btn">Upload</button></div>
+        <p>Paste a 64-byte key as 128 hex characters (e.g. <span class="mono">xxd -p -c256 drone.key</span>).</p>
+      </div>
+
+      <div class="kcard" style="border-color:var(--warn)">
+        <h3>Apply</h3>
+        <button class="kbtn warn" id="key-apply-btn">Apply (restart link)</button>
+        <p>Restarts the wfb stack so the new key takes effect — brief video interruption. Needed after any key change.</p>
+      </div>
+    </div>
+  </section>
 </main>
 
 <script>
@@ -254,7 +314,49 @@ $$("nav button").forEach(b => b.addEventListener("click", () => {
   b.classList.add("active");
   $("#tab-" + b.dataset.tab).classList.add("active");
   if (b.dataset.tab === "tune" && !state.tuneRendered) renderTune();
+  if (b.dataset.tab === "keys") renderKeys();
 }));
+
+// ── Key management ───────────────────────────────────────────────────
+function keyMsg(text, ok) {
+  const el = $("#key-msg");
+  el.textContent = text || "";
+  el.className = ok === undefined ? "" : (ok ? "ok" : "bad");
+}
+function keyRender(j) {
+  $("#key-fp").textContent = j.fingerprint || "?";
+  $("#key-path").textContent = (j.path || "") + (j.exists ? "" : " (missing)");
+}
+async function keyCall(query, note) {
+  try {
+    const r = await fetch("/keys" + (query ? "?" + query : ""), {cache:"no-store"});
+    const j = await r.json();
+    keyRender(j);
+    if (j.error) keyMsg("error: " + j.error, false);
+    else if (note) keyMsg(note + (j.changed ? " — hit Apply to restart" : ""), true);
+    return j;
+  } catch (e) { keyMsg("request failed: " + e, false); return null; }
+}
+function renderKeys() { keyCall("", null); }
+
+$("#key-refresh").addEventListener("click", () => keyCall("", null));
+$("#key-seed-btn").addEventListener("click", () => {
+  const s = $("#key-seed").value.trim();
+  if (!s) { keyMsg("passphrase is empty", false); return; }
+  keyCall("action=seed&seed=" + encodeURIComponent(s), "regenerated from passphrase");
+});
+$("#key-random-btn").addEventListener("click", () => keyCall("action=random", "generated a random pair"));
+$("#key-upload-btn").addEventListener("click", () => {
+  const h = $("#key-hex").value.replace(/\s+/g, "");
+  if (h.length !== 128) { keyMsg("need exactly 128 hex chars (got " + h.length + ")", false); return; }
+  keyCall("action=upload&hex=" + encodeURIComponent(h), "key uploaded");
+});
+$("#key-apply-btn").addEventListener("click", async () => {
+  if (!confirm("Restart the wfb link to apply the key? Brief video interruption.")) return;
+  keyMsg("restarting link…", true);
+  try { await fetch("/keys?action=restart", {cache:"no-store"}); } catch (e) {}
+  setTimeout(() => keyCall("", null), 9000);
+});
 
 // ── Subsystem detection from dotted key ──────────────────────────────
 function subsysOf(key) {

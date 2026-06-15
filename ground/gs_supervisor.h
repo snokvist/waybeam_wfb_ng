@@ -132,27 +132,11 @@ int      write_all(int fd, const void *buf, size_t len);
 #define LOG_ERR(...)   logf_("err",   __VA_ARGS__)
 #define LOG_DEBUG(...) do { if (g_verbose) logf_("debug", __VA_ARGS__); } while (0)
 
-/* ---------- minimal JSON parser (jsmn-shaped) ----------------------- */
-
-typedef enum { JT_NONE = 0, JT_OBJ, JT_ARR, JT_STR, JT_PRIM } JTokType;
-
-typedef struct {
-	JTokType type;
-	int      start;
-	int      end;
-	int      size;
-	int      parent;
-} JTok;
-
-#define JSON_MAX_TOKS 512
-
-int   json_parse(const char *js, int len, JTok *toks, int max);
-bool  jeq(const char *js, const JTok *t, const char *s);
-int   jskip(const JTok *toks, int n, int i);
-int   jfind(const char *js, const JTok *toks, int n, int obj_idx, const char *key);
-int   jstr(const char *js, const JTok *t, char *out, size_t cap);
-int   jint(const char *js, const JTok *t, long *out);
-int   jbool(const char *js, const JTok *t, bool *out);
+/* ---------- minimal JSON parser (jsmn-shaped) ----------------------- *
+ * Single source of truth in shared/wfb_json.h (header-only, static inline) —
+ * provides JTokType / JTok / JSON_MAX_TOKS + json_parse/jeq/jskip/jfind/jstr/
+ * jint/jbool, the same parser the multicall config-env applet uses. */
+#include "wfb_json.h"
 
 /* ---------- config + tunnel model ----------------------------------- */
 
@@ -379,6 +363,9 @@ int build_argv_tx(const Tunnel *t, const char *key_file, ArgvBuilder *ab);
 const char *tunnel_state_name(TunnelState s);
 int  cfg_parse_tunnel(const char *js, JTok *toks, int n, int t_idx, Tunnel *t);
 int  cfg_load(const char *path, Config *c);
+/* Sparse overlay of /etc/wfb-link.json onto a loaded Config (Phase 3b). Only
+ * fields present in the overlay override; absent/missing-file is a no-op. */
+void cfg_apply_wfb_link_overlay(Config *c, const char *path);
 Tunnel *cfg_find_tunnel(Config *c, const char *name);
 
 int  tunnel_spawn(Tunnel *t, const char *key_file);
