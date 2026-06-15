@@ -28,6 +28,7 @@ let CHARTS = [];
 let LABEL_MODE = false;
 let PENDING = null;
 let ZOOMED = false;
+let POLLING = false;   /* guards against overlapping series fetches on slow links */
 const CLICK_PX = 6;
 
 /* ---- overlay bands ---- */
@@ -183,7 +184,7 @@ function renderLabels() {
   if (!LABELS.length) { el.innerHTML = '<p class="muted">No labels yet. Toggle label mode, then click a point or drag a span on a chart.</p>'; return; }
   const rows = LABELS.map(l => `
     <tr>
-      <td><span class="chip hl-${l.kind}">${l.kind}</span></td>
+      <td><span class="chip hl-${escapeHtml(l.kind || "")}">${escapeHtml(l.kind || "")}</span></td>
       <td>${escapeHtml(l.value || "")}</td>
       <td class="num">${l.t0_s.toFixed(2)}–${l.t1_s.toFixed(2)}s</td>
       <td>${escapeHtml(l.author || "")}</td>
@@ -294,12 +295,15 @@ function applySeries(j) {
 async function pollOnce() {
   if (!LIVE) { setLiveDot("● paused", "live-paused"); return; }
   if (LABEL_MODE || PENDING || ZOOMED) { setLiveDot("● live (held)", "live-on"); return; }
+  if (POLLING) return;   /* a previous poll is still in flight — don't stack */
+  POLLING = true;
   let j;
   try {
     const r = await fetch(`/api/v1/telemetry/series?id=${SID}`);
     if (!r.ok) return;
     j = await r.json();
   } catch (e) { return; }
+  finally { POLLING = false; }
   if (j.n !== LAST_N) { applySeries(j); LAST_N = j.n; setLiveDot("● live", "live-on"); }
   else setLiveDot("● idle", "live-idle");
 }

@@ -35,8 +35,8 @@
 /* Live session list + capture control. All endpoints are GET (the supervisor
    API is GET-only); the logger writes from its own thread over WAL. */
 (function () {
-  const esc = s => (s == null ? "—" : String(s)).replace(/[&<>"]/g,
-    c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+  const esc = s => (s == null ? "—" : String(s)).replace(/[&<>"']/g,
+    c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
   const span = (a, b) => (a != null && b != null) ? ((b - a) / 1000).toFixed(1) + "s" : "—";
 
   async function tick() {
