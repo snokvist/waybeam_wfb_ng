@@ -1,9 +1,10 @@
 # Mega binary — single-file deployment (busybox model)
 
-Status: **implemented; both binaries link, on-hardware run pending**. Phases
-0–3 are in-tree. `wfb-gs` (x86) links + dispatches and `wfb-air` cross-links to
-a device-compatible armv7 binary (2026-06-15); only the on-vehicle run remains.
-See the handoff section at the end.
+Status: **implemented and running on hardware** (2026-06-15). Phases 0–3 are
+in-tree; `wfb-gs` (x86) links + dispatches, and `wfb-air` cross-links to a
+device-compatible armv7 binary that runs as the live wfb stack on the vehicle
+(192.168.1.13) — all four roles (video-tx, uplink-rx, probe-tx, link) from the
+one binary, risk #3 verified. Phase 4 packaging is the only remaining item.
 
 ## Motivation
 
@@ -285,11 +286,15 @@ Branch: `claude/hopeful-fermat-2rtbfd`.
   ./ground/build/wfb-gs supervisor -h
   ```
 
-### Remaining work (on-hardware run)
-Both binaries link; `wfb-air` is a device-compatible armv7 ELF. What's left is
-the actual on-vehicle run — verify `S99wfb` brings up all four roles from the
-one binary and that process management (risk #3) behaves with every applet
-sharing the `wfb-air` comm name.
+### On-hardware run — DONE (2026-06-15, vehicle 192.168.1.13)
+`wfb-air` (armv7) was installed to `/usr/bin`, the mega-aware `S99wfb` deployed,
+and the stack restarted. Result: `pidof wfb-air` → 4 PIDs, all `comm=wfb-air`
+(video-tx `-C 8000 -H local_shm`, uplink-rx `wlan0`, probe-tx `-C 8001`, link).
+`S99wfb status` correctly enumerates the shared-comm-name PIDs; the restart
+produced exactly 4 processes (the double-start guard's stop-first ran), so
+**risk #3 holds**. `link_controller` HTTP (:8765) responds, SD logger active,
+`wlan0` monitor TX live, peek `close` mode confirmed in `wfb.log`. The cross
+link command that produced the deployed binary:
 
 ```bash
 # Cross libs are already prepared under wfb-ng/build by build-armv7.sh; if
@@ -297,11 +302,12 @@ sharing the `wfb-air` comm name.
 make -C vehicle mega \
   MEGA_CFLAGS="-I../wfb-ng/build/sodium-install/include -I../wfb-ng/build/pcap-install/include" \
   MEGA_LDFLAGS="-L../wfb-ng/build/sodium-install/lib -L../wfb-ng/build/pcap-install/lib -lpcap -lsodium -lm"
-
-# Deploy wfb-air to the vehicle PATH; S99wfb auto-routes to it when present.
-# Confirm: ps shows video-tx + uplink-rx + probe-tx + link all named wfb-air,
-# and stop/status/the double-start guard still work.
 ```
+
+Note: the device's `wfbpeek` env was a stale `1` (pre-PR#76); reset to `close`
+so the launcher passes a valid `--peek-profile`. Rollback is `rm
+/usr/bin/wfb-air` (S99wfb auto-falls back to the standalone binaries, which
+remain in place) + restoring the `S99wfb` backup.
 
 ### Review risk checklist (verify in this order)
 1. **(GATE) Link-time symbol collisions across `rx.o`/`tx.o`/tools.** ✅
@@ -325,10 +331,11 @@ make -C vehicle mega \
    fit the table's `(int, char**)` fn type — no upstream patch, no
    function-pointer cast/UB. The C tools (`tx_cmd`/`keygen`) are `extern "C"`, so
    their `char**` vs `char* const*` difference is irrelevant (no mangling).
-3. **`S99wfb` process management under mega.** All applets share comm name
-   `wfb-air`; confirm `stop`/`status`/the double-start guard behave with
-   video-tx + uplink-rx + probe-tx + link all named `wfb-air` (busybox
-   `pidof`/`killall` match comm — expected to work).
+3. **`S99wfb` process management under mega.** ✅ **VERIFIED (2026-06-15,
+   .13).** All four applets share comm name `wfb-air`; `pidof wfb-air` returns
+   all four PIDs and `S99wfb status` enumerates them correctly. The restart
+   produced exactly four processes (not eight), so the double-start guard's
+   stop-first path ran — busybox `pidof`/`killall` match comm as expected.
 4. **Strip parity** — vehicle `make mega` strips, ground does not (cosmetic).
 
 ### Deferred cleanup (after the link is proven)
