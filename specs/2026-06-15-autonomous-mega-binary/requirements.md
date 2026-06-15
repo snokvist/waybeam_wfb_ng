@@ -224,8 +224,26 @@ Scope:
 Verify: ground live link → `wfb.sqlite` accrues `records`; dashboard renders
 live; `python` absent from the runtime path.
 
-### Phase 6 — Autonomy hardening + ship
-Open items to close:
+### Phase 6 — Autonomy hardening + ship — ✅ DONE 2026-06-15
+- **Parser dedup**: `gs_supervisor`'s in-file jsmn parser removed; both sides now
+  share `shared/wfb_json.h` (header-only). Host + mega rebuilt clean; config +
+  overlay parse verified on a scratch instance (link/fec overlay applied).
+- **Strip parity**: ground mega now stripped via `MEGA_STRIP` (cross-strip when
+  `CROSS_CC` set, else host `strip`) — 378 KB → 342 KB.
+- **Air-side respawn — decision: keep S99wfb as-is (no new watchdog).** A crashed
+  `wfb_tx`/`wfb_rx` on the SigmaStar is rare; `S99wfb {restart}` (or the Key-tab
+  apply path) brings the stack back, and adding a watchdog to `link_controller`
+  would duplicate the supervisor role it deliberately doesn't own. Revisit only
+  if field data shows mid-flight applet crashes.
+- **`S99wfb.prev` footgun** (memory `wfb_ng_initd_prev_backup_reexec`): documented
+  — back up init scripts OUTSIDE `/etc/init.d` (BusyBox runs every `S*`).
+- **venc SIGHUP**: resolved in Phase 1 (clean respawn re-reads config; only-if-changed).
+- **Pre-existing upstream warnings** (`tx_cmd.c` unused-result, `radiotap.c`
+  packed-member): left as-is — vendored wfb-ng, not touched by this work.
+- Gate: build-verify all four targets, focused review of the new C, on-hardware
+  (air `.13` across phases; ground dual-adapter live on this host), then merge #79.
+
+Original open items:
 - **Air-side respawn**: ground `gs_supervisor` already supervises tunnels; air
   has no supervisor for `wfb_tx`/`wfb_rx` if one dies. Decide: extend
   `link_controller` to respawn, or a minimal S99 watchdog. (Design in this

@@ -113,11 +113,13 @@ MEGA_WFB_DEFS     = -DWFB_VERSION=\"$(MEGA_WFB_VERSION)\"
 # CROSS_CC=aarch64-…` followed by `make mega` would silently link a host-arch
 # wfb-gs. Drives both wfb-ng/mega.mk and the ground-local rules below.
 ifeq ($(strip $(CROSS_CC)),)
-MEGA_CC  := $(CC)
-MEGA_CXX := $(CXX)
+MEGA_CC    := $(CC)
+MEGA_CXX   := $(CXX)
+MEGA_STRIP ?= strip
 else
-MEGA_CC  := $(CROSS_CC)
-MEGA_CXX := $(CROSS_CXX)
+MEGA_CC    := $(CROSS_CC)
+MEGA_CXX   := $(CROSS_CXX)
+MEGA_STRIP ?= $(CROSS_CC:gcc=strip)
 endif
 # C daemon objects (supervisor) — built as C with the multicall guard.
 MEGA_GS_OBJ = $(MEGA_OBJ)/gs_supervisor.o $(MEGA_OBJ)/gs_supervisor_csa.o \
@@ -142,7 +144,8 @@ $(MEGA_OBJ)/gs_applets.o: gs_applets.cpp $(MULTICALL)/wfb_multicall.h $(MULTICAL
 $(MEGA_OUT): $(MEGA_GS_OBJ) $(MEGA_DISP_OBJ) $(MEGA_WFBNG_OBJ)
 	@echo "[wfb-gs] linking mega binary -> $@"
 	$(MEGA_CXX) $(MEGA_CFLAGS) -o $@ $^ $(MEGA_LDFLAGS) $(LDFLAGS_COMMON)
-	@echo "[wfb-gs] done: applets = supervisor rx tx tx_cmd keygen"
+	$(MEGA_STRIP) $@
+	@echo "[wfb-gs] done (stripped): applets = supervisor rx tx tx_cmd keygen"
 
 clean:
 	rm -f $(OUT_HOST) $(OUT_CROSS) $(WEBUI_HDR)

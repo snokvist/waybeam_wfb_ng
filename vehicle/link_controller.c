@@ -4618,6 +4618,9 @@ static void wfb_detach_restart(void)
 	 * S99wfb-spawned applets, and the freshly started link_controller can't bind
 	 * its own :api_port — leaving a dead, backed-up listener. */
 	for (int fd = 3; fd < 1024; fd++) close(fd);
+	/* api_send already wrote the reply and close()d the socket before we forked,
+	 * so the response is on its way; this short settle just gives the client's
+	 * TCP recv a moment before S99wfb tears the stack down. */
 	sleep(1);
 	execl("/etc/init.d/S99wfb", "S99wfb", "restart", (char *)NULL);
 	_exit(127);
