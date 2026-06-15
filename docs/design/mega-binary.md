@@ -1,0 +1,163 @@
+# Mega binary — single-file deployment (busybox model)
+
+Status: **design / not yet implemented**. This document is the plan; no code
+in the tree implements it yet.
+
+## Motivation
+
+Today each side deploys several executables:
+
+- **Ground**: `gs_supervisor`, `wfb_rx`, `wfb_tx`, `wfb_tx_cmd`, `wfb_keygen`.
+- **Vehicle**: `link_controller`, `wfb_tx` (video), `wfb_tx` (probe), `wfb_rx`
+  (uplink), plus `wfb_keygen` for provisioning.
+
+Shipping and version-matching that set of files is the deployment pain we want
+to remove. The goal is **one file to copy/flash per side**, with the same
+runtime behavior.
+
+## Decision: multi-call binary, not a monolith
+
+There are two readings of "single binary":
+
+1. **Multi-call (busybox) binary** — one executable; the role is selected by
+   `argv[0]` or a leading subcommand. Each role still runs as its **own
+   process**; the supervisor keeps `fork()/exec()` but re-execs
+   `/proc/self/exe <applet> …` instead of a separate binary name.
+2. **True monolith** — everything in one address space, roles as threads,
+   loopback UDP replaced by direct calls.
+
+We choose **(1)**. Rationale:
+
+- **No global-state collisions.** `rx.cpp` and `tx.cpp` both define identical
+  file-static globals (`g_stats_udp_fd`, `g_stats_seq`, `g_stats_udp_dst`,
+  `g_stats_udp_enabled`); the supervisor and CSA/scan code carry their own
+  singletons (`g_csa`, `g_scan`, WCMD seq/counters). Separate processes keep
+  these isolated for free.
+- **Signal / SIGCHLD model is untouched.** The supervisor still reaps real
+  children (`gs_supervisor.c` `supervisor_reap`, `waitpid`).
+- **CSA's blocking `iw` calls** (50–300 ms) stay in their own process and
+  cannot stall the live-video path.
+- **The vendored wfb-ng fork stays a near-verbatim patch** — only `main()`
+  gets renamed under an `#ifdef`, so `shm-input.patch` and the peek patch
+  remain easy to rebase.
+- The only thing the monolith would buy over this is eliminating localhost UDP
+  hops, which are not a measured bottleneck.
+
+### Scope: one binary per side, not one universal binary
+
+The daemons are C (`cc`); the wfb-ng tools are C++ + libsodium (and libpcap for
+`rx`). The two sides also target different architectures (vehicle armv7l vs.
+ground x86_64/aarch64). The `rx`/`tx` **source** is shared, but a linked
+artifact cannot span both architectures. So the deliverable is:
+
+| Binary    | Target              | Applets                                    |
+|-----------|---------------------|--------------------------------------------|
+| `wfb-gs`  | ground x86 / aarch64| `supervisor`, `rx`, `tx`, `tx_cmd`, `keygen` |
+| `wfb-air` | vehicle armv7l      | `link`, `tx`, `rx`, `keygen`               |
+
+## How dispatch works
+
+A shared dispatcher (`multicall/wfb_multicall.c`, compiled into both binaries
+with a per-side applet table) does:
+
+```
+main(argc, argv):
+    name = applet token from argv[1], else basename(argv[0])
+    shift argv past the applet token
+    call <applet>_main(argc, argv)   # runs exactly one applet, then exit
+    no match -> print usage (applet list)
+```
+
+Because each invocation runs exactly one `*_main()` in its own process,
+`getopt`/`optind` and all file-static state start fresh every time — there is
+no need to reset anything between applets.
+
+The supervisor (`gs_supervisor.c` argv build at ~`:834-899`, binary lookup at
+`:836`) and the vehicle `init/S99wfb` are changed to launch
+`/proc/self/exe <applet> …` instead of separate binary names. Detection is by
+build flag (`WFB_MULTICALL`) or by checking the `basename` of
+`/proc/self/exe`.
+
+## The `WFB_MULTICALL` contract
+
+- With `WFB_MULTICALL` **unset** (the default), every source builds exactly as
+  today and produces the existing separate binaries. The mega build is opt-in.
+- With `WFB_MULTICALL` **set**, each applet TU exposes `*_main()` and its real
+  `main` is excluded:
+  - **C daemons**: wrap `main` in `#ifndef WFB_MULTICALL`, provide
+    `gs_supervisor_main()` / `link_controller_main()` otherwise.
+    `link_controller.c` already has the `LC_TEST_NO_MAIN` guard (used by
+    `tests/test_selector_law.c`) — generalize that pattern.
+  - **wfb-ng C++ tools**: a small patch in the `wfb-ng/` chain (applied after
+    `shm-input.patch`) renames `main` → `wfb_rx_main` / `wfb_tx_main` under
+    `#ifdef WFB_MULTICALL`; likewise `tx_cmd.c` / `keygen.c`.
+- Applet entry points called from the C/C++ dispatcher boundary are declared
+  `extern "C"`. The merged binary links with `g++`.
+
+## Implementation phases
+
+### Phase 0 — De-`main` the applets (mechanical, no behavior change)
+
+Guard each tool's `main` and expose `*_main()` as above. Acceptance: with
+`WFB_MULTICALL` unset, all existing build paths (`make`, `make vehicle`,
+`make -C ground cross`, `wfb-ng/build-*.sh`) produce unchanged binaries.
+
+### Phase 1 — Dispatcher
+
+Add `multicall/wfb_multicall.c` + a per-side `applets.h` selecting the linked
+`*_main` symbols. Dispatcher is C++ (so it can link the C++ TUs directly);
+`extern "C"` on the C applet entries.
+
+### Phase 2 — Ground binary (`wfb-gs`)
+
+- New `ground/Makefile` targets (`make mega` / `make mega-cross`) linking the
+  dispatcher + `gs_supervisor*.c` + `rx/tx/tx_cmd/keygen/zfex/wifibroadcast/`
+  `radiotap/venc_ring/peek` objects with `-DWFB_MULTICALL`, libsodium +
+  libpcap, via `g++`.
+- Factor wfb-ng object compilation into a shared make fragment so flags aren't
+  duplicated between `build-*.sh` and the ground Makefile.
+- Change `tunnel_spawn` argv to prepend `/proc/self/exe rx|tx` in multicall
+  mode.
+
+Acceptance: `wfb-gs supervisor -c config.json` brings up tunnels that exec
+`wfb-gs rx` / `wfb-gs tx`; REST API + stats fan-out identical to today;
+`make test` (wire-format conformance) green. Fully validatable on x86 host.
+
+### Phase 3 — Vehicle binary (`wfb-air`)
+
+- New `vehicle/Makefile` target linking dispatcher + `link_controller.c
+  csa/csa.c` + cross `rx/tx/…` objects, `-DWFB_MULTICALL`, `-lm` + libsodium +
+  cross libpcap, via cross `g++`.
+- Update `vehicle/init/S99wfb` to call `wfb-air tx …`, `wfb-air rx …`,
+  `wfb-air link …`.
+- Note: vehicle `tx` uses the stub pcap (inject-only) but `rx` (uplink) needs
+  real cross libpcap (already built in `wfb-ng/build-armv7.sh`). The merged
+  link must use real libpcap.
+
+Acceptance: cross-build succeeds; `S99wfb` launches all four roles from one
+binary; `make test` + `vehicle` host build + `test_selector_law` pass.
+
+### Phase 4 — Packaging & docs
+
+- Top-level `make mega` builds both.
+- Update `CLAUDE.md` (Repository layout + Build & test).
+- Keep separate-binary builds as the default until the mega build is proven on
+  hardware.
+
+## Risks / watch-items
+
+1. **C/C++ link & `extern "C"`** — the one real integration point; resolved by
+   linking with `g++` and `extern "C"` on applet entry points.
+2. **libpcap on the merged binary** — ground previously built `wfb_rx`
+   *natively* against system libpcap while `wfb_tx` used a stub pcap header;
+   the merged link must use one real libpcap. Confirm the cross libpcap covers
+   `rx`'s capture path on each target.
+3. **Patch-chain maintenance** — the rename patch must rebase cleanly on top of
+   `shm-input.patch`; keep it minimal and `#ifdef`-gated.
+4. **`/proc/self/exe` availability** — fine on the Linux targets here;
+   documented as an assumption.
+
+## Suggested sequencing
+
+Phase 0 → 1 → 2 (ground first, x86 host — fastest to validate) → 3 (vehicle,
+needs cross toolchain + hardware) → 4.
