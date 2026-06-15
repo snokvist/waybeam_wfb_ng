@@ -381,3 +381,17 @@ wfb-air→drone, wfb-gs→gs), so it's correct regardless of filename. This is a
 warning is logged; replace with a unique key for production. It NEVER overwrites
 an existing key. `S99wfb` calls `wfb_seed_key drone "$KEY"` before launch (single
 writer); the `rx`/`tx` thunks also seed-if-missing as a backstop.
+
+### Unified config `/etc/wfb-link.json` + `config-env` (2026-06-15, Phase 3, air)
+A single optional preset file drives the link. New `config-env` applet
+(`multicall/wfb_configenv.c`) parses it with the shared header-only tokenizer
+`shared/wfb_json.h` (extracted from gs_supervisor's parser) and prints shell
+`NAME=value` lines; the air `S99wfb` does `eval "$(wfb-air config-env
+/etc/wfb-link.json)"` after its static-constant fallback block. **Every field's
+default is baked into the applet**, so a missing/empty/invalid file yields
+exactly the shipped preset (link unchanged) and the scripts stay thin; standalone
+(non-mega) mode falls back to the script constants. String values are
+single-quoted (eval-injection-safe). Schema + defaults: `init/wfb-link.example.json`.
+Device-verified on `.13`: overrides for txpower/probe/peek/fec/mcs propagate;
+malformed file falls back to defaults with a warning. Ground consumption of the
+same file (supervisor-side override) is a follow-up (Phase 3b).

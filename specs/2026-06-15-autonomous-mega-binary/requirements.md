@@ -141,17 +141,35 @@ Verify: `rm /etc/drone.key` on air + `/etc/gs.key` on ground → both auto-creat
 fingerprints match `wfb_keygen Waybeam` reference; encrypted link establishes
 0-loss. Then place a random pair → fallback does not touch it.
 
-### Phase 3 — `/etc/wfb-link.json` + `config-env` applet
-Scope:
-- Promote the hand-rolled JSON tokenizer to a shared `shared/wfb_json.{c,h}`.
-- Add `config-env` applet (both sides): parse file, apply §3 preset defaults,
-  emit `KEY=val`. Malformed/missing ⇒ preset + stderr warning, exit 0.
-- Rewire both startup scripts to `eval "$(wfb-* config-env …)"`.
-- Ground: override `gs_supervisor.json` link-layer fields from the same file.
+### Phase 3 — `/etc/wfb-link.json` + `config-env` applet — ✅ AIR VERIFIED 2026-06-15 (.13); ground = Phase 3b (deferred)
+Done + device-verified on `.13`:
+- `shared/wfb_json.h` — the gs_supervisor jsmn-style tokenizer extracted
+  **header-only** (`static inline`), so config-env and any consumer share one
+  parser with no link conflicts. (gs_supervisor keeps its identical in-file copy
+  for now; folding it onto the header is a trivial Phase 6 cleanup — the code is
+  byte-identical.)
+- `config-env` applet on both sides (`multicall/wfb_configenv.{c,h}`): parses
+  the file, applies §3 preset defaults (baked in C), emits shell `NAME=value`
+  (string values single-quoted → `eval`-injection-safe, verified). Missing /
+  empty `{}` / oversized / malformed ⇒ defaults + stderr warning, exit 0.
+- Air `S99wfb` rewired to `eval "$(wfb-air config-env /etc/wfb-link.json)"`
+  after the static-constant fallback block; `WFB_KEY_SEED`/`WFB_VENC_AUTOWIRE`
+  threaded into the key-seed + venc-shm steps. `init/wfb-link.example.json`
+  documents the schema.
 
-Verify: empty `{}` ⇒ byte-identical link to today; edit channel + txpower + fec
-in the file → both ends apply after restart; corrupt JSON → preset fallback,
-link still comes up.
+Verified: no file & empty `{}` ⇒ identical link (ch161/20dBm/probe-on/peek-close,
+host-confirmed byte-identical sans source comment); override file (txpower 1500,
+probe off, peek off) → all applied (15 dBm, probe-tx gone, `link_controller
+mcs.enabled=false`); remove ⇒ preset restored; malformed `{ broken ]` ⇒ defaults
++ warning, link still up; injection probe (`'`-laden seed) neutralized.
+
+**Phase 3b (deferred — needs a ground bench):** have `gs_supervisor` apply
+`/etc/wfb-link.json` link-layer overrides (channel/key/link-ids/fec/mcs) onto
+its loaded `gs_supervisor.json` tunnels. Different mechanism (C-side; channel
+lives in `system.up` shell strings, not a field) — the `config-env` applet is
+already built into `wfb-gs`, just not yet consumed by the supervisor.
+
+Original scope:
 
 ### Phase 4 — Unified key-management WebUI
 Scope:

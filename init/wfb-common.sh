@@ -38,12 +38,17 @@ wfb_detect_mega() {
 # `wfb_keygen Waybeam`). This is an INSECURE shared default — replace it for
 # production. No-op when the key already exists (never overwrites). In standalone
 # (non-mega) mode the key must be provisioned out of band, as before.
+# wfb_seed_key <drone|gs> <keyfile> [seed]
 wfb_seed_key() {
-    _role="$1"; _kf="$2"
+    _role="$1"; _kf="$2"; _seed="$3"
     [ -f "$_kf" ] && return 0
     if [ -n "$WFB_MEGA" ]; then
         log "key: $_kf missing — seeding shared bring-up key (role=$_role, INSECURE default)"
-        "$WFB_MEGA" keygen-ensure --role "$_role" "$_kf"
+        if [ -n "$_seed" ]; then
+            "$WFB_MEGA" keygen-ensure --role "$_role" --seed "$_seed" "$_kf"
+        else
+            "$WFB_MEGA" keygen-ensure --role "$_role" "$_kf"
+        fi
     else
         log "key: $_kf missing and no mega binary — provide $_kf (wfb tools will abort otherwise)"
     fi

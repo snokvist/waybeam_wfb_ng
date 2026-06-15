@@ -17,6 +17,7 @@
 #ifdef WFB_WITH_WFBNG
 #include <string.h>
 #include "wfb_keyseed.h"
+#include "wfb_configenv.h"
 
 #ifndef WFB_SIDE_ROLE
 #define WFB_SIDE_ROLE WFB_ROLE_DRONE   /* safe default; both sides override */
@@ -48,6 +49,9 @@ static inline int tx_applet(int argc, char **argv) { wfb_seed_key_if_missing(arg
 
 /* keygen-ensure applet — defaults the role to this binary's side. */
 static inline int keygen_ensure_applet(int argc, char **argv) { return wfb_keygen_ensure_main(argc, argv, WFB_SIDE_ROLE); }
+
+/* config-env applet — side-aware (key-file default) wfb-link.json renderer. */
+static inline int config_env_applet(int argc, char **argv) { return wfb_configenv_main(argc, argv, WFB_SIDE_ROLE); }
 
 /* wfb-ng C tools — C linkage (no mangling, char** matches). */
 extern "C" int wfb_tx_cmd_main(int, char **);

@@ -15,7 +15,7 @@ else
     log() { echo "[wfb] $*" | tee -a "$WFB_LOG_FILE"; }
     wfb_detect_mega() { command -v "wfb-$1" >/dev/null 2>&1 && WFB_MEGA="wfb-$1" || WFB_MEGA=""; }
     wfb_ensure_venc_shm() { :; }   # no shared fragment: assume encoder pre-wired
-    wfb_seed_key() { [ -f "$2" ] || { [ -n "$WFB_MEGA" ] && "$WFB_MEGA" keygen-ensure --role "$1" "$2"; }; }
+    wfb_seed_key() { [ -f "$2" ] || { [ -n "$WFB_MEGA" ] && "$WFB_MEGA" keygen-ensure --role "$1" ${3:+--seed "$3"} "$2"; }; }
 fi
 
 # ── Operator settings ────────────────────────────────────────────────
@@ -112,6 +112,18 @@ else
     WFB_PROCS="link_controller wfb_rx wfb_tx"
 fi
 
+# Optional unified link preset: /etc/wfb-link.json overrides the static
+# constants above via the mega binary's config-env applet (every field's
+# default is baked into the applet, so a missing/empty/invalid file yields
+# exactly the preset above — the link comes up unchanged). The constants above
+# remain authoritative in standalone (non-mega) mode. Emits WFB_CHANNEL, KEY,
+# WFB_K/N, WFB_MCS, WFB_PROBE, WFB_PEEK_PROFILE, SHM_RING, WFB_KEY_SEED,
+# WFB_VENC_AUTOWIRE, ... — see multicall/wfb_configenv.c.
+WFB_LINK_CONF="${WFB_LINK_CONF:-/etc/wfb-link.json}"
+if [ -n "$WFB_MEGA" ]; then
+    eval "$("$WFB_MEGA" config-env "$WFB_LINK_CONF" 2>>"$LOG")"
+fi
+
 fw_get() { fw_printenv -n "$1" 2>/dev/null || echo "$2"; }
 is_enabled() { [ "$(fw_get wfbmode 0)" = "1" ]; }
 probe_enabled() { [ "$WFB_PROBE" != "0" ]; }   # default ON; only WFB_PROBE=0 disables
@@ -145,7 +157,7 @@ start_wfb() {
     # First-boot key: seed a shared bring-up drone.key from the built-in
     # "Waybeam" passphrase if none exists, so an unconfigured pair still links
     # (INSECURE shared default — replace for production). No-op if $KEY exists.
-    wfb_seed_key drone "$KEY"
+    wfb_seed_key drone "$KEY" "$WFB_KEY_SEED"
 
     # Tear down AP (kills hostapd + adapter monitor + flushes wlan0)
     /usr/bin/adapter stop >> "$LOG" 2>&1
@@ -160,8 +172,9 @@ start_wfb() {
     # Make the encoder publish into the SHM ring our video wfb_tx reads from.
     # Only rewires + SIGHUPs the encoder if it isn't already on shm://$SHM_RING
     # (so a correctly-configured, fragile SoC encoder is never reinited for
-    # nothing). See wfb_ensure_venc_shm in wfb-common.sh.
-    wfb_ensure_venc_shm "$SHM_RING"
+    # nothing). See wfb_ensure_venc_shm in wfb-common.sh. Gated by
+    # venc.auto_wire (WFB_VENC_AUTOWIRE; default on) from /etc/wfb-link.json.
+    [ "${WFB_VENC_AUTOWIRE:-1}" != "0" ] && wfb_ensure_venc_shm "$SHM_RING"
 
     # Peek = per-frame FEC close. --peek-profile selects the startup state; the
     # WCMD/WebUI peek toggle arms/disarms it live.

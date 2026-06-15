@@ -19,6 +19,7 @@ const struct wfb_applet wfb_applets[] = {
 	{ "tx_cmd", "wfb_tx_cmd", wfb_tx_cmd_main, "wfb_tx runtime control client" },
 	{ "keygen", "wfb_keygen", wfb_keygen_main, "generate wfb-ng keypair" },
 	{ "keygen-ensure", 0, keygen_ensure_applet, "seed drone.key from passphrase if absent" },
+	{ "config-env",    0, config_env_applet,   "render /etc/wfb-link.json as shell env" },
 #endif
 	{ 0, 0, 0, 0 },
 };
