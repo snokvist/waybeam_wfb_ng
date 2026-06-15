@@ -233,3 +233,73 @@ libpcap once and the stub header is unnecessary.
 
 Phase 0 → 1 → 2 (ground first, x86 host — fastest to validate) → 3 (vehicle,
 needs cross toolchain + hardware) → 4.
+
+## Handoff — current state & how to finish (read this first)
+
+Branch: `claude/hopeful-fermat-2rtbfd`.
+
+### Done (in-tree, compile-verified)
+- **Phase 0** — `main()` guarded behind `WFB_MULTICALL` in
+  `vehicle/link_controller.c` (`link_controller_main`) and
+  `ground/gs_supervisor.c` (`gs_supervisor_main`). Default builds unchanged
+  (verified with `nm`); `test_selector_law` passes.
+- **Phase 1** — `multicall/wfb_multicall.{h,cpp}` dispatcher +
+  `ground/gs_applets.cpp` / `vehicle/air_applets.cpp` tables. Daemon-only
+  `wfb-gs`/`wfb-air` link and route (usage / subcommand / symlink-basename).
+- **Phase 2/3** — `make mega` in `ground/Makefile` and `vehicle/Makefile`;
+  `ground/gs_supervisor.c` `tunnel_spawn` self-execs `/proc/self/exe` under
+  `WFB_MULTICALL`; `vehicle/init/S99wfb` routes through `wfb-air` when present.
+  `make -n` confirms the rename flags and link lines.
+
+### NOT yet validated (needs a box with deps — the remaining work)
+The dev container had no `libsodium`/`libpcap` dev libs, no `xxd`/`pytest`, and
+no sibling `waybeam_venc` (source of `venc_ring.{c,h}`), so the **full C++ link
+was never exercised**. To finish:
+
+```bash
+# 1. Prepare the patched wfb-ng tree + deps (fetches upstream, builds libs).
+./wfb-ng/build-aarch64.sh        # ground; or build-armv7.sh for vehicle
+
+# 2. Build the mega binary (point WFBNG_SRC at the patched src/).
+make -C ground  mega WFBNG_SRC=../wfb-ng/build/wfb-ng/src \
+     CC=<gcc> CXX=<g++> MEGA_CFLAGS="--sysroot=… -I<sodium>/include" \
+     MEGA_LDFLAGS="--sysroot=… -lpcap -lsodium -lrt -lpthread"
+make -C vehicle mega WFBNG_SRC=../wfb-ng/build/wfb-ng/src \
+     MEGA_CFLAGS="-I<sodium>/include" \
+     MEGA_LDFLAGS="-L<sodium>/lib -lpcap -lsodium -lrt -lpthread -lm"
+
+# 3. Smoke-test dispatch, then deploy + run S99wfb (vehicle) / supervisor (gs).
+./ground/build/wfb-gs            # → usage listing applets
+./ground/build/wfb-gs supervisor -h
+```
+
+### Review risk checklist (verify in this order)
+1. **(GATE) Link-time symbol collisions across `rx.o`/`tx.o`/tools.** Merging
+   two `main()`-bearing C++ programs into one binary fails to link if any
+   **non-`static`** global or free function shares a name between `rx.cpp` and
+   `tx.cpp` (the shm/peek patches add `g_stats_udp_fd`, `g_stats_seq`,
+   `g_stats_udp_dst`, `g_stats_udp_enabled` to *both* — confirm they are
+   `static`). If `make mega` reports "multiple definition", fix by marking the
+   offending symbols `static` / anonymous-namespace **in the patch chain**
+   (`wfb-ng/shm-input.patch` / `peek.patch`), not in the Makefile, then bump the
+   vendored patch. This is the one thing most likely to bite.
+2. **`-Dmain=` mangling contract.** The dispatcher declares `wfb_rx_main` /
+   `wfb_tx_main` as plain C++; the `-Dmain=`-renamed `main` in `rx.cpp`/`tx.cpp`
+   must mangle to match (it will for `int(int,char**)`). An undefined-reference
+   to `wfb_rx_main`/`wfb_tx_main` at link means the signature/mangling drifted.
+3. **`S99wfb` process management under mega.** All applets share comm name
+   `wfb-air`; confirm `stop`/`status`/the double-start guard behave with
+   video-tx + uplink-rx + probe-tx + link all named `wfb-air` (busybox
+   `pidof`/`killall` match comm — expected to work).
+4. **Strip parity** — vehicle `make mega` strips, ground does not (cosmetic).
+
+### Deferred cleanup (after the link is proven)
+- The two `mega` Makefile blocks are ~40 near-identical lines; hoist the wfb-ng
+  object rules into a shared `wfb-ng/mega.mk` included by both.
+- **Phase 4 packaging** (not started): top-level `make mega` building both
+  sides; update `CLAUDE.md` (Repository layout + Build & test) to mention
+  `multicall/` and the mega binaries. Keep separate-binary builds the default
+  until mega is proven on hardware.
+- Deployment must install the `wfb-air`/`wfb-gs` binary; `S99wfb` already
+  auto-routes when `wfb-air` is on PATH (no symlinks required, but busybox-style
+  symlinks `wfb_rx`→`wfb-air` etc. also work via basename dispatch).
