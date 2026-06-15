@@ -122,6 +122,25 @@ Add `multicall/wfb_multicall.c` + a per-side `applets.h` selecting the linked
 `*_main` symbols. Dispatcher is C++ (so it can link the C++ TUs directly);
 `extern "C"` on the C applet entries.
 
+**Status: done.**
+- `multicall/wfb_multicall.h` — `struct wfb_applet { name, alias, fn, help }`
+  and the per-side `extern const struct wfb_applet wfb_applets[]` (NULL-term).
+- `multicall/wfb_multicall.cpp` — generic `main()`; dispatches by
+  `basename(argv[0])` (busybox-style symlink/exec name), then by leading
+  subcommand, else prints the applet list (rc=2). Compiled as C++.
+- `ground/gs_applets.cpp`, `vehicle/air_applets.cpp` — per-side tables. The
+  C daemon entries (`gs_supervisor_main`, `link_controller_main`) are declared
+  `extern "C"`; the wfb-ng C++ entries (`wfb_rx_main`, `wfb_tx_main`) as plain
+  C++ (mangled name matches the `-Dmain=` rename); the wfb-ng C tools
+  (`wfb_tx_cmd_main`, `wfb_keygen_main`) `extern "C"`. The wfb-ng entries are
+  gated behind `WFB_WITH_WFBNG`, which Phase 2/3 defines once those objects are
+  linked in — so Phase 1 builds and routes with just the in-tree daemons.
+
+Verified: daemon-only `wfb-gs` / `wfb-air` link with `g++`; routing confirmed
+for no-args/unknown (usage, rc=2), subcommand (`supervisor -h` rc=0,
+`link --api-port 70000` rc=1), and `basename`-based symlink dispatch
+(`gs_supervisor`, `link_controller`).
+
 ### Phase 2 — Ground binary (`wfb-gs`)
 
 - New `ground/Makefile` targets (`make mega` / `make mega-cross`) linking the
