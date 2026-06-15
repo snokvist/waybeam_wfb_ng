@@ -246,6 +246,7 @@ start_wfb() {
         --uplink-stats $WFB_UPLINK_RX_PORT \
         --failsafe $WFB_FAILSAFE_S \
         --wfb-iface wlan0 \
+        --key-file "$KEY" \
         $PROBE_ARGS $LOG_ARGS \
         >> "$LOG" 2>&1 &
     echo $! > "$PID_LC"

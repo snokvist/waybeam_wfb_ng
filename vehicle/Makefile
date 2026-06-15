@@ -117,8 +117,9 @@ include ../wfb-ng/mega.mk
 mega: $(MEGA_OUT)
 
 # --- link_controller + csa (C, multicall) ---
-$(MEGA_OBJ)/link_controller.o: link_controller.c $(CSA_HDR) $(WEBUI_HDR) | $(MEGA_OBJ)
-	$(CROSS_CC) $(CFLAGS_COMMON) $(MEGA_DEFS) $(MEGA_CFLAGS) $(SHARED_INC) -I. -Icsa -Iwebui -c -o $@ $<
+# -I$(MULTICALL) lets the WFB_WITH_WFBNG key-management endpoint reach wfb_keyseed.h.
+$(MEGA_OBJ)/link_controller.o: link_controller.c $(CSA_HDR) $(WEBUI_HDR) $(MULTICALL)/wfb_keyseed.h | $(MEGA_OBJ)
+	$(CROSS_CC) $(CFLAGS_COMMON) $(MEGA_DEFS) $(MEGA_CFLAGS) $(SHARED_INC) -I$(MULTICALL) -I. -Icsa -Iwebui -c -o $@ $<
 $(MEGA_OBJ)/csa.o: csa/csa.c $(CSA_HDR) | $(MEGA_OBJ)
 	$(CROSS_CC) $(CFLAGS_COMMON) $(MEGA_DEFS) $(MEGA_CFLAGS) $(SHARED_INC) -I. -Icsa -c -o $@ $<
 

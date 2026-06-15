@@ -395,3 +395,18 @@ single-quoted (eval-injection-safe). Schema + defaults: `init/wfb-link.example.j
 Device-verified on `.13`: overrides for txpower/probe/peek/fec/mcs propagate;
 malformed file falls back to defaults with a warning. Ground consumption of the
 same file (supervisor-side override) is a follow-up (Phase 3b).
+
+### Key-management WebUI (2026-06-15, Phase 4)
+Both daemons gain a key page + backend (gated on `WFB_WITH_WFBNG`; standalone
+builds stay sodium-free). Shared C in `wfb_keyseed.{c,h}`: `wfb_key_fingerprint`
+(8-hex BLAKE2b of the canonical `drone_pk‖gs_pk`, recovered from either side's
+key file via `crypto_scalarmult_base` — a matched air/ground pair shows the
+**same** fingerprint), plus seed/random/raw key writers and a hex parser.
+- Air `link_controller`: `--key-file` flag (default `/etc/drone.key`, passed by
+  `S99wfb`) + GET `/keys?action=seed|random|upload|restart`. Apply does a
+  detached `S99wfb restart` that **closes all inherited fds before exec** (else
+  the `:8765` listen socket leaks into the respawned applets).
+- Ground `gs_supervisor`: GET `/api/v1/keys?action=seed|random|upload`; apply
+  reuses `/api/v1/system/reinit`.
+- WebUI Key tab on both (`index.html`, `gs.html`), shared dark palette.
+Device + host verified; Waybeam fingerprint `000f5280` matches on both ends.

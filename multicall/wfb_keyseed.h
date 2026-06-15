@@ -19,6 +19,8 @@
 #ifndef WFB_KEYSEED_H
 #define WFB_KEYSEED_H
 
+#include <stddef.h>   /* size_t */
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -42,6 +44,24 @@ int wfb_ensure_key(const char *path, int role, const char *seed);
  * Returns 0 on success (incl. existing file without --force), non-zero on error.
  */
 int wfb_keygen_ensure_main(int argc, char **argv, int default_role);
+
+/* --- key management (used by the WebUI HTTP handlers) -------------------- */
+
+/* 8-hex pair fingerprint: BLAKE2b of the canonical drone_pk‖gs_pk, recovered
+ * from this side's key file. Identical on a matched air/ground pair, so it
+ * confirms both ends share a key without revealing it. `out` needs >=9 bytes.
+ * Writes "none" if the file is absent (returns 0); -1 on read/derive error. */
+int wfb_key_fingerprint(const char *path, int role, char *out, size_t cap);
+
+/* (Re)write the key file — these OVERWRITE (unlike wfb_ensure_key). role is
+ * WFB_ROLE_DRONE/WFB_ROLE_GS. Return 0 on success, -1 on error. */
+int wfb_write_key_seed(const char *path, int role, const char *seed); /* deterministic from passphrase */
+int wfb_write_key_random(const char *path, int role);                 /* fresh random pair */
+int wfb_write_key_raw(const char *path, const unsigned char buf[64]); /* verbatim 64 bytes (upload) */
+
+/* Parse exactly 128 hex nibbles (optional surrounding whitespace) -> 64 bytes.
+ * Returns 0 on success, -1 on malformed input. */
+int wfb_hex_to_key(const char *hex, unsigned char out[64]);
 
 #ifdef __cplusplus
 }

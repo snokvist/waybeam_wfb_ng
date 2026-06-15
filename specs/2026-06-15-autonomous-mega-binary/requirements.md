@@ -171,7 +171,29 @@ already built into `wfb-gs`, just not yet consumed by the supervisor.
 
 Original scope:
 
-### Phase 4 — Unified key-management WebUI
+### Phase 4 — Unified key-management WebUI — ✅ VERIFIED 2026-06-15 (.13 + host)
+Shared backend in `wfb_keyseed.{c,h}`: `wfb_key_fingerprint` (8-hex BLAKE2b of
+the canonical `drone_pk‖gs_pk`, recovered via `crypto_scalarmult_base` — same on
+a matched pair), `wfb_write_key_seed/random/raw`, `wfb_hex_to_key`. Both
+endpoints gated on `WFB_WITH_WFBNG` (standalone daemons stay sodium-free).
+
+- **Air**: `link_controller` gains `--key-file` (default `/etc/drone.key`,
+  passed by `S99wfb`) and a GET `/keys` endpoint (status / seed / random /
+  upload / restart). Apply = detached `S99wfb restart` (fork+setsid, **closes
+  all inherited fds** so the `:8765` listen socket doesn't leak through exec —
+  bug found & fixed on device). Key tab added to `vehicle/webui/index.html`.
+- **Ground**: `gs_supervisor` gains GET `/api/v1/keys` (status / seed / random /
+  upload); apply reuses the existing `/api/v1/system/reinit`. Key tab added to
+  `ground/webui/gs.html` (shared dark palette — already identical).
+
+Verified: air `.13` status/seed/random/upload/restart all work (seed
+deterministic, upload restored the real custom key exactly, restart clean with
+no socket leak, link healthy); ground host endpoint status/seed/random/upload +
+malformed rejected; endpoint `gs.key` == `keygen Waybeam` reference. **Pair
+fingerprint cross-check: Waybeam shows `000f5280` on BOTH air (drone) and ground
+(gs)** — confirms the same-fingerprint-means-paired UX. Both WebUI pages serve
+the Key tab (52 KB air / 67 KB ground, all controls present).
+
 Scope:
 - Key page on both WebUIs (seed regenerate / random / upload; fingerprint
   display). Backend: `GET` key status (fingerprint only, never secret),

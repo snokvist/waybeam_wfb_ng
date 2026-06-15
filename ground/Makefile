@@ -131,8 +131,9 @@ include ../wfb-ng/mega.mk
 mega: $(MEGA_OUT)
 
 # --- supervisor (C, multicall) ---
+# -I$(MULTICALL) lets the WFB_WITH_WFBNG key-management endpoint reach wfb_keyseed.h.
 $(MEGA_OBJ)/%.o: %.c $(HDRS) $(WEBUI_HDR) | $(MEGA_OBJ)
-	$(MEGA_CC) $(CFLAGS_COMMON) $(MEGA_DEFS) $(MEGA_CFLAGS) $(SHARED_INC) -I. -Iwebui -c -o $@ $<
+	$(MEGA_CC) $(CFLAGS_COMMON) $(MEGA_DEFS) $(MEGA_CFLAGS) $(SHARED_INC) -I$(MULTICALL) -I. -Iwebui -c -o $@ $<
 
 # --- ground applet table (C++) ---
 $(MEGA_OBJ)/gs_applets.o: gs_applets.cpp $(MULTICALL)/wfb_multicall.h $(MULTICALL)/wfb_applets_common.h $(MULTICALL)/wfb_keyseed.h $(MULTICALL)/wfb_configenv.h | $(MEGA_OBJ)

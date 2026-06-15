@@ -157,6 +157,12 @@ _Static_assert(sizeof(SidecarTransportInfo) == 16,
 /* Opcodes / fixed lengths / sentinels live in shared/wfb_control.h.
  * Local short aliases are kept so the existing call sites read clean. */
 #include "wfb_control.h"
+#ifdef WFB_WITH_WFBNG
+/* Key-management WebUI backend (mega build only — needs libsodium, linked by
+ * the mega; the standalone link_controller links neither sodium nor this). */
+#include <ctype.h>
+#include "wfb_keyseed.h"
+#endif
 #define CMD_SET_FEC            WFB_CMD_SET_FEC
 #define CMD_SET_RADIO          WFB_CMD_SET_RADIO
 #define CMD_GET_FEC            WFB_CMD_GET_FEC
@@ -503,6 +509,9 @@ typedef struct {
 	                                  * the kernel from rejecting jumbo payloads. */
 	bool     dry_run;
 	int      verbose;
+	char     key_file[256];          /* wfb drone.key path — for the key-management
+	                                  * WebUI only (S99wfb owns the -K passed to
+	                                  * wfb_tx/wfb_rx). Default /etc/drone.key. */
 } Config;
 
 #define OSC_RING 16
@@ -4562,6 +4571,59 @@ static bool qparam_long(const char *qs, const char *name, long *out)
 	return false;
 }
 
+#ifdef WFB_WITH_WFBNG
+/* Extract a query-string param value into `out` (URL-decoded: %XX + '+').
+ * Returns true if `name` was present. Used by the /keys endpoint. */
+static bool qparam_str(const char *qs, const char *name, char *out, size_t cap)
+{
+	if (cap) out[0] = '\0';
+	if (!qs || !cap) return false;
+	size_t nl = strlen(name);
+	for (const char *p = qs; (p = strstr(p, name)) != NULL; p += nl) {
+		bool at_bound = (p == qs) || (p[-1] == '&');
+		if (at_bound && p[nl] == '=') {
+			const char *v = p + nl + 1;
+			size_t o = 0;
+			while (*v && *v != '&' && o + 1 < cap) {
+				if (*v == '%' && isxdigit((unsigned char)v[1]) && isxdigit((unsigned char)v[2])) {
+					char h[3] = { v[1], v[2], 0 };
+					out[o++] = (char)strtol(h, NULL, 16);
+					v += 3;
+				} else if (*v == '+') {
+					out[o++] = ' '; v++;
+				} else {
+					out[o++] = *v++;
+				}
+			}
+			out[o] = '\0';
+			return true;
+		}
+	}
+	return false;
+}
+
+/* Detached `/etc/init.d/S99wfb restart` so a key change takes effect (wfb_tx/
+ * wfb_rx re-read -K). We must outlive our own death: S99wfb's stop will SIGTERM
+ * this link_controller, so fork + setsid into a new session, drop the HTTP
+ * socket/std fds, briefly wait for the response to flush, then exec. */
+static void wfb_detach_restart(void)
+{
+	pid_t pid = fork();
+	if (pid != 0) return;   /* parent (or fork failure) returns to send the reply */
+	setsid();
+	int nf = open("/dev/null", O_RDWR);
+	if (nf >= 0) { dup2(nf, 0); dup2(nf, 1); dup2(nf, 2); if (nf > 2) close(nf); }
+	/* Close every inherited fd above stdio BEFORE exec. Otherwise our listening
+	 * sockets (HTTP :api_port, stats, wfb control) leak through exec into the
+	 * S99wfb-spawned applets, and the freshly started link_controller can't bind
+	 * its own :api_port — leaving a dead, backed-up listener. */
+	for (int fd = 3; fd < 1024; fd++) close(fd);
+	sleep(1);
+	execl("/etc/init.d/S99wfb", "S99wfb", "restart", (char *)NULL);
+	_exit(127);
+}
+#endif /* WFB_WITH_WFBNG */
+
 static void api_handle_request(ApiClient *c, Config *cfg, ApiSnapshot *snap)
 {
 	c->buf[c->pos < API_BUF_BYTES ? c->pos : API_BUF_BYTES - 1] = '\0';
@@ -4764,6 +4826,63 @@ static void api_handle_request(ApiClient *c, Config *cfg, ApiSnapshot *snap)
 		LOGV_COMMON(cfg, "api: sse subscriber attached (fd=%d)", c->fd);
 		return;
 	}
+	else if (strcmp(path, "/keys") == 0) {
+#ifdef WFB_WITH_WFBNG
+		/* GET /keys                       -> status (role, path, exists, fingerprint)
+		 * GET /keys?action=seed&seed=...  -> deterministic re-key from passphrase
+		 * GET /keys?action=random         -> fresh random pair
+		 * GET /keys?action=upload&hex=... -> write a verbatim 64-byte (128 hex) key
+		 * GET /keys?action=restart        -> detached S99wfb restart (apply key) */
+		char action[32];
+		qparam_str(qs, "action", action, sizeof(action));
+		if (strcmp(action, "restart") == 0) {
+			n = snprintf(body, sizeof(body), "{\"ok\":true,\"restarting\":true}");
+			api_send(c->fd, 200, "application/json", body, n);
+			c->fd = -1;
+			wfb_detach_restart();   /* after the reply is queued */
+			return;
+		}
+		int rc = 0;
+		const char *errmsg = NULL;
+		if (action[0] == '\0') {
+			/* status only */
+		} else if (strcmp(action, "seed") == 0) {
+			char seed[128];
+			if (!qparam_str(qs, "seed", seed, sizeof(seed)) || !seed[0])
+				snprintf(seed, sizeof(seed), "%s", "Waybeam");
+			rc = wfb_write_key_seed(cfg->key_file, WFB_ROLE_DRONE, seed);
+			if (rc) errmsg = "write failed";
+		} else if (strcmp(action, "random") == 0) {
+			rc = wfb_write_key_random(cfg->key_file, WFB_ROLE_DRONE);
+			if (rc) errmsg = "write failed";
+		} else if (strcmp(action, "upload") == 0) {
+			char hex[160]; unsigned char kb[64];
+			if (!qparam_str(qs, "hex", hex, sizeof(hex)) || wfb_hex_to_key(hex, kb) != 0) {
+				rc = -1; errmsg = "bad key (need 128 hex chars)";
+			} else {
+				rc = wfb_write_key_raw(cfg->key_file, kb);
+				if (rc) errmsg = "write failed";
+			}
+		} else {
+			rc = -1; errmsg = "unknown action";
+		}
+		char fp[16]; wfb_key_fingerprint(cfg->key_file, WFB_ROLE_DRONE, fp, sizeof(fp));
+		int exists = (access(cfg->key_file, F_OK) == 0);
+		char errbuf[80] = "";
+		if (errmsg) snprintf(errbuf, sizeof(errbuf), "\"error\":\"%s\",", errmsg);
+		n = snprintf(body, sizeof(body),
+			"{\"ok\":%s,%s\"role\":\"drone\",\"path\":\"%s\",\"exists\":%s,"
+			"\"fingerprint\":\"%s\",\"changed\":%s,\"seed_default\":\"Waybeam\"}",
+			rc == 0 ? "true" : "false", errbuf, cfg->key_file,
+			exists ? "true" : "false", fp,
+			(rc == 0 && action[0]) ? "true" : "false");
+		api_send(c->fd, rc == 0 ? 200 : 400, "application/json", body, n);
+#else
+		n = snprintf(body, sizeof(body),
+			"{\"ok\":false,\"error\":\"key management requires the mega binary\"}");
+		api_send(c->fd, 501, "application/json", body, n);
+#endif
+	}
 	else {
 		api_send(c->fd, 404, "text/plain", "no such route\n", 14);
 	}
@@ -4949,6 +5068,7 @@ static void config_defaults(Config *c)
 	/* Uplink rx_ant diagnostic listener: off until --uplink-stats. */
 	c->uplink_stats_port = 0;
 	c->api_port = 8765;
+	snprintf(c->key_file, sizeof(c->key_file), "%s", "/etc/drone.key");
 	c->dry_run = false;
 	c->verbose = 0;
 	c->iface_mtu = 0;
@@ -5154,6 +5274,8 @@ int main(int argc, char **argv)
 		OPT_IFACE_MTU,
 		/* sd logger */
 		OPT_LOG_DIR, OPT_NO_LOG,
+		/* key management (WebUI) */
+		OPT_KEY_FILE,
 	};
 	static const struct option longopts[] = {
 		{"wfb",            required_argument, 0, OPT_WFB},
@@ -5174,6 +5296,7 @@ int main(int argc, char **argv)
 		{"iface-mtu",      required_argument, 0, OPT_IFACE_MTU},
 		{"log-dir",        required_argument, 0, OPT_LOG_DIR},
 		{"no-log",         no_argument,       0, OPT_NO_LOG},
+		{"key-file",       required_argument, 0, OPT_KEY_FILE},
 		{"verbose",        no_argument,       0, 'v'},
 		{"help",           no_argument,       0, 'h'},
 		{0, 0, 0, 0},
@@ -5196,6 +5319,9 @@ int main(int argc, char **argv)
 			cfg.api_port = p;
 			break;
 		}
+		case OPT_KEY_FILE:
+			snprintf(cfg.key_file, sizeof(cfg.key_file), "%s", optarg);
+			break;
 		case OPT_DRY_RUN: cfg.dry_run = true; break;
 		case OPT_NO_FEC:  cfg.fec.enabled = false; break;
 		case OPT_NO_MCS:  cfg.mcs.enabled = false; break;
