@@ -5116,7 +5116,14 @@ static void config_defaults(Config *c)
  * ───────────────────────────────────────────────────────────────────── */
 
 #ifndef LC_TEST_NO_MAIN
+/* In the multi-call "mega binary" (see docs/design/mega-binary.md) the
+ * dispatcher owns main() and invokes this as the "link" applet.  Default
+ * builds (WFB_MULTICALL unset) keep main() unchanged. */
+#ifdef WFB_MULTICALL
+int link_controller_main(int argc, char **argv)
+#else
 int main(int argc, char **argv)
+#endif
 {
 	Config cfg;
 	config_defaults(&cfg);

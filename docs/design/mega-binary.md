@@ -88,9 +88,13 @@ build flag (`WFB_MULTICALL`) or by checking the `basename` of
     `gs_supervisor_main()` / `link_controller_main()` otherwise.
     `link_controller.c` already has the `LC_TEST_NO_MAIN` guard (used by
     `tests/test_selector_law.c`) — generalize that pattern.
-  - **wfb-ng C++ tools**: a small patch in the `wfb-ng/` chain (applied after
-    `shm-input.patch`) renames `main` → `wfb_rx_main` / `wfb_tx_main` under
-    `#ifdef WFB_MULTICALL`; likewise `tx_cmd.c` / `keygen.c`.
+  - **wfb-ng C++ tools** (`rx.cpp`, `tx.cpp`, `tx_cmd.c`, `keygen.c`): these
+    are cloned from upstream and patched at build time (`wfb-ng/build-*.sh`),
+    not stored in-tree. Rather than maintain a third rebaseable patch just to
+    rename `main`, the mega target renames it at the **compile line** with
+    `-Dmain=wfb_rx_main` / `-Dmain=wfb_tx_main` / etc. This touches no upstream
+    source and only applies to the mega build, so the existing
+    separate-binary builds stay byte-identical.
 - Applet entry points called from the C/C++ dispatcher boundary are declared
   `extern "C"`. The merged binary links with `g++`.
 
@@ -101,6 +105,16 @@ build flag (`WFB_MULTICALL`) or by checking the `basename` of
 Guard each tool's `main` and expose `*_main()` as above. Acceptance: with
 `WFB_MULTICALL` unset, all existing build paths (`make`, `make vehicle`,
 `make -C ground cross`, `wfb-ng/build-*.sh`) produce unchanged binaries.
+
+**Status: in-tree C daemons done.**
+- `vehicle/link_controller.c` — `WFB_MULTICALL` selects `link_controller_main`;
+  default keeps `main`; the existing `LC_TEST_NO_MAIN` test path still excludes
+  both. Verified by `nm` across all three modes; `test_selector_law` passes.
+- `ground/gs_supervisor.c` — `WFB_MULTICALL` selects `gs_supervisor_main`;
+  default keeps `main`. Verified by `nm` and a default link.
+
+The C++ tools (`rx`/`tx`/`tx_cmd`/`keygen`) need no source change — they are
+renamed via `-Dmain=` on the mega compile line in Phase 2/3.
 
 ### Phase 1 — Dispatcher
 

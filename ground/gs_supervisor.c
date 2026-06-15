@@ -2565,7 +2565,14 @@ static void usage(const char *argv0)
 	    argv0, GS_DEFAULT_CONFIG);
 }
 
+/* In the multi-call "mega binary" (see docs/design/mega-binary.md) the
+ * dispatcher owns main() and invokes this as the "supervisor" applet.
+ * Default builds (WFB_MULTICALL unset) keep main() unchanged. */
+#ifdef WFB_MULTICALL
+int gs_supervisor_main(int argc, char **argv)
+#else
 int main(int argc, char **argv)
+#endif
 {
 	const char *cfg_path = GS_DEFAULT_CONFIG;
 	int port_override = -1;
