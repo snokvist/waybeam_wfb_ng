@@ -576,4 +576,8 @@ int  json_emit_tunnel(char *buf, size_t cap, const Tunnel *t, bool full);
 int  json_emit_status(char *buf, size_t cap, const Config *c, uint64_t up_us);
 void api_handle(ApiClient *cli, Config *c, uint64_t startup_us);
 
+/* Telemetry dashboard + JSON API (gs_supervisor_telemetry.c, Phase 5).
+ * Returns 1 if `path` was a telemetry route (response already sent), else 0. */
+int  tele_route(ApiClient *cli, const char *path, const char *qstr);
+
 #endif /* GS_SUPERVISOR_H */

@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>session · wfb telemetry</title>
+  <link rel="stylesheet" href="/telemetry/static/uPlot.min.css">
+  <link rel="stylesheet" href="/telemetry/static/app.css">
+</head>
+<body>
+  <header>
+    <a href="/telemetry" class="brand">wfb&nbsp;telemetry</a>
+    <span class="sub">data-session store</span>
+  </header>
+  <main>
+    <a class="back" href="/telemetry">← all sessions</a>
+    <h1>Session <span id="sid-h">…</span> <small id="sess-sub"></small></h1>
+    <dl class="meta" id="meta-view">
+      <div><dt>started</dt><dd id="m-started">—</dd></div>
+      <div><dt>location</dt><dd id="m-location">—</dd></div>
+      <div><dt>antenna</dt><dd id="m-antenna_cfg">—</dd></div>
+      <div><dt>tx power</dt><dd id="m-tx_power">—</dd></div>
+      <div><dt>channel</dt><dd id="m-channel">—</dd></div>
+      <div><dt>weather</dt><dd id="m-weather">—</dd></div>
+      <div class="wide"><dt>notes</dt><dd id="m-notes">—</dd></div>
+    </dl>
+
+    <details class="editor">
+      <summary>Edit metadata</summary>
+      <form id="meta-form" class="grid">
+        <label>location <input name="location"></label>
+        <label>antenna cfg <input name="antenna_cfg"></label>
+        <label>tx power <input name="tx_power"></label>
+        <label>channel <input name="channel"></label>
+        <label>scenario <input name="scenario"></label>
+        <label>weather <input name="weather"></label>
+        <label>notes <input name="notes"></label>
+        <div class="actions"><button type="submit">Save metadata</button>
+          <span id="meta-status" class="muted"></span></div>
+      </form>
+    </details>
+
+    <div class="legend">
+      overlays:
+      <span class="chip hl-event">event</span>
+      <span class="chip hl-cliff">cliff</span>
+      <span class="chip hl-action">action</span>
+      <span class="chip hl-state">state</span>
+      <span id="overlay-status" class="muted"></span>
+      <label class="live-toggle"><input type="checkbox" id="live-toggle" checked> live</label>
+      <span id="live-dot" class="muted"></span>
+    </div>
+
+    <label class="labelmode"><input type="checkbox" id="label-mode">
+      Label mode — drag on a chart to select a span (off = drag zooms)</label>
+
+    <form id="label-form" class="hidden">
+      <span class="lf-range" id="lf-range">—</span>
+      <select name="kind">
+        <option value="event">event</option>
+        <option value="cliff">cliff</option>
+        <option value="action">action</option>
+        <option value="state">state</option>
+      </select>
+      <input name="value" placeholder="value (e.g. MCS5 cliff)" autocomplete="off">
+      <input name="author" id="lf-author" placeholder="author" value="human:web">
+      <button type="submit">Add label</button>
+      <button type="button" id="lf-cancel">Cancel</button>
+    </form>
+
+    <div id="charts"></div>
+
+    <h2>Labels</h2>
+    <div id="labels-panel"><p class="muted">loading…</p></div>
+  </main>
+
+  <script src="/telemetry/static/uPlot.iife.min.js"></script>
+  <script>window.SESSION_ID = parseInt(new URLSearchParams(location.search).get("id"), 10);</script>
+  <script src="/telemetry/static/app.js"></script>
+</body>
+</html>

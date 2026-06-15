@@ -19,10 +19,16 @@ SRCS       = gs_supervisor.c \
              gs_supervisor_csa.c \
              gs_supervisor_scan.c \
              gs_supervisor_http.c \
+             gs_supervisor_telemetry.c \
              wfb_logger.c
 HDRS       = gs_supervisor.h wfb_logger.h
 WEBUI_SRC  = webui/gs.html
 WEBUI_HDR  = webui/gs_assets.h
+# Telemetry dashboard assets (Phase 5): embedded the same way as gs.html.
+TELE_DIR   = webui/telemetry
+TELE_HDR   = webui/telemetry_assets.h
+TELE_SRCS  = $(TELE_DIR)/index.html $(TELE_DIR)/session.html $(TELE_DIR)/app.js \
+             $(TELE_DIR)/app.css $(TELE_DIR)/uPlot.iife.min.js $(TELE_DIR)/uPlot.min.css
 OUT_HOST   = $(BUILD_DIR)/gs_supervisor.host
 OUT_CROSS ?= $(BUILD_DIR)/gs_supervisor
 
@@ -58,7 +64,7 @@ all: host
 
 host: $(OUT_HOST)
 
-webui: $(WEBUI_HDR)
+webui: $(WEBUI_HDR) $(TELE_HDR)
 
 # xxd -i embeds the file as `unsigned char gs_webui_html[]` with a matching
 # `_len`. Promote both to const so the C side can put them in .rodata.
@@ -70,6 +76,21 @@ $(WEBUI_HDR): $(WEBUI_SRC)
 	@sed -i 's/^unsigned char gs_webui_html/const unsigned char gs_webui_html/' $@
 	@sed -i 's/^unsigned int gs_webui_html_len/const unsigned int gs_webui_html_len/' $@
 
+# Telemetry dashboard: embed each asset (html/js/css + uPlot vendor) as a
+# distinct const symbol, all in one header. `static const` so the consumer
+# (gs_supervisor_telemetry.c) is the sole owner — no link conflicts.
+$(TELE_HDR): $(TELE_SRCS)
+	@echo "[gs_supervisor] embedding telemetry assets -> $@"
+	@{ \
+	  xxd -i -n tele_index_html   $(TELE_DIR)/index.html; \
+	  xxd -i -n tele_session_html $(TELE_DIR)/session.html; \
+	  xxd -i -n tele_app_js       $(TELE_DIR)/app.js; \
+	  xxd -i -n tele_app_css      $(TELE_DIR)/app.css; \
+	  xxd -i -n tele_uplot_js     $(TELE_DIR)/uPlot.iife.min.js; \
+	  xxd -i -n tele_uplot_css    $(TELE_DIR)/uPlot.min.css; \
+	} | sed -e 's/^unsigned char/static const unsigned char/' \
+	        -e 's/^unsigned int/static const unsigned int/' > $@
+
 $(BUILD_DIR):
 	@mkdir -p $@
 
@@ -78,13 +99,13 @@ $(SQLITE_OBJ_HOST): $(SQLITE_DIR)/sqlite3.c | $(BUILD_DIR)
 	@echo "[gs_supervisor] sqlite3 (host) -> $@"
 	$(CC) -O2 -w $(SQLITE_DEFS) -c -o $@ $<
 
-$(OUT_HOST): $(SRCS) $(HDRS) $(WEBUI_HDR) $(SQLITE_OBJ_HOST) | $(BUILD_DIR)
+$(OUT_HOST): $(SRCS) $(HDRS) $(WEBUI_HDR) $(TELE_HDR) $(SQLITE_OBJ_HOST) | $(BUILD_DIR)
 	@echo "[gs_supervisor] host -> $@"
 	$(CC) $(CFLAGS_COMMON) $(SHARED_INC) $(SQLITE_INC) -I. -Iwebui -g -o $@ $(SRCS) $(SQLITE_OBJ_HOST) $(LDFLAGS_COMMON) $(GS_LDLIBS)
 
 cross: $(OUT_CROSS)
 
-$(OUT_CROSS): $(SRCS) $(HDRS) $(WEBUI_HDR) | $(BUILD_DIR)
+$(OUT_CROSS): $(SRCS) $(HDRS) $(WEBUI_HDR) $(TELE_HDR) | $(BUILD_DIR)
 	@if [ -z "$(CROSS_CC)" ]; then \
 		echo "set CROSS_CC=<path-to-target-gcc>"; exit 2; \
 	fi
@@ -147,6 +168,7 @@ endif
 # wfb_logger.o + sqlite3.o ship in the mega binary too (telemetry logger).
 MEGA_GS_OBJ = $(MEGA_OBJ)/gs_supervisor.o $(MEGA_OBJ)/gs_supervisor_csa.o \
               $(MEGA_OBJ)/gs_supervisor_scan.o $(MEGA_OBJ)/gs_supervisor_http.o \
+              $(MEGA_OBJ)/gs_supervisor_telemetry.o \
               $(MEGA_OBJ)/wfb_logger.o $(MEGA_OBJ)/sqlite3.o
 # Dispatcher (wfb_multicall.o from mega.mk) + ground applet table.
 MEGA_DISP_OBJ = $(MEGA_OBJ)/wfb_multicall.o $(MEGA_OBJ)/gs_applets.o
@@ -159,7 +181,7 @@ mega: $(MEGA_OUT)
 # --- supervisor (C, multicall) ---
 # -I$(MULTICALL) lets the WFB_WITH_WFBNG key-management endpoint reach wfb_keyseed.h;
 # -I$(SQLITE_DIR) lets wfb_logger.o find the vendored sqlite3.h.
-$(MEGA_OBJ)/%.o: %.c $(HDRS) $(WEBUI_HDR) | $(MEGA_OBJ)
+$(MEGA_OBJ)/%.o: %.c $(HDRS) $(WEBUI_HDR) $(TELE_HDR) | $(MEGA_OBJ)
 	$(MEGA_CC) $(CFLAGS_COMMON) $(MEGA_DEFS) $(MEGA_CFLAGS) $(SHARED_INC) $(SQLITE_INC) -I$(MULTICALL) -I. -Iwebui -c -o $@ $<
 
 # --- vendored SQLite amalgamation (mega; host or cross per MEGA_CC) ---
@@ -178,5 +200,5 @@ $(MEGA_OUT): $(MEGA_GS_OBJ) $(MEGA_DISP_OBJ) $(MEGA_WFBNG_OBJ)
 	@echo "[wfb-gs] done (stripped): applets = supervisor rx tx tx_cmd keygen telemetry-import"
 
 clean:
-	rm -f $(OUT_HOST) $(OUT_CROSS) $(WEBUI_HDR) $(SQLITE_OBJ_HOST) $(SQLITE_OBJ_CROSS)
+	rm -f $(OUT_HOST) $(OUT_CROSS) $(WEBUI_HDR) $(TELE_HDR) $(SQLITE_OBJ_HOST) $(SQLITE_OBJ_CROSS)
 	rm -rf $(MEGA_OBJ) $(MEGA_OUT)
