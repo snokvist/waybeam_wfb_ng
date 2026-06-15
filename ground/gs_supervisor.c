@@ -956,7 +956,26 @@ int tunnel_spawn(Tunnel *t, const char *key_file)
 				close(devnull);
 			}
 		}
+#ifdef WFB_MULTICALL
+		/* Mega binary: re-exec ourselves as the rx/tx applet instead of
+		 * relying on separate wfb_rx/wfb_tx binaries on PATH.  Override
+		 * argv[0] with the applet alias so the dispatcher's basename match
+		 * routes correctly (any configured t->binary is ignored — we are
+		 * the binary).  See docs/design/mega-binary.md.
+		 * Map the validated role explicitly — roles are constrained to
+		 * "rx"/"tx" at config parse, so an unrecognized one means a new role
+		 * slipped through; fail loudly rather than silently launching tx. */
+		const char *applet = !strcmp(t->role, "rx") ? "wfb_rx"
+		                   : !strcmp(t->role, "tx") ? "wfb_tx" : NULL;
+		if (!applet) {
+			fprintf(stderr, "[gs] mega: no applet for tunnel role '%s'\n", t->role);
+			_exit(127);
+		}
+		ab.argv[0] = (char *)applet;
+		execv("/proc/self/exe", ab.argv);
+#else
 		execvp(ab.argv[0], ab.argv);
+#endif
 		/* exec failed — best-effort error to whatever fd 2 points to. */
 		fprintf(stderr, "[gs] exec %s: %s\n", ab.argv[0], strerror(errno));
 		_exit(127);
@@ -2565,7 +2584,14 @@ static void usage(const char *argv0)
 	    argv0, GS_DEFAULT_CONFIG);
 }
 
+/* In the multi-call "mega binary" (see docs/design/mega-binary.md) the
+ * dispatcher owns main() and invokes this as the "supervisor" applet.
+ * Default builds (WFB_MULTICALL unset) keep main() unchanged. */
+#ifdef WFB_MULTICALL
+int gs_supervisor_main(int argc, char **argv)
+#else
 int main(int argc, char **argv)
+#endif
 {
 	const char *cfg_path = GS_DEFAULT_CONFIG;
 	int port_override = -1;

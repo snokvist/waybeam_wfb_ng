@@ -21,8 +21,17 @@ PATH=/usr/sbin:/usr/bin:/sbin:/bin
 export PATH
 
 DAEMON="gs_supervisor"
-DAEMON_BIN="/usr/bin/gs_supervisor"
-DAEMON_ARGS="--config /etc/gs_supervisor.json"
+# Mega binary (single wfb-gs) support: if the multi-call wfb-gs binary is on
+# PATH, run it as the `supervisor` applet (it re-execs itself as wfb_rx for the
+# RX tunnel); otherwise fall back to the standalone gs_supervisor. Mirrors the
+# vehicle's S99wfb. See docs/design/mega-binary.md.
+if command -v wfb-gs >/dev/null 2>&1; then
+	DAEMON_BIN="$(command -v wfb-gs)"
+	DAEMON_ARGS="supervisor --config /etc/gs_supervisor.json"
+else
+	DAEMON_BIN="/usr/bin/gs_supervisor"
+	DAEMON_ARGS="--config /etc/gs_supervisor.json"
+fi
 PIDFILE="/var/run/gs_supervisor.pid"
 IFACE="wlx84fc1450bcde"
 IFACE_WAIT=30   # seconds to wait for the USB adapter to enumerate at boot

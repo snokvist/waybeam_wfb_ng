@@ -5115,8 +5115,24 @@ static void config_defaults(Config *c)
  * Main loop
  * ───────────────────────────────────────────────────────────────────── */
 
+/* LC_TEST_NO_MAIN (the selector-law test harness supplies its own main and
+ * never links the mega dispatcher) and WFB_MULTICALL (mega applet entry) are
+ * mutually exclusive build modes: combining them would compile out the entry
+ * point entirely (no main AND no link_controller_main). Catch that explicitly
+ * rather than failing later with a confusing undefined-symbol link error. */
+#if defined(LC_TEST_NO_MAIN) && defined(WFB_MULTICALL)
+#error "LC_TEST_NO_MAIN and WFB_MULTICALL are mutually exclusive"
+#endif
+
 #ifndef LC_TEST_NO_MAIN
+/* In the multi-call "mega binary" (see docs/design/mega-binary.md) the
+ * dispatcher owns main() and invokes this as the "link" applet.  Default
+ * builds (WFB_MULTICALL unset) keep main() unchanged. */
+#ifdef WFB_MULTICALL
+int link_controller_main(int argc, char **argv)
+#else
 int main(int argc, char **argv)
+#endif
 {
 	Config cfg;
 	config_defaults(&cfg);

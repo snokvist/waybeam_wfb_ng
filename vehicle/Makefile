@@ -13,6 +13,7 @@
 
 TOOLCHAIN   ?= ../toolchain/toolchain.sigmastar-infinity6e
 CROSS_CC    ?= $(TOOLCHAIN)/bin/arm-openipc-linux-gnueabihf-gcc
+CROSS_CXX   ?= $(TOOLCHAIN)/bin/arm-openipc-linux-gnueabihf-g++
 CROSS_STRIP ?= $(TOOLCHAIN)/bin/arm-openipc-linux-gnueabihf-strip
 
 BUILD_DIR   ?= build
@@ -32,7 +33,7 @@ LDFLAGS_COMMON = -lm
 DEPLOY_HOST ?= 192.168.1.13
 DEPLOY_DIR  ?= /tmp
 
-.PHONY: all webui clean deploy host help test
+.PHONY: all webui clean deploy host help test mega
 
 all: $(OUT)
 
@@ -77,8 +78,63 @@ $(TEST_SELECTOR): ../tests/test_selector_law.c $(SRC) $(CSA_HDR) $(WEBUI_HDR) | 
 		-I. -Icsa -Iwebui -g \
 		-o $@ ../tests/test_selector_law.c csa/csa.c $(LDFLAGS_COMMON)
 
+# ── Mega binary (multi-call) ─────────────────────────────────────────
+# Single `wfb-air` bundling link_controller + wfb_tx/wfb_rx/wfb_tx_cmd/
+# wfb_keygen as applets (busybox-style). See docs/design/mega-binary.md.
+#
+# Inputs you must supply (the wfb-ng tools are a vendored upstream fork,
+# fetched+patched by wfb-ng/build-armv7.sh, and need libsodium + libpcap):
+#   WFBNG_SRC    patched wfb-ng src/ dir (e.g. ../wfb-ng/build/wfb-ng/src)
+#   CROSS_CC / CROSS_CXX   target C / C++ compilers (armv7l by default)
+#   MEGA_CFLAGS  extra compile flags (e.g. -I<sodium>/include, -I<venc>/include)
+#   MEGA_LDFLAGS link flags/libs (default: -lpcap -lsodium -lm)
+#
+# Defaults below point at the cross libsodium/libpcap that wfb-ng/build-armv7.sh
+# installs, so `make mega` works out of the box after that script has run once.
+# Override MEGA_CFLAGS/MEGA_LDFLAGS for a different sysroot (e.g. host-arch).
+WFBNG_SRC    ?= ../wfb-ng/build/wfb-ng/src
+SODIUM_DIR   ?= ../wfb-ng/build/sodium-install
+PCAP_DIR     ?= ../wfb-ng/build/pcap-install
+MEGA_OUT     ?= $(BUILD_DIR)/wfb-air
+MEGA_OBJ      = $(BUILD_DIR)/mega
+MEGA_DEFS     = -DWFB_MULTICALL -DWFB_WITH_WFBNG
+MEGA_CFLAGS  ?= -I$(SODIUM_DIR)/include -I$(PCAP_DIR)/include
+MEGA_LDFLAGS ?= -L$(SODIUM_DIR)/lib -L$(PCAP_DIR)/lib -lpcap -lsodium -lm
+MULTICALL    = ../multicall
+MEGA_WFB_VERSION ?= shm-patched-mega
+MEGA_WFB_DEFS     = -DWFB_VERSION=\"$(MEGA_WFB_VERSION)\"
+
+# Cross compilers drive the mega rules in wfb-ng/mega.mk.
+MEGA_CC  := $(CROSS_CC)
+MEGA_CXX := $(CROSS_CXX)
+# link_controller + CSA (C, multicall) | dispatcher + air applet table (C++).
+MEGA_LC_OBJ   = $(MEGA_OBJ)/link_controller.o $(MEGA_OBJ)/csa.o
+MEGA_DISP_OBJ = $(MEGA_OBJ)/wfb_multicall.o $(MEGA_OBJ)/air_applets.o
+
+# Shared wfb-ng tool + dispatcher object rules (defines MEGA_WFBNG_OBJ).
+include ../wfb-ng/mega.mk
+
+mega: $(MEGA_OUT)
+
+# --- link_controller + csa (C, multicall) ---
+$(MEGA_OBJ)/link_controller.o: link_controller.c $(CSA_HDR) $(WEBUI_HDR) | $(MEGA_OBJ)
+	$(CROSS_CC) $(CFLAGS_COMMON) $(MEGA_DEFS) $(MEGA_CFLAGS) $(SHARED_INC) -I. -Icsa -Iwebui -c -o $@ $<
+$(MEGA_OBJ)/csa.o: csa/csa.c $(CSA_HDR) | $(MEGA_OBJ)
+	$(CROSS_CC) $(CFLAGS_COMMON) $(MEGA_DEFS) $(MEGA_CFLAGS) $(SHARED_INC) -I. -Icsa -c -o $@ $<
+
+# --- air applet table (C++) ---
+$(MEGA_OBJ)/air_applets.o: air_applets.cpp $(MULTICALL)/wfb_multicall.h $(MULTICALL)/wfb_applets_common.h | $(MEGA_OBJ)
+	$(CROSS_CXX) -std=gnu++11 -O2 -Wall $(MEGA_DEFS) $(MEGA_CFLAGS) -I$(MULTICALL) -c -o $@ $<
+
+$(MEGA_OUT): $(MEGA_LC_OBJ) $(MEGA_DISP_OBJ) $(MEGA_WFBNG_OBJ)
+	@echo "[wfb-air] linking mega binary -> $@"
+	$(CROSS_CXX) $(MEGA_CFLAGS) -o $@ $^ $(MEGA_LDFLAGS)
+	$(CROSS_STRIP) $@
+	@echo "[wfb-air] done: applets = link tx rx tx_cmd keygen"
+
 clean:
 	rm -f $(OUT) $(OUT_HOST) $(WEBUI_HDR)
+	rm -rf $(MEGA_OBJ) $(MEGA_OUT)
 
 deploy: $(OUT)
 	scp -O $(OUT) root@$(DEPLOY_HOST):$(DEPLOY_DIR)/
@@ -88,5 +144,6 @@ help:
 	@echo "make             # cross-build for armv7l (incl. WebUI)"
 	@echo "make webui       # regenerate embedded WebUI header"
 	@echo "make host        # native host build"
+	@echo "make mega        # single wfb-air multi-call binary (needs WFBNG_SRC)"
 	@echo "make deploy      # scp to root@\$$DEPLOY_HOST"
 	@echo "make clean"

@@ -54,8 +54,15 @@ shared/                  cross-side wire-format headers (single source of truth)
   wcmd_proto.h           WCMD command channel (16-byte req/resp)
   rtp_sidecar.h          venc per-frame metadata wire format
 
+multicall/               busybox-style mega-binary dispatcher (opt-in)
+  wfb_multicall.{cpp,h}  generic main(): route applet by argv[0]/subcommand
+                         (per-side tables: ground/gs_applets.cpp,
+                          vehicle/air_applets.cpp). See docs/design/mega-binary.md.
+
 wfb-ng/                  patched wfb-ng fork (build artefacts only)
   shm-input.patch        SHM input + -Y stats push for wfb_tx/wfb_rx
+  peek.patch             per-frame FEC close (peek-profile off|close)
+  mega.mk                shared mega-binary object rules (incl. by both Makefiles)
   build-armv7.sh         cross-build for Infinity6E
   build-aarch64.sh       cross-build for ground aarch64
   build-openwrt.sh       cross-build for OpenWRT MIPS
@@ -98,6 +105,25 @@ make test
 # Run the legacy Python controller-logic tests
 make test-archive
 ```
+
+### Mega binaries (single-file deployment, opt-in)
+
+One multi-call binary per side instead of the separate
+`wfb_rx`/`wfb_tx`/`tx_cmd`/`keygen` + daemon set — `wfb-gs` (ground) and
+`wfb-air` (vehicle) dispatch applets by `argv[0]`/subcommand. The supervisor
+still fork/execs, re-execing `/proc/self/exe <applet>`. Default builds are
+unchanged (mega is `-DWFB_MULTICALL`, opt-in). Prep the patched wfb-ng tree +
+cross libs once (`./wfb-ng/build-aarch64.sh` / `build-armv7.sh`), then:
+
+```bash
+make mega-ground     # wfb-gs (host x86; aarch64 via CC/CXX override)
+make mega-vehicle    # wfb-air (cross armv7; finds cross libs under wfb-ng/build)
+make mega            # both
+```
+
+Validated live on hardware (GS x86 + RTL88x2, vehicle Infinity6E). On the
+vehicle, `init/S99wfb` auto-routes to `wfb-air` when it is on PATH, else falls
+back to the standalone binaries. See @docs/design/mega-binary.md.
 
 ## Target platforms
 
