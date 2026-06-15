@@ -192,6 +192,23 @@ patched tree, then `make mega WFBNG_SRC=…` — these are present.
 Acceptance: cross-build succeeds; `S99wfb` launches all four roles from one
 binary; `make test` + `vehicle` host build + `test_selector_law` pass.
 
+**Status: integration code done; full link pending a box with deps.**
+- `vehicle/Makefile` `make mega` — mirrors ground: dispatcher + `link_controller.o`
+  + `csa.o` + wfb-ng objects (renamed via `-Dmain=`) → `wfb-air`, linked with
+  the cross `g++` (`CROSS_CXX`), `-lpcap -lsodium -lm`. `make -n` confirms the
+  rename flags and link line; the daemon-only `wfb-air` links and routes.
+- `vehicle/init/S99wfb` — adds a mega-detection block: when `wfb-air` is on
+  PATH the launch tokens become `wfb-air tx|rx|link` and the `pidof`/`killall`
+  process-name list collapses to `wfb-air` (all applets share that comm name);
+  `status` reports the shared binary. Falls back to the standalone binaries and
+  the original behavior when `wfb-air` is absent, so the change is a no-op for
+  the multi-binary deployment. `sh -n` clean.
+
+Same dependency caveat as Phase 2 for the final link (libsodium/libpcap +
+`venc_ring` from the sibling repo). Note `wfb-air rx` (uplink) needs real
+libpcap; `wfb-air tx` never calls pcap, so the single binary links real
+libpcap once and the stub header is unnecessary.
+
 ### Phase 4 — Packaging & docs
 
 - Top-level `make mega` builds both.
