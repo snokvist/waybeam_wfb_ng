@@ -8,12 +8,13 @@
   <link rel="stylesheet" href="/telemetry/static/app.css">
 </head>
 <body>
-  <header>
-    <a href="/telemetry" class="brand">wfb&nbsp;telemetry</a>
-    <span class="sub">data-session store</span>
-  </header>
+  <div class="tbar">
+    <div class="tbar-title">waybeam<span>_telemetry</span></div>
+    <div class="tbar-sep"></div>
+    <a class="tbar-link" href="/telemetry">← all sessions</a>
+    <a class="tbar-link" href="/">↩ supervisor</a>
+  </div>
   <main>
-    <a class="back" href="/telemetry">← all sessions</a>
     <h1>Session <span id="sid-h">…</span> <small id="sess-sub"></small></h1>
     <dl class="meta" id="meta-view">
       <div><dt>started</dt><dd id="m-started">—</dd></div>

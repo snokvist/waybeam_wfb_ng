@@ -8,12 +8,11 @@
   <link rel="stylesheet" href="/telemetry/static/app.css">
 </head>
 <body>
-  <header>
-    <a href="/telemetry" class="brand">wfb&nbsp;telemetry</a>
-    <span class="sub">data-session store · in-process logger</span>
-    <span class="toolbar-sep"></span>
-    <a href="/" class="sub" style="text-decoration:none">↩ supervisor</a>
-  </header>
+  <div class="tbar">
+    <div class="tbar-title">waybeam<span>_telemetry</span></div>
+    <div class="tbar-sep"></div>
+    <a class="tbar-link" href="/">↩ supervisor</a>
+  </div>
   <main>
     <div class="toolbar">
       <h1>Sessions</h1>
@@ -41,9 +40,20 @@
   const span = (a, b) => (a != null && b != null) ? ((b - a) / 1000).toFixed(1) + "s" : "—";
 
   async function tick() {
-    let rows;
-    try { const r = await fetch("/api/v1/telemetry/sessions"); if (!r.ok) return; rows = await r.json(); }
-    catch (e) { return; }
+    let rows, cap = {};
+    try {
+      const [rs, cs] = await Promise.all([
+        fetch("/api/v1/telemetry/sessions"),
+        fetch("/api/v1/telemetry/capture"),
+      ]);
+      if (!rs.ok) return;
+      rows = await rs.json();
+      if (cs.ok) cap = await cs.json();
+    } catch (e) { return; }
+    /* Only the session the logger is actively writing RIGHT NOW is "live" —
+       not every row with ended_at NULL (an orphaned/crashed session is also
+       unsealed but is not the active capture). */
+    const liveSid = (cap.running && cap.session_id >= 0) ? cap.session_id : -1;
     const tb = document.querySelector("table.sessions tbody");
     const empty = document.getElementById("empty");
     if (!rows.length) {
@@ -54,7 +64,7 @@
     empty.classList.add("hidden");
     tb.innerHTML = rows.map(s =>
       `<tr onclick="location.href='/telemetry/session?id=${s.id}'"` +
-      `${s.ended_at == null ? ' class="live-session"' : ''}>` +
+      `${s.id === liveSid ? ' class="live-session"' : ''}>` +
       `<td>${s.id}</td><td>${esc(s.source)}</td><td>${esc(s.scenario)}</td>` +
       `<td class="num">${s.n_records}</td><td class="num">${span(s.first_ts, s.last_ts)}</td>` +
       `<td>${esc(s.started_at)}</td><td>${esc(s.location)}</td>` +
