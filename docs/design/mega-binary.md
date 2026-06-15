@@ -304,10 +304,12 @@ make -C vehicle mega \
   MEGA_LDFLAGS="-L../wfb-ng/build/sodium-install/lib -L../wfb-ng/build/pcap-install/lib -lpcap -lsodium -lm"
 ```
 
-Note: the device's `wfbpeek` env was a stale `1` (pre-PR#76); reset to `close`
-so the launcher passes a valid `--peek-profile`. Rollback is `rm
-/usr/bin/wfb-air` (S99wfb auto-falls back to the standalone binaries, which
-remain in place) + restoring the `S99wfb` backup.
+Note: `S99wfb` exposes only `wfbmode` as a boot-env knob; the peek profile,
+probe, and SD-logger toggles are fixed script constants (`WFB_PEEK_PROFILE`,
+`WFB_PROBE`, `WFB_LOG`) edited in the script, not `fw_setenv` overrides. (A
+stale device `wfbpeek=1` env from before this change is simply ignored.)
+Rollback is `rm /usr/bin/wfb-air` (S99wfb auto-falls back to the standalone
+binaries, which remain in place) + restoring the `S99wfb` backup.
 
 ### Review risk checklist (verify in this order)
 1. **(GATE) Link-time symbol collisions across `rx.o`/`tx.o`/tools.** ✅

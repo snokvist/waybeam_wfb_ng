@@ -45,11 +45,19 @@ WFB_UPLINK_RX_PORT=5811
 SAFE_BITRATE=4096
 SHM_RING="local_shm"
 
+# ── Script-controlled policy (NOT environment variables) ─────────────
+# wfbmode is the ONLY boot-env knob (fw_setenv wfbmode 0|1). Everything
+# below is fixed policy for this build — edit it here and redeploy the
+# script; there are no fw_setenv overrides for these.
+WFB_PEEK_PROFILE=close   # per-frame FEC close: off | close (gate close only)
+WFB_PROBE=1              # V+2 boundary probe: 1=on (required for MCS adaptation)
+WFB_LOG=1                # in-process SD telemetry logger: 1=on
+
 # V+2 boundary-probe producer: one extra wfb_tx at V+2, fed and retuned
 # by link_controller. Default ON — it is REQUIRED for MCS adaptation
-# (the unified PER-probe law promotes on probe data only). Opt out with
-# fw_setenv wfbprobe 0, which starts link_controller with --no-mcs
-# (FEC-only; MCS stays at the static WFB_MCS set on wfb_tx above).
+# (the unified PER-probe law promotes on probe data only). Opt out by
+# setting WFB_PROBE=0 (script constant above), which starts link_controller
+# with --no-mcs (FEC-only; MCS stays at the static WFB_MCS set on wfb_tx above).
 # Probe stream mirrors the video PHY (-B/-S/-L), FEC 1/1, AEAD off (-x),
 # on its own link_id so it can never collide with video (207) / uplink (208).
 # See telemetry/PROBE_PER_SPEC.md.
@@ -68,7 +76,8 @@ LOG="/tmp/wfb.log"
 # 1 Hz status.jsonl + an lc.log decision mirror, newest 10 kept, inactive when
 # no SD is mounted (logs never land on the overlay). The GS "New capture"
 # button can also roll a fresh, time-aligned session via WCMD_KEY_LOG_CONTROL.
-# Default ON; disable entirely with: fw_setenv wfblog 0  (passes --no-log).
+# Default ON; disable entirely by setting WFB_LOG=0 (script constant above,
+# passes --no-log).
 
 # ── Mega binary (single wfb-air) support ─────────────────────────────
 # If the multi-call wfb-air binary is installed, route the applets through
@@ -89,7 +98,7 @@ fi
 
 fw_get() { fw_printenv -n "$1" 2>/dev/null || echo "$2"; }
 is_enabled() { [ "$(fw_get wfbmode 0)" = "1" ]; }
-probe_enabled() { [ "$(fw_get wfbprobe 1)" = "1" ]; }
+probe_enabled() { [ "$WFB_PROBE" = "1" ]; }
 log() { echo "[wfb] $*" | tee -a "$LOG"; }
 
 start_wfb() {
@@ -124,8 +133,7 @@ start_wfb() {
     #   off — peek disabled (no per-frame close).
     # The old NAL-aware PROTECT/DROP profiles (idr/refpred) and the short-tail
     # close were removed — both flapped the MCS loop; only the gate close ships.
-    # Override: fw_setenv wfbpeek off|close.
-    WFB_PEEK_PROFILE=$(fw_get wfbpeek close)
+    # Profile is the WFB_PEEK_PROFILE script constant at the top (not an env var).
 
     # wfb_tx (SHM input from venc).  -T sizes the FEC safety-net timeout
     # to the typical frame period (60 fps ≈ 16 ms); fec_controller can
@@ -147,11 +155,11 @@ start_wfb() {
            >> "$LOG" 2>&1 &
     echo $! > "$PID_RX"
 
-    # Probe wfb_tx (V+2 producer; wfbprobe=1). Spawned at a best-effort
+    # Probe wfb_tx (V+2 producer; WFB_PROBE=1). Spawned at a best-effort
     # V+2 MCS; link_controller retunes it on its control socket (-C) and
     # feeds paced PRB packets to its udp input (-u). FEC 1/1 so raw loss
     # is not masked; -x because the GS probe rx runs -x (PER measurement
-    # does not need AEAD). wfbprobe=0 -> no probe -> MCS adaptation off
+    # does not need AEAD). WFB_PROBE=0 -> no probe -> MCS adaptation off
     # (--no-mcs), since the unified law cannot promote without it; the
     # CSA receiver goes with it (it reuses the MCS rx_ant listener).
     PROBE_ARGS="--no-mcs"
@@ -174,12 +182,12 @@ start_wfb() {
     # --failsafe absorbs bursty rx_ant loss over the wfb-ng uplink — see
     # WFB_FAILSAFE_S above.
     # $PROBE_ARGS is intentionally unquoted (--csa-iface + --probe +
-    # --probe-feed when wfbprobe=1, --no-mcs otherwise — CSA rides the
+    # --probe-feed when WFB_PROBE=1, --no-mcs otherwise — CSA rides the
     # MCS rx_ant listener so it is gated together with the probe).
     # $LOG_ARGS gates the in-process SD telemetry logger (default on; --no-log
-    # when wfblog=0). It logs to /mnt/mmcblk0p1 and self-disables if absent.
+    # when WFB_LOG=0). It logs to /mnt/mmcblk0p1 and self-disables if absent.
     LOG_ARGS=""
-    [ "$(fw_get wfblog 1)" = "1" ] || LOG_ARGS="--no-log"
+    [ "$WFB_LOG" = "1" ] || LOG_ARGS="--no-log"
     $LINK_CONTROLLER \
         --wfb 127.0.0.1:$WFB_CTRL \
         --venc 127.0.0.1:80 \
@@ -215,7 +223,7 @@ stop_wfb() {
 }
 
 status_wfb() {
-    echo "wfbmode env: $(fw_get wfbmode 0)  wfbprobe env: $(fw_get wfbprobe 1)"
+    echo "wfbmode env: $(fw_get wfbmode 0)  probe: $WFB_PROBE  peek: $WFB_PEEK_PROFILE  (script-fixed)"
     if command -v wfb-air >/dev/null 2>&1; then
         pids=$(pidof wfb-air 2>/dev/null)
         echo "  wfb-air (link/tx/rx/probe applets): ${pids:-not running}"
@@ -231,7 +239,7 @@ status_wfb() {
             && echo "  probe wfb_tx: $ppid" \
             || echo "  probe wfb_tx: stale pidfile ($ppid)"
     fi
-    echo "  sd logger: in-process in link_controller (wfblog env: $(fw_get wfblog 1), SD: $(grep -q ' /mnt/mmcblk0p1 ' /proc/mounts && echo present || echo absent), latest: $(ls -1d /mnt/mmcblk0p1/walkout/*/ 2>/dev/null | sort | tail -1 || echo none))"
+    echo "  sd logger: in-process in link_controller (log: $WFB_LOG (script), SD: $(grep -q ' /mnt/mmcblk0p1 ' /proc/mounts && echo present || echo absent), latest: $(ls -1d /mnt/mmcblk0p1/walkout/*/ 2>/dev/null | sort | tail -1 || echo none))"
     [ "$(fw_get wfbmode 0)" = "1" ] && command -v curl >/dev/null 2>&1 && \
         echo "  sd logger live: $(curl -s -m 2 http://127.0.0.1:8765/log/status 2>/dev/null || echo '(link_controller /log/status unreachable)')"
     echo "wlan0:"
