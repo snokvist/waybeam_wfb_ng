@@ -5,7 +5,7 @@
 # without remembering which directory each binary lives in.
 
 .PHONY: all ground vehicle probes wfb-ng test test-archive clean help \
-        ground-host vehicle-host
+        ground-host vehicle-host mega mega-ground mega-vehicle
 
 # Default = build everything that's small and host-native (so a fresh
 # checkout proves the C compiles before any cross toolchain is needed).
@@ -40,6 +40,23 @@ probes:
 wfb-ng:
 	cd wfb-ng && ./build-armv7.sh
 
+# ── Mega binaries (single-file multi-call: wfb-gs / wfb-air) ─────────────
+# busybox-style one-binary-per-side build (see docs/design/mega-binary.md).
+# Both need the patched wfb-ng tree + cross libsodium/libpcap that the
+# build-*.sh scripts prepare, so run those once first:
+#   ./wfb-ng/build-aarch64.sh   # ground deps (or build for the GS target)
+#   ./wfb-ng/build-armv7.sh     # vehicle deps (cross libsodium/libpcap)
+# `make mega-ground` is host-native (x86) and self-sufficient once the
+# wfb-ng src/ tree exists; `make mega-vehicle` cross-builds armv7 and finds
+# the cross libs under wfb-ng/build by default (override MEGA_*FLAGS to retarget).
+mega: mega-ground mega-vehicle
+
+mega-ground:
+	$(MAKE) -C ground mega
+
+mega-vehicle:
+	$(MAKE) -C vehicle mega
+
 # ── Tests ───────────────────────────────────────────────────────────────
 # Default test target is the wire-format conformance suite (fast).
 # Prefer the repo's .venv interpreter so contributors don't have to
@@ -69,6 +86,9 @@ help:
 	@echo "  make vehicle-host     host-build link_controller"
 	@echo "  make probes           build host-native dev probes (rtp_timing_probe)"
 	@echo "  make wfb-ng           build the patched wfb-ng fork (armv7)"
+	@echo "  make mega             build both mega binaries (wfb-gs + wfb-air)"
+	@echo "  make mega-ground      build the wfb-gs mega binary (host x86)"
+	@echo "  make mega-vehicle     cross-build the wfb-air mega binary (armv7)"
 	@echo "  make test             pytest tests/protocols (wire-format conformance)"
 	@echo "  make test-archive     pytest archive/python/tests (legacy)"
 	@echo "  make clean            wipe per-component build/ trees"

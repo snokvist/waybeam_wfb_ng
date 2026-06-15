@@ -235,10 +235,17 @@ libpcap once and the stub header is unnecessary.
 
 ### Phase 4 — Packaging & docs
 
-- Top-level `make mega` builds both.
-- Update `CLAUDE.md` (Repository layout + Build & test).
-- Keep separate-binary builds as the default until the mega build is proven on
-  hardware.
+**Status: DONE (2026-06-15).**
+- Top-level `make mega` / `make mega-ground` / `make mega-vehicle` build both
+  sides (umbrella `Makefile`); `make help` lists them.
+- The duplicated wfb-ng object rules were hoisted into `wfb-ng/mega.mk`
+  (parameterized on `MEGA_CC`/`MEGA_CXX`), included by both side Makefiles.
+- `vehicle/Makefile` mega lib flags now default to the `build-armv7.sh`
+  cross-install dirs, so `make mega-vehicle` cross-links with no manual flags.
+- `CLAUDE.md` updated (Repository layout adds `multicall/` + `wfb-ng/mega.mk`;
+  Build & test gains a "Mega binaries" section).
+- Separate-binary builds remain the default (mega is `-DWFB_MULTICALL`,
+  opt-in); the mega path is proven on hardware (both sides, live RF link).
 
 ## Risks / watch-items
 
@@ -340,13 +347,13 @@ binaries, which remain in place) + restoring the `S99wfb` backup.
    stop-first path ran — busybox `pidof`/`killall` match comm as expected.
 4. **Strip parity** — vehicle `make mega` strips, ground does not (cosmetic).
 
-### Deferred cleanup (after the link is proven)
-- The two `mega` Makefile blocks are ~40 near-identical lines; hoist the wfb-ng
-  object rules into a shared `wfb-ng/mega.mk` included by both.
-- **Phase 4 packaging** (not started): top-level `make mega` building both
-  sides; update `CLAUDE.md` (Repository layout + Build & test) to mention
-  `multicall/` and the mega binaries. Keep separate-binary builds the default
-  until mega is proven on hardware.
-- Deployment must install the `wfb-air`/`wfb-gs` binary; `S99wfb` already
+### Cleanup — DONE (2026-06-15)
+- The duplicated `mega` Makefile blocks were hoisted into `wfb-ng/mega.mk`
+  (parameterized on `MEGA_CC`/`MEGA_CXX`), included by both side Makefiles.
+- Phase 4 packaging completed — see the Phase 4 section above.
+- Deployment installs the `wfb-air`/`wfb-gs` binary; `S99wfb` already
   auto-routes when `wfb-air` is on PATH (no symlinks required, but busybox-style
   symlinks `wfb_rx`→`wfb-air` etc. also work via basename dispatch).
+
+Remaining (cosmetic, not blocking): strip parity — `vehicle/make mega` strips,
+ground does not (risk #4).

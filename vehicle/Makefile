@@ -89,34 +89,32 @@ $(TEST_SELECTOR): ../tests/test_selector_law.c $(SRC) $(CSA_HDR) $(WEBUI_HDR) | 
 #   MEGA_CFLAGS  extra compile flags (e.g. -I<sodium>/include, -I<venc>/include)
 #   MEGA_LDFLAGS link flags/libs (default: -lpcap -lsodium -lm)
 #
-# Example (after running wfb-ng/build-armv7.sh once to prep the tree):
-#   make mega \
-#     WFBNG_SRC=../wfb-ng/build/wfb-ng/src \
-#     MEGA_CFLAGS="-I$$SODIUM/include" \
-#     MEGA_LDFLAGS="-L$$SODIUM/lib -lpcap -lsodium -lrt -lpthread -lm"
+# Defaults below point at the cross libsodium/libpcap that wfb-ng/build-armv7.sh
+# installs, so `make mega` works out of the box after that script has run once.
+# Override MEGA_CFLAGS/MEGA_LDFLAGS for a different sysroot (e.g. host-arch).
 WFBNG_SRC    ?= ../wfb-ng/build/wfb-ng/src
+SODIUM_DIR   ?= ../wfb-ng/build/sodium-install
+PCAP_DIR     ?= ../wfb-ng/build/pcap-install
 MEGA_OUT     ?= $(BUILD_DIR)/wfb-air
 MEGA_OBJ      = $(BUILD_DIR)/mega
 MEGA_DEFS     = -DWFB_MULTICALL -DWFB_WITH_WFBNG
-MEGA_CFLAGS  ?=
-MEGA_LDFLAGS ?= -lpcap -lsodium -lm
+MEGA_CFLAGS  ?= -I$(SODIUM_DIR)/include -I$(PCAP_DIR)/include
+MEGA_LDFLAGS ?= -L$(SODIUM_DIR)/lib -L$(PCAP_DIR)/lib -lpcap -lsodium -lm
 MULTICALL    = ../multicall
 MEGA_WFB_VERSION ?= shm-patched-mega
 MEGA_WFB_DEFS     = -DWFB_VERSION=\"$(MEGA_WFB_VERSION)\"
 
-# link_controller + CSA (C, multicall) | dispatcher + applet table (C++).
+# Cross compilers drive the mega rules in wfb-ng/mega.mk.
+MEGA_CC  := $(CROSS_CC)
+MEGA_CXX := $(CROSS_CXX)
+# link_controller + CSA (C, multicall) | dispatcher + air applet table (C++).
 MEGA_LC_OBJ   = $(MEGA_OBJ)/link_controller.o $(MEGA_OBJ)/csa.o
 MEGA_DISP_OBJ = $(MEGA_OBJ)/wfb_multicall.o $(MEGA_OBJ)/air_applets.o
-# wfb-ng tool objects (rx/tx/tx_cmd/keygen renamed to *_main via -Dmain=).
-MEGA_WFBNG_OBJ = $(MEGA_OBJ)/rx.o $(MEGA_OBJ)/tx.o $(MEGA_OBJ)/tx_cmd.o \
-                 $(MEGA_OBJ)/keygen.o $(MEGA_OBJ)/peek.o $(MEGA_OBJ)/zfex.o \
-                 $(MEGA_OBJ)/wifibroadcast.o $(MEGA_OBJ)/radiotap.o \
-                 $(MEGA_OBJ)/venc_ring.o
+
+# Shared wfb-ng tool + dispatcher object rules (defines MEGA_WFBNG_OBJ).
+include ../wfb-ng/mega.mk
 
 mega: $(MEGA_OUT)
-
-$(MEGA_OBJ):
-	@mkdir -p $@
 
 # --- link_controller + csa (C, multicall) ---
 $(MEGA_OBJ)/link_controller.o: link_controller.c $(CSA_HDR) $(WEBUI_HDR) | $(MEGA_OBJ)
@@ -124,31 +122,9 @@ $(MEGA_OBJ)/link_controller.o: link_controller.c $(CSA_HDR) $(WEBUI_HDR) | $(MEG
 $(MEGA_OBJ)/csa.o: csa/csa.c $(CSA_HDR) | $(MEGA_OBJ)
 	$(CROSS_CC) $(CFLAGS_COMMON) $(MEGA_DEFS) $(MEGA_CFLAGS) $(SHARED_INC) -I. -Icsa -c -o $@ $<
 
-# --- dispatcher + applet table (C++) ---
-$(MEGA_OBJ)/wfb_multicall.o: $(MULTICALL)/wfb_multicall.cpp $(MULTICALL)/wfb_multicall.h | $(MEGA_OBJ)
-	$(CROSS_CXX) -std=gnu++11 -O2 -Wall $(MEGA_DEFS) $(MEGA_CFLAGS) -I$(MULTICALL) -c -o $@ $<
+# --- air applet table (C++) ---
 $(MEGA_OBJ)/air_applets.o: air_applets.cpp $(MULTICALL)/wfb_multicall.h | $(MEGA_OBJ)
 	$(CROSS_CXX) -std=gnu++11 -O2 -Wall $(MEGA_DEFS) $(MEGA_CFLAGS) -I$(MULTICALL) -c -o $@ $<
-
-# --- wfb-ng tools (main() renamed to applet entry via -Dmain=) ---
-$(MEGA_OBJ)/rx.o:     $(WFBNG_SRC)/rx.cpp           | $(MEGA_OBJ)
-	$(CROSS_CXX) -std=gnu++11 -O2 -Wall -fno-strict-aliasing $(MEGA_WFB_DEFS) -Dmain=wfb_rx_main     $(MEGA_CFLAGS) -c -o $@ $<
-$(MEGA_OBJ)/tx.o:     $(WFBNG_SRC)/tx.cpp           | $(MEGA_OBJ)
-	$(CROSS_CXX) -std=gnu++11 -O2 -Wall -fno-strict-aliasing $(MEGA_WFB_DEFS) -Dmain=wfb_tx_main     $(MEGA_CFLAGS) -c -o $@ $<
-$(MEGA_OBJ)/tx_cmd.o: $(WFBNG_SRC)/tx_cmd.c         | $(MEGA_OBJ)
-	$(CROSS_CC)  -std=gnu99   -O2 -Wall -fno-strict-aliasing $(MEGA_WFB_DEFS) -Dmain=wfb_tx_cmd_main $(MEGA_CFLAGS) -c -o $@ $<
-$(MEGA_OBJ)/keygen.o: $(WFBNG_SRC)/keygen.c         | $(MEGA_OBJ)
-	$(CROSS_CC)  -std=gnu99   -O2 -Wall -fno-strict-aliasing $(MEGA_WFB_DEFS) -Dmain=wfb_keygen_main $(MEGA_CFLAGS) -c -o $@ $<
-$(MEGA_OBJ)/peek.o:           $(WFBNG_SRC)/peek.cpp          | $(MEGA_OBJ)
-	$(CROSS_CXX) -std=gnu++11 -O2 -Wall -fno-strict-aliasing $(MEGA_WFB_DEFS) $(MEGA_CFLAGS) -c -o $@ $<
-$(MEGA_OBJ)/wifibroadcast.o:  $(WFBNG_SRC)/wifibroadcast.cpp | $(MEGA_OBJ)
-	$(CROSS_CXX) -std=gnu++11 -O2 -Wall -fno-strict-aliasing $(MEGA_WFB_DEFS) $(MEGA_CFLAGS) -c -o $@ $<
-$(MEGA_OBJ)/zfex.o:           $(WFBNG_SRC)/zfex.c            | $(MEGA_OBJ)
-	$(CROSS_CC)  -std=gnu99   -O2 -Wall -fno-strict-aliasing $(MEGA_WFB_DEFS) $(MEGA_CFLAGS) -c -o $@ $<
-$(MEGA_OBJ)/radiotap.o:       $(WFBNG_SRC)/radiotap.c        | $(MEGA_OBJ)
-	$(CROSS_CC)  -std=gnu99   -O2 -Wall -fno-strict-aliasing $(MEGA_WFB_DEFS) $(MEGA_CFLAGS) -c -o $@ $<
-$(MEGA_OBJ)/venc_ring.o:      $(WFBNG_SRC)/venc_ring.c       | $(MEGA_OBJ)
-	$(CROSS_CC)  -std=gnu99   -O2 -Wall -fno-strict-aliasing $(MEGA_WFB_DEFS) $(MEGA_CFLAGS) -c -o $@ $<
 
 $(MEGA_OUT): $(MEGA_LC_OBJ) $(MEGA_DISP_OBJ) $(MEGA_WFBNG_OBJ)
 	@echo "[wfb-air] linking mega binary -> $@"
