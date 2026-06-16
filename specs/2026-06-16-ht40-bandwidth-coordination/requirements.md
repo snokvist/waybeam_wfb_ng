@@ -203,15 +203,17 @@ mechanism. If `SET_RADIO bandwidth=40` is applied while the card stays on a bare
 over-drive → loss. The two must flip together, on both ends.
 
 **Open decisions:**
-- **Who owns the `iw` width in production?** ✅ **DECIDED (PR #82):** the ground
-  defaults to `iw … set channel <ch> HT40+` in all GS configs; the vehicle stays
-  HT20. The literal `system.up` (host configs) and the wired `profile.ht`
-  (`gs_supervisor.c:362–398`) both carry it. **Still open:** `/etc/wfb-link.json`
-  `radio.htmode` is *not* wired to `iw` (the overlay maps only `radio.bw` →
-  radiotap, `gs_supervisor.c:740`). Plumb `radio.htmode` → the `iw set channel`
-  width so deployed grounds can set HT40 from the autonomous preset too.
-  (`radio.bw` → `-B`/`SET_RADIO` is already wired; keep `bw=20` while the air is
-  rtl8812eu.)
+- **Who owns the `iw` width in production?** ✅ **DECIDED + DONE (PR #82):** the
+  ground defaults to `iw … set channel <ch> HT40+` in all GS configs; the vehicle
+  stays HT20. All three ground paths now carry the width: the literal `system.up`
+  (host configs), the wired `profile.ht` (`gs_supervisor.c:362–398`), **and** the
+  `/etc/wfb-link.json` overlay — `cfg_apply_wfb_link_overlay` now rewrites the
+  `iw set channel` width from `radio.htmode` (device-verified: a bare-HT20 base +
+  `wfb-link.json` htmode=HT40+ → cards come up at 40 MHz). The AIR already honored
+  `radio.htmode` via `S99wfb` (`WFB_HTMODE` → `iw set channel`, line 169), so both
+  sides are now symmetric. `radio.bw` → `-B`/`SET_RADIO` (radiotap) was already
+  wired; keep `bw=20` while the air is rtl8812eu. The shared `wfb-link.example.json`
+  keeps the air-safe `htmode=HT20` default (ground operators set HT40+).
 - **Desync guard?** Should `link_controller` refuse the 2× budget when iw width and
   radiotap disagree? It can't read `iw` directly; the supervisor could surface the
   actual width in stats (Phase 2 idea).
