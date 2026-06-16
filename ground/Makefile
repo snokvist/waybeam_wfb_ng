@@ -202,9 +202,17 @@ $(MEGA_OBJ)/%.o: %.c $(HDRS) $(WEBUI_HDR) $(TELE_HDR) | $(MEGA_OBJ)
 	$(MEGA_CC) $(CFLAGS_COMMON) $(MEGA_DEFS) $(MEGA_CFLAGS) $(SHARED_INC) $(SQLITE_INC) -I$(MULTICALL) -I. -Iwebui -c -o $@ $<
 
 # --- vendored SQLite amalgamation (mega; host or cross per MEGA_CC) ---
-$(MEGA_OBJ)/sqlite3.o: $(SQLITE_DIR)/sqlite3.c | $(MEGA_OBJ)
-	@echo "[wfb-gs] sqlite3 -> $@"
-	$(MEGA_CC) -O2 -w $(SQLITE_DEFS) $(MEGA_CFLAGS) -c -o $@ $<
+# Unlike the standalone host/cross objects (separate files), the mega build
+# reuses ONE path for both host and cross. sqlite3.c never changes, so a plain
+# rule would never rebuild on a MEGA_CC switch and the link would pull a stale
+# wrong-arch object. Mirror the standalone-cross guard: a FORCE-driven recipe
+# that recompiles only when the recorded compiler in $@.cc differs from MEGA_CC.
+$(MEGA_OBJ)/sqlite3.o: $(SQLITE_DIR)/sqlite3.c FORCE | $(MEGA_OBJ)
+	@if [ ! -f $@ ] || [ "`cat $@.cc 2>/dev/null`" != "$(MEGA_CC)" ]; then \
+		echo "[wfb-gs] sqlite3 ($(MEGA_CC)) -> $@"; \
+		$(MEGA_CC) -O2 -w $(SQLITE_DEFS) $(MEGA_CFLAGS) -c -o $@ $< && \
+		echo "$(MEGA_CC)" > $@.cc; \
+	else echo "[wfb-gs] sqlite3 (cached) -> $@"; fi
 
 # --- ground applet table (C++) ---
 $(MEGA_OBJ)/gs_applets.o: gs_applets.cpp $(MULTICALL)/wfb_multicall.h $(MULTICALL)/wfb_applets_common.h $(MULTICALL)/wfb_keyseed.h $(MULTICALL)/wfb_configenv.h | $(MEGA_OBJ)
