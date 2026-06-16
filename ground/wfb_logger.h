@@ -27,7 +27,9 @@
 struct sqlite3;
 
 /* Runtime config, filled from the gs_supervisor `telemetry` block (+ wfb-link
- * overlay log.enabled). Defaults reproduce the Python ingester's behaviour. */
+ * overlay log.enabled). Opt-in: disabled unless a config explicitly enables it
+ * (matches the retired Python ingester, which only ran when its launcher was in
+ * system.up). */
 typedef struct {
 	bool enabled;          /* master gate (telemetry.enabled / log.enabled) */
 	char db[512];          /* sqlite path (default "wfb.sqlite") */
@@ -55,7 +57,7 @@ typedef struct {
 	int    listen_port;
 } WfbLogStatus;
 
-/* Fill `cfg` with the built-in defaults (enabled, 127.0.0.1:6700, wfb.sqlite,
+/* Fill `cfg` with the built-in defaults (DISABLED, 127.0.0.1:6700, wfb.sqlite,
  * 1200 s, source "live-gs", no metadata). */
 void wfb_logger_defaults(WfbLogConfig *cfg);
 

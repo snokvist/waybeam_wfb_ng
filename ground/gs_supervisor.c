@@ -493,7 +493,7 @@ int cfg_load(const char *path, Config *c)
 	snprintf(c->http_bind, sizeof(c->http_bind), "0.0.0.0");
 	c->http_port = GS_DEFAULT_HTTP_PORT;
 	c->venc_cmd_rate_limit_ms = 50;
-	wfb_logger_defaults(&c->telemetry);   /* enabled, 127.0.0.1:6700, wfb.sqlite, 1200 s */
+	wfb_logger_defaults(&c->telemetry);   /* DISABLED by default; 127.0.0.1:6700, wfb.sqlite, 1200 s. Opt in via telemetry.enabled or wfb-link log.enabled. */
 
 	int fd = open(path, O_RDONLY);
 	if (fd < 0) { LOG_ERR("config open(%s): %s", path, strerror(errno)); return -1; }
@@ -575,9 +575,10 @@ int cfg_load(const char *path, Config *c)
 			c->venc_cmd_rate_limit_ms = (int)lv;
 	}
 
-	/* telemetry logger (Phase 5): in-process udp->sqlite capture. Defaults
-	 * (set above) reproduce the retired Python ingester; any present field
-	 * overrides. */
+	/* telemetry logger (Phase 5): in-process udp->sqlite capture, replacing the
+	 * retired Python ingester. DISABLED unless opted in (enabled=false default,
+	 * set above) so a config with no `telemetry` block never writes to CWD; any
+	 * present field overrides the defaults. */
 	int tel_idx = jfind(buf, toks, n, 0, "telemetry");
 	if (tel_idx >= 0 && toks[tel_idx].type == JT_OBJ) {
 		bool bv;
@@ -760,6 +761,52 @@ void cfg_apply_wfb_link_overlay(Config *c, const char *path)
 			c->telemetry.enabled = bv;
 			LOG_INFO("wfb-link overlay: telemetry.enabled -> %s", bv ? "true" : "false");
 			applied++;
+		}
+	}
+
+	/* radio.htmode -> the `iw set channel` width in system.up. This is the iw
+	 * channel width (RF), independent of radio.bw (the radiotap TX width above):
+	 * a ground on a 40 MHz channel decodes both 20 and 40 MHz on its primary, so
+	 * htmode=HT40+ with bw=20 is the canonical config while the air is HT20.
+	 * Rewrites every `... set channel <chan> [old-ht]` line, replacing any
+	 * existing width suffix. Runs before supervisor_bring_up(), so the rewritten
+	 * commands are what actually execute. */
+	if ((sec = jfind(buf, toks, n, 0, "radio")) >= 0 && toks[sec].type == JT_OBJ &&
+	    (v = jfind(buf, toks, n, sec, "htmode")) >= 0 && toks[v].type == JT_STR) {
+		char htmode[8] = "";
+		jstr(buf, &toks[v], htmode, sizeof(htmode));
+		if (strcmp(htmode, "HT20") && strcmp(htmode, "HT40+") &&
+		    strcmp(htmode, "HT40-")) {
+			LOG_WARN("wfb-link overlay: ignoring invalid radio.htmode '%s' "
+			         "(want HT20/HT40+/HT40-)", htmode);
+		} else {
+			int rewritten = 0;
+			for (int i = 0; i < c->system_up_count; i++) {
+				char *cmd = c->system_up[i];
+				char *p = strstr(cmd, "set channel ");
+				if (!p) continue;
+				p += strlen("set channel ");
+				const char *q = p;               /* channel number token */
+				while (*q && *q != ' ') q++;
+				int clen = (int)(q - p);
+				if (clen <= 0 || clen >= 8) continue;
+				char chan[8];
+				memcpy(chan, p, (size_t)clen);
+				chan[clen] = 0;
+				int prefix = (int)(p - cmd);     /* through "set channel " */
+				char nb[GS_PATH_MAX];
+				int rc = snprintf(nb, sizeof(nb), "%.*s%s %s",
+				                  prefix, cmd, chan, htmode);
+				if (rc > 0 && rc < (int)sizeof(nb)) {
+					memcpy(cmd, nb, (size_t)rc + 1);
+					rewritten++;
+				}
+			}
+			if (rewritten) {
+				LOG_INFO("wfb-link overlay: radio.htmode -> %s on %d iw "
+				         "set-channel cmd(s)", htmode, rewritten);
+				applied++;
+			}
 		}
 	}
 

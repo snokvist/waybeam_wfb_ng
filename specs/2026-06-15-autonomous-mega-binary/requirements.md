@@ -223,7 +223,10 @@ Built in four device-verifiable sub-phases:
   mega (+`pthread`+`m`) — *not* a separate `libsqlite3.a` (simpler, no
   host/sysroot dep; same static-link outcome). NOT sodium-gated. New
   `telemetry` config block + `log.enabled` overlay; started after API bind,
-  stopped cleanly on shutdown.
+  stopped cleanly on shutdown. **Opt-in:** disabled by default — a config with
+  no `telemetry` block (e.g. `rk3566_passive.json`) never auto-creates
+  `wfb.sqlite` in CWD (respects the no-persisted-logs-on-overlay rule); enable
+  via `telemetry.enabled` or wfb-link `log.enabled`.
 - **5b — read API + dashboard.** `ground/gs_supervisor_telemetry.c` serves the
   dashboard (embedded `ground/webui/telemetry/*` via the `webui` xxd target) at
   `/telemetry[/static/*]` and GET JSON under `/api/v1/telemetry/`

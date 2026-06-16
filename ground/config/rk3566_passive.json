@@ -1,5 +1,5 @@
 {
-  "_comment": "RK3566 / Radxa3e aarch64 ground station — PASSIVE video receiver. Single card wlx84fc1450bcde, RX-only: decodes the vehicle's video downlink (link 207) to 127.0.0.1:5600. NO uplink TX, NO probe RX, NO back-channel stats_out — this node never transmits and does not participate in the control link. Channel MUST match the vehicle's current TX channel (161/HT20, matching the active GS); a passive RX does not follow CSA hops, so re-tune by hand if the link hops.",
+  "_comment": "RK3566 / Radxa3e aarch64 ground station — PASSIVE video receiver. Single card wlx84fc1450bcde, RX-only: decodes the vehicle's video downlink (link 207) to 127.0.0.1:5600. NO uplink TX, NO probe RX, NO back-channel stats_out — this node never transmits and does not participate in the control link. Channel 161 HT40+ (40 MHz): a passive RX on a 40 MHz channel decodes both 20 MHz and 40 MHz transmissions on the primary, so it works with any vehicle width (vehicle stays HT20 — rtl8812eu has no HT40 monitor mode). UNVERIFIED on this card: HT40 monitor RX was bench-confirmed only on the dev host's RTL88x2 adapters; cold-boot-verify wlx84fc1450bcde decodes cleanly at HT40 before relying on it (fall back to bare 'set channel 161' = HT20 if not). A passive RX does not follow CSA hops, so re-tune by hand if the link hops.",
 
   "key_file": "/etc/drone.key",
 
@@ -12,7 +12,7 @@
       "sleep 0.5",
       "ip link set wlx84fc1450bcde up",
       "sleep 0.5",
-      "iw dev wlx84fc1450bcde set channel 161"
+      "iw dev wlx84fc1450bcde set channel 161 HT40+"
     ],
     "down": [
       "ip link set wlx84fc1450bcde down"

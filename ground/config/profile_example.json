@@ -6,11 +6,11 @@
   "http": { "bind": "0.0.0.0", "port": 80 },
 
   "profile": {
-    "_comment": "ifaces = all monitor-mode adapters (RX diversity); uplink_iface (default: last entry) also carries the GS->vehicle TX. txpower_mbm is optional (100 mBm = 1 dBm; omit to leave adapter defaults). wfb_bin_dir is optional (omit to resolve wfb_rx/wfb_tx from $PATH).",
+    "_comment": "ifaces = all monitor-mode adapters (RX diversity); uplink_iface (default: last entry) also carries the GS->vehicle TX. txpower_mbm is optional (100 mBm = 1 dBm; omit to leave adapter defaults). wfb_bin_dir is optional (omit to resolve wfb_rx/wfb_tx from $PATH). ht = iw channel width: ground defaults to HT40+ (decodes 20+40 MHz on the primary, works with any vehicle width). Keep the VEHICLE at HT20 (rtl8812eu has no HT40 monitor mode). For non-161 channels pick the channel-correct HT40+/HT40- (or HT20).",
     "ifaces": ["wlxAAAAAAAAAAA", "wlxBBBBBBBBBBB"],
     "uplink_iface": "wlxBBBBBBBBBBB",
     "channel": 161,
-    "ht": "HT20",
+    "ht": "HT40+",
     "txpower_mbm": 2000
   },
 

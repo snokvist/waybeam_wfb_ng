@@ -1,5 +1,5 @@
 {
-  "_comment": "Host x86 ground station — two RTL88x2 USB adapters, both on channel 161.",
+  "_comment": "Host x86 ground station — two RTL88x2 USB adapters, both on channel 161 HT40+. Ground initializes at HT40 (decodes 20+40 MHz on the primary); the VEHICLE stays HT20 (rtl8812eu has no HT40 monitor mode). radiotap TX width stays 20 — HT40 is the iw channel width only. See host_x86.json for the full rationale.",
   "_comment_iface_a": "wlx40a5ef2f229b — RX-only diversity adapter",
   "_comment_iface_b": "wlx40a5ef2f2308 — RX diversity + uplink TX",
 
@@ -14,7 +14,7 @@
       "sleep 0.5",
       "ip link set wlx40a5ef2f229b up",
       "sleep 0.5",
-      "iw dev wlx40a5ef2f229b set channel 161",
+      "iw dev wlx40a5ef2f229b set channel 161 HT40+",
       "sleep 0.5",
       "iw dev wlx40a5ef2f229b set txpower fixed 2000",
 
@@ -23,7 +23,7 @@
       "sleep 0.5",
       "ip link set wlx40a5ef2f2308 up",
       "sleep 0.5",
-      "iw dev wlx40a5ef2f2308 set channel 161",
+      "iw dev wlx40a5ef2f2308 set channel 161 HT40+",
       "sleep 0.5",
       "iw dev wlx40a5ef2f2308 set txpower fixed 2000"
     ],

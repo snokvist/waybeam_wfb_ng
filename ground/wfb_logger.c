@@ -477,7 +477,12 @@ static void *capture_run(void *arg)
 void wfb_logger_defaults(WfbLogConfig *cfg)
 {
 	memset(cfg, 0, sizeof(*cfg));
-	cfg->enabled = true;
+	/* Opt-in: a config with no `telemetry` block (and no wfb-link log.enabled
+	 * override) must NOT auto-start the udp:6700 capture or create wfb.sqlite in
+	 * the supervisor's CWD — that would persist logs on read-only/overlay deploys
+	 * (e.g. rk3566_passive.json, which carries no telemetry block). Enable
+	 * explicitly via telemetry.enabled or wfb-link.json log.enabled. */
+	cfg->enabled = false;
 	snprintf(cfg->db, sizeof(cfg->db), "wfb.sqlite");
 	snprintf(cfg->bind, sizeof(cfg->bind), "127.0.0.1");
 	cfg->listen_port = 6700;
