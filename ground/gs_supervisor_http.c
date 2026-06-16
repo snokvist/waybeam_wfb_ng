@@ -39,6 +39,36 @@ bool request_wants_html(const char *req)
 	       strstr(headers, "accept: text/html") != NULL;
 }
 
+/* qs_get() returns the raw (still percent-encoded) query value. The WebUI sends
+ * values via encodeURIComponent (space->%20, '+'->%2B, etc.), so any value that
+ * can contain a non-alphanumeric byte — ht=HT40+ (-> "HT40%2B"), a key seed
+ * passphrase — MUST be decoded before use. Without this, e.g. "HT40+" arrives
+ * as "HT40%2B" and fails the exact strcmp against "HT40+".
+ *
+ * Decodes %XX; every other byte (including a literal '+') is copied verbatim —
+ * we do NOT treat '+' as space, because encodeURIComponent emits %20 for space
+ * and %2B for a literal '+', so a bare '+' here is always a real plus. */
+static int hexnib(char c)
+{
+	if (c >= '0' && c <= '9') return c - '0';
+	if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+	if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+	return -1;
+}
+static size_t qs_pct_decode(char *dst, size_t cap, const char *src, size_t len)
+{
+	size_t o = 0;
+	for (size_t i = 0; i < len && cap && o + 1 < cap; i++) {
+		if (src[i] == '%' && i + 2 < len) {
+			int h = hexnib(src[i + 1]), l = hexnib(src[i + 2]);
+			if (h >= 0 && l >= 0) { dst[o++] = (char)((h << 4) | l); i += 2; continue; }
+		}
+		dst[o++] = src[i];
+	}
+	if (cap) dst[o] = 0;
+	return o;
+}
+
 /* ---------- HTTP API ------------------------------------------------- */
 
 int api_listen_open(const char *bind_ip, uint16_t port)
@@ -674,7 +704,7 @@ void api_handle(ApiClient *cli, Config *c, uint64_t startup_us)
 					    "{\"ok\":false,\"error\":\"bad ht\"}", -1);
 					return;
 				}
-				memcpy(hts[hi], p, L); hts[hi][L] = 0;
+				qs_pct_decode(hts[hi], sizeof(hts[hi]), p, L);
 				hi++;
 				p = q + 1;
 			}
@@ -689,7 +719,7 @@ void api_handle(ApiClient *cli, Config *c, uint64_t startup_us)
 			}
 		} else if (htstr && hl_ht > 0 && hl_ht < 8) {
 			char one[8];
-			memcpy(one, htstr, hl_ht); one[hl_ht] = 0;
+			qs_pct_decode(one, sizeof(one), htstr, hl_ht);
 			for (int i = 0; i < chan_count; i++)
 				snprintf(hts[i], 8, "%s", one);
 		}
@@ -887,7 +917,7 @@ void api_handle(ApiClient *cli, Config *c, uint64_t startup_us)
 			}
 		}
 		char ht[8];
-		memcpy(ht, htstr, hl_ht); ht[hl_ht] = 0;
+		qs_pct_decode(ht, sizeof(ht), htstr, hl_ht);
 		if (strcmp(ht, "HT20") && strcmp(ht, "HT40+") && strcmp(ht, "HT40-")) {
 			api_send(cli->fd, 400, "text/plain",
 			    "ht must be HT20|HT40+|HT40-\n", -1);
@@ -907,7 +937,7 @@ void api_handle(ApiClient *cli, Config *c, uint64_t startup_us)
 		const char *pstr = qs_get(qstr, "prev_ht", &pl);
 		char prev_ht[8] = "HT20";
 		if (pstr && pl > 0 && pl < 8) {
-			memcpy(prev_ht, pstr, pl); prev_ht[pl] = 0;
+			qs_pct_decode(prev_ht, sizeof(prev_ht), pstr, pl);
 		}
 		int no_revert = 0;
 		(void)qs_get_int(qstr, "no_revert", &no_revert);
@@ -1322,7 +1352,7 @@ void api_handle(ApiClient *cli, Config *c, uint64_t startup_us)
 		} else if (!strcmp(action, "seed")) {
 			char seed[128] = "Waybeam";
 			size_t sl; const char *ss = qs_get(qstr, "seed", &sl);
-			if (ss && sl && sl < sizeof(seed)) { memcpy(seed, ss, sl); seed[sl] = 0; }
+			if (ss && sl && sl < sizeof(seed)) qs_pct_decode(seed, sizeof(seed), ss, sl);
 			rc = wfb_write_key_seed(c->key_file, WFB_ROLE_GS, seed);
 			if (rc) errmsg = "write failed";
 		} else if (!strcmp(action, "random")) {
