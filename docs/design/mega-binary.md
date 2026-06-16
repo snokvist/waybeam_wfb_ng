@@ -428,8 +428,10 @@ launched from `system.up` via `webui_session.sh`) is folded into `wfb-gs`:
   that binds udp:6700, derives the denormalised columns (a bit-for-bit port of
   `wfb_store.derive_columns`), writes `wfb.sqlite` (same schema + WAL), commits
   every 20 rec / 2 s, rolls a fresh session at `max_duration`, and stops cleanly
-  (flag + join → final commit + `ended_at`). Config: a `telemetry` block in
-  `gs_supervisor.json` (+ `log.enabled` overlay). NOT sodium-gated.
+  (flag + join → final commit + `ended_at`). Config: opt-in via a `telemetry`
+  block in `gs_supervisor.json` (disabled by default; use an explicit non-overlay
+  `db` path). The air wfb-link `log.enabled` flag is NOT wired to it — that flag
+  drives only the air SD logger. NOT sodium-gated.
 - **SQLite**: the vendored 3.48.0 amalgamation (`ground/vendor/sqlite`, matched
   to the RK3566 buildroot) compiled to one `sqlite3.o` (`THREADSAFE=2` + size
   omits) and linked into both standalone + mega (+`pthread`+`m`). Chosen over a

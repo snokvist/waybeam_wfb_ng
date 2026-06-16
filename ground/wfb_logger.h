@@ -26,12 +26,13 @@
 
 struct sqlite3;
 
-/* Runtime config, filled from the gs_supervisor `telemetry` block (+ wfb-link
- * overlay log.enabled). Opt-in: disabled unless a config explicitly enables it
- * (matches the retired Python ingester, which only ran when its launcher was in
- * system.up). */
+/* Runtime config, filled from the gs_supervisor `telemetry` block. Opt-in:
+ * disabled unless that block sets enabled=true (matches the retired Python
+ * ingester, which only ran when its launcher was in system.up). The air-side
+ * wfb-link `log.enabled` flag is deliberately NOT wired here (it drives the air
+ * SD logger only) — see the note in gs_supervisor.c cfg_apply_wfb_link_overlay. */
 typedef struct {
-	bool enabled;          /* master gate (telemetry.enabled / log.enabled) */
+	bool enabled;          /* master gate (gs_supervisor.json telemetry.enabled) */
 	char db[512];          /* sqlite path (default "wfb.sqlite") */
 	char bind[64];         /* udp bind addr (default "127.0.0.1") */
 	int  listen_port;      /* udp port to ingest stats on (default 6700) */

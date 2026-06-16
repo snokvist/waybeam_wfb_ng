@@ -493,7 +493,7 @@ int cfg_load(const char *path, Config *c)
 	snprintf(c->http_bind, sizeof(c->http_bind), "0.0.0.0");
 	c->http_port = GS_DEFAULT_HTTP_PORT;
 	c->venc_cmd_rate_limit_ms = 50;
-	wfb_logger_defaults(&c->telemetry);   /* DISABLED by default; 127.0.0.1:6700, wfb.sqlite, 1200 s. Opt in via telemetry.enabled or wfb-link log.enabled. */
+	wfb_logger_defaults(&c->telemetry);   /* DISABLED by default; 127.0.0.1:6700, wfb.sqlite, 1200 s. Opt in via the gs_supervisor.json telemetry block only. */
 
 	int fd = open(path, O_RDONLY);
 	if (fd < 0) { LOG_ERR("config open(%s): %s", path, strerror(errno)); return -1; }
@@ -754,15 +754,14 @@ void cfg_apply_wfb_link_overlay(Config *c, const char *path)
 		}
 	}
 
-	/* log.enabled -> telemetry.enabled (parity with the air-side WFB_LOG env). */
-	if ((sec = jfind(buf, toks, n, 0, "log")) >= 0 && toks[sec].type == JT_OBJ) {
-		bool bv;
-		if ((v = jfind(buf, toks, n, sec, "enabled")) >= 0 && jbool(buf, &toks[v], &bv) == 0) {
-			c->telemetry.enabled = bv;
-			LOG_INFO("wfb-link overlay: telemetry.enabled -> %s", bv ? "true" : "false");
-			applied++;
-		}
-	}
+	/* NOTE: wfb-link `log.enabled` is an AIR-side flag (the link_controller SD
+	 * session logger, which writes to /mnt/mmcblk0p1 and self-disables if the SD
+	 * is absent). It is deliberately NOT mapped to the ground telemetry logger:
+	 * the ground in-process sqlite logger writes a real file at telemetry.db
+	 * (default "wfb.sqlite" in CWD = / under start-stop-daemon -b), so auto-
+	 * enabling it from the air flag would persist a growing DB on the overlay
+	 * rootfs. Ground telemetry is opt-in via the `telemetry` block in
+	 * gs_supervisor.json (with an explicit non-overlay db path) only. */
 
 	/* radio.htmode -> the `iw set channel` width in system.up. This is the iw
 	 * channel width (RF), independent of radio.bw (the radiotap TX width above):
