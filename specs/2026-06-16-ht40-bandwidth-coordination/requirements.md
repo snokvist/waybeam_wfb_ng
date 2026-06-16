@@ -2,11 +2,12 @@
 
 Status: **COMBO-VERIFIED 2026-06-16** — host (phy_mbps scaling + live-switch
 plumbing) **and** a live gs+air link (vehicle `link_controller` budget). The HT40
-budget accounting is **correct and live-verified (2.10×/MCS)**; the end-to-end
-throughput-doubling criterion **did not pass on this rig** — HT40 degraded the
-GS-side RX so the MCS controller demoted and net `safe_kbps` *fell*. See §3.1
-for the combo run. The controller behaved correctly: loss feedback demoted MCS
-rather than over-driving the 2× budget.
+budget accounting is **correct and live-verified (2.10×/MCS)**. The end-to-end
+throughput-doubling criterion **did not pass** — but the cause is the **air
+adapter (rtl8812eu has no working HT40 monitor mode)**, not the controller or the
+GS cards. Production outcome (§3.1): **ground defaults to HT40, vehicle stays
+HT20** — shipped in **PR #82**, device-verified clean. Pursuing the downlink 2×
+needs an HT40-capable air radio. See §3.1 for both runs.
 Date: 2026-06-16
 Branch: `spec/ht40-coordinated-test`
 Depends on: `link_controller` budget law (on `main`, `ee230b1`); the mega-binary
@@ -167,24 +168,29 @@ RX both cards. Runner: `test/ht40_combo_test.sh` (ordering rule + trap-revert).
   a real vehicle link, not just dry-run. The original question — *does the
   controller account for HT40's doubled bandwidth?* — is a definitive **yes**.
 - **The pass criterion (`safe_kbps` ratio ∈ [1.9, 2.2]) was NOT met**, because the
-  GS-side RX degraded badly at HT40: `lost` spiked to **0.27** and RSSI fell ~3 dB
+  link degraded badly at HT40: `lost` spiked to **0.27** and RSSI fell ~3 dB
   (−12 → −15). The MCS controller **correctly demoted 5 → 0/1**, so net `safe_kbps`
   *fell* (18200 → ~4–8k) rather than doubling.
-- **Root cause is the GS RTL88x2 monitor RX, not the budget.** The vehicle TX'd
-  HT40 fine; `lost` is reported back via rx_ant stats, i.e. it is the GS `wfb_rx`
-  failing to decode ~27% of 40 MHz frames. −3 dB is the textbook HT40 noise-
-  bandwidth penalty, but 27% loss at −15 dBm on a bench is **poor HT40 monitor-mode
-  RX on these cards** (a known RTL88x2 class — cf. memory `rtl88x2cu_cooperative_rx`).
+- **Root cause (corrected): the AIR adapter is rtl8812eu, which has no working
+  HT40 monitor mode.** This test set the *vehicle* card to HT40+ via `iw` — `iw`
+  accepted it (reported width 40 MHz) but the rtl8812eu monitor TX at 40 MHz is
+  corrupt, so the GS decodes ~27% garbage. The budget law and the GS cards are both
+  fine; the air radio simply can't transmit HT40. **The vehicle must stay HT20.**
+- **Follow-up confirmation (same session):** with the *ground* cards at HT40+ and
+  the vehicle left at **HT20**, video is clean — `lost=0.0000`, MCS holds at 5,
+  phy=52 — at only a ~2 dB RSSI cost. A ground on a 40 MHz channel decodes the
+  vehicle's 20 MHz video on its primary. **This is the production config**, shipped
+  in **PR #82** (all GS configs default to `iw … HT40+`; vehicle untouched).
 - **The §4 desync did NOT bite** — both layers were flipped together per the
   ordering rule. The controller's loss-feedback demotion is what kept it safe; it
   never over-drove the 2× budget into the wall.
 
-**Practical conclusion:** HT40 is *not* a free 2× on this hardware. It pays off only
-on a link with enough SNR margin to hold the **same MCS** at HT40's higher noise
-floor (rule of thumb: ≥ ~6 dB headroom above the MCS threshold). Below that, MCS
-demotion erases the bandwidth gain — and the controller is right to demote. Re-run
-on a link with real margin (longer range / better antennas / a cleaner band, or
-RTL88x2EU/AX cards with better HT40 RX) before treating HT40 as a throughput lever.
+**Practical conclusion:** HT40 as a *throughput* lever needs an HT40-capable air
+radio (rtl8812eu is not) **and** enough SNR margin to hold the same MCS at HT40's
+higher noise floor (rule of thumb: ≥ ~6 dB headroom). As a *ground* default it is
+free and strictly-more-capable (decodes 20+40 MHz) — adopted in PR #82. To pursue
+the downlink 2× later: an HT40-capable air adapter (e.g. RTL88x2EU/AX) on a link
+with real margin, then re-run §3 with the vehicle also at HT40.
 
 ---
 
@@ -196,13 +202,16 @@ mechanism. If `SET_RADIO bandwidth=40` is applied while the card stays on a bare
 20 MHz channel, the controller computes a **2.1× ceiling the link cannot carry** →
 over-drive → loss. The two must flip together, on both ends.
 
-**Open decisions (for a follow-up phase, not this test):**
-- **Who owns the `iw` width in production?** Today `system.up` sets it statically
-  with a bare `set channel <ch>` (= HT20) — see `ground/config/host_x86.json`.
-  `init/wfb-link.example.json` *already* carries `"htmode":"HT20"` but it is not
-  wired through. **Recommended:** plumb `radio.htmode` → (a) the `iw set channel …
-  <htmode>` call, (b) the `wfb_tx -B <bw>` arg, and (c) the `SET_RADIO` default, so
-  one config field moves all three coherently.
+**Open decisions:**
+- **Who owns the `iw` width in production?** ✅ **DECIDED (PR #82):** the ground
+  defaults to `iw … set channel <ch> HT40+` in all GS configs; the vehicle stays
+  HT20. The literal `system.up` (host configs) and the wired `profile.ht`
+  (`gs_supervisor.c:362–398`) both carry it. **Still open:** `/etc/wfb-link.json`
+  `radio.htmode` is *not* wired to `iw` (the overlay maps only `radio.bw` →
+  radiotap, `gs_supervisor.c:740`). Plumb `radio.htmode` → the `iw set channel`
+  width so deployed grounds can set HT40 from the autonomous preset too.
+  (`radio.bw` → `-B`/`SET_RADIO` is already wired; keep `bw=20` while the air is
+  rtl8812eu.)
 - **Desync guard?** Should `link_controller` refuse the 2× budget when iw width and
   radiotap disagree? It can't read `iw` directly; the supervisor could surface the
   actual width in stats (Phase 2 idea).
