@@ -1,7 +1,8 @@
 {
   "_comment": "Unified wfb link preset. Install as /etc/wfb-link.json on air and/or ground. EVERY field is optional — a missing or empty file ({}) yields exactly the shipped preset (the link comes up unchanged). The mega binary's `config-env` applet renders this into shell env for the startup script; defaults live in C (multicall/wfb_configenv.c). The values shown below ARE the built-in defaults. Link ids and fec/mcs/peek must match on both ends.",
 
-  "radio": { "channel": 161, "htmode": "HT20", "bw": 20, "txpower_mbm": 2000 },
+  "radio": { "channel": 161, "htmode": "HT20", "bw": 20, "txpower_mbm": 2000,
+             "_comment": "htmode = iw channel WIDTH (RF), honored on both sides: GROUND (gs_supervisor overlay) and AIR (S99wfb). The GROUND should set HT40+ (decodes both 20 and 40 MHz on its primary; pick the channel-correct HT40+/HT40-); the AIR MUST stay HT20 — rtl8812eu has no working HT40 monitor mode, HT40 corrupts its TX. Shipped default HT20 is the air-safe value (this file is unified air+ground). bw = radiotap TX width — keep 20 while the air is HT20." },
 
   "key":   { "file": "/etc/drone.key", "seed": "Waybeam",
              "_comment": "file default is /etc/drone.key on air, /etc/gs.key on ground. If absent at boot, a deterministic shared key is derived from `seed` (INSECURE shared default — replace for production)." },

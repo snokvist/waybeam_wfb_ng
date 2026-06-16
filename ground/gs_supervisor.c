@@ -726,6 +726,52 @@ void cfg_apply_wfb_link_overlay(Config *c, const char *path)
 		}
 	}
 
+	/* radio.htmode -> the `iw set channel` width in system.up. This is the iw
+	 * channel width (RF), independent of radio.bw (the radiotap TX width above):
+	 * a ground on a 40 MHz channel decodes both 20 and 40 MHz on its primary, so
+	 * htmode=HT40+ with bw=20 is the canonical config while the air is HT20.
+	 * Rewrites every `... set channel <chan> [old-ht]` line, replacing any
+	 * existing width suffix. Runs before supervisor_bring_up(), so the rewritten
+	 * commands are what actually execute. */
+	if ((sec = jfind(buf, toks, n, 0, "radio")) >= 0 && toks[sec].type == JT_OBJ &&
+	    (v = jfind(buf, toks, n, sec, "htmode")) >= 0 && toks[v].type == JT_STR) {
+		char htmode[8] = "";
+		jstr(buf, &toks[v], htmode, sizeof(htmode));
+		if (strcmp(htmode, "HT20") && strcmp(htmode, "HT40+") &&
+		    strcmp(htmode, "HT40-")) {
+			LOG_WARN("wfb-link overlay: ignoring invalid radio.htmode '%s' "
+			         "(want HT20/HT40+/HT40-)", htmode);
+		} else {
+			int rewritten = 0;
+			for (int i = 0; i < c->system_up_count; i++) {
+				char *cmd = c->system_up[i];
+				char *p = strstr(cmd, "set channel ");
+				if (!p) continue;
+				p += strlen("set channel ");
+				const char *q = p;               /* channel number token */
+				while (*q && *q != ' ') q++;
+				int clen = (int)(q - p);
+				if (clen <= 0 || clen >= 8) continue;
+				char chan[8];
+				memcpy(chan, p, (size_t)clen);
+				chan[clen] = 0;
+				int prefix = (int)(p - cmd);     /* through "set channel " */
+				char nb[GS_PATH_MAX];
+				int rc = snprintf(nb, sizeof(nb), "%.*s%s %s",
+				                  prefix, cmd, chan, htmode);
+				if (rc > 0 && rc < (int)sizeof(nb)) {
+					memcpy(cmd, nb, (size_t)rc + 1);
+					rewritten++;
+				}
+			}
+			if (rewritten) {
+				LOG_INFO("wfb-link overlay: radio.htmode -> %s on %d iw "
+				         "set-channel cmd(s)", htmode, rewritten);
+				applied++;
+			}
+		}
+	}
+
 	LOG_INFO("wfb-link overlay: %d field group(s) applied from %s", applied, path);
 	free(buf);
 }
