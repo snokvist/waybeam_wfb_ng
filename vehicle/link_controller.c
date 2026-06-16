@@ -271,9 +271,19 @@ typedef struct {
 		 * wfb_tx to the lower MCS. Gives the encoder a few frames to
 		 * settle at the lower rate before the radio link can no longer
 		 * carry the old bitrate, preventing SHM/queue overflow during
-		 * the transition. MCS-up is unaffected (radio commits first,
-		 * bitrate rises on next stats tick). */
+		 * the transition. Must be long enough for the encoder to actually
+		 * spool its OUTPUT down (not just receive the HTTP write) — venc
+		 * rate control takes several hundred ms to converge, so a lead in
+		 * the tens of ms moves the MCS while the old high bitrate is still
+		 * on the wire. */
 		float    bitrate_lead_s;
+
+		/* MCS-up grace: after the radio commits a HIGHER mcs (synchronous
+		 * SET_RADIO), hold the bitrate increase off for this long so the
+		 * higher modulation is established on-air before the encoder is
+		 * told to use the larger budget. Implemented as a short
+		 * bitrate_up_lock. 0 = raise on the next stats tick (old behaviour). */
+		float    mcs_up_grace_s;
 
 		/* Tick intervals */
 		float    subscribe_s;
@@ -2712,6 +2722,21 @@ static int commit_mcs_change(
 		    pending->target_mcs, new_mcs);
 		pending_mcs_clear(pending);
 	}
+
+	/* MCS-up grace: hold the bitrate increase off for mcs_up_grace_s after
+	 * the higher modulation commits, so the radio settles at the new rate
+	 * before the encoder is told to use the larger budget. Reuses the
+	 * bitrate up-lock (which suppresses only increases; downward writes
+	 * still pass). Armed before SET_RADIO so the observation that follows
+	 * sees the lock. */
+	if (new_mcs > prev_mcs && cfg->fec.mcs_up_grace_s > 0.0f && !cfg->dry_run) {
+		uint64_t lock_end = now + (uint64_t)(cfg->fec.mcs_up_grace_s * 1e6f);
+		if (lock_end > ctrl->bitrate_up_lock_until_us)
+			ctrl->bitrate_up_lock_until_us = lock_end;
+		LOGV_MCS(cfg, "ordered up: mcs=%d->%d, bitrate raise held %.0fms",
+		    prev_mcs, new_mcs, (double)(cfg->fec.mcs_up_grace_s * 1000.0f));
+	}
+
 	if (cfg->dry_run) return 0;
 	if (wfb_set_radio(cfg, &r) != 0) return -1;
 	return 0;
@@ -3414,6 +3439,7 @@ static const TunableDesc TUNABLES[] = {
 	{"fec.bitrate_grace_s",         SUB_FEC, TF_FLOAT, OFF_FEC(bitrate_grace_s),         0.0, 60.0, "post-bitrate-write FEC suppress"},
 	{"fec.mcs_settle_s",            SUB_FEC, TF_FLOAT, OFF_FEC(mcs_settle_s),            0.0, 60.0, "post-MCS-change FEC suppress"},
 	{"fec.bitrate_lead_s",          SUB_FEC, TF_FLOAT, OFF_FEC(bitrate_lead_s),          0.0, 5.0,  "MCS-down: lead time between bitrate pre-drop and SET_RADIO"},
+	{"fec.mcs_up_grace_s",          SUB_FEC, TF_FLOAT, OFF_FEC(mcs_up_grace_s),          0.0, 5.0,  "MCS-up: hold bitrate increase this long after the higher mcs commits"},
 	{"fec.boost_s",                 SUB_FEC, TF_FLOAT, OFF_FEC(boost_s),                 0.0, 30.0, "parity boost duration"},
 	{"fec.boost_mult",              SUB_FEC, TF_FLOAT, OFF_FEC(boost_mult),              1.0, 5.0,  "(n-k) parity multiplier during boost"},
 	/* Payload sizing — payload_max is intentionally NOT live (startup
@@ -3933,7 +3959,7 @@ static int append_mcs_json(char *buf, size_t cap, size_t pos,
 		"\"flap_guard\":{\"mcs\":%d,\"active\":%s,\"freeze_mcs\":%d,\"frozen\":%s},"
 		"\"commit_count\":%u,\"changes_in_window\":%d,"
 		"\"last_emit_mcs\":%d,\"rx_ant_age_s\":%.3f,"
-		"\"bitrate_lead_s\":%.3f,"
+		"\"bitrate_lead_s\":%.3f,\"mcs_up_grace_s\":%.3f,"
 		"\"pending_drop\":{\"active\":%s,\"target_mcs\":%d,\"ms_remaining\":%d},"
 		"\"probe\":{\"records\":%u,\"parse_errors\":%u,\"age_s\":%.3f,"
 		"\"v2_mcs\":%d,\"v2_per_milli\":%d,\"v2_accounted\":%ld,\"v2_age_s\":%.3f,"
@@ -3959,6 +3985,7 @@ static int append_mcs_json(char *buf, size_t cap, size_t pos,
 		s->sel->commit_count, s->sel->changes_count,
 		s->last_emit_mcs, rx_age_s,
 		(double)s->cfg->fec.bitrate_lead_s,
+		(double)s->cfg->fec.mcs_up_grace_s,
 		s->pending_drop_active ? "true" : "false",
 		s->pending_drop_target_mcs,
 		s->pending_drop_ms_remaining,
@@ -5100,7 +5127,8 @@ static void config_defaults(Config *c)
 	c->fec.bitrate_tolerance = 0.15f;
 	c->fec.bitrate_grace_s = 2.0f;
 	c->fec.mcs_settle_s    = 5.0f;
-	c->fec.bitrate_lead_s  = 0.05f;
+	c->fec.bitrate_lead_s  = 0.5f;   /* MCS-down: let venc spool down ~500ms before dropping MCS */
+	c->fec.mcs_up_grace_s  = 0.25f;  /* MCS-up: settle the higher modulation before raising bitrate */
 	c->fec.subscribe_s = 2.0f;
 	c->fec.radio_poll_s = 1.0f;
 	c->fec.wfb_stats_port = 0;
