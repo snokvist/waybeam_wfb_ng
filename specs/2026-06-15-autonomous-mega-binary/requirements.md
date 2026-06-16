@@ -243,7 +243,13 @@ Built in four device-verifiable sub-phases:
   API), x-www-form-urlencoded decode for text: `labels?action=add|del`,
   `meta`, `session?action=delete` (refuses the active live capture, 409),
   `capture?action=roll`. Label/meta via short-lived WAL conns; roll signals the
-  capture thread.
+  capture thread. **Ad-hoc capture control:** `capture?action=start|stop`
+  (`wfb_logger_runtime_start`/`_stop`) spawn/seal the capture thread at runtime,
+  so the logger ships disabled (`telemetry.enabled=false`) and is toggled from
+  the dashboard Start/Stop buttons; `/capture` status carries `started` (thread
+  exists) + `running` (loop ingesting) + the `db` write target. Idempotent and
+  serialised by the single-threaded API loop (also closes the prior latent
+  double-start gap).
 - **5d — retire Python + wiring.** `wfb-gs telemetry-import <file.jsonl>` applet
   (reuses the logger insert path) for old logs. Replaced runtime Python
   (`wfb_capture.py`, `wfb_ingest.py`, `webui/`, `webui_session.sh`,

@@ -491,30 +491,69 @@ void wfb_logger_defaults(WfbLogConfig *cfg)
 	snprintf(cfg->source, sizeof(cfg->source), "live-gs");
 }
 
+/* Spawn the capture thread. Caller guarantees it is not already running.
+ * Claims L.started under the lock first (so a concurrent caller bails) and
+ * resets the signals + status snapshot for a fresh run. Returns 0 / -1. */
+static int logger_spawn(void)
+{
+	pthread_mutex_lock(&L.lock);
+	if (L.started) { pthread_mutex_unlock(&L.lock); return 0; }  /* already running */
+	L.started = 1;                                                /* claim before create */
+	L.stop = 0; L.roll = 0; L.pending_duration = -2; L.session_id = -1;
+	L.running = 0; L.bind_error = 0; L.db_error = 0; L.records = 0; L.bad = 0;
+	L.max_duration = L.cfg.max_duration;
+	pthread_mutex_unlock(&L.lock);
+
+	if (pthread_create(&L.thread, NULL, capture_run, NULL) != 0) {
+		LOGE("telemetry: pthread_create: %s", strerror(errno));
+		pthread_mutex_lock(&L.lock); L.started = 0; pthread_mutex_unlock(&L.lock);
+		return -1;
+	}
+	return 0;
+}
+
 int wfb_logger_start(const WfbLogConfig *cfg)
 {
 	if (cfg) L.cfg = *cfg;
 	if (!L.cfg.db[0]) wfb_logger_defaults(&L.cfg);   /* never started w/ empty path */
 	if (!L.cfg.enabled) {
-		LOGI("telemetry: logger disabled (telemetry.enabled=false)");
+		LOGI("telemetry: logger disabled at boot (telemetry.enabled=false) — start ad-hoc from the dashboard");
 		return 0;
 	}
-	L.max_duration = L.cfg.max_duration;
-	L.stop = 0; L.roll = 0; L.pending_duration = -2; L.session_id = -1;
-	if (pthread_create(&L.thread, NULL, capture_run, NULL) != 0) {
-		LOGE("telemetry: pthread_create: %s", strerror(errno));
-		return -1;
-	}
-	L.started = 1;
-	return 0;
+	return logger_spawn();
 }
 
 void wfb_logger_stop(void)
 {
-	if (!L.started) return;
-	pthread_mutex_lock(&L.lock); L.stop = 1; pthread_mutex_unlock(&L.lock);
+	pthread_mutex_lock(&L.lock);
+	if (!L.started) { pthread_mutex_unlock(&L.lock); return; }
+	L.stop = 1;
+	pthread_mutex_unlock(&L.lock);
 	pthread_join(L.thread, NULL);
-	L.started = 0;
+	pthread_mutex_lock(&L.lock); L.started = 0; pthread_mutex_unlock(&L.lock);
+}
+
+int wfb_logger_runtime_start(void)
+{
+	pthread_mutex_lock(&L.lock);
+	int already = L.started;
+	pthread_mutex_unlock(&L.lock);
+	if (already) return 1;
+	if (!L.cfg.db[0]) wfb_logger_defaults(&L.cfg);
+	L.cfg.enabled = true;   /* ad-hoc: force on regardless of the boot config */
+	LOGI("telemetry: runtime start -> %s (udp:%d)", L.cfg.db, L.cfg.listen_port);
+	return logger_spawn();
+}
+
+int wfb_logger_runtime_stop(void)
+{
+	pthread_mutex_lock(&L.lock);
+	int running = L.started;
+	pthread_mutex_unlock(&L.lock);
+	if (!running) return 1;
+	wfb_logger_stop();
+	LOGI("telemetry: runtime stop — capture sealed");
+	return 0;
 }
 
 void wfb_logger_roll(int duration)
@@ -529,6 +568,7 @@ void wfb_logger_status(WfbLogStatus *out)
 {
 	pthread_mutex_lock(&L.lock);
 	out->running     = L.running;
+	out->started     = L.started;
 	out->bind_error  = L.bind_error;
 	out->db_error    = L.db_error;
 	out->session_id  = L.session_id;

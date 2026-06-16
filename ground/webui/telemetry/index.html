@@ -16,7 +16,11 @@
   <main>
     <div class="toolbar">
       <h1>Sessions</h1>
-      <button id="new-capture" type="button"
+      <button id="cap-start" type="button" hidden
+        title="Start the in-process SQLite telemetry logger (udp:6700 → the db shown). Use when it shipped disabled in config.">▶ Start logging</button>
+      <button id="cap-stop" type="button" hidden
+        title="Stop the logger — seals the current session cleanly (final commit + ended_at).">⏹ Stop logging</button>
+      <button id="new-capture" type="button" hidden
         title="Close the current GS capture and start a fresh session (clean break).">⏺ New capture session</button>
       <span id="capture-status" class="muted"></span>
     </div>
@@ -75,25 +79,50 @@
   setInterval(tick, 5000);
   tick();
 
-  /* Capture status line (session id / records / age). */
+  /* Capture status line + Start/Stop/New-capture button state. The logger can
+     ship disabled in config and be toggled here; `started` = thread exists,
+     `running` = loop ingesting. */
+  const elCap = document.getElementById("capture-status");
+  const bStart = document.getElementById("cap-start");
+  const bStop  = document.getElementById("cap-stop");
+  function renderCap(j) {
+    const on = j.started || j.running;
+    bStart.hidden = on;
+    bStop.hidden  = !on;
+    document.getElementById("new-capture").hidden = !j.running;
+    const where = j.db ? ` → ${j.db}` : "";
+    if (!on) { elCap.textContent = " ◌ stopped" + where; return; }
+    if (j.bind_error) { elCap.textContent = " ⚠ capture failed (port busy)" + where; return; }
+    if (j.db_error)   { elCap.textContent = " ⚠ capture failed (db error)" + where; return; }
+    elCap.textContent = (j.session_id >= 0
+      ? ` ● session ${j.session_id} · ${j.records} rec · ${Math.round(j.age)}s`
+      : " ● listening") + where;
+  }
   async function capStatus() {
     try {
       const r = await fetch("/api/v1/telemetry/capture"); if (!r.ok) return;
-      const j = await r.json();
-      const el = document.getElementById("capture-status");
-      if (!j.running) {
-        el.textContent = j.bind_error ? " ⚠ capture disabled (port busy)"
-                       : j.db_error   ? " ⚠ capture disabled (db error)"
-                       : " (idle)";
-        return;
-      }
-      el.textContent = j.session_id >= 0
-        ? ` ● session ${j.session_id} · ${j.records} rec · ${Math.round(j.age)}s`
-        : " ● listening";
+      renderCap(await r.json());
     } catch (e) {}
   }
   setInterval(capStatus, 2000);
   capStatus();
+
+  /* Start / Stop the logger (both return the refreshed status). */
+  bStart.addEventListener("click", async () => {
+    bStart.disabled = true; elCap.textContent = " starting…";
+    try { const r = await fetch("/api/v1/telemetry/capture?action=start");
+          if (r.ok) renderCap(await r.json()); setTimeout(tick, 1200); }
+    catch (e) { elCap.textContent = " ✗ start failed"; }
+    finally { bStart.disabled = false; }
+  });
+  bStop.addEventListener("click", async () => {
+    if (!confirm("Stop the telemetry logger? The current session is sealed cleanly.")) return;
+    bStop.disabled = true; elCap.textContent = " stopping…";
+    try { const r = await fetch("/api/v1/telemetry/capture?action=stop");
+          if (r.ok) renderCap(await r.json()); setTimeout(tick, 1200); }
+    catch (e) { elCap.textContent = " ✗ stop failed"; }
+    finally { bStop.disabled = false; }
+  });
 
   /* Delete a session (capture-phase listener so it runs before the row navigate). */
   document.querySelector("table.sessions").addEventListener("click", async (e) => {

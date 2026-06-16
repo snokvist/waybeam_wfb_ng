@@ -411,14 +411,26 @@ static void tele_capture_status(ApiClient *cli)
 {
 	WfbLogStatus s;
 	wfb_logger_status(&s);
-	char body[256];
-	int n = snprintf(body, sizeof(body),
-		"{\"running\":%s,\"bind_error\":%s,\"db_error\":%s,\"session_id\":%ld,\"records\":%ld,"
-		"\"bad\":%ld,\"age\":%.1f,\"max_duration\":%d,\"listen\":%d}",
-		s.running ? "true" : "false", s.bind_error ? "true" : "false",
-		s.db_error ? "true" : "false",
+	SB sb = {0};
+	sb_printf(&sb,
+		"{\"running\":%s,\"started\":%s,\"bind_error\":%s,\"db_error\":%s,\"session_id\":%ld,"
+		"\"records\":%ld,\"bad\":%ld,\"age\":%.1f,\"max_duration\":%d,\"listen\":%d,\"db\":",
+		s.running ? "true" : "false", s.started ? "true" : "false",
+		s.bind_error ? "true" : "false", s.db_error ? "true" : "false",
 		s.session_id, s.records, s.bad, s.age_s, s.max_duration, s.listen_port);
-	api_send(cli->fd, 200, "application/json", body, n);
+	sb_jstr(&sb, wfb_logger_db_path());
+	sb_putc(&sb, '}');
+	sb_finish(&sb, cli);
+}
+
+/* ad-hoc start/stop of the capture thread (ships disabled in config, toggled
+ * from the dashboard). Returns the refreshed status so the UI updates in one
+ * round-trip. */
+static void tele_capture_set(ApiClient *cli, int start)
+{
+	if (start) wfb_logger_runtime_start();
+	else       wfb_logger_runtime_stop();
+	tele_capture_status(cli);
 }
 
 /* ---- write endpoints (GET + ?action=, matching the GET-only API) ---------- */
@@ -621,7 +633,9 @@ int tele_route(ApiClient *cli, const char *path, const char *qstr)
 
 	if (!strcmp(path, "/api/v1/telemetry/capture")) {
 		size_t al = 0; const char *act = qs_get(qstr, "action", &al);
-		if (act && al == 4 && !strncmp(act, "roll", 4)) tele_capture_roll(cli, qstr);
+		if      (act && al == 4 && !strncmp(act, "roll",  4)) tele_capture_roll(cli, qstr);
+		else if (act && al == 5 && !strncmp(act, "start", 5)) tele_capture_set(cli, 1);
+		else if (act && al == 4 && !strncmp(act, "stop",  4)) tele_capture_set(cli, 0);
 		else tele_capture_status(cli);
 		return 1;
 	}

@@ -47,7 +47,8 @@ typedef struct {
 /* Status snapshot — written by the capture thread, read by HTTP handlers
  * under the internal lock. */
 typedef struct {
-	int    running;
+	int    running;        /* capture loop actively ingesting */
+	int    started;        /* thread exists (joinable); 1 even if it errored out */
 	int    bind_error;     /* 1 = udp bind failed; capture disabled, reads OK */
 	int    db_error;       /* 1 = sqlite open/init failed; capture disabled, reads OK */
 	long   session_id;     /* -1 when no session is open */
@@ -71,6 +72,17 @@ int  wfb_logger_start(const WfbLogConfig *cfg);
  * call when not started. Clean (flag + join) — runs the final commit and
  * stamps ended_at; never a hard kill. */
 void wfb_logger_stop(void);
+
+/* Ad-hoc runtime start/stop, driven from the dashboard so the logger can ship
+ * disabled in config (telemetry.enabled=false) yet be toggled on demand. Start
+ * spawns the capture thread using the config parsed at init (db/listen/etc.),
+ * forcing enabled on; the db write target is whatever the `telemetry` block set
+ * (or "wfb.sqlite" in CWD if none — surfaced in /capture status so the operator
+ * can see where it writes). Both are idempotent and serialise with the single-
+ * threaded API loop. start: 0 = started, 1 = already running, -1 = spawn error.
+ * stop: 0 = stopped (final commit + ended_at), 1 = was not running. */
+int  wfb_logger_runtime_start(void);
+int  wfb_logger_runtime_stop(void);
 
 /* Request a clean session roll: close the current session now, open a fresh one
  * on the next datagram. duration >= 0 sets a new max_duration; <0 keeps it.
