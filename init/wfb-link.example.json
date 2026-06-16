@@ -17,7 +17,7 @@
 
   "peek":  { "profile": "close", "_comment": "per-frame FEC close: off | close" },
 
-  "log":   { "enabled": true, "_comment": "in-process SD telemetry logger" },
+  "log":   { "enabled": true, "_comment": "AIR-side only: enables the link_controller in-process SD session logger (writes to /mnt/mmcblk0p1, self-disables if no SD). NOT wired to the ground telemetry logger — ground sqlite telemetry is opt-in via the gs_supervisor.json `telemetry` block (with a non-overlay db path), so this flag never persists anything on a ground overlay rootfs." },
 
   "venc":  { "shm": "local_shm", "auto_wire": true,
              "_comment": "auto_wire: air S99wfb sets venc outgoing.server=shm://<shm> if it differs (then SIGHUPs). No effect on ground." }

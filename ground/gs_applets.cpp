@@ -9,10 +9,14 @@
 
 /* C daemon entry — C linkage (gs_supervisor.c built as C with -DWFB_MULTICALL). */
 extern "C" int gs_supervisor_main(int, char **);
+/* Offline JSONL -> telemetry sqlite import (wfb_logger.c; not sodium-gated). */
+extern "C" int wfb_telemetry_import_main(int, char **);
 
 const struct wfb_applet wfb_applets[] = {
 	{ "supervisor", "gs_supervisor", gs_supervisor_main,
 	  "fork/manage wfb_rx+wfb_tx, REST API, WebUI" },
+	{ "telemetry-import", 0, wfb_telemetry_import_main,
+	  "import a JSONL capture into the telemetry sqlite" },
 #ifdef WFB_WITH_WFBNG
 	{ "rx",     "wfb_rx",     rx_applet,       "wfb-ng receiver (pcap capture, FEC decode)" },
 	{ "tx",     "wfb_tx",     tx_applet,       "wfb-ng transmitter (802.11 inject, FEC encode)" },

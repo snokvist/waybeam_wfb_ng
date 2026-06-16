@@ -26,15 +26,23 @@
       "iw dev wlx40a5ef2f2308 set channel 161 HT40+",
       "sleep 0.5",
       "iw dev wlx40a5ef2f2308 set txpower fixed 2000",
-      "/home/snokvist/dev/waybeam-coordination/waybeam_wfb_ng/ground/scripts/walkout_logger.sh start",
-      "/home/snokvist/dev/waybeam-coordination/waybeam_wfb_ng/telemetry/webui_session.sh start 8088"
+      "/home/snokvist/dev/waybeam-coordination/waybeam_wfb_ng/ground/scripts/walkout_logger.sh start"
     ],
     "down": [
-      "/home/snokvist/dev/waybeam-coordination/waybeam_wfb_ng/telemetry/webui_session.sh stop",
       "/home/snokvist/dev/waybeam-coordination/waybeam_wfb_ng/ground/scripts/walkout_logger.sh stop",
       "ip link set wlx40a5ef2f229b down",
       "ip link set wlx40a5ef2f2308 down"
     ]
+  },
+  "_comment_telemetry": "In-process udp:6700 -> sqlite logger + dashboard (replaces the Python webui_session.sh). The video rx tunnel taps stats to 127.0.0.1:6700; the logger ingests and serves the dashboard at /telemetry on the supervisor's HTTP port.",
+  "telemetry": {
+    "enabled": true,
+    "db": "/home/snokvist/dev/waybeam-coordination/waybeam_wfb_ng/telemetry/wfb.sqlite",
+    "listen": 6700,
+    "max_duration": 1200,
+    "channel": 161,
+    "tx_power": "2000mBm",
+    "antenna_cfg": "2x RTL88x2 diversity"
   },
   "tunnels": [
     {

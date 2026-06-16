@@ -1,0 +1,148 @@
+{% extends "base.html" %}
+{% block title %}sessions · wfb telemetry{% endblock %}
+{% block content %}
+<div class="toolbar">
+  <h1>Sessions</h1>
+  <button id="new-capture" type="button" title="Close the current GS capture and start a fresh session (clean break). With LOG_SYNC the vehicle log carries over automatically.">⏺ New capture session</button>
+  <span id="capture-status" class="muted"></span>
+  <span class="toolbar-sep"></span>
+  <form id="vehicle-fetch" class="inline-fetch"
+        title="scp the vehicle's walkout status.jsonl and import it as a vehicle-uplink session (LOG_SYNC marker-fit attributes it to its GS session).">
+    <input name="ip" value="192.168.1.13" size="13" aria-label="vehicle IP" autocomplete="off">
+    <input name="session" value="latest" size="7" aria-label="session (latest or 6 digits)" autocomplete="off">
+    <button type="submit">⬇ Fetch vehicle</button>
+  </form>
+  <span id="vehicle-status" class="muted"></span>
+</div>
+{% if not sessions %}
+  <p class="empty">No sessions yet. Import a capture:
+    <code>python3 telemetry/wfb_store.py import telemetry/real_wfb.jsonl</code>
+    or run <code>wfb_ingest.py</code> on a live tap.</p>
+{% else %}
+<table class="sessions">
+  <thead><tr>
+    <th>#</th><th>source</th><th>scenario</th><th>records</th><th>span</th>
+    <th>started</th><th>location</th><th>notes</th><th></th>
+  </tr></thead>
+  <tbody>
+  {% for s in sessions %}
+    <tr onclick="location.href='{{ url_for('session', sid=s.id) }}'"
+        class="{% if not s.ended_at %}live-session{% endif %}">
+      <td>{{ s.id }}</td>
+      <td>{{ s.source or '—' }}</td>
+      <td>{{ s.scenario or '—' }}</td>
+      <td class="num">{{ s.n_records }}</td>
+      <td class="num">{% if s.first_ts is not none and s.last_ts is not none %}
+        {{ '%.1f'|format((s.last_ts - s.first_ts) / 1000) }}s{% else %}—{% endif %}</td>
+      <td>{{ s.started_at or '—' }}</td>
+      <td>{{ s.location or '—' }}</td>
+      <td><div class="cell-clip" title="{{ s.notes or '' }}">{{ s.notes or '—' }}</div></td>
+      <td class="actions"><button class="del-session" data-id="{{ s.id }}" title="Delete session {{ s.id }}">✕</button></td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+
+<script>
+/* Live-refresh the session list (record counts + span grow as a capture runs). */
+(function () {
+  const esc = s => (s == null ? "—" : String(s)).replace(/[&<>"]/g,
+    c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+  const span = (a, b) => (a != null && b != null) ? ((b - a) / 1000).toFixed(1) + "s" : "—";
+  async function tick() {
+    let rows;
+    try { const r = await fetch("/api/sessions"); if (!r.ok) return; rows = await r.json(); }
+    catch (e) { return; }
+    const tb = document.querySelector("table.sessions tbody");
+    if (!tb) { if (rows.length) location.reload(); return; }  // 0 → N: build the table
+    tb.innerHTML = rows.map(s =>
+      `<tr onclick="location.href='/session/${s.id}'"` +
+      `${s.ended_at == null ? ' class="live-session"' : ''}>` +
+      `<td>${s.id}</td><td>${esc(s.source)}</td><td>${esc(s.scenario)}</td>` +
+      `<td class="num">${s.n_records}</td><td class="num">${span(s.first_ts, s.last_ts)}</td>` +
+      `<td>${esc(s.started_at)}</td><td>${esc(s.location)}</td>` +
+      `<td><div class="cell-clip" title="${esc(s.notes)}">${esc(s.notes)}</div></td>` +
+      `<td class="actions"><button class="del-session" data-id="${s.id}" title="Delete session ${s.id}">✕</button></td></tr>`
+    ).join("");
+  }
+  setInterval(tick, 5000);
+
+  /* Delete a session (capture phase, so it runs BEFORE the row's navigate-
+     onclick; one listener on the table survives tbody rebuilds by tick()). */
+  const table = document.querySelector("table.sessions");
+  if (table) table.addEventListener("click", async (e) => {
+    const del = e.target.closest(".del-session");
+    if (!del) return;
+    e.stopPropagation(); e.preventDefault();
+    const id = del.dataset.id;
+    if (!confirm(`Delete session ${id} and all its records, predictions and labels?\nThis cannot be undone.`)) return;
+    del.disabled = true; del.textContent = "…";
+    try {
+      const r = await fetch(`/api/session/${id}`, { method: "DELETE" });
+      const j = await r.json();
+      if (j.ok) tick();
+      else { alert("Delete failed: " + (j.error || "unknown")); del.disabled = false; del.textContent = "✕"; }
+    } catch (err) {
+      alert("Delete request failed"); del.disabled = false; del.textContent = "✕";
+    }
+  }, true);
+
+  /* "New capture session" — roll a fresh GS ingester session for a clean
+     break. Confirms first (it ends the current capture), then refreshes. */
+  const btn = document.getElementById("new-capture");
+  const st = document.getElementById("capture-status");
+  if (btn) btn.addEventListener("click", async () => {
+    const mins = prompt("New capture session — max length in minutes.\n" +
+                        "The session rolls itself at this age; the vehicle SD log " +
+                        "rolls too so the two stay aligned.", "20");
+    if (mins === null) return;                       // cancelled
+    const dur = Math.round(parseFloat(mins) * 60);
+    if (!isFinite(dur) || dur <= 0) { alert("Enter a positive number of minutes."); return; }
+    btn.disabled = true; st.textContent = " rolling…";
+    try {
+      const r = await fetch("/api/capture/new", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ duration: dur }),
+      });
+      const j = await r.json();
+      st.textContent = j.ok
+        ? " ✓ " + (j.message || "new session started") +
+          (j.vehicle_log ? ` · vehicle ${j.vehicle_log}` : "")
+        : " ✗ " + (j.error || j.message || "failed");
+      if (j.ok) setTimeout(tick, 1500);  // let the fresh ingester open its row
+    } catch (e) {
+      st.textContent = " ✗ request failed";
+    } finally {
+      btn.disabled = false;
+    }
+  });
+
+  /* "Fetch vehicle" — scp + import a vehicle walkout session into the same DB.
+     The vehicle keeps logging across GS session breaks, so one fetch may pull a
+     log spanning several walks; the importer's marker-fit attributes it. */
+  const vf = document.getElementById("vehicle-fetch");
+  const vst = document.getElementById("vehicle-status");
+  if (vf) vf.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const ip = vf.elements.ip.value.trim();
+    const session = vf.elements.session.value.trim() || "latest";
+    const sub = vf.querySelector("button");
+    sub.disabled = true; vst.textContent = " fetching… (scp + import)";
+    try {
+      const r = await fetch("/api/vehicle/fetch", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ip, session }),
+      });
+      const j = await r.json();
+      vst.textContent = (j.ok ? " ✓ " : " ✗ ") + (j.message || j.error || "done");
+      if (j.ok) tick();
+    } catch (err) {
+      vst.textContent = " ✗ request failed";
+    } finally {
+      sub.disabled = false;
+    }
+  });
+})();
+</script>
+{% endblock %}

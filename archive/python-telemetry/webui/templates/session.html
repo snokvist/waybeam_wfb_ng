@@ -1,0 +1,73 @@
+{% extends "base.html" %}
+{% block title %}session {{ session.id }} · wfb telemetry{% endblock %}
+{% block content %}
+<a class="back" href="{{ url_for('index') }}">← all sessions</a>
+<h1>Session {{ session.id }}
+  <small>{{ session.scenario or '—' }} · {{ session.source or '—' }}</small>
+  {% if session.source == 'vehicle-uplink' or (session.source or '').startswith('live-') %}
+  <a class="overlay-link" href="{{ url_for('overlay_page', sid=session.id) }}">⇅ uplink↔downlink overlay</a>
+  {% endif %}</h1>
+<dl class="meta">
+  <div><dt>started</dt><dd>{{ session.started_at or '—' }}</dd></div>
+  <div><dt>location</dt><dd>{{ session.location or '—' }}</dd></div>
+  <div><dt>antenna</dt><dd>{{ session.antenna_cfg or '—' }}</dd></div>
+  <div><dt>tx power</dt><dd>{{ session.tx_power or '—' }}</dd></div>
+  <div><dt>channel</dt><dd>{{ session.channel or '—' }}</dd></div>
+  <div><dt>weather</dt><dd>{{ session.weather or '—' }}</dd></div>
+  <div class="wide"><dt>notes</dt><dd>{{ session.notes or '—' }}</dd></div>
+</dl>
+
+<details class="editor">
+  <summary>Edit metadata</summary>
+  <form id="meta-form" class="grid">
+    {% for f in ['location','antenna_cfg','tx_power','channel','scenario','weather','notes'] %}
+    <label>{{ f.replace('_',' ') }}
+      <input name="{{ f }}" value="{{ session[f] if session[f] is not none else '' }}">
+    </label>
+    {% endfor %}
+    <div class="actions"><button type="submit">Save metadata</button>
+      <span id="meta-status" class="muted"></span></div>
+  </form>
+</details>
+
+<div class="legend">
+  overlays:
+  <span class="chip ml-crit">Tier-1 critical</span>
+  <span class="chip ml-degr">Tier-1 degraded</span>
+  <span class="chip hl-event">event</span>
+  <span class="chip hl-cliff">cliff</span>
+  <span class="chip hl-action">action</span>
+  <span class="chip hl-state">state</span>
+  <span id="overlay-status" class="muted"></span>
+  <label class="live-toggle"><input type="checkbox" id="live-toggle" checked> live</label>
+  <span id="live-dot" class="muted"></span>
+</div>
+
+<label class="labelmode"><input type="checkbox" id="label-mode">
+  Label mode — drag on a chart to select a span (off = drag zooms)</label>
+
+<form id="label-form" class="hidden">
+  <span class="lf-range" id="lf-range">—</span>
+  <select name="kind">
+    <option value="event">event</option>
+    <option value="cliff">cliff</option>
+    <option value="action">action</option>
+    <option value="state">state</option>
+  </select>
+  <input name="value" placeholder="value (e.g. MCS5 cliff)" autocomplete="off">
+  <input name="author" id="lf-author" placeholder="author" value="human:web">
+  <button type="submit">Add label</button>
+  <button type="button" id="lf-cancel">Cancel</button>
+</form>
+
+<div id="charts"></div>
+
+<h2>Labels</h2>
+<div id="labels-panel"><p class="muted">loading…</p></div>
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', filename='vendor/uPlot.iife.min.js') }}"></script>
+<script>window.SESSION_ID = {{ session.id }};</script>
+<script src="{{ url_for('static', filename='app.js') }}"></script>
+{% endblock %}

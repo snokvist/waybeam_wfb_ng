@@ -35,6 +35,8 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "wfb_logger.h"   /* WfbLogConfig (telemetry logger, Phase 5) */
+
 /* ---------- compile-time limits (small, predictable) ----------------- */
 
 #define GS_MAX_TUNNELS       8
@@ -301,6 +303,8 @@ typedef struct {
 	bool     venc_cmd_enabled;
 	char     venc_cmd_uplink[GS_NAME_MAX];
 	int      venc_cmd_rate_limit_ms;
+
+	WfbLogConfig telemetry;   /* in-process udp->sqlite logger (Phase 5) */
 
 	SystemState system_state;
 } Config;
@@ -571,5 +575,9 @@ void api_send_blob(int fd, const char *ctype,
 int  json_emit_tunnel(char *buf, size_t cap, const Tunnel *t, bool full);
 int  json_emit_status(char *buf, size_t cap, const Config *c, uint64_t up_us);
 void api_handle(ApiClient *cli, Config *c, uint64_t startup_us);
+
+/* Telemetry dashboard + JSON API (gs_supervisor_telemetry.c, Phase 5).
+ * Returns 1 if `path` was a telemetry route (response already sent), else 0. */
+int  tele_route(ApiClient *cli, const char *path, const char *qstr);
 
 #endif /* GS_SUPERVISOR_H */

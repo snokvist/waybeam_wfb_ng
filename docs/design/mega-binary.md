@@ -420,3 +420,32 @@ key file via `crypto_scalarmult_base` — a matched air/ground pair shows the
   reuses `/api/v1/system/reinit`.
 - WebUI Key tab on both (`index.html`, `gs.html`), shared dark palette.
 Device + host verified; Waybeam fingerprint `000f5280` matches on both ends.
+
+### In-process telemetry logger + dashboard (2026-06-15, Phase 5, ground)
+The Python telemetry stack (udp:6700 → SQLite capture + Flask/uPlot dashboard,
+launched from `system.up` via `webui_session.sh`) is folded into `wfb-gs`:
+- **Logger** `ground/wfb_logger.c` — a background pthread of `gs_supervisor`
+  that binds udp:6700, derives the denormalised columns (a bit-for-bit port of
+  `wfb_store.derive_columns`), writes `wfb.sqlite` (same schema + WAL), commits
+  every 20 rec / 2 s, rolls a fresh session at `max_duration`, and stops cleanly
+  (flag + join → final commit + `ended_at`). Config: opt-in via a `telemetry`
+  block in `gs_supervisor.json` (disabled by default; use an explicit non-overlay
+  `db` path). The air wfb-link `log.enabled` flag is NOT wired to it — that flag
+  drives only the air SD logger. NOT sodium-gated.
+- **SQLite**: the vendored 3.48.0 amalgamation (`ground/vendor/sqlite`, matched
+  to the RK3566 buildroot) compiled to one `sqlite3.o` (`THREADSAFE=2` + size
+  omits) and linked into both standalone + mega (+`pthread`+`m`). Chosen over a
+  separate `libsqlite3.a` prebuild: same static outcome, no host/sysroot dep.
+- **Dashboard** `ground/gs_supervisor_telemetry.c` — embedded assets
+  (`ground/webui/telemetry/*` via the `webui` xxd target) at `/telemetry[/static/*]`
+  and GET JSON under `/api/v1/telemetry/` (sessions/series/labels/meta/capture).
+  Mutations are GET+query (matching the GET-only API). Read handlers open their
+  own short-lived WAL connection (`wfb_logger_open`).
+- **Import**: `wfb-gs telemetry-import <file.jsonl>` applet (reuses the logger
+  insert path) for old logs, so the retirement needs no Python.
+- Retired Python moved to `archive/python-telemetry/`; `webui_session.sh`
+  dropped from `host_x86.json`. `wfb_store.py` + offline ML/import tools stay.
+  Deferred to that archived Python (offline): the uplink↔downlink overlay, ML
+  `tier1_state` bands, the SCP vehicle-fetch import.
+Host-verified (0 warnings on host standalone + host mega + aarch64 cross);
+live dual-adapter browser render + RK3566 deploy = the remaining on-device gate.

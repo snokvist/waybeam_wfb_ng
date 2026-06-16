@@ -16,6 +16,7 @@ wfb-ng/install/
 # xxd-generated WebUI asset headers (regenerate via the per-component
 # `make webui` target).
 ground/webui/gs_assets.h
+ground/webui/telemetry_assets.h
 vehicle/webui/index_assets.h
 
 # Developer-machine convenience symlinks that some local workflows expect at
@@ -40,3 +41,12 @@ telemetry/*.sqlite
 telemetry/*.sqlite-journal
 telemetry/*.sqlite-wal
 telemetry/*.sqlite-shm
+
+# In-process GS telemetry logger default DB. When telemetry is enabled with no
+# explicit telemetry.db, wfb_logger writes wfb.sqlite (+ WAL/SHM) to the
+# supervisor's CWD (often ground/ on the dev host) — a runtime artifact, never
+# committed.
+ground/wfb.sqlite
+ground/wfb.sqlite-wal
+ground/wfb.sqlite-shm
+ground/wfb.sqlite-journal

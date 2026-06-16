@@ -1,0 +1,163 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>sessions · wfb telemetry</title>
+  <link rel="stylesheet" href="/telemetry/static/uPlot.min.css">
+  <link rel="stylesheet" href="/telemetry/static/app.css">
+</head>
+<body>
+  <div class="tbar">
+    <div class="tbar-title">waybeam<span>_telemetry</span></div>
+    <div class="tbar-sep"></div>
+    <a class="tbar-link" href="/">↩ supervisor</a>
+  </div>
+  <main>
+    <div class="toolbar">
+      <h1>Sessions</h1>
+      <button id="cap-start" type="button" hidden
+        title="Start the in-process SQLite telemetry logger (udp:6700 → the db shown). Use when it shipped disabled in config.">▶ Start logging</button>
+      <button id="cap-stop" type="button" hidden
+        title="Stop the logger — seals the current session cleanly (final commit + ended_at).">⏹ Stop logging</button>
+      <button id="new-capture" type="button" hidden
+        title="Close the current GS capture and start a fresh session (clean break).">⏺ New capture session</button>
+      <span id="capture-status" class="muted"></span>
+    </div>
+    <table class="sessions">
+      <thead><tr>
+        <th>#</th><th>source</th><th>scenario</th><th>records</th><th>span</th>
+        <th>started</th><th>location</th><th>notes</th><th></th>
+      </tr></thead>
+      <tbody><tr><td colspan="9" class="muted">loading…</td></tr></tbody>
+    </table>
+    <p class="empty hidden" id="empty">No sessions yet — the logger opens one on the
+      first datagram (the rx tunnel's <code>stats_tap</code> must point at udp:6700).</p>
+  </main>
+
+<script>
+/* Live session list + capture control. All endpoints are GET (the supervisor
+   API is GET-only); the logger writes from its own thread over WAL. */
+(function () {
+  const esc = s => (s == null ? "—" : String(s)).replace(/[&<>"']/g,
+    c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+  const span = (a, b) => (a != null && b != null) ? ((b - a) / 1000).toFixed(1) + "s" : "—";
+
+  async function tick() {
+    let rows, cap = {};
+    try {
+      const [rs, cs] = await Promise.all([
+        fetch("/api/v1/telemetry/sessions"),
+        fetch("/api/v1/telemetry/capture"),
+      ]);
+      if (!rs.ok) return;
+      rows = await rs.json();
+      if (cs.ok) cap = await cs.json();
+    } catch (e) { return; }
+    /* Only the session the logger is actively writing RIGHT NOW is "live" —
+       not every row with ended_at NULL (an orphaned/crashed session is also
+       unsealed but is not the active capture). */
+    const liveSid = (cap.running && cap.session_id >= 0) ? cap.session_id : -1;
+    const tb = document.querySelector("table.sessions tbody");
+    const empty = document.getElementById("empty");
+    if (!rows.length) {
+      tb.innerHTML = "";
+      empty.classList.remove("hidden");
+      return;
+    }
+    empty.classList.add("hidden");
+    tb.innerHTML = rows.map(s =>
+      `<tr onclick="location.href='/telemetry/session?id=${s.id}'"` +
+      `${s.id === liveSid ? ' class="live-session"' : ''}>` +
+      `<td>${s.id}</td><td>${esc(s.source)}</td><td>${esc(s.scenario)}</td>` +
+      `<td class="num">${s.n_records}</td><td class="num">${span(s.first_ts, s.last_ts)}</td>` +
+      `<td>${esc(s.started_at)}</td><td>${esc(s.location)}</td>` +
+      `<td><div class="cell-clip" title="${esc(s.notes)}">${esc(s.notes)}</div></td>` +
+      `<td class="actions"><button class="del-session" data-id="${s.id}" title="Delete session ${s.id}">✕</button></td></tr>`
+    ).join("");
+  }
+  setInterval(tick, 5000);
+  tick();
+
+  /* Capture status line + Start/Stop/New-capture button state. The logger can
+     ship disabled in config and be toggled here; `started` = thread exists,
+     `running` = loop ingesting. */
+  const elCap = document.getElementById("capture-status");
+  const bStart = document.getElementById("cap-start");
+  const bStop  = document.getElementById("cap-stop");
+  function renderCap(j) {
+    const on = j.started || j.running;
+    bStart.hidden = on;
+    bStop.hidden  = !on;
+    document.getElementById("new-capture").hidden = !j.running;
+    const where = j.db ? ` → ${j.db}` : "";
+    if (!on) { elCap.textContent = " ◌ stopped" + where; return; }
+    if (j.bind_error) { elCap.textContent = " ⚠ capture failed (port busy)" + where; return; }
+    if (j.db_error)   { elCap.textContent = " ⚠ capture failed (db error)" + where; return; }
+    elCap.textContent = (j.session_id >= 0
+      ? ` ● session ${j.session_id} · ${j.records} rec · ${Math.round(j.age)}s`
+      : " ● listening") + where;
+  }
+  async function capStatus() {
+    try {
+      const r = await fetch("/api/v1/telemetry/capture"); if (!r.ok) return;
+      renderCap(await r.json());
+    } catch (e) {}
+  }
+  setInterval(capStatus, 2000);
+  capStatus();
+
+  /* Start / Stop the logger (both return the refreshed status). */
+  bStart.addEventListener("click", async () => {
+    bStart.disabled = true; elCap.textContent = " starting…";
+    try { const r = await fetch("/api/v1/telemetry/capture?action=start");
+          if (r.ok) renderCap(await r.json()); setTimeout(tick, 1200); }
+    catch (e) { elCap.textContent = " ✗ start failed"; }
+    finally { bStart.disabled = false; }
+  });
+  bStop.addEventListener("click", async () => {
+    if (!confirm("Stop the telemetry logger? The current session is sealed cleanly.")) return;
+    bStop.disabled = true; elCap.textContent = " stopping…";
+    try { const r = await fetch("/api/v1/telemetry/capture?action=stop");
+          if (r.ok) renderCap(await r.json()); setTimeout(tick, 1200); }
+    catch (e) { elCap.textContent = " ✗ stop failed"; }
+    finally { bStop.disabled = false; }
+  });
+
+  /* Delete a session (capture-phase listener so it runs before the row navigate). */
+  document.querySelector("table.sessions").addEventListener("click", async (e) => {
+    const del = e.target.closest(".del-session");
+    if (!del) return;
+    e.stopPropagation(); e.preventDefault();
+    const id = del.dataset.id;
+    if (!confirm(`Delete session ${id} and all its records and labels?\nThis cannot be undone.`)) return;
+    del.disabled = true; del.textContent = "…";
+    try {
+      const r = await fetch(`/api/v1/telemetry/session?id=${id}&action=delete`);
+      const j = await r.json();
+      if (j.ok) tick();
+      else { alert("Delete failed: " + (j.error || "unknown")); del.disabled = false; del.textContent = "✕"; }
+    } catch (err) { alert("Delete request failed"); del.disabled = false; del.textContent = "✕"; }
+  }, true);
+
+  /* New capture session — roll a clean break (optional max minutes). */
+  const btn = document.getElementById("new-capture");
+  const st = document.getElementById("capture-status");
+  btn.addEventListener("click", async () => {
+    const mins = prompt("New capture session — max length in minutes (rolls itself at this age).", "20");
+    if (mins === null) return;
+    const dur = Math.round(parseFloat(mins) * 60);
+    if (!isFinite(dur) || dur <= 0) { alert("Enter a positive number of minutes."); return; }
+    btn.disabled = true; st.textContent = " rolling…";
+    try {
+      const r = await fetch(`/api/v1/telemetry/capture?action=roll&duration=${dur}`);
+      const j = await r.json();
+      st.textContent = j.ok ? " ✓ new session rolling" : " ✗ " + (j.error || "failed");
+      if (j.ok) setTimeout(tick, 1500);
+    } catch (e) { st.textContent = " ✗ request failed"; }
+    finally { btn.disabled = false; }
+  });
+})();
+</script>
+</body>
+</html>

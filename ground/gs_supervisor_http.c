@@ -287,6 +287,10 @@ void api_handle(ApiClient *cli, Config *c, uint64_t startup_us)
 		}
 		return;
 	}
+	/* Telemetry dashboard + JSON API (Phase 5) — owns the /telemetry and
+	 * /api/v1/telemetry routes. Lives in gs_supervisor_telemetry.c. */
+	if (tele_route(cli, path, qstr)) return;
+
 	if (!strcmp(path, "/api/v1/health")) {
 		api_send(cli->fd, 200, "text/plain", "ok\n", -1);
 		return;

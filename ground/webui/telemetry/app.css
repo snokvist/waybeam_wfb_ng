@@ -1,0 +1,141 @@
+/* Telemetry dashboard — styled to match the gs_supervisor UI (gs.html):
+   same palette, fonts, sticky .tbar, and card/section aesthetic. */
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=DM+Sans:wght@400;500;600;700&display=swap');
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+:root {
+  --bg:#0a0a12; --bg2:#0f1019; --card:#141520; --card-hover:#191a2a;
+  --border:#1e2035; --border-hi:#2a2d4a;
+  --text:#c8cad0; --text-dim:#6b6e7a; --text-bright:#eef0f4;
+  --accent:#e94560; --accent-glow:rgba(233,69,96,.15);
+  --live:#22c55e; --live-bg:rgba(34,197,94,.1);
+  --warn:#f59e0b; --bad:#ef4444; --blue:#3b82f6;
+}
+html { font-size: 13px; }
+body { background: var(--bg); color: var(--text);
+  font-family: 'DM Sans', system-ui, sans-serif; min-height: 100vh; }
+code, pre, .mono { font-family: 'JetBrains Mono', monospace; font-size: .85em; }
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+.muted { color: var(--text-dim); }
+
+/* sticky top bar (mirrors gs.html .tbar) */
+.tbar { position: sticky; top: 0; z-index: 100; background: var(--bg2);
+  border-bottom: 1px solid var(--border); padding: 0 1.2rem; height: 44px;
+  display: flex; align-items: center; gap: 1rem; backdrop-filter: blur(12px); }
+.tbar-title { font-family: 'JetBrains Mono', monospace; font-weight: 700;
+  font-size: 1rem; color: var(--text-bright); letter-spacing: -.02em; white-space: nowrap; }
+.tbar-title span { color: var(--accent); font-weight: 400; }
+.tbar-sep { width: 1px; height: 20px; background: var(--border); }
+.tbar a.tbar-link { color: var(--text-dim); font-size: .8rem; }
+.tbar a.tbar-link:hover { color: var(--text); text-decoration: none; }
+.tbar-right { margin-left: auto; display: flex; align-items: center; gap: .8rem; }
+
+main { padding: 1.2rem; max-width: 1100px; margin: 0 auto; }
+h1 { font-size: 1.3rem; font-weight: 600; color: var(--text-bright); margin: .2rem 0 1rem; }
+h1 small { color: var(--text-dim); font-weight: 400; font-size: .8rem; }
+h2 { font-size: 1rem; font-weight: 600; color: var(--text-bright); margin: 1.2rem 0 .6rem; }
+.back { display: inline-block; margin-bottom: .6rem; }
+.empty { color: var(--text-dim); }
+.empty code, code { background: var(--card); border: 1px solid var(--border);
+  padding: .1rem .35rem; border-radius: 4px; }
+
+/* buttons + inputs (gs.html aesthetic) */
+input, select, button { font: inherit; }
+input, select { background: var(--bg); color: var(--text); border: 1px solid var(--border);
+  border-radius: 4px; padding: 5px 8px; font-size: .8rem; font-family: 'JetBrains Mono', monospace; }
+input:focus, select:focus { outline: none; border-color: var(--accent); }
+button { background: var(--bg); border: 1px solid var(--border); color: var(--text);
+  padding: 4px 12px; border-radius: 4px; cursor: pointer; font-size: .75rem; font-weight: 600;
+  font-family: 'JetBrains Mono', monospace; transition: all .15s; }
+button:hover:not(:disabled) { border-color: var(--accent); color: var(--text-bright); }
+button:disabled { opacity: .4; cursor: not-allowed; }
+
+/* toolbar (session list) */
+.toolbar { display: flex; align-items: center; gap: .8rem; margin-bottom: 1rem; }
+.toolbar h1 { margin: 0; }
+#capture-status { font-size: .8rem; font-family: 'JetBrains Mono', monospace; }
+
+/* sessions table */
+table.sessions { width: 100%; border-collapse: collapse; }
+table.sessions th, table.sessions td { text-align: left; padding: .45rem .6rem;
+  border-bottom: 1px solid var(--border); white-space: nowrap; }
+table.sessions th { color: var(--text-dim); font-weight: 500; font-size: .72rem;
+  text-transform: uppercase; letter-spacing: .04em; }
+table.sessions tbody tr { cursor: pointer; transition: background .12s; }
+table.sessions tbody tr:hover { background: var(--card-hover); }
+/* live (actively-captured) session — JS adds .live-session ONLY to the row the
+   logger is writing right now (matched to capture.session_id). */
+table.sessions tbody tr.live-session { background: var(--live-bg);
+  box-shadow: inset 3px 0 0 var(--live); }
+table.sessions tbody tr.live-session:hover { background: rgba(34,197,94,.18); }
+td.num { text-align: right; font-variant-numeric: tabular-nums; font-family: 'JetBrains Mono', monospace; }
+td.actions { text-align: center; }
+.cell-clip { max-width: 22rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.del-session { padding: 3px 9px; color: var(--bad); border-color: var(--border); }
+.del-session:hover:not(:disabled) { border-color: var(--bad); color: var(--bad); background: rgba(239,68,68,.1); }
+
+/* session metadata card */
+dl.meta { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: .4rem 1.2rem; margin: 0 0 1rem; padding: .8rem 1rem;
+  background: var(--card); border: 1px solid var(--border); border-radius: 6px; }
+dl.meta div.wide { grid-column: 1 / -1; }
+dl.meta dt { color: var(--text-dim); font-size: .68rem; text-transform: uppercase;
+  letter-spacing: .04em; font-family: 'JetBrains Mono', monospace; }
+dl.meta dd { margin: 0; color: var(--text); }
+
+details.editor { margin: 0 0 1rem; }
+details.editor summary { cursor: pointer; color: var(--accent); font-size: .85rem; }
+form.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: .6rem; margin-top: .7rem; padding: .8rem 1rem; background: var(--card);
+  border: 1px solid var(--border); border-radius: 6px; }
+form.grid label { display: flex; flex-direction: column; gap: .25rem; font-size: .68rem;
+  text-transform: uppercase; letter-spacing: .04em; color: var(--text-dim);
+  font-family: 'JetBrains Mono', monospace; }
+form.grid .actions { grid-column: 1 / -1; display: flex; align-items: center; gap: .8rem; }
+#meta-status { font-size: .8rem; }
+
+/* overlay legend + label chips (band colours mirror app.js OVL) */
+.legend { margin: 0 0 .8rem; color: var(--text-dim); display: flex; flex-wrap: wrap;
+  align-items: center; gap: .5rem; font-size: .8rem; }
+.chip { padding: .1rem .5rem; border-radius: 4px; font-size: .72rem; color: var(--text-bright);
+  font-family: 'JetBrains Mono', monospace; }
+.chip.ml-crit   { background: rgba(239,68,68,.28); }
+.chip.ml-degr   { background: rgba(245,158,11,.28); }
+.chip.hl-event  { background: rgba(59,130,246,.30); }
+.chip.hl-cliff  { background: rgba(219,97,162,.32); }
+.chip.hl-action { background: rgba(34,197,94,.28); }
+.chip.hl-state  { background: rgba(139,148,158,.30); }
+
+.labelmode { display: inline-flex; align-items: center; gap: .4rem; margin: 0 0 .7rem;
+  color: var(--text-dim); font-size: .85rem; }
+body.labeling #charts { cursor: crosshair; }
+#label-form { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem;
+  margin: 0 0 1rem; padding: .6rem .8rem; background: var(--card);
+  border: 1px solid var(--accent); border-radius: 6px; }
+#label-form.hidden { display: none; }
+.lf-range { font-variant-numeric: tabular-nums; color: var(--text-bright);
+  font-family: 'JetBrains Mono', monospace; }
+
+/* charts */
+#charts > div { margin-bottom: 1rem; background: var(--card);
+  border: 1px solid var(--border); border-radius: 6px; padding: .5rem; }
+.u-title { color: var(--text-bright); font-size: .9rem; font-family: 'JetBrains Mono', monospace; }
+.uplot, .u-wrap { color: var(--text-dim); }
+
+/* labels table */
+table.labels { width: 100%; border-collapse: collapse; }
+table.labels th, table.labels td { text-align: left; padding: .4rem .6rem;
+  border-bottom: 1px solid var(--border); }
+table.labels th { color: var(--text-dim); font-weight: 500; font-size: .72rem;
+  text-transform: uppercase; letter-spacing: .04em; }
+button.del { padding: 2px 9px; font-size: .72rem; color: var(--bad); border-color: var(--border); }
+button.del:hover:not(:disabled) { border-color: var(--bad); background: rgba(239,68,68,.1); }
+
+/* live-tail indicator + toggle */
+.live-toggle { margin-left: .6em; font-size: .85em; color: var(--text-dim); cursor: pointer; }
+.live-toggle input { vertical-align: middle; accent-color: var(--accent); }
+#live-dot { margin-left: .5em; font-size: .85em; font-family: 'JetBrains Mono', monospace; }
+.live-on     { color: var(--live); }
+.live-idle   { color: var(--text-dim); }
+.live-paused { color: var(--warn); }

@@ -18,15 +18,37 @@ BUILD_DIR ?= build
 SRCS       = gs_supervisor.c \
              gs_supervisor_csa.c \
              gs_supervisor_scan.c \
-             gs_supervisor_http.c
-HDRS       = gs_supervisor.h
+             gs_supervisor_http.c \
+             gs_supervisor_telemetry.c \
+             wfb_logger.c
+HDRS       = gs_supervisor.h wfb_logger.h
 WEBUI_SRC  = webui/gs.html
 WEBUI_HDR  = webui/gs_assets.h
+# Telemetry dashboard assets (Phase 5): embedded the same way as gs.html.
+TELE_DIR   = webui/telemetry
+TELE_HDR   = webui/telemetry_assets.h
+TELE_SRCS  = $(TELE_DIR)/index.html $(TELE_DIR)/session.html $(TELE_DIR)/app.js \
+             $(TELE_DIR)/app.css $(TELE_DIR)/uPlot.iife.min.js $(TELE_DIR)/uPlot.min.css
 OUT_HOST   = $(BUILD_DIR)/gs_supervisor.host
 OUT_CROSS ?= $(BUILD_DIR)/gs_supervisor
 
 # `shared/` carries WCMD wire-format and other cross-side headers.
 SHARED_INC = -I../shared
+
+# Vendored SQLite amalgamation (Phase 5 telemetry logger). Compiled ONCE as a
+# standalone object (9 MB source; never in SRCS) and linked into both the
+# standalone and mega builds. NOT sodium-gated — the logger ships in every
+# ground build. THREADSAFE=2 = multi-thread (logger thread writes; HTTP handlers
+# read/write on their own connections).
+SQLITE_DIR       = vendor/sqlite
+SQLITE_INC       = -I$(SQLITE_DIR)
+SQLITE_DEFS      = -DSQLITE_THREADSAFE=2 -DSQLITE_OMIT_LOAD_EXTENSION -DSQLITE_DQS=0 \
+                   -DSQLITE_DEFAULT_MEMSTATUS=0 -DSQLITE_OMIT_DEPRECATED
+SQLITE_OBJ_HOST  = $(BUILD_DIR)/sqlite3.host.o
+SQLITE_OBJ_CROSS = $(BUILD_DIR)/sqlite3.cross.o
+SQLITE_CC_STAMP  = $(BUILD_DIR)/.cross-cc
+# logger needs pthreads (capture thread) + libm (sqlite).
+GS_LDLIBS        = -lpthread -lm
 
 CFLAGS_COMMON  = -std=gnu99 -O2 -Wall -Wextra -Wno-missing-field-initializers
 LDFLAGS_COMMON =
@@ -43,7 +65,7 @@ all: host
 
 host: $(OUT_HOST)
 
-webui: $(WEBUI_HDR)
+webui: $(WEBUI_HDR) $(TELE_HDR)
 
 # xxd -i embeds the file as `unsigned char gs_webui_html[]` with a matching
 # `_len`. Promote both to const so the C side can put them in .rodata.
@@ -55,21 +77,59 @@ $(WEBUI_HDR): $(WEBUI_SRC)
 	@sed -i 's/^unsigned char gs_webui_html/const unsigned char gs_webui_html/' $@
 	@sed -i 's/^unsigned int gs_webui_html_len/const unsigned int gs_webui_html_len/' $@
 
+# Telemetry dashboard: embed each asset (html/js/css + uPlot vendor) as a
+# distinct const symbol, all in one header. `static const` so the consumer
+# (gs_supervisor_telemetry.c) is the sole owner — no link conflicts.
+$(TELE_HDR): $(TELE_SRCS)
+	@echo "[gs_supervisor] embedding telemetry assets -> $@"
+	@{ \
+	  xxd -i -n tele_index_html   $(TELE_DIR)/index.html; \
+	  xxd -i -n tele_session_html $(TELE_DIR)/session.html; \
+	  xxd -i -n tele_app_js       $(TELE_DIR)/app.js; \
+	  xxd -i -n tele_app_css      $(TELE_DIR)/app.css; \
+	  xxd -i -n tele_uplot_js     $(TELE_DIR)/uPlot.iife.min.js; \
+	  xxd -i -n tele_uplot_css    $(TELE_DIR)/uPlot.min.css; \
+	} | sed -e 's/^unsigned char/static const unsigned char/' \
+	        -e 's/^unsigned int/static const unsigned int/' > $@
+
 $(BUILD_DIR):
 	@mkdir -p $@
 
-$(OUT_HOST): $(SRCS) $(HDRS) $(WEBUI_HDR) | $(BUILD_DIR)
+# SQLite amalgamation -> object (vendored; -w because it is not our code).
+$(SQLITE_OBJ_HOST): $(SQLITE_DIR)/sqlite3.c | $(BUILD_DIR)
+	@echo "[gs_supervisor] sqlite3 (host) -> $@"
+	$(CC) -O2 -w $(SQLITE_DEFS) -c -o $@ $<
+
+$(OUT_HOST): $(SRCS) $(HDRS) $(WEBUI_HDR) $(TELE_HDR) $(SQLITE_OBJ_HOST) | $(BUILD_DIR)
 	@echo "[gs_supervisor] host -> $@"
-	$(CC) $(CFLAGS_COMMON) $(SHARED_INC) -I. -Iwebui -g -o $@ $(SRCS) $(LDFLAGS_COMMON)
+	$(CC) $(CFLAGS_COMMON) $(SHARED_INC) $(SQLITE_INC) -I. -Iwebui -g -o $@ $(SRCS) $(SQLITE_OBJ_HOST) $(LDFLAGS_COMMON) $(GS_LDLIBS)
 
 cross: $(OUT_CROSS)
 
-$(OUT_CROSS): $(SRCS) $(HDRS) $(WEBUI_HDR) | $(BUILD_DIR)
+# Toolchain-keyed stamp: rewritten only when CROSS_CC changes (the cmp keeps its
+# mtime stable otherwise). Making it a prereq of OUT_CROSS forces the cross
+# recipe to re-fire on a toolchain switch — without it, make sees OUT_CROSS as
+# up to date (its sources are unchanged) and silently relinks wrong-arch objects.
+.PHONY: FORCE
+FORCE:
+$(SQLITE_CC_STAMP): FORCE | $(BUILD_DIR)
+	@[ -f $@ ] && [ "`cat $@ 2>/dev/null`" = "$(CROSS_CC)" ] || echo "$(CROSS_CC)" > $@
+
+$(OUT_CROSS): $(SRCS) $(HDRS) $(WEBUI_HDR) $(TELE_HDR) $(SQLITE_CC_STAMP) | $(BUILD_DIR)
 	@if [ -z "$(CROSS_CC)" ]; then \
 		echo "set CROSS_CC=<path-to-target-gcc>"; exit 2; \
 	fi
+	@# Cache the 9 MB sqlite3.c compile, keyed on the compiler recorded beside the
+	@# .o; a toolchain switch (re-fired via the stamp above) rebuilds it instead of
+	@# relinking a wrong-arch object. The .o.cc record is read here, not the stamp,
+	@# so the compare sees the *previous* compiler (the stamp was already synced).
+	@if [ ! -f $(SQLITE_OBJ_CROSS) ] || [ "`cat $(SQLITE_OBJ_CROSS).cc 2>/dev/null`" != "$(CROSS_CC)" ]; then \
+		echo "[gs_supervisor] sqlite3 (cross $(CROSS_CC)) -> $(SQLITE_OBJ_CROSS)"; \
+		$(CROSS_CC) -O2 -w $(SQLITE_DEFS) -c -o $(SQLITE_OBJ_CROSS) $(SQLITE_DIR)/sqlite3.c && \
+		echo "$(CROSS_CC)" > $(SQLITE_OBJ_CROSS).cc; \
+	else echo "[gs_supervisor] sqlite3 (cross) cached -> $(SQLITE_OBJ_CROSS)"; fi
 	@echo "[gs_supervisor] cross ($(CROSS_CC)) -> $@"
-	$(CROSS_CC) $(CFLAGS_COMMON) $(SHARED_INC) -I. -Iwebui -o $@ $(SRCS) $(LDFLAGS_COMMON)
+	$(CROSS_CC) $(CFLAGS_COMMON) $(SHARED_INC) $(SQLITE_INC) -I. -Iwebui -o $@ $(SRCS) $(SQLITE_OBJ_CROSS) $(LDFLAGS_COMMON) $(GS_LDLIBS)
 
 deploy: $(OUT_CROSS)
 	scp $(OUT_CROSS) root@$(DEPLOY_HOST):$(DEPLOY_DIR)/
@@ -122,8 +182,11 @@ MEGA_CXX   := $(CROSS_CXX)
 MEGA_STRIP ?= $(CROSS_CC:gcc=strip)
 endif
 # C daemon objects (supervisor) — built as C with the multicall guard.
+# wfb_logger.o + sqlite3.o ship in the mega binary too (telemetry logger).
 MEGA_GS_OBJ = $(MEGA_OBJ)/gs_supervisor.o $(MEGA_OBJ)/gs_supervisor_csa.o \
-              $(MEGA_OBJ)/gs_supervisor_scan.o $(MEGA_OBJ)/gs_supervisor_http.o
+              $(MEGA_OBJ)/gs_supervisor_scan.o $(MEGA_OBJ)/gs_supervisor_http.o \
+              $(MEGA_OBJ)/gs_supervisor_telemetry.o \
+              $(MEGA_OBJ)/wfb_logger.o $(MEGA_OBJ)/sqlite3.o
 # Dispatcher (wfb_multicall.o from mega.mk) + ground applet table.
 MEGA_DISP_OBJ = $(MEGA_OBJ)/wfb_multicall.o $(MEGA_OBJ)/gs_applets.o
 
@@ -133,9 +196,23 @@ include ../wfb-ng/mega.mk
 mega: $(MEGA_OUT)
 
 # --- supervisor (C, multicall) ---
-# -I$(MULTICALL) lets the WFB_WITH_WFBNG key-management endpoint reach wfb_keyseed.h.
-$(MEGA_OBJ)/%.o: %.c $(HDRS) $(WEBUI_HDR) | $(MEGA_OBJ)
-	$(MEGA_CC) $(CFLAGS_COMMON) $(MEGA_DEFS) $(MEGA_CFLAGS) $(SHARED_INC) -I$(MULTICALL) -I. -Iwebui -c -o $@ $<
+# -I$(MULTICALL) lets the WFB_WITH_WFBNG key-management endpoint reach wfb_keyseed.h;
+# -I$(SQLITE_DIR) lets wfb_logger.o find the vendored sqlite3.h.
+$(MEGA_OBJ)/%.o: %.c $(HDRS) $(WEBUI_HDR) $(TELE_HDR) | $(MEGA_OBJ)
+	$(MEGA_CC) $(CFLAGS_COMMON) $(MEGA_DEFS) $(MEGA_CFLAGS) $(SHARED_INC) $(SQLITE_INC) -I$(MULTICALL) -I. -Iwebui -c -o $@ $<
+
+# --- vendored SQLite amalgamation (mega; host or cross per MEGA_CC) ---
+# Unlike the standalone host/cross objects (separate files), the mega build
+# reuses ONE path for both host and cross. sqlite3.c never changes, so a plain
+# rule would never rebuild on a MEGA_CC switch and the link would pull a stale
+# wrong-arch object. Mirror the standalone-cross guard: a FORCE-driven recipe
+# that recompiles only when the recorded compiler in $@.cc differs from MEGA_CC.
+$(MEGA_OBJ)/sqlite3.o: $(SQLITE_DIR)/sqlite3.c FORCE | $(MEGA_OBJ)
+	@if [ ! -f $@ ] || [ "`cat $@.cc 2>/dev/null`" != "$(MEGA_CC)" ]; then \
+		echo "[wfb-gs] sqlite3 ($(MEGA_CC)) -> $@"; \
+		$(MEGA_CC) -O2 -w $(SQLITE_DEFS) $(MEGA_CFLAGS) -c -o $@ $< && \
+		echo "$(MEGA_CC)" > $@.cc; \
+	else echo "[wfb-gs] sqlite3 (cached) -> $@"; fi
 
 # --- ground applet table (C++) ---
 $(MEGA_OBJ)/gs_applets.o: gs_applets.cpp $(MULTICALL)/wfb_multicall.h $(MULTICALL)/wfb_applets_common.h $(MULTICALL)/wfb_keyseed.h $(MULTICALL)/wfb_configenv.h | $(MEGA_OBJ)
@@ -143,10 +220,10 @@ $(MEGA_OBJ)/gs_applets.o: gs_applets.cpp $(MULTICALL)/wfb_multicall.h $(MULTICAL
 
 $(MEGA_OUT): $(MEGA_GS_OBJ) $(MEGA_DISP_OBJ) $(MEGA_WFBNG_OBJ)
 	@echo "[wfb-gs] linking mega binary -> $@"
-	$(MEGA_CXX) $(MEGA_CFLAGS) -o $@ $^ $(MEGA_LDFLAGS) $(LDFLAGS_COMMON)
+	$(MEGA_CXX) $(MEGA_CFLAGS) -o $@ $^ $(MEGA_LDFLAGS) $(LDFLAGS_COMMON) $(GS_LDLIBS)
 	$(MEGA_STRIP) $@
-	@echo "[wfb-gs] done (stripped): applets = supervisor rx tx tx_cmd keygen"
+	@echo "[wfb-gs] done (stripped): applets = supervisor rx tx tx_cmd keygen telemetry-import"
 
 clean:
-	rm -f $(OUT_HOST) $(OUT_CROSS) $(WEBUI_HDR)
+	rm -f $(OUT_HOST) $(OUT_CROSS) $(WEBUI_HDR) $(TELE_HDR) $(SQLITE_OBJ_HOST) $(SQLITE_OBJ_CROSS) $(SQLITE_OBJ_CROSS).cc $(SQLITE_CC_STAMP)
 	rm -rf $(MEGA_OBJ) $(MEGA_OUT)
