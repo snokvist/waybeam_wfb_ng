@@ -78,6 +78,7 @@ static struct {
 	/* status snapshot */
 	int    running;
 	int    bind_error;
+	int    db_error;            /* 1 = sqlite open/init failed; capture disabled */
 	long   session_id;
 	double session_start;       /* monotonic seconds */
 	long   records;
@@ -345,7 +346,7 @@ static void *capture_run(void *arg)
 	if (sqlite3_open_v2(cfg->db, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, NULL) != SQLITE_OK) {
 		LOGE("telemetry: open %s: %s", cfg->db, db ? sqlite3_errmsg(db) : "?");
 		if (db) sqlite3_close(db);
-		pthread_mutex_lock(&L.lock); L.running = 0; L.bind_error = 1; pthread_mutex_unlock(&L.lock);
+		pthread_mutex_lock(&L.lock); L.running = 0; L.db_error = 1; pthread_mutex_unlock(&L.lock);
 		return NULL;
 	}
 	conn_tune(db);
@@ -523,6 +524,7 @@ void wfb_logger_status(WfbLogStatus *out)
 	pthread_mutex_lock(&L.lock);
 	out->running     = L.running;
 	out->bind_error  = L.bind_error;
+	out->db_error    = L.db_error;
 	out->session_id  = L.session_id;
 	out->records     = L.records;
 	out->bad         = L.bad;

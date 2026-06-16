@@ -46,6 +46,7 @@ typedef struct {
 typedef struct {
 	int    running;
 	int    bind_error;     /* 1 = udp bind failed; capture disabled, reads OK */
+	int    db_error;       /* 1 = sqlite open/init failed; capture disabled, reads OK */
 	long   session_id;     /* -1 when no session is open */
 	long   records;
 	long   bad;

@@ -81,7 +81,12 @@
       const r = await fetch("/api/v1/telemetry/capture"); if (!r.ok) return;
       const j = await r.json();
       const el = document.getElementById("capture-status");
-      if (!j.running) { el.textContent = j.bind_error ? " ⚠ capture disabled (port busy)" : " (idle)"; return; }
+      if (!j.running) {
+        el.textContent = j.bind_error ? " ⚠ capture disabled (port busy)"
+                       : j.db_error   ? " ⚠ capture disabled (db error)"
+                       : " (idle)";
+        return;
+      }
       el.textContent = j.session_id >= 0
         ? ` ● session ${j.session_id} · ${j.records} rec · ${Math.round(j.age)}s`
         : " ● listening";

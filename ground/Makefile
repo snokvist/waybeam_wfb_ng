@@ -46,6 +46,7 @@ SQLITE_DEFS      = -DSQLITE_THREADSAFE=2 -DSQLITE_OMIT_LOAD_EXTENSION -DSQLITE_D
                    -DSQLITE_DEFAULT_MEMSTATUS=0 -DSQLITE_OMIT_DEPRECATED
 SQLITE_OBJ_HOST  = $(BUILD_DIR)/sqlite3.host.o
 SQLITE_OBJ_CROSS = $(BUILD_DIR)/sqlite3.cross.o
+SQLITE_CC_STAMP  = $(BUILD_DIR)/.cross-cc
 # logger needs pthreads (capture thread) + libm (sqlite).
 GS_LDLIBS        = -lpthread -lm
 
@@ -105,12 +106,28 @@ $(OUT_HOST): $(SRCS) $(HDRS) $(WEBUI_HDR) $(TELE_HDR) $(SQLITE_OBJ_HOST) | $(BUI
 
 cross: $(OUT_CROSS)
 
-$(OUT_CROSS): $(SRCS) $(HDRS) $(WEBUI_HDR) $(TELE_HDR) | $(BUILD_DIR)
+# Toolchain-keyed stamp: rewritten only when CROSS_CC changes (the cmp keeps its
+# mtime stable otherwise). Making it a prereq of OUT_CROSS forces the cross
+# recipe to re-fire on a toolchain switch — without it, make sees OUT_CROSS as
+# up to date (its sources are unchanged) and silently relinks wrong-arch objects.
+.PHONY: FORCE
+FORCE:
+$(SQLITE_CC_STAMP): FORCE | $(BUILD_DIR)
+	@[ -f $@ ] && [ "`cat $@ 2>/dev/null`" = "$(CROSS_CC)" ] || echo "$(CROSS_CC)" > $@
+
+$(OUT_CROSS): $(SRCS) $(HDRS) $(WEBUI_HDR) $(TELE_HDR) $(SQLITE_CC_STAMP) | $(BUILD_DIR)
 	@if [ -z "$(CROSS_CC)" ]; then \
 		echo "set CROSS_CC=<path-to-target-gcc>"; exit 2; \
 	fi
-	@echo "[gs_supervisor] sqlite3 (cross) -> $(SQLITE_OBJ_CROSS)"
-	@test -f $(SQLITE_OBJ_CROSS) || $(CROSS_CC) -O2 -w $(SQLITE_DEFS) -c -o $(SQLITE_OBJ_CROSS) $(SQLITE_DIR)/sqlite3.c
+	@# Cache the 9 MB sqlite3.c compile, keyed on the compiler recorded beside the
+	@# .o; a toolchain switch (re-fired via the stamp above) rebuilds it instead of
+	@# relinking a wrong-arch object. The .o.cc record is read here, not the stamp,
+	@# so the compare sees the *previous* compiler (the stamp was already synced).
+	@if [ ! -f $(SQLITE_OBJ_CROSS) ] || [ "`cat $(SQLITE_OBJ_CROSS).cc 2>/dev/null`" != "$(CROSS_CC)" ]; then \
+		echo "[gs_supervisor] sqlite3 (cross $(CROSS_CC)) -> $(SQLITE_OBJ_CROSS)"; \
+		$(CROSS_CC) -O2 -w $(SQLITE_DEFS) -c -o $(SQLITE_OBJ_CROSS) $(SQLITE_DIR)/sqlite3.c && \
+		echo "$(CROSS_CC)" > $(SQLITE_OBJ_CROSS).cc; \
+	else echo "[gs_supervisor] sqlite3 (cross) cached -> $(SQLITE_OBJ_CROSS)"; fi
 	@echo "[gs_supervisor] cross ($(CROSS_CC)) -> $@"
 	$(CROSS_CC) $(CFLAGS_COMMON) $(SHARED_INC) $(SQLITE_INC) -I. -Iwebui -o $@ $(SRCS) $(SQLITE_OBJ_CROSS) $(LDFLAGS_COMMON) $(GS_LDLIBS)
 
@@ -200,5 +217,5 @@ $(MEGA_OUT): $(MEGA_GS_OBJ) $(MEGA_DISP_OBJ) $(MEGA_WFBNG_OBJ)
 	@echo "[wfb-gs] done (stripped): applets = supervisor rx tx tx_cmd keygen telemetry-import"
 
 clean:
-	rm -f $(OUT_HOST) $(OUT_CROSS) $(WEBUI_HDR) $(TELE_HDR) $(SQLITE_OBJ_HOST) $(SQLITE_OBJ_CROSS)
+	rm -f $(OUT_HOST) $(OUT_CROSS) $(WEBUI_HDR) $(TELE_HDR) $(SQLITE_OBJ_HOST) $(SQLITE_OBJ_CROSS) $(SQLITE_OBJ_CROSS).cc $(SQLITE_CC_STAMP)
 	rm -rf $(MEGA_OBJ) $(MEGA_OUT)

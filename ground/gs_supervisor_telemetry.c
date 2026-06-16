@@ -413,9 +413,10 @@ static void tele_capture_status(ApiClient *cli)
 	wfb_logger_status(&s);
 	char body[256];
 	int n = snprintf(body, sizeof(body),
-		"{\"running\":%s,\"bind_error\":%s,\"session_id\":%ld,\"records\":%ld,"
+		"{\"running\":%s,\"bind_error\":%s,\"db_error\":%s,\"session_id\":%ld,\"records\":%ld,"
 		"\"bad\":%ld,\"age\":%.1f,\"max_duration\":%d,\"listen\":%d}",
 		s.running ? "true" : "false", s.bind_error ? "true" : "false",
+		s.db_error ? "true" : "false",
 		s.session_id, s.records, s.bad, s.age_s, s.max_duration, s.listen_port);
 	api_send(cli->fd, 200, "application/json", body, n);
 }
