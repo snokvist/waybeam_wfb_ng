@@ -147,6 +147,14 @@ Asymmetric gating — fast increase, slow decrease (mirror of TCP AIMD):
 - Under-protection (lost frames) is far worse than over-protection
   (wasted bandwidth); airtime efficiency on P-frames beats
   "one frame = one block" guarantee.
+- **Redundancy (Adaptive-n)**: the static k→r curve sets the redundancy
+  *floor*; on top of it `fec.loss_adapt` (default **on**) biases `n` up
+  from measured loss — reusing the `smoothed_lost_ratio` /
+  `smoothed_recov_ratio` rx_ant EWMAs the MCS loop already computes (no
+  new wire/feedback path). Fast-attack / slow-decay, decay frozen during
+  MCS settle, hard-railed by `loss_adapt_ceiling` + an `n·fps` airtime
+  cap. A clean link is identical to the old static path. Came out of an
+  swfec evaluation; see `docs/design/adaptive-n-rs-peek.md`.
 
 ## WCMD redundancy
 
@@ -169,4 +177,7 @@ no longer drops the command but duplicates don't double-apply.  The
 - The ground's `gs_supervisor` is the single supervisor for `wfb_rx`
   and `wfb_tx` on the GS host; manual `wfb-ng.sh` / `wbmode` was
   retired (kept under `archive/init-old/` for reference).
-- Loss-rate feedback and dual-stream FEC are out of scope.
+- Dual-stream FEC is out of scope. Loss-rate feedback *into FEC
+  redundancy* is now in scope (Adaptive-n — see the FEC gating design
+  section); it reuses the existing rx_ant loss EWMAs, so no new feedback
+  wire was added.

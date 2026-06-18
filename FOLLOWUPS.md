@@ -59,6 +59,16 @@ stay searchable.
 
 ## link_controller (vehicle)
 
+- **Adaptive-n (loss-driven FEC redundancy) deferred items** — landed
+  default-on; see `docs/design/adaptive-n-rs-peek.md` §10. (1) loss-driven
+  `n` moves are guarded only by `cooldown_up_s` on down-moves, not the FEC
+  oscillation accounting — wire them in if bench shows parity flap. (2) the
+  MCS-down parity boost still composes with the loss bias (harmless overlap);
+  decide whether to fully delete it once loss adaptation is trusted on
+  hardware. (3) coarse RS parity granularity on tiny high-fps P-frames — the
+  multi-frame-block-spanning mitigation (peek closes every Nth M-bit) is
+  unbuilt. (4) gains (`fec.loss_adapt_gain` / `_recov_gain` / `_ceiling` /
+  `loss_decay_s` / `airtime_max_pps`) are bench-tuning starting points.
 - ~~No first-class way to set the wlan iface MTU.~~  PR #48 adds
   `--iface-mtu N` (range [576, 9000]) which fork+execvp's
   `ip link set dev <iface> mtu N` against `{csa.iface, cmd.wfb_iface}`
