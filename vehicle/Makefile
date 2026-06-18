@@ -87,6 +87,18 @@ $(TEST_LOSS): ../tests/test_fec_loss_adapt.c $(SRC) $(CSA_HDR) $(WEBUI_HDR) | $(
 		-I. -Icsa -Iwebui -g \
 		-o $@ ../tests/test_fec_loss_adapt.c csa/csa.c $(LDFLAGS_COMMON)
 
+# FPV loss-scenario bench for Adaptive-n (report, not a pass/fail gate; runs
+# the real controller through scripted Gilbert-Elliott burst timelines).
+.PHONY: bench
+BENCH_LOSS = $(BUILD_DIR)/bench_fec_loss_adapt
+bench: $(BENCH_LOSS)
+	@cd $(CURDIR) && ./$(BENCH_LOSS)
+
+$(BENCH_LOSS): ../tests/bench_fec_loss_adapt.c $(SRC) $(CSA_HDR) $(WEBUI_HDR) | $(BUILD_DIR)
+	cc $(CFLAGS_COMMON) -Wno-unused-function -DLC_TEST_NO_MAIN $(SHARED_INC) \
+		-I. -Icsa -Iwebui -g \
+		-o $@ ../tests/bench_fec_loss_adapt.c csa/csa.c $(LDFLAGS_COMMON)
+
 # ── Mega binary (multi-call) ─────────────────────────────────────────
 # Single `wfb-air` bundling link_controller + wfb_tx/wfb_rx/wfb_tx_cmd/
 # wfb_keygen as applets (busybox-style). See docs/design/mega-binary.md.

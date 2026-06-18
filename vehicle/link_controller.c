@@ -5240,9 +5240,10 @@ static void config_defaults(Config *c)
 	c->fec.wfb_stats_port = 0;
 	c->fec.boost_s = 3.0f;
 	c->fec.boost_mult = 1.3f;
-	/* Adaptive-n: off by default. Gains/ceiling are bench-tuning starting
-	 * points (see docs/design/adaptive-n-rs-peek.md). */
-	c->fec.loss_adapt = false;
+	/* Adaptive-n: ON by default. Gains/ceiling are bench-tuning starting
+	 * points (see docs/design/adaptive-n-rs-peek.md). The curve stays the
+	 * floor, so with a clean link this is identical to the static path. */
+	c->fec.loss_adapt = true;
 	c->fec.loss_adapt_gain = 3.0f;
 	c->fec.loss_adapt_recov_gain = 0.5f;
 	c->fec.loss_adapt_ceiling = 0.60f;

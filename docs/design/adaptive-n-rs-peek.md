@@ -1,7 +1,8 @@
 # Design note: Adaptive-n RS+peek (loss-driven redundancy)
 
-Status: **IMPLEMENTED** (2026-06-18), behind `fec.loss_adapt` (default
-**off**) — pending bench tuning of the gains. Branch:
+Status: **IMPLEMENTED** (2026-06-18), `fec.loss_adapt` default **ON**
+(curve is the floor → identical to the static path on a clean link).
+Host-bench validated; pending on-hardware tuning. Branch:
 `claude/swfec-wfb-ng-patches-v9xvvq`.
 
 Landed in `vehicle/link_controller.c` (control law in `controller_update`,
@@ -260,6 +261,38 @@ This makes the A/B in §9 measurable without a packet capture.
   decisions vs. current main on a recorded sidecar+rx_ant trace.
 
 ---
+
+## 9a. Host-bench results (2026-06-18)
+
+`tests/bench_fec_loss_adapt.c` (`make -C vehicle bench`) drives the real
+`controller_update()` through scripted FPV timelines on a Gilbert-Elliott burst
+channel with delayed closed-loop feedback (6-frame ≈ 100 ms RTT). Same
+channel + frame sizes fed to both modes; airtime rail off to isolate the law.
+Default gains (3.0 / 0.5 / ceiling 0.60 / decay 2.0 s).
+
+| scenario | static deliv% | adaptive deliv% | drops | airtime |
+|---|---|---|---|---|
+| clean-cruise        | 100.00 | 100.00 | 0→0   | +1.1% |
+| obstacle-flyby      | 98.87  | 99.01  | 8→7   | +7.1% |
+| range-edge-fade     | 98.44  | 98.87  | 11→8  | +8.5% |
+| sharp-turn-nulls    | 99.43  | 99.58  | 4→3   | +8.7% |
+| **foliage-sustained** | 98.44 | **99.43** | **11→4** | +9.0% |
+| aggregate           | 99.04  | 99.38  | +0.34 pp | +6.9% |
+
+Takeaways:
+- **Clean link is free** (delivery identical; the +1.1% is noise off the
+  model's 0.02 stress floor — true 0% loss gives 0 overhead).
+- **Biggest win is sustained loss** (foliage: drops −64%), which is precisely
+  the design target — loss with no MCS-down event, the static curve's blind
+  spot.
+- The loop biases hardest on **small/fragile blocks**: in the trace, during the
+  fade peak `k=26` (large block from the 8 s k-down dwell) absorbs bursts with
+  no bias; once `k` shrinks to 9 the bias jumps to the ceiling (redundancy
+  0.61 vs the curve's ~0.32). Block FEC is already decent on big blocks, so
+  adaptive shaves the failure tail rather than transforming it.
+- Tuning levers for hardware: `loss_adapt_recov_gain` buys earlier pre-emption
+  (currently the hard residual term dominates and only fires *after* a block
+  fails); `loss_decay_s` trades airtime-after-event vs. flap resistance.
 
 ## 10. Implementation checklist (action order)
 
