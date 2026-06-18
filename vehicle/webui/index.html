@@ -494,7 +494,13 @@ function renderStatus(s) {
     const bps = encoded_kbps > 0
       ? (encoded_kbps/1000).toFixed(2) + " Mbps · "
       : "";
-    $("#c-fec-sub").textContent = bps + parity_pct.toFixed(0) + "% parity · " + (fec.fps||0).toFixed(0) + " fps";
+    // Adaptive-n: surface the loss-driven bias at a glance when it's lifting
+    // parity above the static curve floor (the parity_pct above already
+    // includes it, since fec.n carries the bias).
+    const adapt = (fec.loss_adapt && (fec.r_loss_bias||0) > 0.001)
+      ? " · +" + ((fec.r_loss_bias||0)*100).toFixed(1) + "% adapt"
+      : "";
+    $("#c-fec-sub").textContent = bps + parity_pct.toFixed(0) + "% parity · " + (fec.fps||0).toFixed(0) + " fps" + adapt;
   } else {
     $("#c-fec").textContent = "—";
     $("#c-fec").className = "v";
@@ -652,9 +658,17 @@ function renderStatus(s) {
   fmtKv($("#kv-ctrl"), {
     have_current: !!fec.have_current,
     k: fec.k, n: fec.n,
+    redundancy: (fec.redundancy||0).toFixed(3),
     avg_frame_size: (fec.avg_frame_size||0).toFixed(1),
     update_count: fec.update_count,
     fps: (fec.fps||0).toFixed(2),
+    // Adaptive-n loss-driven redundancy (see docs/design/adaptive-n-rs-peek.md):
+    // r_loss_bias is the redundancy added on top of the static curve floor;
+    // loss/recov_ewma are the rx_ant feedback EWMAs driving it.
+    loss_adapt: !!fec.loss_adapt,
+    r_loss_bias: (fec.r_loss_bias||0).toFixed(4),
+    loss_ewma: (fec.loss_ewma||0).toFixed(4),
+    recov_ewma: (fec.recov_ewma||0).toFixed(4),
   });
   const radio = s.radio || {};
   fmtKv($("#kv-radio"), {
