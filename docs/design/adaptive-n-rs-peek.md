@@ -1,7 +1,18 @@
 # Design note: Adaptive-n RS+peek (loss-driven redundancy)
 
-Status: **PROPOSED** (2026-06-18). Actionable spec, not yet implemented.
-Branch: `claude/swfec-wfb-ng-patches-v9xvvq`.
+Status: **IMPLEMENTED** (2026-06-18), behind `fec.loss_adapt` (default
+**off**) — pending bench tuning of the gains. Branch:
+`claude/swfec-wfb-ng-patches-v9xvvq`.
+
+Landed in `vehicle/link_controller.c` (control law in `controller_update`,
+config + settings rows + telemetry) with a host unit test at
+`tests/test_fec_loss_adapt.c` (regression lock, attack, ceiling, decay,
+staleness, airtime rail — run by `make -C vehicle test`). The control law
+ended up *simpler* than the spec's §3 sketch: `last_lost_ratio` /
+`last_recov_ratio` / `last_rx_ant_us` are already function-local in the main
+loop (computed for the MCS path), so no `LossSnapshot` struct was needed —
+they pass straight into `controller_update`. Gains/ceiling below are
+bench-tuning starting points, not final.
 
 This note came out of an swfec (sliding-window RLNC FEC) evaluation. The
 conclusion there was that swfec would *replace* RS+peek rather than extend
@@ -252,20 +263,32 @@ This makes the A/B in §9 measurable without a packet capture.
 
 ## 10. Implementation checklist (action order)
 
-1. `LossSnapshot` struct + publish in the rx_ant handler, read in the sidecar
-   FEC branch; staleness field.
-2. `fec_compute()` / `controller_update()`: `r_base → r_loss → r_eff → n` with
-   attack/decay; route changes through the existing oscillation accounting.
-3. Subsume/seed the MCS-down boost from `r_loss`.
-4. §5 coordination: freeze loss-decay during MCS settle / `bitrate_up_lock`.
-5. Config rows (`fec.loss_adapt*`, `loss_decay_s`, `loss_stale_s`,
-   `airtime_max_pps`) + startup validation warnings (gains ≥ 0, ceiling in
-   (0,0.99], min_n ≤ max_n already checked).
-6. Telemetry (§8): LOG_FEC fields + `append_fec_json` fields.
-7. Host controller-logic test (§9) + `make test` green.
-8. Bench A/B; tune `loss_adapt_gain` / `recov_gain` / `ceiling`; record results
-   back into this note (promote Status PROPOSED → VERIFIED or document removal,
-   peek-note style).
+1. ✅ Loss signal: reused the existing `last_lost_ratio` / `last_recov_ratio` /
+   `last_rx_ant_us` main-loop locals (no `LossSnapshot` struct needed); the
+   sidecar FEC branch computes `loss_fresh` from `loss_stale_s`.
+2. ✅ `controller_update()`: `r_base → r_loss → r_eff → n` (only ever raises n)
+   with fast-attack / slow-decay one-pole; loss-only n-moves now commit via the
+   `k_delta == 0` branch (up immediately, down gated by `cooldown_up_s`).
+3. ✅ MCS-down boost composes with loss (loss takes the max; boost is the
+   fast-start floor). Full subsumption deferred — harmless overlap, revisit
+   after bench.
+4. ✅ §5 coordination: loss-decay frozen during MCS settle / `bitrate_up_lock`.
+5. ✅ Config + settings rows (`fec.loss_adapt*`, `loss_decay_s`, `loss_stale_s`,
+   `airtime_max_pps`) with table ranges. (Startup cross-field validation
+   warnings not added — ranges enforced by the settings table; revisit if
+   bench wants them.)
+6. ✅ Telemetry: `LOG_FEC` `rloss=` field + `append_fec_json`
+   (`loss_adapt`, `redundancy`, `r_loss_bias`, `loss_ewma`, `recov_ewma`).
+7. ✅ Host unit test `tests/test_fec_loss_adapt.c` + `make test` green.
+8. ⏳ **Bench A/B**: tune `loss_adapt_gain` / `recov_gain` / `ceiling` /
+   `decay_s` / `airtime_max_pps`; record results here (promote Status
+   IMPLEMENTED → VERIFIED, or document removal, peek-note style).
+
+Deferred follow-ups (not blocking bench): wire loss-driven n-moves through the
+oscillation detector (currently guarded only by `cooldown_up_s` on down-moves);
+multi-frame block spanning for fine parity granularity on tiny high-fps frames
+(§6); decide whether to fully delete the MCS-down boost once loss adaptation is
+trusted.
 
 Default stays **off** through the entire rollout; flip on per-rig for A/B.
 
