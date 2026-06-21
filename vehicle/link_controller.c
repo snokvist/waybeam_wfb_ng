@@ -364,6 +364,18 @@ typedef struct {
 		 * frame rate whenever in grace or coalescing is predicted, so the
 		 * transition window is captured densely.  Off by default (0). */
 		bool     desync_probe;
+
+		/* Feed-forward FEC block sizing (prototype fix for the MCS-down
+		 * blocksize<->MCS desync; see docs/design/fec-blocksize-mcs-desync.md).
+		 * When enabled, k is sized from the *committed* venc bitrate
+		 * (lag-free operating point: bytes/frame = kbps*1000/8/fps) instead
+		 * of the lagging measured-frame EWMA, and the resulting k step is
+		 * committed promptly during an MCS transition (bypassing the grace
+		 * freeze and the k_down_dwell that otherwise pin k at the pre-drop
+		 * value while frames have already collapsed -> peek coalescing).
+		 * The measured-frame path is the fallback when the committed bitrate
+		 * or fps is not yet known.  Off by default (0) -> identical to today. */
+		bool     blocksize_feedforward;
 	} fec;
 
 	/* ── MCS subsystem ── */
@@ -891,6 +903,7 @@ static bool controller_update(Controller *c, const Config *cfg,
                               uint64_t now,
                               float loss_ewma, float recov_ewma,
                               bool loss_fresh, float fps,
+                              long committed_kbps,
                               FecParams *out)
 {
 	if (c->start_us == 0) c->start_us = now;
@@ -911,7 +924,18 @@ static bool controller_update(Controller *c, const Config *cfg,
 		ring, cfg->fec.headroom_margin, cfg->fec.headroom_min, cfg->fec.headroom_max);
 
 	int cur_ppf = c->have_current ? c->current.packets_per_frame : 0;
-	FecParams cand = fec_compute(c->avg_frame_size, headroom, cfg, cur_ppf);
+
+	/* Feed-forward sizing (cfg.fec.blocksize_feedforward): derive the block
+	 * size from the *committed* venc bitrate (lag-free operating point) rather
+	 * than the lagging measured-frame EWMA.  bytes/frame = kbps*1000/8/fps.
+	 * Falls back to the measured EWMA when the bitrate/fps are not yet known. */
+	float size_basis = c->avg_frame_size;
+	bool ff_active = false;
+	if (cfg->fec.blocksize_feedforward && committed_kbps > 0 && fps > 0.1f) {
+		float ff_bytes = (float)committed_kbps * 1000.0f / 8.0f / fps;
+		if (ff_bytes > 0.0f) { size_basis = ff_bytes; ff_active = true; }
+	}
+	FecParams cand = fec_compute(size_basis, headroom, cfg, cur_ppf);
 
 	bool boost_active = (c->boost_until_us != 0 && now < c->boost_until_us);
 	bool boost_expired_now = (c->boost_until_us != 0 && !boost_active);
@@ -1007,6 +1031,20 @@ static bool controller_update(Controller *c, const Config *cfg,
 		if (cand.k == c->current.k && cand.n == c->current.n) return false;
 		return controller_commit(c, &cand, now, out);
 	}
+
+	/* Feed-forward step: the committed-bitrate operating point is lag-free, so
+	 * commit a changed k *immediately* — do not freeze it through the settle
+	 * grace or gate it behind k_down_dwell.  Those guards exist to damp
+	 * measurement noise; a commanded operating-point change is not noise, and
+	 * freezing it is exactly the blocksize<->MCS desync (k pinned high while
+	 * frames have collapsed -> peek coalescing).  k unchanged falls through to
+	 * the normal measurement-trim / n-adaptation path below.
+	 *
+	 * Startup grace is still honored: it damps cold-start measurement
+	 * transients before the operating point is meaningfully established, and
+	 * bypassing it is a different rationale than skipping the *settle* freeze. */
+	if (ff_active && !in_startup_grace && cand.k != c->current.k)
+		return controller_commit(c, &cand, now, out);
 
 	if (in_grace) return false;
 
@@ -3563,6 +3601,7 @@ static const TunableDesc TUNABLES[] = {
 	{"fec.skip_on_backpressure",    SUB_FEC, TF_BOOL,  OFF_FEC(skip_on_backpressure),    0, 0,      "suppress FEC update for one tick when sidecar reports producer backpressure"},
 	{"fec.backpressure_fill_pct",   SUB_FEC, TF_INT,   OFF_FEC(backpressure_fill_pct),   0, 100,    "skip-FEC threshold (output queue fill %)"},
 	{"fec.desync_probe",            SUB_FEC, TF_BOOL,  OFF_FEC(desync_probe),            0, 0,      "diagnostic: per-frame trace of sidecar frame size vs committed k vs grace + peek coalescing factor"},
+	{"fec.blocksize_feedforward",   SUB_FEC, TF_BOOL,  OFF_FEC(blocksize_feedforward),   0, 0,      "size FEC k from committed venc bitrate (lag-free) + commit promptly across MCS transitions (fixes blocksize<->MCS desync)"},
 
 	/* ── mcs ── */
 	{"mcs.enabled",                       SUB_MCS, TF_BOOL,  OFF_MCS(enabled),                       0, 0,       "enable MCS subsystem", 1},
@@ -5284,6 +5323,7 @@ static void config_defaults(Config *c)
 	c->fec.skip_on_backpressure       = true;
 	c->fec.backpressure_fill_pct      = 80;
 	c->fec.desync_probe               = false;  /* diagnostic; opt-in */
+	c->fec.blocksize_feedforward      = false;  /* prototype fix; opt-in */
 
 	/* MCS defaults — unified PER-probe law (hardware-validated 2026-06-10;
 	 * legacy RSSI-bucket FSM removed the same day). */
@@ -7010,6 +7050,7 @@ int main(int argc, char **argv)
 			                              fec_now,
 			                              last_lost_ratio, last_recov_ratio,
 			                              loss_fresh, fps_get(&fps),
+			                              last_written_kbps,
 			                              &next_params);
 			if (emit) {
 				LOG_FEC("FEC %s: k=%d n=%d (avg=%.0fB hd=%.2f ppf=%d red=%.2f rloss=%.2f fps=%.1f)",
