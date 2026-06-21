@@ -248,6 +248,27 @@ int main(void)
 		                               0.0f, 0.0f, false, 120.0f, 16000, &oute);
 		CHECK(!emit3, "ff ON: no commit during startup grace");
 		CHECK(!e.have_current, "ff ON: have_current stays false under startup grace");
+
+		printf("[feedforward — cooldown rate-limits rapid k-steps]\n");
+		Config onc = on; onc.fec.ff_cooldown_s = 0.20f;
+		Controller f = {0};
+		HeadroomRing rf = {0};
+		uint64_t tf = BASE;
+		feed_ff(&f, &onc, &rf, &tf, 60, 1200u, 1500, 120.0f);   /* low op point, k small */
+		int kf0 = f.current.k;
+		FecParams o;
+		bool e1 = controller_update(&f, &onc, 1200u, &rf, tf,
+		                            0.0f, 0.0f, false, 120.0f, 20000, &o);
+		CHECK(e1 && f.current.k > kf0, "ff cooldown: first k-step commits immediately");
+		int kf1 = f.current.k;
+		/* 2nd op-point change 50 ms later (< 200 ms cooldown) -> suppressed */
+		bool e2 = controller_update(&f, &onc, 1200u, &rf, tf + 50*1000ULL,
+		                            0.0f, 0.0f, false, 120.0f, 1500, &o);
+		CHECK(!e2 && f.current.k == kf1, "ff cooldown: rapid 2nd k-step suppressed");
+		/* once the cooldown elapses, the step lands */
+		bool e3 = controller_update(&f, &onc, 1200u, &rf, tf + 300*1000ULL,
+		                            0.0f, 0.0f, false, 120.0f, 1500, &o);
+		CHECK(e3 && f.current.k < kf1, "ff cooldown: k-step resumes after cooldown");
 	}
 
 	printf(g_fail ? "\nFAILED (%d failures)\n" : "\nPASSED (0 failures)\n", g_fail);

@@ -374,8 +374,14 @@ typedef struct {
 		 * freeze and the k_down_dwell that otherwise pin k at the pre-drop
 		 * value while frames have already collapsed -> peek coalescing).
 		 * The measured-frame path is the fallback when the committed bitrate
-		 * or fps is not yet known.  Off by default (0) -> identical to today. */
+		 * or fps is not yet known. */
 		bool     blocksize_feedforward;
+
+		/* Feed-forward thrash backstop: min seconds between feed-forward
+		 * k-step commits.  The first step of a transition is immediate; rapid
+		 * repeats (flapping committed bitrate) are rate-limited to one per
+		 * window.  0 disables the backstop. */
+		float    ff_cooldown_s;
 	} fec;
 
 	/* ── MCS subsystem ── */
@@ -868,6 +874,11 @@ typedef struct {
 	 * slow decay).  loss_last_us bounds the decay one-pole. */
 	float     loss_r_held;
 	uint64_t  loss_last_us;
+
+	/* Feed-forward (blocksize_feedforward) thrash backstop: timestamp of the
+	 * last feed-forward k-step commit.  A flapping committed bitrate can't
+	 * drive more than one feed-forward k-step per fec.ff_cooldown_s. */
+	uint64_t  ff_last_commit_us;
 } Controller;
 
 /* Arm the post-change settling window (extending only). */
@@ -1042,9 +1053,21 @@ static bool controller_update(Controller *c, const Config *cfg,
 	 *
 	 * Startup grace is still honored: it damps cold-start measurement
 	 * transients before the operating point is meaningfully established, and
-	 * bypassing it is a different rationale than skipping the *settle* freeze. */
-	if (ff_active && !in_startup_grace && cand.k != c->current.k)
-		return controller_commit(c, &cand, now, out);
+	 * bypassing it is a different rationale than skipping the *settle* freeze.
+	 *
+	 * Thrash backstop (ff_cooldown_s): the first k-step of any transition fires
+	 * immediately (no recent ff commit), but a flapping committed bitrate can't
+	 * drive more than one feed-forward k-step per cooldown — bounding k/n write
+	 * rate to wfb_tx on an oscillating link (set ff_cooldown_s=0 to disable). */
+	if (ff_active && !in_startup_grace && cand.k != c->current.k) {
+		uint64_t ff_cd = (uint64_t)(cfg->fec.ff_cooldown_s * 1e6f);
+		if (c->ff_last_commit_us == 0 || ff_cd == 0 ||
+		    (now - c->ff_last_commit_us) >= ff_cd) {
+			c->ff_last_commit_us = now;
+			return controller_commit(c, &cand, now, out);
+		}
+		return false;   /* within cooldown: hold k this tick */
+	}
 
 	if (in_grace) return false;
 
@@ -3602,6 +3625,7 @@ static const TunableDesc TUNABLES[] = {
 	{"fec.backpressure_fill_pct",   SUB_FEC, TF_INT,   OFF_FEC(backpressure_fill_pct),   0, 100,    "skip-FEC threshold (output queue fill %)"},
 	{"fec.desync_probe",            SUB_FEC, TF_BOOL,  OFF_FEC(desync_probe),            0, 0,      "diagnostic: per-frame trace of sidecar frame size vs committed k vs grace + peek coalescing factor"},
 	{"fec.blocksize_feedforward",   SUB_FEC, TF_BOOL,  OFF_FEC(blocksize_feedforward),   0, 0,      "size FEC k from committed venc bitrate (lag-free) + commit promptly across MCS transitions (fixes blocksize<->MCS desync)"},
+	{"fec.ff_cooldown_s",           SUB_FEC, TF_FLOAT, OFF_FEC(ff_cooldown_s),           0.0, 10.0, "min seconds between feed-forward k-step commits (thrash backstop; 0=off)"},
 
 	/* ── mcs ── */
 	{"mcs.enabled",                       SUB_MCS, TF_BOOL,  OFF_MCS(enabled),                       0, 0,       "enable MCS subsystem", 1},
@@ -5323,7 +5347,8 @@ static void config_defaults(Config *c)
 	c->fec.skip_on_backpressure       = true;
 	c->fec.backpressure_fill_pct      = 80;
 	c->fec.desync_probe               = false;  /* diagnostic; opt-in */
-	c->fec.blocksize_feedforward      = false;  /* prototype fix; opt-in */
+	c->fec.blocksize_feedforward      = true;   /* default ON (fixes MCS-down desync) */
+	c->fec.ff_cooldown_s              = 0.15f;  /* feed-forward thrash backstop */
 
 	/* MCS defaults — unified PER-probe law (hardware-validated 2026-06-10;
 	 * legacy RSSI-bucket FSM removed the same day). */
