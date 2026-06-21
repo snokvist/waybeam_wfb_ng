@@ -271,6 +271,28 @@ int main(void)
 		CHECK(e3 && f.current.k < kf1, "ff cooldown: k-step resumes after cooldown");
 	}
 
+	/* ── min_k floor: low-MCS sub-MTU frames don't collapse to k=2 ──
+	 * A single-packet frame would size to ppf=1 (k clamped up by min_k).
+	 * With the production floor min_k=4 the block is k=4, and the curve
+	 * gives n=7 (r(4)=0.40). This is what keeps MCS0 off the 2/4↔2/5
+	 * budget-cliff limit cycle: at k=4 a +/-1 n step is a ~12% budget
+	 * swing that stays inside bitrate_tolerance instead of forcing a
+	 * bitrate rewrite every tick. */
+	{
+		printf("[min_k floor — sub-MTU frame holds k>=4]\n");
+		Config dflt;
+		config_defaults(&dflt);
+		CHECK(dflt.fec.min_k == 4, "default min_k is 4");
+		CHECK(dflt.fec.min_n > dflt.fec.min_k, "default min_n > min_k (parity floor)");
+		dflt.fec.loss_adapt = false;   /* isolate the static curve+floor */
+		Controller c = {0};
+		HeadroomRing r = {0};
+		uint64_t t = BASE;
+		feed(&c, &dflt, &r, &t, 40, 1200u, 0.00f, 0.00f, true, 120.0f);
+		CHECK(c.current.k == 4, "tiny frame floors k to 4 (not 1/2)");
+		CHECK(c.current.n == 7, "curve gives n=7 at k=4 (4/7, not 2/5)");
+	}
+
 	printf(g_fail ? "\nFAILED (%d failures)\n" : "\nPASSED (0 failures)\n", g_fail);
 	return g_fail ? 1 : 0;
 }

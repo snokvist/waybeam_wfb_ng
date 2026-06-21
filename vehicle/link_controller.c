@@ -5257,6 +5257,12 @@ static int cfg_validate_warnings(const Config *c)
 		    c->fec.min_n, c->fec.max_n);
 		n++;
 	}
+	if (c->fec.enabled && c->fec.min_n <= c->fec.min_k) {
+		LOG_FEC("WARNING fec.min_n (%d) <= fec.min_k (%d) — no parity floor; "
+		    "n will be forced to k+1 at the minimum block size",
+		    c->fec.min_n, c->fec.min_k);
+		n++;
+	}
 	if (c->fec.enabled && c->fec.headroom_min > c->fec.headroom_max) {
 		LOG_FEC("WARNING fec.headroom_min (%.2f) > fec.headroom_max (%.2f) — bound inverted",
 		    (double)c->fec.headroom_min, (double)c->fec.headroom_max);
@@ -5291,8 +5297,8 @@ static void config_defaults(Config *c)
 	strcpy(c->fec.sidecar_host, "127.0.0.1"); c->fec.sidecar_port = 5602;
 	strcpy(c->fec.venc_host,    "127.0.0.1"); c->fec.venc_port    = 80;
 	c->fec.mtu = 1446;
-	c->fec.min_k = 1;    c->fec.max_k = 48;
-	c->fec.min_n = 2;    c->fec.max_n = 72;
+	c->fec.min_k = 4;    c->fec.max_k = 48;
+	c->fec.min_n = 6;    c->fec.max_n = 72;
 	c->fec.ewma_alpha = 0.05f;
 	c->fec.headroom_min = 1.05f;
 	c->fec.headroom_max = 1.40f;
