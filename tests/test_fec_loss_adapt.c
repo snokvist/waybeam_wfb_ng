@@ -48,8 +48,25 @@ static void feed(Controller *c, const Config *cfg, HeadroomRing *ring,
 {
 	FecParams out;
 	for (int i = 0; i < frames; i++) {
+		/* committed_kbps=0 -> feed-forward disabled (measurement path),
+		 * matching this suite's assertions. */
 		controller_update(c, cfg, fsize, ring, *now,
-		                   loss, recov, fresh, fps, &out);
+		                   loss, recov, fresh, fps, 0, &out);
+		*now += DT_US;
+	}
+}
+
+/* Like feed(), but with an explicit committed venc bitrate so the feed-forward
+ * sizing path (cfg.fec.blocksize_feedforward) is exercised.  Loss feedback is
+ * held off here so these cases isolate k behaviour. */
+static void feed_ff(Controller *c, const Config *cfg, HeadroomRing *ring,
+                    uint64_t *now, int frames, uint32_t fsize,
+                    long kbps, float fps)
+{
+	FecParams out;
+	for (int i = 0; i < frames; i++) {
+		controller_update(c, cfg, fsize, ring, *now,
+		                   0.0f, 0.0f, false, fps, kbps, &out);
 		*now += DT_US;
 	}
 }
@@ -158,6 +175,100 @@ int main(void)
 		feed(&c, &ar, &r, &t, 3, FRAME_SIZE, 0.05f, 0.00f, true, 60.0f);
 		CHECK(c.current.n > nb && c.current.n <= 20,
 		      "loss parity is capped at floor(airtime_max_pps / fps)");
+	}
+
+	/* ── feed-forward sizing: the blocksize<->MCS desync fix ──
+	 * These lock the prototype `fec.blocksize_feedforward` behaviour:
+	 *   - OFF is byte-identical to the measurement path (regression).
+	 *   - ON sizes k from the committed bitrate, not the frame EWMA.
+	 *   - ON commits a k-down promptly *during* settle grace (the fix);
+	 *     OFF freezes k high through grace (the bug we are fixing).
+	 *   - ON still honors startup grace. */
+	{
+		printf("[feedforward — off is byte-identical to measurement]\n");
+		Config ff = cfg; ff.fec.loss_adapt = false;
+		Config on = ff;  on.fec.blocksize_feedforward = true;
+		Config off = ff; off.fec.blocksize_feedforward = false;
+		/* Same big frames; OFF must ignore the (huge) committed bitrate and
+		 * size purely from frame size. */
+		Controller a = {0}, b = {0};
+		HeadroomRing ra = {0}, rb = {0};
+		uint64_t ta = BASE, tb = BASE;
+		feed_ff(&a, &off, &ra, &ta, 60, FRAME_SIZE, 999999, 30.0f);
+		/* drive the measurement path on b with committed_kbps=0 via feed() */
+		feed(&b, &off, &rb, &tb, 60, FRAME_SIZE, 0.0f, 0.0f, false, 30.0f);
+		CHECK(a.current.k == b.current.k && a.current.n == b.current.n,
+		      "ff OFF: committed bitrate is ignored (== measurement path)");
+		CHECK(a.current.k == 12, "ff OFF: k stays on the frame-size curve (k=12)");
+
+		printf("[feedforward — k sized from committed bitrate]\n");
+		Controller c = {0};
+		HeadroomRing r = {0};
+		uint64_t t = BASE;
+		/* Tiny frames (1 pkt) but a high committed bitrate: ff must size k
+		 * up from the bitrate, NOT down from the small measured frame. */
+		feed_ff(&c, &on, &r, &t, 60, 1200u, 16000, 120.0f);
+		/* 16000 kbps / 120 fps = ~16.7 KB/frame -> ~12 pkts -> k ~ 12. */
+		CHECK(c.current.k >= 8,
+		      "ff ON: k sized from committed bitrate, not the 1-pkt frame");
+		int k_hi = c.current.k;
+
+		printf("[feedforward — k-down commits during settle grace (the fix)]\n");
+		/* Arm a 5 s settle freeze (as an MCS-down would), then deliver a
+		 * still-big frame but a collapsed committed bitrate. ff must commit
+		 * k DOWN immediately despite the grace freeze and the lagging frame. */
+		controller_arm_settle(&c, t, 5.0f);
+		FecParams out;
+		bool emit = controller_update(&c, &on, FRAME_SIZE, &r, t,
+		                              0.0f, 0.0f, false, 120.0f, 2000, &out);
+		CHECK(emit, "ff ON: k-step commits during settle grace (not frozen)");
+		CHECK(c.current.k < k_hi,
+		      "ff ON: k drops to the low operating point in grace");
+
+		printf("[feedforward — baseline freezes k in grace (the bug)]\n");
+		/* Same setup, ff OFF: grace must freeze k at the high value even
+		 * though the operating point (and eventually frames) have collapsed. */
+		Controller d = {0};
+		HeadroomRing rd = {0};
+		uint64_t td = BASE;
+		feed_ff(&d, &on, &rd, &td, 60, 1200u, 16000, 120.0f);  /* same high k */
+		int kd_hi = d.current.k;
+		controller_arm_settle(&d, td, 5.0f);
+		bool emit2 = controller_update(&d, &off, 1200u, &rd, td,
+		                               0.0f, 0.0f, false, 120.0f, 2000, &out);
+		CHECK(!emit2, "ff OFF: no commit during settle grace (frozen)");
+		CHECK(d.current.k == kd_hi, "ff OFF: k stays pinned high in grace");
+
+		printf("[feedforward — startup grace is honored]\n");
+		Controller e = {0};
+		HeadroomRing re = {0};
+		FecParams oute;
+		/* First frame is inside startup_grace_s (default 2 s) → no commit. */
+		bool emit3 = controller_update(&e, &on, FRAME_SIZE, &re, BASE,
+		                               0.0f, 0.0f, false, 120.0f, 16000, &oute);
+		CHECK(!emit3, "ff ON: no commit during startup grace");
+		CHECK(!e.have_current, "ff ON: have_current stays false under startup grace");
+
+		printf("[feedforward — cooldown rate-limits rapid k-steps]\n");
+		Config onc = on; onc.fec.ff_cooldown_s = 0.20f;
+		Controller f = {0};
+		HeadroomRing rf = {0};
+		uint64_t tf = BASE;
+		feed_ff(&f, &onc, &rf, &tf, 60, 1200u, 1500, 120.0f);   /* low op point, k small */
+		int kf0 = f.current.k;
+		FecParams o;
+		bool e1 = controller_update(&f, &onc, 1200u, &rf, tf,
+		                            0.0f, 0.0f, false, 120.0f, 20000, &o);
+		CHECK(e1 && f.current.k > kf0, "ff cooldown: first k-step commits immediately");
+		int kf1 = f.current.k;
+		/* 2nd op-point change 50 ms later (< 200 ms cooldown) -> suppressed */
+		bool e2 = controller_update(&f, &onc, 1200u, &rf, tf + 50*1000ULL,
+		                            0.0f, 0.0f, false, 120.0f, 1500, &o);
+		CHECK(!e2 && f.current.k == kf1, "ff cooldown: rapid 2nd k-step suppressed");
+		/* once the cooldown elapses, the step lands */
+		bool e3 = controller_update(&f, &onc, 1200u, &rf, tf + 300*1000ULL,
+		                            0.0f, 0.0f, false, 120.0f, 1500, &o);
+		CHECK(e3 && f.current.k < kf1, "ff cooldown: k-step resumes after cooldown");
 	}
 
 	printf(g_fail ? "\nFAILED (%d failures)\n" : "\nPASSED (0 failures)\n", g_fail);
