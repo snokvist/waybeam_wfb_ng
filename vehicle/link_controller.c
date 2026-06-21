@@ -351,6 +351,19 @@ typedef struct {
 		 * agree on what "heavily filled" means. */
 		bool     skip_on_backpressure;
 		int      backpressure_fill_pct;  /* skip-FEC threshold, 0..100 */
+
+		/* Desync probe (diagnostic).  When enabled, emit a per-frame
+		 * "FEC DESYNC" trace correlating the live sidecar frame size against
+		 * the committed FEC block size (k), the feed-forward packets-per-frame
+		 * implied by the *commanded* venc bitrate, the controller grace state,
+		 * and a deterministic replay of the peek frame-boundary close gate
+		 * (block_fill*2 >= k) — so the TX-side coalescing factor (frames per
+		 * FEC block) is observable from the controller without any TX
+		 * feedback.  Confirms/denies the MCS-down block-size desync
+		 * hypothesis.  Throttled to ~1 Hz on a synced link; bursts to full
+		 * frame rate whenever in grace or coalescing is predicted, so the
+		 * transition window is captured densely.  Off by default (0). */
+		bool     desync_probe;
 	} fec;
 
 	/* ── MCS subsystem ── */
@@ -3549,6 +3562,7 @@ static const TunableDesc TUNABLES[] = {
 	{"fec.payload_min",             SUB_FEC, TF_INT,   OFF_FEC(payload_min),             576, 4000, "live payload floor (bytes); venc API floor is 576"},
 	{"fec.skip_on_backpressure",    SUB_FEC, TF_BOOL,  OFF_FEC(skip_on_backpressure),    0, 0,      "suppress FEC update for one tick when sidecar reports producer backpressure"},
 	{"fec.backpressure_fill_pct",   SUB_FEC, TF_INT,   OFF_FEC(backpressure_fill_pct),   0, 100,    "skip-FEC threshold (output queue fill %)"},
+	{"fec.desync_probe",            SUB_FEC, TF_BOOL,  OFF_FEC(desync_probe),            0, 0,      "diagnostic: per-frame trace of sidecar frame size vs committed k vs grace + peek coalescing factor"},
 
 	/* ── mcs ── */
 	{"mcs.enabled",                       SUB_MCS, TF_BOOL,  OFF_MCS(enabled),                       0, 0,       "enable MCS subsystem", 1},
@@ -5269,6 +5283,7 @@ static void config_defaults(Config *c)
 	 * is no longer a clean rate signal. */
 	c->fec.skip_on_backpressure       = true;
 	c->fec.backpressure_fill_pct      = 80;
+	c->fec.desync_probe               = false;  /* diagnostic; opt-in */
 
 	/* MCS defaults — unified PER-probe law (hardware-validated 2026-06-10;
 	 * legacy RSSI-bucket FSM removed the same day). */
@@ -5820,6 +5835,16 @@ int main(int argc, char **argv)
 	uint32_t last_transport_packets_sent = 0;
 	uint64_t last_transport_us = 0;
 	uint32_t fec_skipped_on_pressure = 0;
+
+	/* Desync probe state (cfg.fec.desync_probe).  dp_block_fill replays the
+	 * peek frame-boundary close gate (block_fill*2 >= k) deterministically:
+	 * each frame adds its packet count, the block "closes" at a frame
+	 * boundary when the gate passes (or naturally at k), and dp_frames_in_blk
+	 * is the resulting coalescing factor (frames per FEC block; >1 = peek
+	 * isolation defeated).  dp_last_log_us throttles the synced-link case. */
+	int      dp_block_fill   = 0;
+	int      dp_frames_in_blk = 0;
+	uint64_t dp_last_log_us  = 0;
 
 	/* Ordered MCS-down state (see commit_mcs_change above). The deadline
 	 * fires `bitrate_lead_s` after the bitrate pre-drop and writes the
@@ -7007,6 +7032,78 @@ int main(int argc, char **argv)
 				 * fec_k/n against this value) doesn't accuse wfb_tx of
 				 * "external change" against a value we never actually
 				 * sent. Same reasoning applies to bitrate_assert. */
+			}
+
+			/* ── Desync probe (diagnostic; cfg.fec.desync_probe) ──────────
+			 * Correlate, per frame, the three signals the MCS-down desync
+			 * hypothesis is about:
+			 *   - sidecar ground truth: this frame's size → packets it needs
+			 *     (ppf_meas);
+			 *   - link decision: the committed FEC block size k actually in
+			 *     force on wfb_tx (last_written_fec_k);
+			 *   - feed-forward: packets/frame implied by the *commanded* venc
+			 *     bitrate (ppf_ff) — what k would be if it tracked the
+			 *     setpoint synchronously instead of the lagging frame EWMA.
+			 * Plus a deterministic replay of the peek frame-boundary close
+			 * gate (block_fill*2 >= k, peek.patch) → fpb = frames coalesced
+			 * into the FEC block that closed on this frame (>1 ⇒ per-frame
+			 * isolation defeated → chunked RX release under loss).
+			 * k > ppf_meas (k stale-high) is the coalescing desync;
+			 * k < ppf_meas (k stale-low / led the downramp) is the
+			 * over-fragmentation desync (one frame spans many blocks). */
+			if (cfg.fec.desync_probe) {
+				int mtu = cfg.fec.mtu > 0 ? cfg.fec.mtu : 1446;
+				int ppf_meas = (int)((frame_size + (uint32_t)mtu - 1) / (uint32_t)mtu);
+				if (ppf_meas < 1) ppf_meas = 1;
+				int k_live = last_written_fec_k;   /* what wfb_tx is using */
+				int n_live = last_written_fec_n;
+
+				/* Replay the peek frame-boundary close gate. */
+				int fpb = 0;
+				dp_block_fill += ppf_meas;
+				dp_frames_in_blk += 1;
+				bool gate_close = (k_live <= 0) || (dp_block_fill * 2 >= k_live);
+				if (gate_close) {
+					fpb = dp_frames_in_blk;     /* frames in the block that closed */
+					dp_block_fill = 0;
+					dp_frames_in_blk = 0;
+				}
+
+				/* Feed-forward packets/frame from the commanded bitrate. */
+				float fps_now = fps_get(&fps);
+				int ppf_ff = 0;
+				if (last_written_kbps > 0 && fps_now > 0.1f) {
+					float bpf = (float)last_written_kbps * 1000.0f / 8.0f / fps_now;
+					ppf_ff = (int)ceilf(bpf / (float)mtu);
+					if (ppf_ff < 1) ppf_ff = 1;
+				}
+
+				/* Grace state (mirrors controller_update's in_grace gate). */
+				bool in_startup = (fec_now - fec_ctrl.start_us) <
+				    (uint64_t)(cfg.fec.startup_grace_s * 1e6f);
+				bool in_settle  = (fec_ctrl.bitrate_grace_until_us != 0 &&
+				    fec_now < fec_ctrl.bitrate_grace_until_us);
+				bool in_grace   = in_startup || in_settle;
+				long grace_ms   = in_settle
+				    ? (long)((fec_ctrl.bitrate_grace_until_us - fec_now) / 1000)
+				    : 0;
+				bool coalesce_pred = (k_live > 0 && ppf_meas * 2 < k_live);
+
+				/* Throttle to ~1 Hz when synced; full rate while in grace, or
+				 * whenever a desync is predicted/observed, so the transition
+				 * window is captured densely. */
+				bool interesting = in_grace || coalesce_pred || fpb > 1 ||
+				    (k_live > 0 && ppf_meas > k_live);
+				if (interesting ||
+				    (fec_now - dp_last_log_us) >= 1000000ULL) {
+					LOG_FEC("DESYNC fsz=%uB ppf_meas=%d k=%d n=%d ppf_ff=%d "
+					    "fpb=%d coalesce=%d grace=%d gms=%ld mcs=%d br=%ld fps=%.1f",
+					    frame_size, ppf_meas, k_live, n_live, ppf_ff,
+					    fpb, coalesce_pred ? 1 : 0, in_grace ? 1 : 0,
+					    grace_ms, radio.valid ? radio.mcs : -1,
+					    last_written_kbps, (double)fps_now);
+					dp_last_log_us = fec_now;
+				}
 			}
 		}
 	}
