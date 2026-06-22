@@ -218,6 +218,36 @@ int main(void)
 		CHECK(c.current.k < k0, "k dropped to track the lower operating point");
 	}
 
+	/* ── FF op-point anchor stays fresh every tick (stale-anchor regression) ──
+	 * The feed-forward gate compares the committed bitrate against an anchor
+	 * that MUST track every tick, not just feed-forward commits. The old code
+	 * refreshed it only on an FF commit, so after a non-FF commit (or just a
+	 * steady stretch at a slightly different committed rate) the anchor went
+	 * stale; a later MCS-down could then read as "no move" and skip the prompt
+	 * k-down (the blocksize<->MCS desync the FF path exists to prevent). */
+	{
+		printf("[ff-anchor — operating-point anchor refreshed every tick]\n");
+		Controller c = {0};
+		HeadroomRing ring = {0};
+		uint64_t t = BASE;
+		feed_ff(&c, &cfg, &ring, &t, 40, 18000u, 17333, 120.0f);  /* settle high */
+		CHECK(c.last_committed_kbps == 17333, "anchor == committed after FF settle");
+		uint32_t upd = c.update_count;
+		/* Same operating point within tolerance: NO commit, but the anchor must
+		 * still advance to the freshest committed value — impossible under the
+		 * old commit-only update (it would stay pinned at 17333). */
+		feed_ff(&c, &cfg, &ring, &t, 3, 18000u, 17200, 120.0f);
+		CHECK(c.update_count == upd, "no commit on a within-tolerance bitrate");
+		CHECK(c.last_committed_kbps == 17200,
+		      "anchor advanced despite no commit (was stale in old code)");
+		/* A genuine MCS-down operating-point step now fires a PROMPT FF k-down. */
+		int emits = feed_ff(&c, &cfg, &ring, &t, 2, 1700u, 1625, 120.0f);
+		CHECK(emits >= 1, "MCS-down step fires a prompt FF resize");
+		CHECK(c.current.k <= 4, "k dropped promptly to the low operating point");
+		CHECK(c.last_committed_kbps == 1625,
+		      "anchor follows down to the new operating point");
+	}
+
 	printf(g_fail ? "\nFAILED (%d failures)\n" : "\nPASSED (0 failures)\n", g_fail);
 	return g_fail ? 1 : 0;
 }

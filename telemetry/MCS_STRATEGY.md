@@ -119,11 +119,13 @@ mandatory** as the demote backstop.
   the only thing that catches *rapid* degradation (state 4). The probe window does
   **not** gate it.
 - **Probe window / promote / pre-emptive-demote = 0.5 s** default (`probe_window_s`,
-  tunable). Halving the window halves packets/window; pair with `probe_pps` (push to
-  ~40 pps to keep ~20 samples per 0.5 s window if resolution suffers). The sharp
-  cliff makes ~10 samples enough for go/no-go.
-- The "20" in "20 pps probe" is a **packet** rate, not an emit rate — distinct from
-  the 0.5 s decision window and from the rx_ant `-l` rate. Three independent clocks.
+  tunable). The shipped probe runs at **40 pps** (`probe_feed_pps`, default 40),
+  giving ~20 packets per 0.5 s window (≈50‰ PER granularity). 20 pps was the
+  prototype rate — its 10-packet windows let a single lost packet land on the old
+  fail threshold, so it was doubled to 40. Halving the window halves
+  packets/window, so keep `probe_feed_pps` up if you shorten it.
+- The probe rate is a **packet** rate, not an emit rate — distinct from the 0.5 s
+  decision window and from the rx_ant `-l` rate. Three independent clocks.
 
 ### What changes in `link_controller`
 - **Remove** `bucket_from_rssi()` and the `mcs.mcs_bucket_{0,1,2}` /

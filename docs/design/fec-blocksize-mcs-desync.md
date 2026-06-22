@@ -1,13 +1,25 @@
 # FEC block-size ↔ MCS/bitrate desync (FPS oscillation root-cause + fix)
 
-Status: **diagnosis + proposed architecture.** The per-frame *desync probe*
-(`fec.desync_probe`, shipped in this branch) is the confirmation instrument;
-the architecture below is the proposed fix once the probe confirms the cause.
+> **STATUS: FIXED / SHIPPED (PR #87, refined in #91).** The fix is
+> `fec.blocksize_feedforward`, which ships **default ON** (`config_defaults`,
+> `link_controller.c`). On an operating-point move (MCS transition) the
+> controller now sizes `k` directly from the *committed* venc bitrate and
+> commits it promptly, bypassing the settle/startup grace — so `k` no longer
+> freezes at the pre-drop MCS values. Sections 2–5 below are retained as the
+> historical **root-cause analysis and the originally-proposed architecture**;
+> they describe the *old* freeze-coupled behavior and a deadline-bound variant
+> that was **not** the chosen implementation. For the as-built coupling read
+> `controller_update()`'s feed-forward block in `link_controller.c` (the gate
+> fires when the committed bitrate moves past `bitrate_tolerance` since the
+> previous tick). Adaptive-n (PR #85), referenced below, was **removed** in
+> `refactor/fec-minimal-mcs-driven` — `n` is now `curve(k)` only, with no
+> loss-reactive term. Line numbers cited below have drifted; trust the
+> function names.
 
-Related: PR #84 (MCS↔bitrate transition grace), PR #85 (Adaptive-n), PR #86
-(backpressure wedge watchdog — parked the MCS0 frame-drop chase as
-"downstream/decoder"), `docs/design/adaptive-n-rs-peek.md`,
-`docs/design/peek-proportional-parity.md`.
+Related: PR #84 (MCS↔bitrate transition grace), PR #85 (Adaptive-n, since
+removed), PR #86 (backpressure wedge watchdog — parked the MCS0 frame-drop
+chase as "downstream/decoder"), `docs/design/adaptive-n-rs-peek.md`
+(superseded), `docs/design/peek-proportional-parity.md`.
 
 ---
 
@@ -146,8 +158,10 @@ exactly what the desync probe already computes as `ppf_ff`.
   over/undershoot and scene complexity.
 
 The EWMA stops driving the *step* changes (its lag no longer sits on the
-critical path); it only fine-tunes. `n` continues to come from the static
-redundancy curve + Adaptive-n on top, unchanged.
+critical path); it only fine-tunes. `n` comes from the static redundancy
+curve alone — `n = curve(k)`, a pure function of `k`. (The original draft said
+"+ Adaptive-n on top"; Adaptive-n was removed in
+`refactor/fec-minimal-mcs-driven`, so there is no loss-reactive term.)
 
 ### 5.3 Sequence the FEC resize *inside* the ordered MCS transition
 
@@ -189,9 +203,12 @@ that is redundant once k tracks the setpoint.
 
 ## 6. Migration / safety
 
-- Feature-flag (`fec.blocksize_feedforward`, default off → identical to today).
-- Regression-lock: clean-link, steady-state `k`/`n` byte-identical to the static
-  path (unit test, same pattern as `tests/test_fec_loss_adapt.c`).
+- Feature-flag (`fec.blocksize_feedforward`). *As shipped it defaults ON*; the
+  original plan staged it default-off ("identical to today") before flipping it
+  on after device validation.
+- Regression-lock: clean-link, steady-state `k`/`n` stay constant on the
+  feed-forward path (unit test `tests/test_fec_sizing.c`; the older
+  `test_fec_loss_adapt.c` was retired with Adaptive-n).
 - Fallback to the measurement path when the feed-forward inputs are unavailable
   (no committed bitrate yet at startup, or `fps` not yet estimated).
 - The bench harness (`tests/bench_fec_loss_adapt.c`) gains an MCS-step timeline

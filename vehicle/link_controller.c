@@ -369,9 +369,10 @@ typedef struct {
 		 * healthy case, but a one-shot safe-startup bitrate write that never
 		 * lands (venc not ready at controller start) leaves venc stranded
 		 * high; the ring then stays saturated, EVERY frame is skipped, and
-		 * controller_update() — which carries the bitrate_assert that would
-		 * lower venc — never runs.  The result is a permanent wedge the MCS
-		 * escape can't drain when venc exceeds max-MCS capacity.  If skips
+		 * controller_update() — which re-sizes FEC k/n and (on a commit)
+		 * re-asserts the venc bitrate for the collapsed frames — never runs
+		 * because no clean frame reaches it.  The result is a permanent wedge
+		 * the MCS escape can't drain when venc exceeds max-MCS capacity.  If skips
 		 * persist CONTINUOUSLY for this long, re-apply the known-safe
 		 * (bitrate, payload) pair to break the spiral (0 = watchdog off). */
 		float    backpressure_recover_s;
@@ -825,6 +826,13 @@ static FecParams fec_compute(float avg_size, float headroom, const Config *cfg,
 	int k = ppf;
 	if (k < cfg->fec.min_k) k = cfg->fec.min_k;
 	if (k > cfg->fec.max_k) k = cfg->fec.max_k;
+	/* Keep k strictly below max_n so the "n = k+1" floor below cannot exceed
+	 * the configured max_n. With the defaults (max_k=48 < max_n=72) this is a
+	 * no-op; it only bites a misconfig where max_n <= max_k, which would
+	 * otherwise emit an n the operator explicitly disallowed. min_k wins if
+	 * the two bounds collide (degenerate config). */
+	if (cfg->fec.max_n > cfg->fec.min_k && k >= cfg->fec.max_n)
+		k = cfg->fec.max_n - 1;
 
 	float r = interpolate_redundancy(k);
 	if (r > 0.99f) r = 0.99f;
@@ -868,12 +876,18 @@ typedef struct {
 	 * drive more than one feed-forward k-step per fec.ff_cooldown_s. */
 	uint64_t  ff_last_commit_us;
 
-	/* Committed venc bitrate at the last feed-forward commit (<=0 = none).
-	 * The prompt feed-forward path only fires when the operating point
-	 * actually moves; at a constant bitrate, k wiggle from headroom/fps
-	 * measurement noise falls through to the normal hysteresis path so a
-	 * stable link stays quiet. */
-	long      ff_last_kbps;
+	/* Committed venc bitrate observed on the PREVIOUS controller tick
+	 * (<=0 = none yet). The feed-forward op-point gate fires only when the
+	 * operating point actually moves since the last observation; at a
+	 * constant bitrate, k wiggle from headroom/fps measurement noise falls
+	 * through to the normal hysteresis path so a stable link stays quiet.
+	 * Refreshed every tick the bitrate is known (NOT only on a feed-forward
+	 * commit) so it tracks every commit path — matching bitrate_assert's
+	 * always-fresh last_written_kbps anchor. Anchoring only on the last
+	 * feed-forward commit let this go stale after a hysteresis / min_n
+	 * commit, masking a genuine subsequent MCS-down move (the
+	 * blocksize<->MCS desync the feed-forward path exists to prevent). */
+	long      last_committed_kbps;
 } Controller;
 
 /* Arm the post-change settling window (extending only). */
@@ -933,6 +947,15 @@ static bool controller_update(Controller *c, const Config *cfg,
 		float ff_bytes = (float)committed_kbps * 1000.0f / 8.0f / fps;
 		if (ff_bytes > 0.0f) { size_basis = ff_bytes; ff_active = true; }
 	}
+	/* NOTE: headroom (the max/avg frame-size ratio, [headroom_min,headroom_max])
+	 * is applied to size_basis EVEN on the feed-forward path. This is deliberate:
+	 * ff_bytes is the mean frame at the committed rate, but I-frames span several
+	 * mean frames, so the headroom multiplier sizes k to cover the peak rather
+	 * than relying solely on the peek per-frame close for the I-frame span. The
+	 * consequence is that a sustained shift in frame-size variance (e.g. a scene
+	 * change) can move k at a constant committed bitrate; that is a real
+	 * frame-content signal, not measurement noise, and the ppf_deadband_frac band
+	 * still suppresses the ±1-ppf jitter at a boundary. */
 	FecParams cand = fec_compute(size_basis, headroom, cfg, cur_ppf);
 
 	/* FEC is purely frame-size driven: k tracks the frame, n = curve(k).
@@ -963,7 +986,7 @@ static bool controller_update(Controller *c, const Config *cfg,
 	 * desync (k pinned high while frames have collapsed -> peek coalescing).
 	 *
 	 * Gate on the bitrate having actually moved (> bitrate_tolerance since the
-	 * last ff commit).  At a CONSTANT bitrate the same ff_bytes path still
+	 * previous tick's committed bitrate).  At a CONSTANT bitrate the same ff_bytes path still
 	 * produces a k that wiggles ±1-2 from headroom / fps measurement noise;
 	 * that is NOT an operating-point change, so it falls through to the normal
 	 * hysteresis path below (which stays silent on a steady link).  This is the
@@ -984,16 +1007,20 @@ static bool controller_update(Controller *c, const Config *cfg,
 	 * bitrate is intentionally NOT an operating-point move — it routes through
 	 * the normal hysteresis path below (rare, and that path converges). */
 	bool op_point_moved =
-	    (c->ff_last_kbps <= 0) ||
-	    (fabsf((float)(committed_kbps - c->ff_last_kbps)) >
+	    (c->last_committed_kbps <= 0) ||
+	    (fabsf((float)(committed_kbps - c->last_committed_kbps)) >
 	     cfg->fec.bitrate_tolerance * (float)committed_kbps);
+	/* Refresh the operating-point anchor every tick the bitrate is known,
+	 * before the branch below consumes op_point_moved. This tracks ALL
+	 * commit paths (feed-forward, hysteresis, min_n) so the anchor can never
+	 * go stale and mask a real MCS-down (see the field comment). */
+	if (committed_kbps > 0) c->last_committed_kbps = committed_kbps;
 	if (ff_active && !in_startup_grace && cand.k != c->current.k &&
 	    op_point_moved) {
 		uint64_t ff_cd = (uint64_t)(cfg->fec.ff_cooldown_s * 1e6f);
 		if (c->ff_last_commit_us == 0 || ff_cd == 0 ||
 		    (now - c->ff_last_commit_us) >= ff_cd) {
 			c->ff_last_commit_us = now;
-			c->ff_last_kbps = committed_kbps;
 			return controller_commit(c, &cand, now, out);
 		}
 		return false;   /* within cooldown: hold k this tick */
@@ -1134,9 +1161,10 @@ static float phy_mbps(int mcs, int bw_mhz, int short_gi,
  *   ≥ 25000 kbps → 3200 B (≥  977 pps; tier ceiling)
  *
  * MCS 0/1/2 are pps-limited but the bitrate they'll sustain (≤ ~7 Mbps
- * post-FEC at 50 % safety) lands them in the 800/1000/1200 tiers, well
- * under their pps cliffs. MCS 3+ sustains ≥ 1100 pps so the high tiers
- * are also safe. */
+ * post-FEC at 50 % safety) lands them in the 1000/1000/1200 tiers, well
+ * under their pps cliffs. (MCS0 is held at the 2800 kbps bitrate_min floor,
+ * so it uses the <4000→1000 B tier ≈ 350 pps, not the 800 B tier.) MCS 3+
+ * sustains ≥ 1100 pps so the high tiers are also safe. */
 typedef struct {
 	long bitrate_lt_kbps;  /* tier matches when bitrate < this (last entry: LONG_MAX) */
 	int  payload_bytes;
@@ -2820,10 +2848,17 @@ static int commit_mcs_change(
 	 * still pass). Armed before SET_RADIO so the observation that follows
 	 * sees the lock. */
 	if (new_mcs > prev_mcs && cfg->fec.mcs_up_grace_s > 0.0f && !cfg->dry_run) {
-		uint64_t lock_end = now + (uint64_t)(cfg->fec.mcs_up_grace_s * 1e6f);
-		if (lock_end > ctrl->bitrate_up_lock_until_us)
-			ctrl->bitrate_up_lock_until_us = lock_end;
-		LOGV_MCS(cfg, "ordered up: mcs=%d->%d, bitrate raise held %.0fms",
+		/* SET the lock to the up-grace window rather than extend-only. An
+		 * MCS-up invalidates any active down-lock: that lock's premise —
+		 * stale high-MCS wfb_stats datagrams pumping the bitrate back up —
+		 * no longer holds once the rung is genuinely back up. Extend-only
+		 * (the old max()) let a quick MCS-down->MCS-up flap strand the
+		 * restored higher rung at the pre-drop bitrate for the rest of the
+		 * ~5.5s (bitrate_lead_s+mcs_settle_s) down-lock. Overwriting clears
+		 * that stale window and arms only the short up grace. */
+		ctrl->bitrate_up_lock_until_us =
+		    now + (uint64_t)(cfg->fec.mcs_up_grace_s * 1e6f);
+		LOGV_MCS(cfg, "ordered up: mcs=%d->%d, bitrate raise held %.0fms (down-lock cleared)",
 		    prev_mcs, new_mcs, (double)(cfg->fec.mcs_up_grace_s * 1000.0f));
 	}
 
@@ -3397,11 +3432,31 @@ static SelectDecision selector_update(Selector *s, const Config *cfg,
 	 *     until the ring drains (in_pressure clears) or mcs_max. */
 	if (in_pressure && cfg->mcs.pressure_escape_s > 0.0f &&
 	    s->pressure_since_us != 0 && s->current_mcs < cfg->mcs.mcs_max) {
+		/* Don't climb into a rung the hard flap-freeze just pinned out:
+		 * escape exists to drain a saturated ring, but stepping past an
+		 * active freeze re-introduces the exact oscillation the freeze was
+		 * armed to stop. (The freeze only trips on a clean-RF flap, so a
+		 * genuine pressure-escape and a flap-freeze rarely coincide; when
+		 * they do, the freeze wins and the operator can lift it via
+		 * flap_freeze_s.) */
+		bool freeze_blocks =
+		    s->flap_freeze_mcs >= 0 && now < s->flap_freeze_until_us &&
+		    s->current_mcs + 1 >= s->flap_freeze_mcs;
+		/* Require RSSI clear of the fade-ARM zone, not merely a clean
+		 * instantaneous fade sample. The fade demote needs 3 consecutive hits
+		 * to fire, so an emerging marginal fade in the armed band would
+		 * otherwise let escape keep climbing on the in-between clean ticks
+		 * (a bare !fade_sample test is moot — fade_streak is reset to 0 on the
+		 * same tick whenever fade_sample is false). Escape's premise is "RF is
+		 * genuinely clean," so gate it on RSSI above rssi_fade_arm_dbm where no
+		 * fade can be developing. */
 		bool rf_clean = !floor_hit && !fade_sample &&
 		    score->smoothed_rssi >
-		        cfg->mcs.rssi_floor_dbm + cfg->mcs.rssi_floor_hyst_db;
+		        cfg->mcs.rssi_floor_dbm + cfg->mcs.rssi_floor_hyst_db &&
+		    score->smoothed_rssi > cfg->mcs.rssi_fade_arm_dbm;
 		float held = (float)(now - s->pressure_since_us) / 1e6f;
-		if (rf_clean && held >= cfg->mcs.pressure_escape_s &&
+		if (rf_clean && !freeze_blocks &&
+		    held >= cfg->mcs.pressure_escape_s &&
 		    elapsed >= cfg->mcs.down_cooldown_s) {
 			s->pressure_escape_count++;
 			LOG_MCS("pressure-escape promote: held=%.1fs rssi=%.0f %d->%d",
@@ -5234,9 +5289,11 @@ static void config_defaults(Config *c)
 	c->fec.startup_grace_s = 2.0f;
 	c->fec.safety_margin = 0.5f;
 	/* Bitrate floor. Bites only where the safe budget (phy*k/n*margin) is
-	 * below it — i.e. only MCS0 (and MCS1 at very low fps); MCS2+ compute well
-	 * above this and keep margin 0.5. Set to 2800 so MCS0 runs an aggressive
-	 * ~60% airtime (≈2800 video + 4/6 FEC) instead of the 50%-margin 1857. */
+	 * below it — i.e. only MCS0; MCS1+ compute well above this and keep
+	 * margin 0.5 (MCS1's safe budget is >=4333 kbps for every reachable k/n).
+	 * Set to 2800 so MCS0 runs an aggressive ~65% airtime (2800*(6/4)=4200
+	 * kbps on-air of the 6500 kbps MCS0 channel) instead of the 50%-margin
+	 * 2167 (=6500*0.5*4/6 for the current 4/6 block). */
 	c->fec.bitrate_min_kbps = 2800;
 	c->fec.bitrate_max_kbps = 0;
 	c->fec.bitrate_tolerance = 0.15f;
@@ -6258,8 +6315,16 @@ int main(int argc, char **argv)
 			next_watchdog_us = now + (uint64_t)(period_s * 1e6f);
 		}
 
-		/* --- FEC CMD_GET_RADIO polling fallback --- */
-		if (cfg.fec.enabled && cfg.fec.wfb_stats_port == 0 &&
+		/* --- FEC CMD_GET_RADIO polling fallback ---
+		 * Normally inert in --wfb-stats mode (the stats datagrams drive
+		 * radio_apply_observation + bitrate_assert). But if that stream goes
+		 * stale (stats_was_stale, e.g. wfb_tx restart) bitrate_assert would
+		 * otherwise stop running entirely while controller_update keeps
+		 * resizing k — stranding venc bitrate on a subsequent MCS-up. Resume
+		 * the poll while stale so the budget keeps being asserted; it stops
+		 * again the moment stats resume (stats_was_stale cleared above). */
+		if (cfg.fec.enabled &&
+		    (cfg.fec.wfb_stats_port == 0 || stats_was_stale) &&
 		    now >= next_radio_us) {
 			RadioBody resp;
 			if (wfb_get_radio(&cfg, &resp) == 0) {
@@ -7050,6 +7115,15 @@ int main(int argc, char **argv)
 				 * fec_k/n against this value) doesn't accuse wfb_tx of
 				 * "external change" against a value we never actually
 				 * sent. Same reasoning applies to bitrate_assert. */
+				/* A k/n change moves the safe budget (phy*k/n*margin), so
+				 * re-assert the bitrate immediately rather than waiting for
+				 * the next stats/poll tick. Matters most on a feed-forward
+				 * k-down across an MCS-down: the smaller k/n must pull venc
+				 * down without a tick of lag. bitrate_assert self-guards on
+				 * radio->valid and honours the up-lock / tolerance band. */
+				bitrate_assert(&radio, &fec_ctrl, &cfg,
+				               &last_written_kbps, &last_written_payload,
+				               fec_now);
 			}
 
 			/* ── Desync probe (diagnostic; cfg.fec.desync_probe) ──────────
