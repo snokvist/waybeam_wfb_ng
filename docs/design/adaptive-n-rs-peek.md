@@ -1,6 +1,15 @@
 # Design note: Adaptive-n RS+peek (loss-driven redundancy)
 
-Status: **IMPLEMENTED** (2026-06-18), `fec.loss_adapt` default **ON**
+> **SUPERSEDED (2026-06-22, `refactor/fec-minimal-mcs-driven`).** Adaptive-n
+> and the post-MCS-drop parity boost were **removed**. On device they churned
+> n=7↔8 on a clean link (the rx_ant `recov` EWMA never sits exactly at zero),
+> producing a steady-state FEC/bitrate oscillation. The FEC controller is now
+> purely frame-size driven (k tracks the frame, `n = curve(k)`, emit only on
+> real change) and the **MCS selector is the sole loss-response loop**. This
+> note is retained for the rationale/derivation only — it does not describe
+> shipping behavior. See the "FEC gating design" section in `CLAUDE.md`.
+
+Status (historical): **IMPLEMENTED** (2026-06-18), `fec.loss_adapt` default **ON**
 (curve is the floor → identical to the static path on a clean link).
 Host-bench validated; pending on-hardware tuning. Branch:
 `claude/swfec-wfb-ng-patches-v9xvvq`.

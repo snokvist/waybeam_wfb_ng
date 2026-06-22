@@ -135,26 +135,38 @@ back to the standalone binaries. See @docs/design/mega-binary.md.
 
 ## FEC gating design
 
-Asymmetric gating — fast increase, slow decrease (mirror of TCP AIMD):
-- **Sizing**: k from EWMA × bounded headroom (1.05–1.40). I-frames
-  exceeding k×MTU span multiple blocks; the peek per-frame FEC close
-  (M-bit) closes each frame's final block via the gate mode. Close
+The FEC controller is deliberately minimal: **the MCS selector is the sole
+loss-response loop; FEC just keeps the block size matched to the frame
+size.** On a stable link the controller is silent — it writes a new k/n to
+wfb_tx only when k or n actually changes.
+
+- **Sizing (k)**: k = packets-per-frame, sized from the *committed* venc
+  bitrate (feed-forward, lag-free) and floored by `fec.min_k`; a
+  `ppf_deadband_frac` hysteresis band suppresses ±1 jitter at a boundary.
+  I-frames exceeding k×MTU span multiple blocks; the peek per-frame FEC
+  close (M-bit) closes each frame's final block via the gate mode. Close
   cost/mode: see the peek note in the Architecture section above and
   `docs/design/peek-proportional-parity.md`.
-- **Increase**: hysteresis=1, cooldown=0.1 s
-- **Decrease**: hysteresis=3, cooldown=2.0 s
-- **Oscillation detector**: >4 updates in 5 s → decrease cooldown × 3
-- Under-protection (lost frames) is far worse than over-protection
-  (wasted bandwidth); airtime efficiency on P-frames beats
-  "one frame = one block" guarantee.
-- **Redundancy (Adaptive-n)**: the static k→r curve sets the redundancy
-  *floor*; on top of it `fec.loss_adapt` (default **on**) biases `n` up
-  from measured loss — reusing the `smoothed_lost_ratio` /
-  `smoothed_recov_ratio` rx_ant EWMAs the MCS loop already computes (no
-  new wire/feedback path). Fast-attack / slow-decay, decay frozen during
-  MCS settle, hard-railed by `loss_adapt_ceiling` + an `n·fps` airtime
-  cap. A clean link is identical to the old static path. Came out of an
-  swfec evaluation; see `docs/design/adaptive-n-rs-peek.md`.
+- **Redundancy (n)**: `n = curve(k)` — a pure function of k via the static
+  `REDUNDANCY_CURVE`, clamped to `[fec.min_n, fec.max_n]`. There is **no
+  loss-reactive parity**: the link responds to loss by demoting the MCS
+  rung (more robust modulation), not by inflating n. This is why a clean
+  link never moves.
+- **Transitions**: k commits promptly across an MCS change (feed-forward
+  bypasses the settle freeze, bounded by `ff_cooldown_s`); k-down off a
+  transient is damped by `k_down_dwell_s`. The bitrate pre-drop / SET_RADIO
+  ordering (`bitrate_lead_s`, `mcs_up_grace_s`) keeps the rung and the venc
+  bitrate sequenced so the channel is never over budget mid-transition.
+- Under-protection (lost frames) is handled by the MCS demote; the static
+  curve's 40–50% parity at low k plus the peek close carry block-level
+  protection in between.
+
+> History: an earlier "Adaptive-n" (`fec.loss_adapt`) biased n up from the
+> rx_ant loss EWMAs, and a post-MCS-drop parity boost transiently raised n.
+> Both were removed (`refactor/fec-minimal-mcs-driven`) because they churned
+> n=7↔8 on a clean link reacting to ~0% recovered-loss noise. The design
+> rationale survives in `docs/design/adaptive-n-rs-peek.md` (marked
+> superseded).
 
 ## WCMD redundancy
 
@@ -178,6 +190,5 @@ no longer drops the command but duplicates don't double-apply.  The
   and `wfb_tx` on the GS host; manual `wfb-ng.sh` / `wbmode` was
   retired (kept under `archive/init-old/` for reference).
 - Dual-stream FEC is out of scope. Loss-rate feedback *into FEC
-  redundancy* is now in scope (Adaptive-n — see the FEC gating design
-  section); it reuses the existing rx_ant loss EWMAs, so no new feedback
-  wire was added.
+  redundancy* is also out of scope: loss is handled by MCS demotion, and
+  FEC stays a pure frame-size tracker (see the FEC gating design section).

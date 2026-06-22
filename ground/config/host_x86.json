@@ -99,6 +99,7 @@
       "radio_port": 0,
       "udp_in_port": 6600,
       "control_port": 8000,
+      "radio": { "bandwidth_mhz": 20, "mcs_index": 1, "stbc": 1, "ldpc": 1 },
       "fec": {
         "k": 1,
         "n": 2

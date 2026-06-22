@@ -70,34 +70,23 @@ $(OUT_HOST): $(SRC) $(CSA_HDR) $(WEBUI_HDR) | $(BUILD_DIR)
 # drives selector_update() directly; csa/csa.c is linked for the file-scope
 # CSA refs the daemon carries.
 TEST_SELECTOR = $(BUILD_DIR)/test_selector_law
-TEST_LOSS     = $(BUILD_DIR)/test_fec_loss_adapt
-test: $(TEST_SELECTOR) $(TEST_LOSS)
+TEST_SIZING   = $(BUILD_DIR)/test_fec_sizing
+test: $(TEST_SELECTOR) $(TEST_SIZING)
 	@$(TEST_SELECTOR)
-	@$(TEST_LOSS)
+	@$(TEST_SIZING)
 
 $(TEST_SELECTOR): ../tests/test_selector_law.c $(SRC) $(CSA_HDR) $(WEBUI_HDR) | $(BUILD_DIR)
 	cc $(CFLAGS_COMMON) -Wno-unused-function -DLC_TEST_NO_MAIN $(SHARED_INC) \
 		-I. -Icsa -Iwebui -g \
 		-o $@ ../tests/test_selector_law.c csa/csa.c $(LDFLAGS_COMMON)
 
-# Host unit test for Adaptive-n loss-driven redundancy (controller_update /
-# fec_compute). Same #include-the-unit pattern as test_selector_law.c.
-$(TEST_LOSS): ../tests/test_fec_loss_adapt.c $(SRC) $(CSA_HDR) $(WEBUI_HDR) | $(BUILD_DIR)
+# Host unit test for the minimal frame-size-driven FEC sizing
+# (controller_update / fec_compute). Same #include-the-unit pattern as
+# test_selector_law.c.
+$(TEST_SIZING): ../tests/test_fec_sizing.c $(SRC) $(CSA_HDR) $(WEBUI_HDR) | $(BUILD_DIR)
 	cc $(CFLAGS_COMMON) -Wno-unused-function -DLC_TEST_NO_MAIN $(SHARED_INC) \
 		-I. -Icsa -Iwebui -g \
-		-o $@ ../tests/test_fec_loss_adapt.c csa/csa.c $(LDFLAGS_COMMON)
-
-# FPV loss-scenario bench for Adaptive-n (report, not a pass/fail gate; runs
-# the real controller through scripted Gilbert-Elliott burst timelines).
-.PHONY: bench
-BENCH_LOSS = $(BUILD_DIR)/bench_fec_loss_adapt
-bench: $(BENCH_LOSS)
-	@cd $(CURDIR) && ./$(BENCH_LOSS)
-
-$(BENCH_LOSS): ../tests/bench_fec_loss_adapt.c $(SRC) $(CSA_HDR) $(WEBUI_HDR) | $(BUILD_DIR)
-	cc $(CFLAGS_COMMON) -Wno-unused-function -DLC_TEST_NO_MAIN $(SHARED_INC) \
-		-I. -Icsa -Iwebui -g \
-		-o $@ ../tests/bench_fec_loss_adapt.c csa/csa.c $(LDFLAGS_COMMON)
+		-o $@ ../tests/test_fec_sizing.c csa/csa.c $(LDFLAGS_COMMON)
 
 # ── Mega binary (multi-call) ─────────────────────────────────────────
 # Single `wfb-air` bundling link_controller + wfb_tx/wfb_rx/wfb_tx_cmd/
