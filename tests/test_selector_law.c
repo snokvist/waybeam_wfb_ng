@@ -92,6 +92,17 @@ int main(void)
 	out = -1; d = selector_update(&s, &cfg, &sc, &pr, false, BASE, &out);
 	CHECK(d == SD_DOWN && out == START - 1, "probe-fail demotes when not in_pressure");
 
+	/* Ceiling-probe sawtooth fix: at the operating cap (current==mcs_max) the
+	 * V+2 probe rung is cap+2 (e.g. mcs7 at cap 5); its ceiling PER is a
+	 * hardware limit, not link degradation, and must NOT demote off the cap.
+	 * Before the fix this returned SD_DOWN and cascaded mcs_max -> 0 at 0%
+	 * video loss / strong RSSI. (The in-range case above — v2=5 at cap 5 —
+	 * still demotes, proving the gate doesn't over-suppress.) */
+	mk_sel(&s, cfg.mcs.mcs_max); sc = mk_score(-40, 0, 0.0f);
+	mk_probe(&pr, cfg.mcs.mcs_max + 2, 700);
+	out = -1; d = selector_update(&s, &cfg, &sc, &pr, false, BASE, &out);
+	CHECK(d == SD_NONE, "V+2 fail above mcs_max does NOT demote (holds the cap)");
+
 	/* probe-clean (V+2=5 at 0‰) on clean RF -> promote */
 	mk_sel(&s, START); sc = mk_score(-40, 0, 0.0f); mk_probe(&pr, START + 2, 0);
 	out = -1; d = selector_update(&s, &cfg, &sc, &pr, false, BASE, &out);

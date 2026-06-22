@@ -3503,10 +3503,22 @@ static SelectDecision selector_update(Selector *s, const Config *cfg,
 			/* Fail branch FIRST: with an inverted config
 			 * (clean >= fail, warned at startup/set) a failing rung
 			 * must demote, never promote. */
-			if (pr->per_milli >= cfg->mcs.probe_fail_milli) {
+			if (pr->per_milli >= cfg->mcs.probe_fail_milli &&
+			    v2 <= cfg->mcs.mcs_max) {
 				/* +2 fail while video healthy -> conservative demote 1.
 				 * Suppressed under backpressure (the rung PER is airtime-
-				 * starved, not RF — the escape rule above handles it). */
+				 * starved, not RF — the escape rule above handles it).
+				 *
+				 * Gate on v2 <= mcs_max: only pre-empt-demote when the
+				 * failing probe rung is one we could actually USE.  Above the
+				 * operating cap the V+2 rung is a hardware/ceiling limit, not
+				 * link degradation, so its PER must NOT knock us off the cap.
+				 * Without this, capping at mcs_max made the controller climb
+				 * to the cap, probe cap+2 (e.g. mcs7 at cap 5), read its
+				 * ceiling PER as "fail", and cascade all the way back down at
+				 * 0% video loss / strong RSSI (device-observed 0->5 sawtooth).
+				 * The reactive video-PER + RSSI floor/fade rules still protect
+				 * the cap rung against real degradation. */
 				if (!pressure_block && can_demote)
 					return selector_commit(s, cfg, s->current_mcs - 1,
 					                       now, SD_DOWN, out_mcs);
