@@ -382,6 +382,17 @@ typedef struct {
 		 * repeats (flapping committed bitrate) are rate-limited to one per
 		 * window.  0 disables the backstop. */
 		float    ff_cooldown_s;
+
+		/* Backpressure wedge watchdog.  The skip above is "one tick" in the
+		 * healthy case, but a one-shot safe-startup bitrate write that never
+		 * lands (venc not ready at controller start) leaves venc stranded
+		 * high; the ring then stays saturated, EVERY frame is skipped, and
+		 * controller_update() — which carries the bitrate_assert that would
+		 * lower venc — never runs.  The result is a permanent wedge the MCS
+		 * escape can't drain when venc exceeds max-MCS capacity.  If skips
+		 * persist CONTINUOUSLY for this long, re-apply the known-safe
+		 * (bitrate, payload) pair to break the spiral (0 = watchdog off). */
+		float    backpressure_recover_s;
 	} fec;
 
 	/* ── MCS subsystem ── */
@@ -3638,6 +3649,7 @@ static const TunableDesc TUNABLES[] = {
 	{"fec.desync_probe",            SUB_FEC, TF_BOOL,  OFF_FEC(desync_probe),            0, 0,      "diagnostic: per-frame trace of sidecar frame size vs committed k vs grace + peek coalescing factor"},
 	{"fec.blocksize_feedforward",   SUB_FEC, TF_BOOL,  OFF_FEC(blocksize_feedforward),   0, 0,      "size FEC k from committed venc bitrate (lag-free) + commit promptly across MCS transitions (fixes blocksize<->MCS desync)"},
 	{"fec.ff_cooldown_s",           SUB_FEC, TF_FLOAT, OFF_FEC(ff_cooldown_s),           0.0, 10.0, "min seconds between feed-forward k-step commits (thrash backstop; 0=off)"},
+	{"fec.backpressure_recover_s",  SUB_FEC, TF_FLOAT, OFF_FEC(backpressure_recover_s),  0.0, 30.0, "continuous-backpressure duration before re-applying safe-startup bitrate to break a wedge (0=off)"},
 
 	/* ── mcs ── */
 	{"mcs.enabled",                       SUB_MCS, TF_BOOL,  OFF_MCS(enabled),                       0, 0,       "enable MCS subsystem", 1},
@@ -5367,6 +5379,11 @@ static void config_defaults(Config *c)
 	c->fec.desync_probe               = false;  /* diagnostic; opt-in */
 	c->fec.blocksize_feedforward      = true;   /* default ON (fixes MCS-down desync) */
 	c->fec.ff_cooldown_s              = 0.15f;  /* feed-forward thrash backstop */
+	/* Wedge watchdog: 3 s of UNBROKEN backpressure-skip means no clean frame
+	 * has reached controller_update to lower venc — re-apply the safe pair to
+	 * break out. A healthy link gets clean frames between bursts and never
+	 * accumulates 3 s of continuous skips, so this stays dormant. */
+	c->fec.backpressure_recover_s     = 3.0f;
 
 	/* MCS defaults — unified PER-probe law (hardware-validated 2026-06-10;
 	 * legacy RSSI-bucket FSM removed the same day). */
@@ -5918,6 +5935,13 @@ int main(int argc, char **argv)
 	uint32_t last_transport_packets_sent = 0;
 	uint64_t last_transport_us = 0;
 	uint32_t fec_skipped_on_pressure = 0;
+	/* Backpressure wedge watchdog (see cfg.fec.backpressure_recover_s).
+	 * bp_skip_since_us marks the start of the current UNBROKEN skip run
+	 * (0 = not skipping); any clean frame reaching controller_update clears
+	 * it. bp_recover_us throttles the corrective venc write to once per
+	 * backpressure_recover_s while still stuck. */
+	uint64_t bp_skip_since_us = 0;
+	uint64_t bp_recover_us    = 0;
 
 	/* Desync probe state (cfg.fec.desync_probe).  dp_block_fill replays the
 	 * peek frame-boundary close gate (block_fill*2 >= k) deterministically:
@@ -6026,11 +6050,9 @@ int main(int argc, char **argv)
 			LOG_FEC("safe-startup: wrote video0.bitrate=%ld outgoing.maxPayloadSize=%d (one-time guard)",
 			    br, pl);
 		} else {
-			LOG_FEC("safe-startup: venc write failed (br=%ld pl=%d) — venc unreachable; controller will retry on first bitrate_assert",
+			LOG_FEC("safe-startup: venc write failed (br=%ld pl=%d) — venc unreachable; the backpressure watchdog will re-apply if the ring wedges",
 			    br, pl);
 		}
-	} else if (cfg.fec.enabled && !cfg.fec.safe_startup_enabled) {
-		LOG_FEC("safe-startup: disabled (--no-safe-startup) — venc state inherited as-is");
 	}
 
 	/* ── SD telemetry logger ── */
@@ -7077,8 +7099,41 @@ int main(int argc, char **argv)
 				    last_transport_fill_pct,
 				    last_transport_pressure_drops_delta,
 				    last_transport_in_pressure);
+
+				/* Wedge watchdog: this `continue` is what makes the skip
+				 * safe in the healthy case (the next clean frame adapts),
+				 * but if NO clean frame ever arrives — venc stranded high
+				 * because a one-shot safe-startup write never landed — the
+				 * bitrate_assert in controller_update() can't run and the
+				 * ring never drains.  After backpressure_recover_s of
+				 * unbroken skips, re-apply the known-safe (bitrate,payload)
+				 * to break out (throttled to once per interval). */
+				if (cfg.fec.skip_on_backpressure && !cfg.dry_run &&
+				    cfg.fec.enabled && cfg.fec.safe_startup_enabled &&
+				    cfg.fec.backpressure_recover_s > 0.0f) {
+					uint64_t bnow = now_us();
+					if (bp_skip_since_us == 0) bp_skip_since_us = bnow;
+					float stuck_s = (float)(bnow - bp_skip_since_us) / 1e6f;
+					bool  due = (bp_recover_us == 0) ||
+					    ((float)(bnow - bp_recover_us) / 1e6f >=
+					        cfg.fec.backpressure_recover_s);
+					if (stuck_s >= cfg.fec.backpressure_recover_s && due) {
+						long br = cfg.fec.safe_startup_bitrate_kbps;
+						int  pl = cfg.fec.safe_startup_payload;
+						if (venc_apply(&cfg, br, pl) == 0)
+							LOG_FEC("backpressure watchdog: %.1fs unbroken skip — re-applied safe bitrate=%ld payload=%d to break wedge",
+							    (double)stuck_s, br, pl);
+						else
+							LOG_FEC("backpressure watchdog: %.1fs unbroken skip — venc re-apply FAILED (br=%ld) — venc unreachable",
+							    (double)stuck_s, br);
+						bp_recover_us = bnow;
+					}
+				}
 				continue;
 			}
+			/* Clean frame reached the controller — clear the wedge watchdog. */
+			bp_skip_since_us = 0;
+			bp_recover_us    = 0;
 
 			/* Adaptive-n loss feedback: reuse the rx_ant EWMAs the MCS loop
 			 * already maintains.  Stale (no recent rx_ant) → terms forced to
