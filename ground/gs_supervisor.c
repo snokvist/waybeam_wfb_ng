@@ -496,7 +496,15 @@ int cfg_load(const char *path, Config *c)
 	wfb_logger_defaults(&c->telemetry);   /* DISABLED by default; 127.0.0.1:6700, wfb.sqlite, 1200 s. Opt in via the gs_supervisor.json telemetry block only. */
 
 	int fd = open(path, O_RDONLY);
-	if (fd < 0) { LOG_ERR("config open(%s): %s", path, strerror(errno)); return -1; }
+	if (fd < 0) {
+		LOG_ERR("config open(%s): %s", path, strerror(errno));
+		if (errno == ENOENT)
+			LOG_ERR("  hint: pass --config PATH, or install %s "
+			        "(see ground/config/example.json). Unlike the air side, the "
+			        "ground supervisor has no built-in default — it needs the "
+			        "host's wlan interface names.", GS_DEFAULT_CONFIG);
+		return -1;
+	}
 	struct stat st;
 	if (fstat(fd, &st) < 0) { close(fd); return -1; }
 	if (st.st_size <= 0 || st.st_size > 256 * 1024) { close(fd); return -1; }
