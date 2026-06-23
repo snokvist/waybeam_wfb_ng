@@ -8,7 +8,7 @@
              "_comment": "file default is /etc/drone.key on air, /etc/gs.key on ground. If absent at boot, a deterministic shared key is derived from `seed` (INSECURE shared default — replace for production)." },
 
   "links": { "video": 207, "uplink": 208, "probe": 50, "probe_port": 50,
-             "_comment": "wfb link ids (must match the GS supervisor). probe_port = the V+2 probe wfb_tx radio port (-p). AIR-only fields: probe_port." },
+             "_comment": "wfb link ids (video/uplink/probe must match the GS supervisor). probe_port (AIR-only) = the V+2 probe wfb_tx radio port (-p)." },
 
   "fec":   { "k": 8, "n": 12, "_comment": "boot values only; link_controller retunes within ~2s" },
 

@@ -68,6 +68,10 @@ static void ce_prim(const char *js, JTok *t, int n, const char *sec, const char 
 	if (t[v].type != JT_PRIM) return;
 	int len = t[v].end - t[v].start;
 	if (len <= 0 || (size_t)len >= cap) return;
+	/* Numbers only — reject true/false/null so a bool can't become a bogus
+	 * numeric arg (e.g. --failsafe true). Non-numeric primitive -> keep def. */
+	char c0 = js[t[v].start];
+	if (c0 != '-' && c0 != '+' && c0 != '.' && (c0 < '0' || c0 > '9')) return;
 	memcpy(out, js + t[v].start, (size_t)len);
 	out[len] = 0;
 }
@@ -93,8 +97,11 @@ int wfb_configenv_main(int argc, char **argv, int role)
 	const char *path = CONFIGENV_DEFAULT_PATH;
 	for (int i = 1; i < argc; i++) {
 		if (argv[i][0] == '-') {
-			fprintf(stderr, "config-env: unknown option %s\n", argv[i]);
-			return 2;
+			/* Never abort: in mega mode S99wfb does `eval "$(config-env …)"`
+			 * with no fallback, so emitting nothing would leave every WFB_*
+			 * unset. Warn and skip — we still print the full default set. */
+			fprintf(stderr, "config-env: ignoring unknown option %s\n", argv[i]);
+			continue;
 		}
 		path = argv[i];  /* last positional wins */
 	}
@@ -110,21 +117,27 @@ int wfb_configenv_main(int argc, char **argv, int role)
 		fprintf(stderr, "config-env: %s not found — using preset defaults\n", path);
 	} else {
 		buf = (char *)malloc(CONFIGENV_MAX_BYTES + 1);
-		if (!buf) { fclose(fp); fprintf(stderr, "config-env: out of memory\n"); return 1; }
-		size_t len = fread(buf, 1, CONFIGENV_MAX_BYTES, fp);
-		int truncated = !feof(fp);
-		fclose(fp);
-		buf[len] = 0;
-		if (truncated) {
-			fprintf(stderr, "config-env: %s larger than %d bytes — using defaults\n",
-			        path, CONFIGENV_MAX_BYTES);
+		if (!buf) {
+			/* Don't abort (see the unknown-option note) — fall through to
+			 * the default emit with js == NULL. */
+			fclose(fp);
+			fprintf(stderr, "config-env: out of memory — using preset defaults\n");
 		} else {
-			ntok = json_parse(buf, (int)len, toks, JSON_MAX_TOKS);
-			if (ntok < 1 || toks[0].type != JT_OBJ) {
-				fprintf(stderr, "config-env: %s is not valid JSON object — using defaults\n", path);
+			size_t len = fread(buf, 1, CONFIGENV_MAX_BYTES, fp);
+			int truncated = !feof(fp);
+			fclose(fp);
+			buf[len] = 0;
+			if (truncated) {
+				fprintf(stderr, "config-env: %s larger than %d bytes — using defaults\n",
+				        path, CONFIGENV_MAX_BYTES);
 			} else {
-				js = buf;
-				src = path;
+				ntok = json_parse(buf, (int)len, toks, JSON_MAX_TOKS);
+				if (ntok < 1 || toks[0].type != JT_OBJ) {
+					fprintf(stderr, "config-env: %s is not valid JSON object — using defaults\n", path);
+				} else {
+					js = buf;
+					src = path;
+				}
 			}
 		}
 	}
