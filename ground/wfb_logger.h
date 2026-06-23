@@ -42,11 +42,14 @@ typedef struct {
 	int  channel;          /* 0 = unset */
 	char tx_power[32];     /* "" = unset */
 	char antenna_cfg[64];  /* "" = unset */
-	/* Drop pure-idle records (no antenna data AND all packet counters zero)
-	 * instead of writing them. wfb_rx -Y emits one rx_ant datagram per interval
-	 * even when nothing is received (ant:[], pkt.all=0); on a link left up all
-	 * day those zero rows dominate the db (~60% observed on a 1.4 GB capture).
-	 * Default true. Set telemetry.drop_empty=false to keep every datagram. */
+	/* Drop pure-idle rx_ant records (no antenna data AND all packet counters
+	 * zero) instead of writing them. wfb_rx -Y emits one rx_ant datagram per
+	 * interval even when nothing is received (ant:[], pkt.all=0); on a link left
+	 * up all day those zero rows dominate the db (~60% observed on a 1.4 GB
+	 * capture). The FIRST idle row of each dropout is kept as the onset marker;
+	 * only the run after it is dropped, so a dead-link interval stays visible.
+	 * Non-rx_ant datagrams (e.g. tx_stats) are never idle-dropped. Default true;
+	 * set telemetry.drop_empty=false to keep every datagram. */
 	bool drop_empty;
 } WfbLogConfig;
 
