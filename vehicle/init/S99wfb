@@ -151,7 +151,7 @@ start_wfb() {
     #   off — peek disabled (no per-frame close).
     # The old NAL-aware PROTECT/DROP profiles (idr/refpred) and the short-tail
     # close were removed — both flapped the MCS loop; only the gate close ships.
-    # Profile is the WFB_PEEK_PROFILE script constant at the top (not an env var).
+    # Profile is WFB_PEEK_PROFILE from /etc/wfb-link.json (peek.profile).
 
     # wfb_tx (SHM input from venc).  -T sizes the FEC safety-net timeout
     # to the typical frame period (60 fps ≈ 16 ms); fec_controller can
@@ -242,7 +242,7 @@ stop_wfb() {
 }
 
 status_wfb() {
-    echo "wfbmode env: $(fw_get wfbmode 0)  probe: $(probe_enabled && echo on || echo off)  peek: $WFB_PEEK_PROFILE  (script-fixed)"
+    echo "wfbmode env: $(fw_get wfbmode 0)  probe: $(probe_enabled && echo on || echo off)  peek: $WFB_PEEK_PROFILE  (from wfb-link.json)"
     if command -v wfb-air >/dev/null 2>&1; then
         # All applets share comm 'wfb-air'; report per-role from the pid files
         # so a single dead applet is still visible (pidof wfb-air can't tell

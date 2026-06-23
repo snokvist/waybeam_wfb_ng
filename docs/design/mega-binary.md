@@ -312,9 +312,10 @@ make -C vehicle mega \
 ```
 
 Note: `S99wfb` exposes only `wfbmode` as a boot-env knob; the peek profile,
-probe, and SD-logger toggles are fixed script constants (`WFB_PEEK_PROFILE`,
-`WFB_PROBE`, `WFB_LOG`) edited in the script, not `fw_setenv` overrides. (A
-stale device `wfbpeek=1` env from before this change is simply ignored.)
+probe, and SD-logger toggles (`WFB_PEEK_PROFILE`, `WFB_PROBE`, `WFB_LOG`)
+come from `/etc/wfb-link.json` via `config-env` (see the unified-config
+section below), not `fw_setenv` overrides. (A stale device `wfbpeek=1` env
+from before this change is simply ignored.)
 Rollback is `rm /usr/bin/wfb-air` (S99wfb auto-falls back to the standalone
 binaries, which remain in place) + restoring the `S99wfb` backup.
 
