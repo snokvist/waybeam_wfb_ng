@@ -312,9 +312,10 @@ make -C vehicle mega \
 ```
 
 Note: `S99wfb` exposes only `wfbmode` as a boot-env knob; the peek profile,
-probe, and SD-logger toggles are fixed script constants (`WFB_PEEK_PROFILE`,
-`WFB_PROBE`, `WFB_LOG`) edited in the script, not `fw_setenv` overrides. (A
-stale device `wfbpeek=1` env from before this change is simply ignored.)
+probe, and SD-logger toggles (`WFB_PEEK_PROFILE`, `WFB_PROBE`, `WFB_LOG`)
+come from `/etc/wfb-link.json` via `config-env` (see the unified-config
+section below), not `fw_setenv` overrides. (A stale device `wfbpeek=1` env
+from before this change is simply ignored.)
 Rollback is `rm /usr/bin/wfb-air` (S99wfb auto-falls back to the standalone
 binaries, which remain in place) + restoring the `S99wfb` backup.
 
@@ -387,13 +388,32 @@ A single optional preset file drives the link. New `config-env` applet
 (`multicall/wfb_configenv.c`) parses it with the shared header-only tokenizer
 `shared/wfb_json.h` (extracted from gs_supervisor's parser) and prints shell
 `NAME=value` lines; the air `S99wfb` does `eval "$(wfb-air config-env
-/etc/wfb-link.json)"` after its static-constant fallback block. **Every field's
-default is baked into the applet**, so a missing/empty/invalid file yields
-exactly the shipped preset (link unchanged) and the scripts stay thin; standalone
-(non-mega) mode falls back to the script constants. String values are
-single-quoted (eval-injection-safe). Schema + defaults: `init/wfb-link.example.json`.
-Device-verified on `.13`: overrides for txpower/probe/peek/fec/mcs propagate;
-malformed file falls back to defaults with a warning. Ground consumption of the same file is **Phase 3b** (below).
+/etc/wfb-link.json)"`. **Every field's default is baked into the applet**, so a
+missing/empty/invalid file yields exactly the shipped preset (link unchanged) and
+the script stays thin. String values are single-quoted (eval-injection-safe).
+Schema + defaults: `init/wfb-link.example.json`.
+
+**Single source of truth (2026-06-23).** `config-env` is now the *only* place
+air-side defaults live — `S99wfb` no longer carries a parallel static-constant
+block (the previous duplication was a drift risk). In mega mode every `WFB_*`
+comes from the applet; the script keeps one clearly-labeled `: "${VAR:=…}"`
+fallback block **only** under the non-mega `else` branch (standalone has no
+applet to call), which must mirror `wfb_configenv.c`. Coverage was also completed:
+beyond radio/key/links/fec/mcs/probe/peek/log/venc, the applet now also renders
+the formerly-hardcoded wiring — `failsafe.uplink_s`→`WFB_FAILSAFE_S` (fractional,
+via a raw-primitive reader), `venc.host`→`WFB_VENC_HOST`,
+`venc.safe_startup_kbps`→`SAFE_BITRATE`, `links.probe_port`→`WFB_PROBE_PORT`, and
+the `ports.*` section (`video_ctrl`/`uplink_fwd`/`uplink_rx_stats`/`probe_ctrl`/
+`probe_feed`), and `radio.iface`→`WFB_IFACE` (the monitor-mode wlan device,
+default `wlan0`, passed to `iw`/`ip`, the tx `-x`/rx args, `link_controller`
+`--wfb-iface`/`--csa-iface`, and `IFACE=… /usr/bin/adapter`). So the air
+mega-binary is now fully JSON-configurable.
+
+Device-verified on `.13`: with no file the assembled argv is byte-identical to
+the old hardcoded values (cold-boot tested, 4/4 applets, video flowing); a
+`/etc/wfb-link.json` override for failsafe/safe-bitrate propagates to the running
+link_controller; malformed/absent file falls back to defaults with a warning.
+Ground consumption of the same file is **Phase 3b** (below).
 
 ### Ground wfb-link overlay (2026-06-15, Phase 3b)
 `gs_supervisor` applies a **sparse** `/etc/wfb-link.json` overlay onto the loaded

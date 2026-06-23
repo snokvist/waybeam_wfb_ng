@@ -1,13 +1,14 @@
 {
   "_comment": "Unified wfb link preset. Install as /etc/wfb-link.json on air and/or ground. EVERY field is optional — a missing or empty file ({}) yields exactly the shipped preset (the link comes up unchanged). The mega binary's `config-env` applet renders this into shell env for the startup script; defaults live in C (multicall/wfb_configenv.c). The values shown below ARE the built-in defaults. Link ids and fec/mcs/peek must match on both ends.",
 
-  "radio": { "channel": 161, "htmode": "HT20", "bw": 20, "txpower_mbm": 2000,
-             "_comment": "htmode = iw channel WIDTH (RF), honored on both sides: GROUND (gs_supervisor overlay) and AIR (S99wfb). The GROUND should set HT40+ (decodes both 20 and 40 MHz on its primary; pick the channel-correct HT40+/HT40-); the AIR MUST stay HT20 — rtl8812eu has no working HT40 monitor mode, HT40 corrupts its TX. Shipped default HT20 is the air-safe value (this file is unified air+ground). bw = radiotap TX width — keep 20 while the air is HT20." },
+  "radio": { "channel": 161, "htmode": "HT20", "bw": 20, "txpower_mbm": 2000, "iface": "wlan0",
+             "_comment": "htmode = iw channel WIDTH (RF), honored on both sides: GROUND (gs_supervisor overlay) and AIR (S99wfb). The GROUND should set HT40+ (decodes both 20 and 40 MHz on its primary; pick the channel-correct HT40+/HT40-); the AIR MUST stay HT20 — rtl8812eu has no working HT40 monitor mode, HT40 corrupts its TX. Shipped default HT20 is the air-safe value (this file is unified air+ground). bw = radiotap TX width — keep 20 while the air is HT20. iface is AIR-only (the monitor-mode wlan device S99wfb drives; ground picks interfaces per-tunnel in gs_supervisor.json)." },
 
   "key":   { "file": "/etc/drone.key", "seed": "Waybeam",
              "_comment": "file default is /etc/drone.key on air, /etc/gs.key on ground. If absent at boot, a deterministic shared key is derived from `seed` (INSECURE shared default — replace for production)." },
 
-  "links": { "video": 207, "uplink": 208, "probe": 50 },
+  "links": { "video": 207, "uplink": 208, "probe": 50, "probe_port": 50,
+             "_comment": "wfb link ids (video/uplink/probe must match the GS supervisor). probe_port (AIR-only) = the V+2 probe wfb_tx radio port (-p)." },
 
   "fec":   { "k": 8, "n": 12, "_comment": "boot values only; link_controller retunes within ~2s" },
 
@@ -19,6 +20,12 @@
 
   "log":   { "enabled": true, "_comment": "AIR-side only: enables the link_controller in-process SD session logger (writes to /mnt/mmcblk0p1, self-disables if no SD). NOT wired to the ground telemetry logger — ground sqlite telemetry is opt-in via the gs_supervisor.json `telemetry` block (with a non-overlay db path), so this flag never persists anything on a ground overlay rootfs." },
 
-  "venc":  { "shm": "local_shm", "auto_wire": true,
-             "_comment": "auto_wire: air S99wfb sets venc outgoing.server=shm://<shm> if it differs (then SIGHUPs). No effect on ground." }
+  "venc":  { "shm": "local_shm", "auto_wire": true, "host": "127.0.0.1:80", "safe_startup_kbps": 4096,
+             "_comment": "auto_wire: air S99wfb sets venc outgoing.server=shm://<shm> if it differs (then SIGHUPs). No effect on ground. AIR-only fields: host (link_controller --venc, the venc HTTP API), safe_startup_kbps (initial bitrate clamp)." },
+
+  "failsafe": { "uplink_s": 2.0,
+             "_comment": "AIR-only. link_controller uplink-loss watchdog (seconds): drop MCS to mcs_min if no rx_ant heard for this long. Absorbs bursty -k1/-n2 uplink loss; raise if your uplink is lossier. Fractional values allowed." },
+
+  "ports": { "video_ctrl": 8000, "uplink_fwd": 5801, "uplink_rx_stats": 5811, "probe_ctrl": 8001, "probe_feed": 5750,
+             "_comment": "AIR-only local UDP/control ports. video_ctrl = video wfb_tx control socket (link_controller CMD_SET_FEC/RADIO). uplink_fwd = decoded uplink + rx_ant listener (MCS scoring + WCMD). uplink_rx_stats = diagnostic uplink rx_ant (never feeds MCS). probe_ctrl/probe_feed = probe wfb_tx control + paced feed. Defaults rarely need changing; here for completeness/conflict avoidance." }
 }
