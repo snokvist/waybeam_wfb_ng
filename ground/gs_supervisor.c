@@ -497,8 +497,9 @@ int cfg_load(const char *path, Config *c)
 
 	int fd = open(path, O_RDONLY);
 	if (fd < 0) {
-		LOG_ERR("config open(%s): %s", path, strerror(errno));
-		if (errno == ENOENT)
+		int e = errno;   /* LOG_ERR does I/O — capture before it can clobber errno */
+		LOG_ERR("config open(%s): %s", path, strerror(e));
+		if (e == ENOENT)
 			LOG_ERR("  hint: pass --config PATH, or install %s "
 			        "(see ground/config/example.json). Unlike the air side, the "
 			        "ground supervisor has no built-in default — it needs the "
