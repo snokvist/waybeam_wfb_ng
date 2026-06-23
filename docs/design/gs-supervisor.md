@@ -69,7 +69,8 @@ stays small and the webui shell is consistent.
 
 ## Config (JSON)
 
-Single file, default `/etc/waybeam/gs_supervisor.json`. Reload via
+Single file, default `/etc/gs_supervisor.json` (matches the deployed
+`ground/init/S46gs_supervisor`; override with `--config PATH`). Reload via
 `POST /api/v1/reload` (only changed tunnels are stopped/started).
 
 > **2026-06 addition — `profile` mode.** For the standard deployment a

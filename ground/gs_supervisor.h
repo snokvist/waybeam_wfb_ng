@@ -58,7 +58,10 @@
 #define API_CLIENT_IDLE_US  (5ULL * 1000000ULL)
 
 #define GS_DEFAULT_HTTP_PORT 9080
-#define GS_DEFAULT_CONFIG    "/etc/waybeam/gs_supervisor.json"
+/* Must match the deployed path in ground/init/S46gs_supervisor and
+ * ground/init/README.md (the init script passes this explicitly; this default
+ * is what a bare `wfb-gs supervisor` falls back to). */
+#define GS_DEFAULT_CONFIG    "/etc/gs_supervisor.json"
 
 /* respawn backoff schedule (ms). */
 extern const int GS_BACKOFF_MS[7];
