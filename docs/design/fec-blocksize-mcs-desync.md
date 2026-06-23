@@ -211,8 +211,9 @@ that is redundant once k tracks the setpoint.
   `test_fec_loss_adapt.c` was retired with Adaptive-n).
 - Fallback to the measurement path when the feed-forward inputs are unavailable
   (no committed bitrate yet at startup, or `fps` not yet estimated).
-- The bench harness (`tests/bench_fec_loss_adapt.c`) gains an MCS-step timeline
-  to score frames-per-block across a 5→0 drop with loss.
+- MCS-step behavior (the 5→0 drop and recovery) is covered on-device by the live
+  `/set mcs.mcs_max`/`mcs.mcs_min` clamp recipe rather than a bench harness; the
+  loss-driven `tests/bench_fec_loss_adapt.c` was retired with Adaptive-n.
 
 ## 7. Confirming the cause first — the desync probe (this branch)
 
