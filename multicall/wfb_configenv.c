@@ -52,6 +52,26 @@ static void ce_str(const char *js, JTok *t, int n, const char *sec, const char *
 		snprintf(out, cap, "%s", tmp);
 }
 
+/* Raw primitive text (for fractional numbers like failsafe seconds, which
+ * jint would truncate and jstr rejects as non-string). Copies the literal
+ * token bytes, e.g. JSON `2.5` -> "2.5". Falls back to def for any other
+ * token type or a missing key. */
+static void ce_prim(const char *js, JTok *t, int n, const char *sec, const char *key,
+                    const char *def, char *out, size_t cap)
+{
+	snprintf(out, cap, "%s", def);
+	if (!js) return;
+	int s = jfind(js, t, n, 0, sec);
+	if (s < 0) return;
+	int v = jfind(js, t, n, s, key);
+	if (v < 0) return;
+	if (t[v].type != JT_PRIM) return;
+	int len = t[v].end - t[v].start;
+	if (len <= 0 || (size_t)len >= cap) return;
+	memcpy(out, js + t[v].start, (size_t)len);
+	out[len] = 0;
+}
+
 /* --- shell-safe emitters --- */
 
 static void emit_int(const char *name, long v)  { printf("%s=%ld\n", name, v); }
@@ -132,6 +152,19 @@ int wfb_configenv_main(int argc, char **argv, int role)
 	emit_b01("WFB_LOG", ce_bool01(js, toks, ntok, "log", "enabled", 1));
 	ce_str(js, toks, ntok, "venc", "shm", "local_shm", s, sizeof(s)); emit_str("SHM_RING", s);
 	emit_b01("WFB_VENC_AUTOWIRE", ce_bool01(js, toks, ntok, "venc", "auto_wire", 1));
+
+	/* Vehicle wiring (AIR-only; S99wfb consumes these). The ground supervisor
+	 * ignores any section it does not know, so these are safe in the shared
+	 * /etc/wfb-link.json. failsafe is fractional seconds -> ce_prim. */
+	ce_prim(js, toks, ntok, "failsafe", "uplink_s", "2.0", s, sizeof(s)); emit_str("WFB_FAILSAFE_S", s);
+	emit_int("SAFE_BITRATE",       ce_int(js, toks, ntok, "venc", "safe_startup_kbps", 4096));
+	ce_str(js, toks, ntok, "venc", "host", "127.0.0.1:80", s, sizeof(s)); emit_str("WFB_VENC_HOST", s);
+	emit_int("WFB_PROBE_PORT",     ce_int(js, toks, ntok, "links", "probe_port", 50));
+	emit_int("WFB_CTRL",           ce_int(js, toks, ntok, "ports", "video_ctrl", 8000));
+	emit_int("WFB_RX_FWD_PORT",    ce_int(js, toks, ntok, "ports", "uplink_fwd", 5801));
+	emit_int("WFB_UPLINK_RX_PORT", ce_int(js, toks, ntok, "ports", "uplink_rx_stats", 5811));
+	emit_int("WFB_PROBE_CTRL",     ce_int(js, toks, ntok, "ports", "probe_ctrl", 8001));
+	emit_int("WFB_PROBE_FEED",     ce_int(js, toks, ntok, "ports", "probe_feed", 5750));
 
 	free(buf);
 	return 0;

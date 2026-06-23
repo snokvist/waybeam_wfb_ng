@@ -18,68 +18,26 @@ else
     wfb_seed_key() { [ -f "$2" ] || { [ -n "$WFB_MEGA" ] && "$WFB_MEGA" keygen-ensure --role "$1" ${3:+--seed "$3"} "$2"; }; }
 fi
 
-# ── Operator settings ────────────────────────────────────────────────
-# Everything else in this script is fixed wiring; live tuning happens
-# via the link_controller HTTP API (port 8765, GET /schema).
-WFB_CHANNEL=161
-WFB_HTMODE=HT20
-WFB_BW=20
-WFB_TXPOWER=2000
-KEY="/etc/drone.key"
-# link_controller failsafe gating against rx_ant uplink burst loss.
-# Default 0.5 s is too tight for a wfb-ng -k 1 -n 2 (50 % parity)
-# rx_ant return path: occasional 0.5–2.0 s gaps from consecutive
-# fragmented-frame loss trip the watchdog and force mcs_min even
-# when the radio link itself is fine. 2.0 s absorbs typical bursts;
-# raise WFB_FAILSAFE_S further if your uplink is lossier (or tighten
-# the wfb-ng parity ratio of the uplink instead).
-# See poc/CMD_PROXY.md → "Failsafe tuning".
-WFB_FAILSAFE_S=2.0
-
-# ── Fixed wiring — not tuning knobs ──────────────────────────────────
-# Boot placeholders + topology. MCS/k/n below are only the static boot
-# state of wfb_tx: link_controller rewrites all three within ~2 s of
-# start (and the boot-armed failsafe drops MCS to mcs_min if no GS is
-# heard), so there is nothing to tune here. Link ids/ports must match
-# the GS supervisor config and link_controller defaults.
-WFB_MCS=2
-WFB_K=8
-WFB_N=12
-WFB_TX_LINK=207
-WFB_RX_LINK=208
-WFB_CTRL=8000
-WFB_RX_FWD_PORT=5801
-# Vehicle-side uplink rx_ant: the uplink wfb_rx pushes its OWN reception stats
-# (GS->vehicle RSSI, how the vehicle hears the GS) here via -Y. link_controller
-# ingests it on a separate, diagnostic-only listener (never feeds MCS/FEC) and
-# surfaces it under "uplink_rx" in /status. This is genuinely independent
-# antenna data from the GS-relayed downlink rx_ant on WFB_RX_FWD_PORT, and
-# proves WCMD/CSA actionable data actually reaches the vehicle.
-WFB_UPLINK_RX_PORT=5811
-SAFE_BITRATE=4096
-SHM_RING="local_shm"
-
-# ── Script-controlled policy (NOT environment variables) ─────────────
-# wfbmode is the ONLY boot-env knob (fw_setenv wfbmode 0|1). Everything
-# below is fixed policy for this build — edit it here and redeploy the
-# script; there are no fw_setenv overrides for these.
-WFB_PEEK_PROFILE=close   # per-frame FEC close: off | close (gate close only)
-WFB_PROBE=               # V+2 boundary probe: default ON; set WFB_PROBE=0 to disable
-WFB_LOG=1                # in-process SD telemetry logger: 1=on
-
-# V+2 boundary-probe producer: one extra wfb_tx at V+2, fed and retuned
-# by link_controller. Default ON (enabled unless WFB_PROBE=0) — it is REQUIRED
-# for MCS adaptation (the unified PER-probe law promotes on probe data only).
-# Leaving WFB_PROBE empty/unset keeps it on; only an explicit WFB_PROBE=0 opts
-# out, which starts link_controller with --no-mcs (FEC-only; MCS stays at the
-# static WFB_MCS set on wfb_tx above).
-# Probe stream mirrors the video PHY (-B/-S/-L), FEC 1/1, AEAD off (-x),
-# on its own link_id so it can never collide with video (207) / uplink (208).
-# See telemetry/PROBE_PER_SPEC.md.
-WFB_PROBE_LINK=50
-WFB_PROBE_PORT=50
-WFB_PROBE_CTRL=8001
-WFB_PROBE_FEED=5750
+# ── Configuration ────────────────────────────────────────────────────
+# Every operator setting lives in /etc/wfb-link.json, rendered to shell by
+# the mega binary's `config-env` applet. The defaults are authoritative in
+# multicall/wfb_configenv.c — there is NO second copy of them here. A
+# missing/empty/invalid file yields exactly the shipped preset, so the link
+# comes up unchanged. The ONLY boot-env knob is `fw_setenv wfbmode 0|1`;
+# live tuning of the adaptive loop is via the link_controller HTTP API
+# (:8765, GET /schema). Knobs rendered (see wfb_configenv.c for defaults):
+#   radio:    WFB_CHANNEL WFB_HTMODE WFB_BW WFB_TXPOWER
+#   key:      KEY WFB_KEY_SEED
+#   links:    WFB_TX_LINK WFB_RX_LINK WFB_PROBE_LINK WFB_PROBE_PORT
+#   fec/mcs:  WFB_K WFB_N WFB_MCS WFB_MCS_MIN WFB_MCS_MAX
+#   policy:   WFB_PROBE WFB_PEEK_PROFILE WFB_LOG
+#   venc:     SHM_RING WFB_VENC_AUTOWIRE WFB_VENC_HOST SAFE_BITRATE
+#   failsafe: WFB_FAILSAFE_S   (link_controller uplink-loss watchdog, seconds)
+#   ports:    WFB_CTRL WFB_RX_FWD_PORT WFB_UPLINK_RX_PORT
+#             WFB_PROBE_CTRL WFB_PROBE_FEED
+# WFB_PROBE is the V+2 boundary probe (default ON; required for MCS
+# adaptation — 0 starts link_controller with --no-mcs). Link ids, fec/mcs,
+# bw/htmode and peek must match the GS supervisor config on both ends.
 
 PID_TX="/var/run/wfb_tx.pid"
 PID_RX="/var/run/wfb_rx.pid"
@@ -91,8 +49,8 @@ LOG="/tmp/wfb.log"
 # 1 Hz status.jsonl + an lc.log decision mirror, newest 10 kept, inactive when
 # no SD is mounted (logs never land on the overlay). The GS "New capture"
 # button can also roll a fresh, time-aligned session via WCMD_KEY_LOG_CONTROL.
-# Default ON; disable entirely by setting WFB_LOG=0 (script constant above,
-# passes --no-log).
+# Default ON; disable via `log.enabled: false` in /etc/wfb-link.json
+# (WFB_LOG=0 -> link_controller --no-log).
 
 # ── Mega binary (single wfb-air) support ─────────────────────────────
 # If the multi-call wfb-air binary is installed, route the applets through
@@ -112,16 +70,26 @@ else
     WFB_PROCS="link_controller wfb_rx wfb_tx"
 fi
 
-# Optional unified link preset: /etc/wfb-link.json overrides the static
-# constants above via the mega binary's config-env applet (every field's
-# default is baked into the applet, so a missing/empty/invalid file yields
-# exactly the preset above — the link comes up unchanged). The constants above
-# remain authoritative in standalone (non-mega) mode. Emits WFB_CHANNEL, KEY,
-# WFB_K/N, WFB_MCS, WFB_PROBE, WFB_PEEK_PROFILE, SHM_RING, WFB_KEY_SEED,
-# WFB_VENC_AUTOWIRE, ... — see multicall/wfb_configenv.c.
+# Render the unified link preset (/etc/wfb-link.json) into this shell. The
+# config-env applet bakes every default, so a missing/empty/invalid file
+# yields the shipped preset and the link comes up unchanged. This is the
+# single source of truth for the mega deployment — no constants above.
 WFB_LINK_CONF="${WFB_LINK_CONF:-/etc/wfb-link.json}"
 if [ -n "$WFB_MEGA" ]; then
     eval "$("$WFB_MEGA" config-env "$WFB_LINK_CONF" 2>>"$LOG")"
+else
+    # Standalone fallback (no mega binary => no config-env applet). These
+    # MUST mirror the defaults in multicall/wfb_configenv.c, which stays
+    # authoritative. Standalone is a legacy path — prefer the mega binary.
+    : "${WFB_CHANNEL:=161}"  "${WFB_HTMODE:=HT20}"  "${WFB_BW:=20}"  "${WFB_TXPOWER:=2000}"
+    : "${KEY:=/etc/drone.key}"  "${WFB_KEY_SEED:=Waybeam}"
+    : "${WFB_TX_LINK:=207}"  "${WFB_RX_LINK:=208}"  "${WFB_PROBE_LINK:=50}"  "${WFB_PROBE_PORT:=50}"
+    : "${WFB_K:=8}"  "${WFB_N:=12}"  "${WFB_MCS:=2}"  "${WFB_MCS_MIN:=1}"  "${WFB_MCS_MAX:=7}"
+    : "${WFB_PROBE:=1}"  "${WFB_PEEK_PROFILE:=close}"  "${WFB_LOG:=1}"
+    : "${SHM_RING:=local_shm}"  "${WFB_VENC_AUTOWIRE:=1}"  "${WFB_VENC_HOST:=127.0.0.1:80}"
+    : "${SAFE_BITRATE:=4096}"  "${WFB_FAILSAFE_S:=2.0}"
+    : "${WFB_CTRL:=8000}"  "${WFB_RX_FWD_PORT:=5801}"  "${WFB_UPLINK_RX_PORT:=5811}"
+    : "${WFB_PROBE_CTRL:=8001}"  "${WFB_PROBE_FEED:=5750}"
 fi
 
 fw_get() { fw_printenv -n "$1" 2>/dev/null || echo "$2"; }
@@ -240,7 +208,7 @@ start_wfb() {
     [ "$WFB_LOG" = "1" ] || LOG_ARGS="--no-log"
     $LINK_CONTROLLER \
         --wfb 127.0.0.1:$WFB_CTRL \
-        --venc 127.0.0.1:80 \
+        --venc "$WFB_VENC_HOST" \
         --safe-startup-bitrate $SAFE_BITRATE \
         --stats 0.0.0.0:$WFB_RX_FWD_PORT \
         --uplink-stats $WFB_UPLINK_RX_PORT \
