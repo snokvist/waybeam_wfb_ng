@@ -1,5 +1,5 @@
 #!/bin/sh
-# S99wfb - optional WFB-NG broadcaster mode for wlan0
+# S99wfb - optional WFB-NG broadcaster mode (radio.iface, default wlan0)
 # Enable:  fw_setenv wfbmode 1 ; reboot
 # Disable: fw_setenv wfbmode 0 ; reboot
 # Manual:  /etc/init.d/S99wfb {start|stop|restart|status}
@@ -26,7 +26,7 @@ fi
 # comes up unchanged. The ONLY boot-env knob is `fw_setenv wfbmode 0|1`;
 # live tuning of the adaptive loop is via the link_controller HTTP API
 # (:8765, GET /schema). Knobs rendered (see wfb_configenv.c for defaults):
-#   radio:    WFB_CHANNEL WFB_HTMODE WFB_BW WFB_TXPOWER
+#   radio:    WFB_CHANNEL WFB_HTMODE WFB_BW WFB_TXPOWER WFB_IFACE
 #   key:      KEY WFB_KEY_SEED
 #   links:    WFB_TX_LINK WFB_RX_LINK WFB_PROBE_LINK WFB_PROBE_PORT
 #   fec/mcs:  WFB_K WFB_N WFB_MCS WFB_MCS_MIN WFB_MCS_MAX
@@ -81,7 +81,7 @@ else
     # Standalone fallback (no mega binary => no config-env applet). These
     # MUST mirror the defaults in multicall/wfb_configenv.c, which stays
     # authoritative. Standalone is a legacy path — prefer the mega binary.
-    : "${WFB_CHANNEL:=161}"  "${WFB_HTMODE:=HT20}"  "${WFB_BW:=20}"  "${WFB_TXPOWER:=2000}"
+    : "${WFB_CHANNEL:=161}"  "${WFB_HTMODE:=HT20}"  "${WFB_BW:=20}"  "${WFB_TXPOWER:=2000}"  "${WFB_IFACE:=wlan0}"
     : "${KEY:=/etc/drone.key}"  "${WFB_KEY_SEED:=Waybeam}"
     : "${WFB_TX_LINK:=207}"  "${WFB_RX_LINK:=208}"  "${WFB_PROBE_LINK:=50}"  "${WFB_PROBE_PORT:=50}"
     : "${WFB_K:=8}"  "${WFB_N:=12}"  "${WFB_MCS:=2}"  "${WFB_MCS_MIN:=1}"  "${WFB_MCS_MAX:=7}"
@@ -127,15 +127,16 @@ start_wfb() {
     # (INSECURE shared default — replace for production). No-op if $KEY exists.
     wfb_seed_key drone "$KEY" "$WFB_KEY_SEED"
 
-    # Tear down AP (kills hostapd + adapter monitor + flushes wlan0)
-    /usr/bin/adapter stop >> "$LOG" 2>&1
+    # Tear down AP (kills hostapd + adapter monitor + flushes the iface).
+    # adapter honors $IFACE (defaults to wlan0) — pass WFB_IFACE through.
+    IFACE="$WFB_IFACE" /usr/bin/adapter stop >> "$LOG" 2>&1
     sleep 0.5
 
     # Monitor mode + channel + txpower
-    iw dev wlan0 set monitor otherbss >> "$LOG" 2>&1
-    ip link set wlan0 up
-    iw dev wlan0 set channel $WFB_CHANNEL $WFB_HTMODE >> "$LOG" 2>&1
-    iw dev wlan0 set txpower fixed $WFB_TXPOWER >> "$LOG" 2>&1
+    iw dev "$WFB_IFACE" set monitor otherbss >> "$LOG" 2>&1
+    ip link set "$WFB_IFACE" up
+    iw dev "$WFB_IFACE" set channel $WFB_CHANNEL $WFB_HTMODE >> "$LOG" 2>&1
+    iw dev "$WFB_IFACE" set txpower fixed $WFB_TXPOWER >> "$LOG" 2>&1
 
     # Make the encoder publish into the SHM ring our video wfb_tx reads from.
     # Only rewires + SIGHUPs the encoder if it isn't already on shm://$SHM_RING
@@ -160,7 +161,7 @@ start_wfb() {
            -P 1 -Q -S 1 -L 1 -C $WFB_CTRL -T 16 \
            -H "$SHM_RING" -R 2097152 -s 2097152 \
            --peek-profile "$WFB_PEEK_PROFILE" \
-           -l 1000 -i $WFB_TX_LINK -p 0 -x wlan0 \
+           -l 1000 -i $WFB_TX_LINK -p 0 -x "$WFB_IFACE" \
            >> "$LOG" 2>&1 &
     echo $! > "$PID_TX"
     log "video wfb_tx up (peek-profile=$WFB_PEEK_PROFILE)"
@@ -169,7 +170,7 @@ start_wfb() {
     # -Y pushes this RX's own rx_ant stats (the GS->vehicle uplink as the
     # vehicle hears it) to link_controller's diagnostic uplink listener.
     $WFB_RX -K "$KEY" -i $WFB_RX_LINK -u $WFB_RX_FWD_PORT -p 0 \
-           -Y 127.0.0.1:$WFB_UPLINK_RX_PORT wlan0 \
+           -Y 127.0.0.1:$WFB_UPLINK_RX_PORT "$WFB_IFACE" \
            >> "$LOG" 2>&1 &
     echo $! > "$PID_RX"
 
@@ -187,10 +188,10 @@ start_wfb() {
         $WFB_TX -K "$KEY" -i $WFB_PROBE_LINK -p $WFB_PROBE_PORT \
                -M $PROBE_MCS -B $WFB_BW -S 1 -L 1 -k 1 -n 1 \
                -C $WFB_PROBE_CTRL -u $WFB_PROBE_FEED \
-               -l 1000 -x wlan0 \
+               -l 1000 -x "$WFB_IFACE" \
                >> "$LOG" 2>&1 &
         echo $! > "$PID_PTX"
-        PROBE_ARGS="--csa-iface wlan0 --probe 127.0.0.1:$WFB_PROBE_CTRL --probe-feed 127.0.0.1:$WFB_PROBE_FEED"
+        PROBE_ARGS="--csa-iface $WFB_IFACE --probe 127.0.0.1:$WFB_PROBE_CTRL --probe-feed 127.0.0.1:$WFB_PROBE_FEED"
         log "probe wfb_tx up (link=$WFB_PROBE_LINK port=$WFB_PROBE_PORT mcs=$PROBE_MCS ctrl=$WFB_PROBE_CTRL feed=$WFB_PROBE_FEED)"
     fi
 
@@ -213,7 +214,7 @@ start_wfb() {
         --stats 0.0.0.0:$WFB_RX_FWD_PORT \
         --uplink-stats $WFB_UPLINK_RX_PORT \
         --failsafe $WFB_FAILSAFE_S \
-        --wfb-iface wlan0 \
+        --wfb-iface "$WFB_IFACE" \
         --key-file "$KEY" \
         $PROBE_ARGS $LOG_ARGS \
         >> "$LOG" 2>&1 &
@@ -235,10 +236,10 @@ stop_wfb() {
     killall -q walkout_logger.sh 2>/dev/null
     rm -f /var/run/walkout_logger.pid 2>/dev/null
     sleep 0.3
-    ip link set wlan0 down 2>/dev/null
-    # Return wlan0 to AP mode (or whatever wlanmode is set to)
-    /usr/bin/adapter start >> "$LOG" 2>&1
-    log "wlan0 restored via adapter"
+    ip link set "$WFB_IFACE" down 2>/dev/null
+    # Return the iface to AP mode (or whatever wlanmode is set to)
+    IFACE="$WFB_IFACE" /usr/bin/adapter start >> "$LOG" 2>&1
+    log "$WFB_IFACE restored via adapter"
 }
 
 status_wfb() {
@@ -271,8 +272,8 @@ status_wfb() {
     echo "  sd logger: in-process in link_controller (log: $WFB_LOG (script), SD: $(grep -q ' /mnt/mmcblk0p1 ' /proc/mounts && echo present || echo absent), latest: $(ls -1d /mnt/mmcblk0p1/walkout/*/ 2>/dev/null | sort | tail -1 || echo none))"
     [ "$(fw_get wfbmode 0)" = "1" ] && command -v curl >/dev/null 2>&1 && \
         echo "  sd logger live: $(curl -s -m 2 http://127.0.0.1:8765/log/status 2>/dev/null || echo '(link_controller /log/status unreachable)')"
-    echo "wlan0:"
-    iw dev wlan0 info 2>/dev/null | grep -E "type|channel|txpower" | sed 's/^/  /'
+    echo "$WFB_IFACE:"
+    iw dev "$WFB_IFACE" info 2>/dev/null | grep -E "type|channel|txpower" | sed 's/^/  /'
 }
 
 case "$1" in

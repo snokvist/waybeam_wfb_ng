@@ -404,7 +404,10 @@ the formerly-hardcoded wiring — `failsafe.uplink_s`→`WFB_FAILSAFE_S` (fracti
 via a raw-primitive reader), `venc.host`→`WFB_VENC_HOST`,
 `venc.safe_startup_kbps`→`SAFE_BITRATE`, `links.probe_port`→`WFB_PROBE_PORT`, and
 the `ports.*` section (`video_ctrl`/`uplink_fwd`/`uplink_rx_stats`/`probe_ctrl`/
-`probe_feed`). So the air mega-binary is now fully JSON-configurable.
+`probe_feed`), and `radio.iface`→`WFB_IFACE` (the monitor-mode wlan device,
+default `wlan0`, passed to `iw`/`ip`, the tx `-x`/rx args, `link_controller`
+`--wfb-iface`/`--csa-iface`, and `IFACE=… /usr/bin/adapter`). So the air
+mega-binary is now fully JSON-configurable.
 
 Device-verified on `.13`: with no file the assembled argv is byte-identical to
 the old hardcoded values (cold-boot tested, 4/4 applets, video flowing); a

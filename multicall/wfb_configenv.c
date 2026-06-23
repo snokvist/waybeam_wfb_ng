@@ -137,6 +137,7 @@ int wfb_configenv_main(int argc, char **argv, int role)
 	ce_str(js, toks, ntok, "radio", "htmode", "HT20", s, sizeof(s)); emit_str("WFB_HTMODE", s);
 	emit_int("WFB_BW",      ce_int(js, toks, ntok, "radio", "bw", 20));
 	emit_int("WFB_TXPOWER", ce_int(js, toks, ntok, "radio", "txpower_mbm", 2000));
+	ce_str(js, toks, ntok, "radio", "iface", "wlan0", s, sizeof(s)); emit_str("WFB_IFACE", s);
 	ce_str(js, toks, ntok, "key", "file", key_def, s, sizeof(s)); emit_str("KEY", s);
 	ce_str(js, toks, ntok, "key", "seed", "Waybeam", s, sizeof(s)); emit_str("WFB_KEY_SEED", s);
 	emit_int("WFB_TX_LINK",    ce_int(js, toks, ntok, "links", "video", 207));
