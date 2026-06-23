@@ -414,10 +414,10 @@ static void tele_capture_status(ApiClient *cli)
 	SB sb = {0};
 	sb_printf(&sb,
 		"{\"running\":%s,\"started\":%s,\"bind_error\":%s,\"db_error\":%s,\"session_id\":%ld,"
-		"\"records\":%ld,\"bad\":%ld,\"age\":%.1f,\"max_duration\":%d,\"listen\":%d,\"db\":",
+		"\"records\":%ld,\"bad\":%ld,\"dropped\":%ld,\"age\":%.1f,\"max_duration\":%d,\"listen\":%d,\"db\":",
 		s.running ? "true" : "false", s.started ? "true" : "false",
 		s.bind_error ? "true" : "false", s.db_error ? "true" : "false",
-		s.session_id, s.records, s.bad, s.age_s, s.max_duration, s.listen_port);
+		s.session_id, s.records, s.bad, s.dropped, s.age_s, s.max_duration, s.listen_port);
 	sb_jstr(&sb, wfb_logger_db_path());
 	sb_putc(&sb, '}');
 	sb_finish(&sb, cli);

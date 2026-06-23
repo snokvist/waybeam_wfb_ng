@@ -83,6 +83,7 @@ static struct {
 	double session_start;       /* monotonic seconds */
 	long   records;
 	long   bad;
+	long   dropped;             /* idle/empty records skipped (drop_empty) */
 	int    max_duration;        /* live (roll may change it) */
 } L = { .pending_duration = -2, .session_id = -1, .lock = PTHREAD_MUTEX_INITIALIZER };
 
@@ -133,6 +134,7 @@ typedef struct {
 	long fec_rec;  int has_fec_rec;
 	long dec_err;  int has_dec_err;
 	double per;    int has_per;
+	int  is_rx_ant;   /* type=="rx_ant" — only these are eligible for idle-drop */
 } Derived;
 
 /* object child "sec.key" as int / double, with presence. */
@@ -155,6 +157,17 @@ static void derive(const char *js, JTok *t, int n, Derived *d)
 	memset(d, 0, sizeof(*d));
 
 	long lv;
+	/* Record type — only rx_ant carries the ant[]/pkt reception block that the
+	 * idle-drop targets. tx_stats / other types have no ant/pkt and would look
+	 * "empty" here, so they must NEVER be idle-dropped. */
+	int tv = jfind(js, t, n, 0, "type");
+	if (tv >= 0) {
+		char ty[16];
+		/* jstr() returns the string length on success (>=0), -1 on error —
+		 * NOT 0-on-success like jint(). */
+		if (jstr(js, &t[tv], ty, sizeof(ty)) >= 0 && strcmp(ty, "rx_ant") == 0)
+			d->is_rx_ant = 1;
+	}
 	if (sub_int(js, t, n, 0, "ts_ms", &lv) == 0) d->ts_ms = lv;
 	if (sub_int(js, t, n, 0, "seq", &lv) == 0) { d->seq = lv; d->has_seq = 1; }
 
@@ -214,6 +227,18 @@ static void derive(const char *js, JTok *t, int n, Derived *d)
 	}
 	/* uplink_rx is present only on imported vehicle sessions; live GS rows
 	 * carry no such block, so uplink_* stay NULL (no derivation here). */
+}
+
+/* A "pure-idle" record: no antenna reported anything (ant:[] -> no rssi/snr/mcs)
+ * AND every packet counter is zero/absent. wfb_rx -Y emits one such datagram per
+ * interval whenever the GS hears nothing, so on a link left up they pile up with
+ * zero analytical value. derive() memsets d, so absent fields read as 0 here. */
+static int derived_is_empty(const Derived *d)
+{
+	return d->is_rx_ant &&
+	       !d->has_rssi_comb && !d->has_snr_avg && !d->has_mcs &&
+	       d->pkt_all == 0 && d->pkt_uniq == 0 && d->pkt_lost == 0 &&
+	       d->fec_rec == 0 && d->dec_err == 0;
 }
 
 /* ---- SQLite store --------------------------------------------------------- */
@@ -327,13 +352,15 @@ int wfb_logger_open(sqlite3 **out)
 const char *wfb_logger_db_path(void) { return L.cfg.db; }
 
 /* ---- the capture loop ----------------------------------------------------- */
-static void status_set_session(long id, double start, long records, long bad)
+static void status_set_session(long id, double start, long records, long bad,
+                               long dropped)
 {
 	pthread_mutex_lock(&L.lock);
 	L.session_id = id;
 	L.session_start = start;
 	L.records = records;
 	L.bad = bad;
+	L.dropped = dropped;
 	pthread_mutex_unlock(&L.lock);
 }
 
@@ -388,7 +415,8 @@ static void *capture_run(void *arg)
 	     cfg->bind, cfg->listen_port, cfg->db, cfg->source[0] ? cfg->source : "live-gs", cfg->max_duration);
 
 	long session_id = -1;
-	long records = 0, bad = 0;
+	long records = 0, bad = 0, dropped = 0;
+	int  idle_run = 0;   /* 1 once an idle row has been kept as the run's onset */
 	double session_start = 0;
 	int in_txn = 0, pend = 0;
 	double last_commit = mono_s();
@@ -399,8 +427,8 @@ static void *capture_run(void *arg)
 	#define COMMIT_TXN() do { if (in_txn) { sqlite3_exec(db, "COMMIT", NULL, NULL, NULL); in_txn = 0; } last_commit = mono_s(); } while (0)
 	#define CLOSE_SESSION() do { \
 		if (session_id >= 0) { COMMIT_TXN(); store_close_session(db, session_id); \
-			LOGI("telemetry: closed session %ld: %ld records (%ld bad)", session_id, records, bad); \
-			session_id = -1; status_set_session(-1, 0, records, bad); } \
+			LOGI("telemetry: closed session %ld: %ld records (%ld bad, %ld idle-dropped)", session_id, records, bad, dropped); \
+			session_id = -1; status_set_session(-1, 0, records, bad, dropped); } \
 	} while (0)
 
 	for (;;) {
@@ -426,20 +454,31 @@ static void *capture_run(void *arg)
 					if (session_id < 0) { COMMIT_TXN(); LOGE("telemetry: create_session failed"); }
 					else {
 						session_start = mono_s();
-						records = 0; bad = 0;
+						records = 0; bad = 0; dropped = 0; idle_run = 0;
 						LOGI("telemetry: opened session %ld", session_id);
-						status_set_session(session_id, session_start, 0, 0);
+						status_set_session(session_id, session_start, 0, 0, 0);
 					}
 				}
 				if (session_id >= 0) {
-					BEGIN_TXN();
 					Derived d;
 					derive(buf, toks, n, &d);
-					store_insert(ins, session_id, &d, buf, (int)got);
-					records++; pend++;
+					/* Pure-idle rx_ant datagrams (no reception) carry no signal
+					 * and otherwise dominate a long-running capture. Drop the
+					 * RUN of them, but keep the first one as the dropout onset so
+					 * a dead-link interval stays visible (and the trailing gap is
+					 * implicit in the next kept row's ts_ms). */
+					int empty = cfg->drop_empty && derived_is_empty(&d);
+					if (empty && idle_run) {
+						dropped++;
+					} else {
+						BEGIN_TXN();
+						store_insert(ins, session_id, &d, buf, (int)got);
+						records++; pend++;
+						idle_run = empty;   /* set on the kept onset; cleared by any non-idle row */
+					}
 				}
 			}
-			status_set_session(session_id, session_start, records, bad);
+			status_set_session(session_id, session_start, records, bad, dropped);
 		}
 
 		double now = mono_s();
@@ -489,6 +528,7 @@ void wfb_logger_defaults(WfbLogConfig *cfg)
 	cfg->listen_port = 6700;
 	cfg->max_duration = 1200;
 	snprintf(cfg->source, sizeof(cfg->source), "live-gs");
+	cfg->drop_empty = true;   /* skip pure-idle rx_ant rows; see WfbLogConfig */
 }
 
 /* Spawn the capture thread. Caller guarantees it is not already running.
@@ -500,7 +540,7 @@ static int logger_spawn(void)
 	if (L.started) { pthread_mutex_unlock(&L.lock); return 0; }  /* already running */
 	L.started = 1;                                                /* claim before create */
 	L.stop = 0; L.roll = 0; L.pending_duration = -2; L.session_id = -1;
-	L.running = 0; L.bind_error = 0; L.db_error = 0; L.records = 0; L.bad = 0;
+	L.running = 0; L.bind_error = 0; L.db_error = 0; L.records = 0; L.bad = 0; L.dropped = 0;
 	L.max_duration = L.cfg.max_duration;
 	pthread_mutex_unlock(&L.lock);
 
@@ -574,6 +614,7 @@ void wfb_logger_status(WfbLogStatus *out)
 	out->session_id  = L.session_id;
 	out->records     = L.records;
 	out->bad         = L.bad;
+	out->dropped     = L.dropped;
 	out->age_s       = (L.session_id >= 0) ? (mono_s() - L.session_start) : 0.0;
 	out->max_duration = L.max_duration;
 	out->listen_port = L.cfg.listen_port;
