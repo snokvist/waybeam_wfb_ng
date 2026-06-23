@@ -42,6 +42,12 @@ typedef struct {
 	int  channel;          /* 0 = unset */
 	char tx_power[32];     /* "" = unset */
 	char antenna_cfg[64];  /* "" = unset */
+	/* Drop pure-idle records (no antenna data AND all packet counters zero)
+	 * instead of writing them. wfb_rx -Y emits one rx_ant datagram per interval
+	 * even when nothing is received (ant:[], pkt.all=0); on a link left up all
+	 * day those zero rows dominate the db (~60% observed on a 1.4 GB capture).
+	 * Default true. Set telemetry.drop_empty=false to keep every datagram. */
+	bool drop_empty;
 } WfbLogConfig;
 
 /* Status snapshot — written by the capture thread, read by HTTP handlers
@@ -54,6 +60,7 @@ typedef struct {
 	long   session_id;     /* -1 when no session is open */
 	long   records;
 	long   bad;
+	long   dropped;        /* idle/empty records skipped (drop_empty) this session */
 	double age_s;          /* age of the current session */
 	int    max_duration;
 	int    listen_port;

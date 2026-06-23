@@ -584,6 +584,8 @@ int cfg_load(const char *path, Config *c)
 		bool bv;
 		if ((v = jfind(buf, toks, n, tel_idx, "enabled")) >= 0 && jbool(buf, &toks[v], &bv) == 0)
 			c->telemetry.enabled = bv;
+		if ((v = jfind(buf, toks, n, tel_idx, "drop_empty")) >= 0 && jbool(buf, &toks[v], &bv) == 0)
+			c->telemetry.drop_empty = bv;
 		if ((v = jfind(buf, toks, n, tel_idx, "db")) >= 0)
 			jstr(buf, &toks[v], c->telemetry.db, sizeof(c->telemetry.db));
 		if ((v = jfind(buf, toks, n, tel_idx, "bind")) >= 0)
