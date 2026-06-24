@@ -153,6 +153,10 @@ int wfb_configenv_main(int argc, char **argv, int role)
 	ce_str(js, toks, ntok, "radio", "iface", "wlan0", s, sizeof(s)); emit_str("WFB_IFACE", s);
 	ce_str(js, toks, ntok, "key", "file", key_def, s, sizeof(s)); emit_str("KEY", s);
 	ce_str(js, toks, ntok, "key", "seed", "Waybeam", s, sizeof(s)); emit_str("WFB_KEY_SEED", s);
+	/* AIR-only: video downlink session crypto. 1 -> wfb_tx -xx (open/keyless,
+	 * WFB_PACKET_SESSION_PLAIN); 0 -> -x (encrypted session, keypair required on
+	 * the RX). Default 1 matches the shipped open-video preset. */
+	emit_b01("WFB_VIDEO_OPEN", ce_bool01(js, toks, ntok, "key", "open", 1));
 	emit_int("WFB_TX_LINK",    ce_int(js, toks, ntok, "links", "video", 207));
 	emit_int("WFB_RX_LINK",    ce_int(js, toks, ntok, "links", "uplink", 208));
 	emit_int("WFB_PROBE_LINK", ce_int(js, toks, ntok, "links", "probe", 50));

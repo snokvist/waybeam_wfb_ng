@@ -27,7 +27,7 @@ fi
 # live tuning of the adaptive loop is via the link_controller HTTP API
 # (:8765, GET /schema). Knobs rendered (see wfb_configenv.c for defaults):
 #   radio:    WFB_CHANNEL WFB_HTMODE WFB_BW WFB_TXPOWER WFB_IFACE
-#   key:      KEY WFB_KEY_SEED
+#   key:      KEY WFB_KEY_SEED WFB_VIDEO_OPEN
 #   links:    WFB_TX_LINK WFB_RX_LINK WFB_PROBE_LINK WFB_PROBE_PORT
 #   fec/mcs:  WFB_K WFB_N WFB_MCS WFB_MCS_MIN WFB_MCS_MAX
 #   policy:   WFB_PROBE WFB_PEEK_PROFILE WFB_LOG
@@ -85,7 +85,7 @@ else
     : "${KEY:=/etc/drone.key}"  "${WFB_KEY_SEED:=Waybeam}"
     : "${WFB_TX_LINK:=207}"  "${WFB_RX_LINK:=208}"  "${WFB_PROBE_LINK:=50}"  "${WFB_PROBE_PORT:=50}"
     : "${WFB_K:=8}"  "${WFB_N:=12}"  "${WFB_MCS:=2}"  "${WFB_MCS_MIN:=1}"  "${WFB_MCS_MAX:=7}"
-    : "${WFB_PROBE:=1}"  "${WFB_PEEK_PROFILE:=close}"  "${WFB_LOG:=1}"
+    : "${WFB_PROBE:=1}"  "${WFB_PEEK_PROFILE:=close}"  "${WFB_LOG:=1}"  "${WFB_VIDEO_OPEN:=1}"
     : "${SHM_RING:=local_shm}"  "${WFB_VENC_AUTOWIRE:=1}"  "${WFB_VENC_HOST:=127.0.0.1:80}"
     : "${SAFE_BITRATE:=4096}"  "${WFB_FAILSAFE_S:=2.0}"
     : "${WFB_CTRL:=8000}"  "${WFB_RX_FWD_PORT:=5801}"  "${WFB_UPLINK_RX_PORT:=5811}"
@@ -158,21 +158,25 @@ start_wfb() {
     # to the typical frame period (60 fps ≈ 16 ms); fec_controller can
     # rewrite this at runtime via CMD_SET_FEC's fec_timeout_ms field.
     #
-    # -xx = OPEN VIDEO (default): plaintext data + cleartext, keyless session
-    # announce (WFB_PACKET_SESSION_PLAIN).  No keypair is required and the
-    # camera stream is viewable by any wfb_rx running -x — including receivers
-    # that hold no key.  -K is still passed (harmless; the ctor ignores the key
-    # in -xx mode) so the same KEY drives the encrypted uplink rx below.
-    # Drop one x (-x) for an authenticated session, or remove both for full
-    # AEAD, if a private link is ever wanted.
+    # Video session crypto is config-driven via WFB_VIDEO_OPEN (wfb-link.json
+    # key.open, default 1):
+    #   1 -> -xx OPEN VIDEO: plaintext data + cleartext, keyless session announce
+    #        (WFB_PACKET_SESSION_PLAIN). No keypair needed; viewable by any wfb_rx
+    #        running -x, including receivers that hold no key. -K is still passed
+    #        (harmless; the ctor ignores the key in -xx mode) so the same KEY
+    #        drives the encrypted uplink rx below.
+    #   0 -> -x  authenticated session: data plaintext but the session announce
+    #        is crypto_box-signed; the RX needs the matching keypair.
+    # (Drop to no -x for full per-fragment AEAD; not exposed as a knob here.)
+    if [ "${WFB_VIDEO_OPEN:-1}" = "1" ]; then WFB_VIDEO_SESS="-xx"; else WFB_VIDEO_SESS="-x"; fi
     $WFB_TX -K "$KEY" -M $WFB_MCS -B $WFB_BW -k $WFB_K -n $WFB_N \
            -P 1 -Q -S 1 -L 1 -C $WFB_CTRL -T 16 \
            -H "$SHM_RING" -R 2097152 -s 2097152 \
            --peek-profile "$WFB_PEEK_PROFILE" \
-           -l 1000 -i $WFB_TX_LINK -p 0 -xx "$WFB_IFACE" \
+           -l 1000 -i $WFB_TX_LINK -p 0 $WFB_VIDEO_SESS "$WFB_IFACE" \
            >> "$LOG" 2>&1 &
     echo $! > "$PID_TX"
-    log "video wfb_tx up (peek-profile=$WFB_PEEK_PROFILE)"
+    log "video wfb_tx up (peek-profile=$WFB_PEEK_PROFILE session=$WFB_VIDEO_SESS)"
 
     # wfb_rx (uplink data forwarder - decoded packets to 127.0.0.1:5801).
     # -Y pushes this RX's own rx_ant stats (the GS->vehicle uplink as the

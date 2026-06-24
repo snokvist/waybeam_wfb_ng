@@ -193,6 +193,11 @@ typedef struct {
 	int         extra_arg_count;
 	char        extra_args[GS_MAX_EXTRA_ARGS][GS_ARG_MAX];
 
+	/* "keyless": true -> don't pass -K to this tunnel, even when a global
+	 * key_file is set. For receiving an open (-xx) video downlink with no key
+	 * (WFB_PACKET_SESSION_PLAIN); the global key still serves uplink/probe. */
+	bool        keyless;
+
 	bool        autostart;
 
 	/* runtime state (mutable) */

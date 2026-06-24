@@ -167,6 +167,11 @@ int cfg_parse_tunnel(const char *js, JTok *toks, int n, int t_idx, Tunnel *t)
 		t->autostart = bv;
 	}
 
+	if ((v = jfind(js, toks, n, t_idx, "keyless")) >= 0) {
+		if (jbool(js, &toks[v], &bv) < 0) return -1;
+		t->keyless = bv;
+	}
+
 	if ((v = jfind(js, toks, n, t_idx, "binary")) >= 0) {
 		if (jstr(js, &toks[v], t->binary, sizeof(t->binary)) < 0) return -1;
 	}
@@ -843,7 +848,9 @@ int ab_push(ArgvBuilder *ab, const char *fmt, ...)
 int build_argv_rx(const Tunnel *t, const char *key_file, ArgvBuilder *ab)
 {
 	if (ab_push(ab, "%s", t->binary[0] ? t->binary : "wfb_rx") < 0) return -1;
-	if (key_file && key_file[0] && (ab_push(ab, "-K") < 0 || ab_push(ab, "%s", key_file) < 0))
+	/* keyless tunnel: omit -K so wfb_rx runs without a key (open -xx streams only). */
+	if (key_file && key_file[0] && !t->keyless &&
+	    (ab_push(ab, "-K") < 0 || ab_push(ab, "%s", key_file) < 0))
 		return -1;
 	if (t->udp_out_ip[0]) {
 		if (ab_push(ab, "-c") < 0 || ab_push(ab, "%s", t->udp_out_ip) < 0) return -1;

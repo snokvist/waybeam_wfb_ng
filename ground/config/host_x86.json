@@ -46,7 +46,7 @@
   },
   "tunnels": [
     {
-      "_comment": "Diversity RX. udp_out omitted -> wfb_rx default 127.0.0.1:5600. Stats forwarded to uplink TX UDP-in for back-channel.",
+      "_comment": "Diversity RX. udp_out omitted -> wfb_rx default 127.0.0.1:5600. Stats forwarded to uplink TX UDP-in for back-channel. keyless:true -> no -K passed; receives the vehicle's open (-xx) video downlink without any key (the global key_file still serves uplink TX + probe RX).",
       "name": "video",
       "role": "rx",
       "binary": "/home/snokvist/dev/waybeam-coordination/waybeam_wfb_ng/wfb-ng/build/wfb_rx_native",
@@ -57,6 +57,7 @@
       "link_id": 207,
       "radio_port": 0,
       "stats_out": "127.0.0.1:6600",
+      "keyless": true,
       "extra_args": [
         "-x",
         "-l",
