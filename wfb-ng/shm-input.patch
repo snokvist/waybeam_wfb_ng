@@ -1,5 +1,5 @@
 diff --git a/src/rx.cpp b/src/rx.cpp
-index 1603b6e..629a18e 100644
+index 1603b6e..af6f4b3 100644
 --- a/src/rx.cpp
 +++ b/src/rx.cpp
 @@ -52,6 +52,101 @@ extern "C"
@@ -556,7 +556,7 @@ index 1603b6e..629a18e 100644
          switch (opt) {
          case 'K':
              keypair = optarg;
-@@ -1187,15 +1508,35 @@ int main(int argc, char* const *argv)
+@@ -1187,15 +1508,37 @@ int main(int argc, char* const *argv)
          case 'e':
              epoch = atoll(optarg);
              break;
@@ -591,12 +591,14 @@ index 1603b6e..629a18e 100644
 +                     "  -x   expect WFB_PACKET_DATA_PLAIN (cleartext data) from TX; session\n"
 +                     "       packets remain encrypted and authenticated.  Both sides must\n"
 +                     "       match or packets are silently dropped (see count_p_mode_mismatch\n"
-+                     "       in the PKT stats).\n");
++                     "       in the PKT stats).\n"
++                     "       -K is optional: with no key the RX runs keyless and accepts only\n"
++                     "       open (-xx) WFB_PACKET_SESSION_PLAIN streams (drops encrypted ones).\n");
 +            WFB_INFO("Default: K='%s', connect=%s:%d, link_id=0x%06x, radio_port=%u, epoch=%" PRIu64 ", log_interval=%d, rcv_buf=system_default, snd_buf=system_default, aead=%s\n", keypair.c_str(), client_addr.c_str(), client_port, link_id, radio_port, epoch, log_interval, encrypt_data ? "on" : "off");
              WFB_INFO("WFB-ng version %s, FEC: %s\n", WFB_VERSION, zfex_opt);
              WFB_INFO("WFB-ng home page: <http://wfb-ng.org>\n");
              exit(1);
-@@ -1223,6 +1564,9 @@ int main(int argc, char* const *argv)
+@@ -1223,6 +1566,9 @@ int main(int argc, char* const *argv)
          return 1;
      }
  
@@ -606,7 +608,7 @@ index 1603b6e..629a18e 100644
      try
      {
          uint32_t channel_id = (link_id << 8) + radio_port;
-@@ -1239,21 +1583,41 @@ int main(int argc, char* const *argv)
+@@ -1239,21 +1585,41 @@ int main(int argc, char* const *argv)
  
          unique_ptr<BaseAggregator> agg;
  
@@ -737,7 +739,7 @@ index 856248e..a747687 100644
      PacketLossListener* packet_loss_listener_ = nullptr;
  };
 diff --git a/src/tx.cpp b/src/tx.cpp
-index 5aac75d..ba59304 100644
+index 5aac75d..4cab4f2 100644
 --- a/src/tx.cpp
 +++ b/src/tx.cpp
 @@ -29,6 +29,7 @@
@@ -1602,7 +1604,7 @@ index 5aac75d..ba59304 100644
          case 'u':
              udp_port = atoi(optarg);
              break;
-@@ -1814,22 +2321,52 @@ int main(int argc, char * const *argv)
+@@ -1814,22 +2321,55 @@ int main(int argc, char * const *argv)
              inject_retry_delay = atoi(optarg);
              break;
  
@@ -1654,13 +1656,16 @@ index 5aac75d..ba59304 100644
 -                     keypair.c_str(), k, n, fec_delay, udp_port, link_id, radio_port, epoch, bandwidth, short_gi ? "short" : "long", stbc, ldpc, mcs_index, vht_nss, vht_mode, fec_timeout, log_interval, fwmark, control_port, inject_retries, inject_retry_delay);
 +            WFB_INFO("\nAEAD option:\n"
 +                     "  -x   disable per-fragment AEAD (emit WFB_PACKET_DATA_PLAIN; session still signed).\n"
-+                     "       RX must run with -x too or DATA_PLAIN packets are dropped.\n");
++                     "       RX must run with -x too or DATA_PLAIN packets are dropped.\n"
++                     "  -xx  also drop session crypto: emit a keyless WFB_PACKET_SESSION_PLAIN\n"
++                     "       announce and require NO keypair. Open video — any RX with -x can\n"
++                     "       decode it, with or without a key. Default is full encryption.\n");
 +            WFB_INFO("Default: K='%s', k=%d, n=%d, fec_delay=%u [us], udp_port=%d, link_id=0x%06x, radio_port=%u, epoch=%" PRIu64 ", bandwidth=%d guard_interval=%s stbc=%d ldpc=%d mcs_index=%d vht_nss=%d, vht_mode=%d, fec_timeout=%d, log_interval=%d, rcv_buf=system_default, snd_buf=system_default, frame_type=data, mirror=false, use_qdisc=false, fwmark=%u, control_port=%d, inject_retries=%u, inject_retry_delay=%u, aead=%s\n",
 +                     keypair.c_str(), k, n, fec_delay, udp_port, link_id, radio_port, epoch, bandwidth, short_gi ? "short" : "long", stbc, ldpc, mcs_index, vht_nss, vht_mode, fec_timeout, log_interval, fwmark, control_port, inject_retries, inject_retry_delay, encrypt_data ? "on" : "off");
              WFB_INFO("Radio MTU: %lu\n", (unsigned long)MAX_PAYLOAD_SIZE);
              WFB_INFO("WFB-ng version %s, FEC: %s\n", WFB_VERSION, zfex_opt);
              WFB_INFO("WFB-ng home page: <http://wfb-ng.org>\n");
-@@ -1841,6 +2378,17 @@ int main(int argc, char * const *argv)
+@@ -1841,6 +2381,17 @@ int main(int argc, char * const *argv)
          goto show_usage;
      }
  
@@ -1678,7 +1683,7 @@ index 5aac75d..ba59304 100644
      {
          int fd;
          int c;
-@@ -1862,11 +2410,28 @@ int main(int argc, char * const *argv)
+@@ -1862,11 +2413,28 @@ int main(int argc, char * const *argv)
          return 1;
      }
  
@@ -1707,7 +1712,7 @@ index 5aac75d..ba59304 100644
          switch(tx_mode)
          {
          case INJECTOR:
-@@ -1880,7 +2445,17 @@ int main(int argc, char * const *argv)
+@@ -1880,7 +2448,17 @@ int main(int argc, char * const *argv)
                                  unix_socket, debug_port, k, n, keypair, fec_timeout,
                                  epoch, channel_id, fec_delay, use_qdisc, fwmark,
                                  radiotap_header, frame_type, control_port, mirror,
@@ -1726,7 +1731,7 @@ index 5aac75d..ba59304 100644
              }
              else
              {
-@@ -1888,7 +2463,8 @@ int main(int argc, char * const *argv)
+@@ -1888,7 +2466,8 @@ int main(int argc, char * const *argv)
                                 udp_port, debug_port, k, n, keypair, fec_timeout,
                                 epoch, channel_id, fec_delay, use_qdisc, fwmark,
                                 radiotap_header, frame_type, control_port, mirror,
@@ -1736,7 +1741,7 @@ index 5aac75d..ba59304 100644
              }
              break;
  
-@@ -1899,7 +2475,7 @@ int main(int argc, char * const *argv)
+@@ -1899,7 +2478,7 @@ int main(int argc, char * const *argv)
                                        unix_socket, k, n, keypair, fec_timeout,
                                        epoch, channel_id, fec_delay, use_qdisc, fwmark,
                                        radiotap_header, frame_type, control_port, mirror,
@@ -1745,7 +1750,7 @@ index 5aac75d..ba59304 100644
              }
              else
              {
-@@ -1907,7 +2483,7 @@ int main(int argc, char * const *argv)
+@@ -1907,7 +2486,7 @@ int main(int argc, char * const *argv)
                                   udp_port, k, n, keypair, fec_timeout,
                                   epoch, channel_id, fec_delay, use_qdisc, fwmark,
                                   radiotap_header, frame_type, control_port, mirror,

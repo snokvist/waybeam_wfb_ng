@@ -131,7 +131,7 @@ index 0000000..65e9762
 +
 +#endif // WFB_PEEK_HPP
 diff --git a/src/rx.cpp b/src/rx.cpp
-index 629a18e..69c526c 100644
+index af6f4b3..4236adb 100644
 --- a/src/rx.cpp
 +++ b/src/rx.cpp
 @@ -1010,8 +1010,9 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
@@ -177,7 +177,7 @@ index 629a18e..69c526c 100644
              max_packet_size = max(max_packet_size, rx_ring[ring_idx].fragment_map[j]);
              in_blocks[i] = rx_ring[ring_idx].fragments[j];
 diff --git a/src/tx.cpp b/src/tx.cpp
-index ba59304..fc41fb4 100644
+index 4cab4f2..f8307d6 100644
 --- a/src/tx.cpp
 +++ b/src/tx.cpp
 @@ -22,6 +22,7 @@
@@ -433,10 +433,10 @@ index ba59304..fc41fb4 100644
          case 'I':
              tx_mode = INJECTOR;
              srv_port = atoi(optarg);
-@@ -2365,6 +2478,10 @@ int main(int argc, char * const *argv)
-             WFB_INFO("\nAEAD option:\n"
-                      "  -x   disable per-fragment AEAD (emit WFB_PACKET_DATA_PLAIN; session still signed).\n"
-                      "       RX must run with -x too or DATA_PLAIN packets are dropped.\n");
+@@ -2368,6 +2481,10 @@ int main(int argc, char * const *argv)
+                      "  -xx  also drop session crypto: emit a keyless WFB_PACKET_SESSION_PLAIN\n"
+                      "       announce and require NO keypair. Open video — any RX with -x can\n"
+                      "       decode it, with or without a key. Default is full encryption.\n");
 +            WFB_INFO("\nPeek options:\n"
 +                     "  --peek-profile <off|close>   per-frame FEC close (default off)\n"
 +                     "       close = close each video frame's FEC block at the RTP marker for\n"
@@ -445,7 +445,7 @@ index ba59304..fc41fb4 100644
                       keypair.c_str(), k, n, fec_delay, udp_port, link_id, radio_port, epoch, bandwidth, short_gi ? "short" : "long", stbc, ldpc, mcs_index, vht_nss, vht_mode, fec_timeout, log_interval, fwmark, control_port, inject_retries, inject_retry_delay, encrypt_data ? "on" : "off");
              WFB_INFO("Radio MTU: %lu\n", (unsigned long)MAX_PAYLOAD_SIZE);
 diff --git a/src/tx.hpp b/src/tx.hpp
-index 704503d..a0afa48 100644
+index b9bff4a..1c54989 100644
 --- a/src/tx.hpp
 +++ b/src/tx.hpp
 @@ -90,6 +90,13 @@ public:
