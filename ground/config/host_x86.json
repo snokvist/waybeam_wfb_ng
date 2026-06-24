@@ -110,11 +110,36 @@
         "1"
       ],
       "autostart": true
+    },
+    {
+      "_comment": "Recovery backdoor TX (open/keyless -xx). Separate link id 209 carries the UNAUTHENTICATED APFPV-recovery channel, reachable even when the keyed uplink is dead (lost/mismatched drone.key). Robust low MCS (0) so it gets through in poor conditions; shares the uplink card. POST /api/v1/recovery emits WCMD_KEY_RECOVERY_APFPV here as a heavy redundancy burst; the vehicle's keyless recovery wfb_rx (link 209) + recovery_dispatch accept ONLY that one safe, deferred action. -K is passed but ignored in -xx mode.",
+      "name": "recovery",
+      "role": "tx",
+      "binary": "/home/snokvist/dev/waybeam-coordination/waybeam_wfb_ng/wfb-ng/build/wfb_tx_native",
+      "interfaces": [
+        "wlx40a5ef2f2308"
+      ],
+      "link_id": 209,
+      "radio_port": 0,
+      "udp_in_port": 6601,
+      "radio": { "bandwidth_mhz": 20, "mcs_index": 0, "stbc": 1, "ldpc": 1 },
+      "fec": {
+        "k": 1,
+        "n": 2
+      },
+      "extra_args": [
+        "-xx"
+      ],
+      "autostart": true
     }
   ],
   "venc_cmd": {
     "enabled": true,
     "uplink_tunnel": "uplink",
     "rate_limit_ms": 50
+  },
+  "recovery_cmd": {
+    "enabled": true,
+    "tunnel": "recovery"
   }
 }

@@ -43,6 +43,7 @@ PID_TX="/var/run/wfb_tx.pid"
 PID_RX="/var/run/wfb_rx.pid"
 PID_LC="/var/run/link_controller.pid"
 PID_PTX="/var/run/wfb_probe_tx.pid"
+PID_RXR="/var/run/wfb_rx_recovery.pid"
 LOG="/tmp/wfb.log"
 # SD telemetry logging is now IN-PROCESS in link_controller (it replaced the
 # separate walkout_logger.sh): per-boot sessions under /mnt/mmcblk0p1/walkout/,
@@ -90,6 +91,8 @@ else
     : "${SAFE_BITRATE:=4096}"  "${WFB_FAILSAFE_S:=2.0}"
     : "${WFB_CTRL:=8000}"  "${WFB_RX_FWD_PORT:=5801}"  "${WFB_UPLINK_RX_PORT:=5811}"
     : "${WFB_PROBE_CTRL:=8001}"  "${WFB_PROBE_FEED:=5750}"
+    : "${WFB_RECOVERY:=1}"  "${WFB_RECOVERY_LINK:=209}"  "${WFB_RECOVERY_PORT:=5802}"
+    : "${WFB_RECOVERY_CMD:=/etc/wfb/recovery-apfpv.sh}"
 fi
 
 fw_get() { fw_printenv -n "$1" 2>/dev/null || echo "$2"; }
@@ -100,7 +103,7 @@ probe_enabled() { [ "$WFB_PROBE" != "0" ]; }   # default ON; only WFB_PROBE=0 di
 # our daemons from an unrelated/manual wfb-air invocation (e.g. a debug
 # tx_cmd/keygen) — which would make the double-start guard over-reach.
 wfb_running() {
-    for f in "$PID_LC" "$PID_TX" "$PID_RX" "$PID_PTX"; do
+    for f in "$PID_LC" "$PID_TX" "$PID_RX" "$PID_PTX" "$PID_RXR"; do
         [ -f "$f" ] && kill -0 "$(cat "$f")" 2>/dev/null && return 0
     done
     return 1
@@ -186,6 +189,24 @@ start_wfb() {
            >> "$LOG" 2>&1 &
     echo $! > "$PID_RX"
 
+    # Recovery backdoor wfb_rx (WFB_RECOVERY=1). KEYLESS by design: no -K, -x
+    # only, so it decodes the GS's open (-xx) recovery TX even when the keyed
+    # uplink is dead (wrong/lost drone.key). Forwards decoded frames to the
+    # link_controller recovery listener (127.0.0.1:$WFB_RECOVERY_PORT), where
+    # recovery_dispatch() accepts ONLY the single APFPV-recovery key. Separate
+    # link id ($WFB_RECOVERY_LINK) keeps it off the keyed uplink entirely.
+    RECOVERY_ARGS=""
+    if [ "$WFB_RECOVERY" = "1" ]; then
+        $WFB_RX -i $WFB_RECOVERY_LINK -u $WFB_RECOVERY_PORT -p 0 \
+               -x "$WFB_IFACE" \
+               >> "$LOG" 2>&1 &
+        echo $! > "$PID_RXR"
+        RECOVERY_ARGS="--recovery-port $WFB_RECOVERY_PORT --recovery-cmd $WFB_RECOVERY_CMD"
+        log "recovery rx up (keyless -x, link=$WFB_RECOVERY_LINK -> :$WFB_RECOVERY_PORT, hook=$WFB_RECOVERY_CMD)"
+    else
+        RECOVERY_ARGS="--no-recovery"
+    fi
+
     # Probe wfb_tx (V+2 producer; WFB_PROBE=1). Spawned at a best-effort
     # V+2 MCS; link_controller retunes it on its control socket (-C) and
     # feeds paced PRB packets to its udp input (-u). FEC 1/1 so raw loss
@@ -228,16 +249,16 @@ start_wfb() {
         --failsafe $WFB_FAILSAFE_S \
         --wfb-iface "$WFB_IFACE" \
         --key-file "$KEY" \
-        $PROBE_ARGS $LOG_ARGS \
+        $PROBE_ARGS $LOG_ARGS $RECOVERY_ARGS \
         >> "$LOG" 2>&1 &
     echo $! > "$PID_LC"
 
-    log "started (tx=$(cat $PID_TX) rx=$(cat $PID_RX) lc=$(cat $PID_LC)$(probe_enabled && echo " ptx=$(cat $PID_PTX)"))"
+    log "started (tx=$(cat $PID_TX) rx=$(cat $PID_RX) lc=$(cat $PID_LC)$(probe_enabled && echo " ptx=$(cat $PID_PTX)")$([ "$WFB_RECOVERY" = "1" ] && echo " rxr=$(cat $PID_RXR)"))"
 }
 
 stop_wfb() {
     log "stopping"
-    for f in "$PID_LC" "$PID_PTX" "$PID_RX" "$PID_TX"; do
+    for f in "$PID_LC" "$PID_PTX" "$PID_RXR" "$PID_RX" "$PID_TX"; do
         [ -f "$f" ] && { kill "$(cat $f)" 2>/dev/null; rm -f "$f"; }
     done
     sleep 0.5
@@ -261,7 +282,7 @@ status_wfb() {
         # so a single dead applet is still visible (pidof wfb-air can't tell
         # them apart).
         echo "  (mega: applets share comm 'wfb-air' — per-role from pidfiles)"
-        for rolepid in "video-tx:$PID_TX" "uplink-rx:$PID_RX" "link:$PID_LC" "probe-tx:$PID_PTX"; do
+        for rolepid in "video-tx:$PID_TX" "uplink-rx:$PID_RX" "link:$PID_LC" "probe-tx:$PID_PTX" "recovery-rx:$PID_RXR"; do
             role=${rolepid%%:*}; f=${rolepid#*:}
             if [ -f "$f" ] && kill -0 "$(cat "$f")" 2>/dev/null; then
                 echo "  $role (wfb-air): $(cat "$f")"

@@ -118,7 +118,17 @@ extern const int GS_BACKOFF_MS[7];
  * WCMD_KEY_MAX and never indexes the per-operator-key rate-limit array.
  * value: 1=start/roll a fresh vehicle SD log session, 0=stop. */
 #define WCMD_KEY_LOG_CONTROL    19
+/* Recovery backdoor key (see shared/wcmd_proto.h). Emitted via /api/v1/recovery
+ * onto the SEPARATE keyless/open (-xx) recovery tx tunnel — NOT the operator
+ * /api/v1/cmd path nor the keyed uplink. Numbered above WCMD_KEY_MAX (and above
+ * the vehicle's WCMD_NUM_KEYS) so the operator and recovery command spaces are
+ * mutually exclusive. value is ignored. */
+#define WCMD_KEY_RECOVERY_APFPV 64
 #define WCMD_BURST_FRAMES        3
+/* Recovery is open + has no ARQ, so emit a heavier redundancy burst than the
+ * keyed WCMD path; combined with the vehicle's arm-count gate this rides out
+ * uplink loss without re-triggering the (idempotent, deferred) action. */
+#define WCMD_RECOVERY_BURST_FRAMES 8
 
 /* ---------- log helpers --------------------------------------------- */
 
@@ -312,6 +322,11 @@ typedef struct {
 	char     venc_cmd_uplink[GS_NAME_MAX];
 	int      venc_cmd_rate_limit_ms;
 
+	/* Recovery backdoor emit (GET /api/v1/recovery → WCMD_KEY_RECOVERY_APFPV
+	 * onto the named keyless/open -xx recovery tx tunnel). */
+	bool     recovery_cmd_enabled;
+	char     recovery_cmd_tunnel[GS_NAME_MAX];
+
 	WfbLogConfig telemetry;   /* in-process udp->sqlite logger (Phase 5) */
 
 	SystemState system_state;
@@ -489,10 +504,13 @@ extern uint64_t g_wcmd_emit_total;
 extern uint64_t g_wcmd_emit_frames;
 extern uint64_t g_wcmd_emit_rate_limit;
 extern uint64_t g_wcmd_emit_failed;
+extern uint64_t g_recovery_emit_total;
+extern uint64_t g_recovery_emit_failed;
 
 int         wcmd_key_from_str(const char *s, size_t n);
 const char *wcmd_key_name(int key);
 int         wcmd_emit(const Config *c, int key, int32_t value, uint16_t *seq_out);
+int         recovery_emit(const Config *c, uint16_t *seq_out);
 
 /* ---------- CSA orchestrator ---------------------------------------- */
 

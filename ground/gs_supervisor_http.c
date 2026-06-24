@@ -239,14 +239,19 @@ int json_emit_status(char *buf, size_t cap, const Config *c, uint64_t up_us)
 	APP("{\"uptime_s\":%.1f,\"system_state\":\"%s\",\"wcmd\":{"
 	    "\"emit_total\":%llu,\"emit_frames\":%llu,"
 	    "\"rate_limited\":%llu,\"emit_failed\":%llu,"
-	    "\"burst_frames\":%d},\"tunnels\":[",
+	    "\"burst_frames\":%d},\"recovery\":{"
+	    "\"emit_total\":%llu,\"emit_failed\":%llu,\"burst_frames\":%d},"
+	    "\"tunnels\":[",
 	    (double)up_us / 1e6,
 	    system_state_name(c->system_state),
 	    (unsigned long long)g_wcmd_emit_total,
 	    (unsigned long long)g_wcmd_emit_frames,
 	    (unsigned long long)g_wcmd_emit_rate_limit,
 	    (unsigned long long)g_wcmd_emit_failed,
-	    WCMD_BURST_FRAMES);
+	    WCMD_BURST_FRAMES,
+	    (unsigned long long)g_recovery_emit_total,
+	    (unsigned long long)g_recovery_emit_failed,
+	    WCMD_RECOVERY_BURST_FRAMES);
 	for (int i = 0; i < c->tunnel_count; i++) {
 		if (i) APP(",");
 		int n = json_emit_tunnel(buf + p, cap - p, &c->tunnels[i], false);
@@ -576,6 +581,35 @@ void api_handle(ApiClient *cli, Config *c, uint64_t startup_us)
 		int p = snprintf(body, sizeof(body),
 		                 "{\"ok\":true,\"seq\":%u,\"key\":\"log_control\",\"value\":%d}",
 		                 (unsigned)seq, (int)value);
+		api_send(cli->fd, 200, "application/json", body, p);
+		return;
+	}
+	/* Recovery backdoor: arm boot-into-APFPV on the vehicle's NEXT reboot over
+	 * the SEPARATE keyless/open (-xx) recovery tunnel (WCMD_KEY_RECOVERY_APFPV).
+	 * This is the one command path that still works when the keyed uplink is
+	 * dead (lost/mismatched drone.key). Unauthenticated by nature; the vehicle's
+	 * recovery_dispatch() accepts only this one safe, deferred action. No value
+	 * (the key carries no payload); no operator rate-limit table (above
+	 * WCMD_KEY_MAX). */
+	if (!strcmp(path, "/api/v1/recovery")) {
+		uint16_t seq = 0;
+		int rc = recovery_emit(c, &seq);
+		if (rc == -1) {
+			api_send(cli->fd, 503, "application/json",
+			         "{\"ok\":false,\"error\":\"recovery disabled or recovery tunnel missing\"}", -1);
+			return;
+		}
+		if (rc != 0) {
+			char body[128];
+			int p = snprintf(body, sizeof(body),
+			                 "{\"ok\":false,\"error\":\"sendto: %s\"}", strerror(rc));
+			api_send(cli->fd, 502, "application/json", body, p);
+			return;
+		}
+		char body[96];
+		int p = snprintf(body, sizeof(body),
+		                 "{\"ok\":true,\"seq\":%u,\"key\":\"recovery_apfpv\"}",
+		                 (unsigned)seq);
 		api_send(cli->fd, 200, "application/json", body, p);
 		return;
 	}

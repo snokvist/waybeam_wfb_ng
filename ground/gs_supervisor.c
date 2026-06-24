@@ -498,6 +498,11 @@ int cfg_load(const char *path, Config *c)
 	snprintf(c->http_bind, sizeof(c->http_bind), "0.0.0.0");
 	c->http_port = GS_DEFAULT_HTTP_PORT;
 	c->venc_cmd_rate_limit_ms = 50;
+	/* Recovery emit defaults ON, targeting a "recovery" tx tunnel. If no such
+	 * tunnel is configured, recovery_emit() returns -1 and /api/v1/recovery
+	 * reports the feature unavailable (graceful, backward-compatible). */
+	c->recovery_cmd_enabled = true;
+	snprintf(c->recovery_cmd_tunnel, sizeof(c->recovery_cmd_tunnel), "recovery");
 	wfb_logger_defaults(&c->telemetry);   /* DISABLED by default; 127.0.0.1:6700, wfb.sqlite, 1200 s. Opt in via the gs_supervisor.json telemetry block only. */
 
 	int fd = open(path, O_RDONLY);
@@ -587,6 +592,18 @@ int cfg_load(const char *path, Config *c)
 		if ((v = jfind(buf, toks, n, vc_idx, "rate_limit_ms")) >= 0 &&
 		    jint(buf, &toks[v], &lv) == 0)
 			c->venc_cmd_rate_limit_ms = (int)lv;
+	}
+
+	/* recovery_cmd: GET /api/v1/recovery emits WCMD_KEY_RECOVERY_APFPV onto
+	 * the named keyless/open (-xx) recovery tx tunnel (default "recovery"). */
+	int rc_idx = jfind(buf, toks, n, 0, "recovery_cmd");
+	if (rc_idx >= 0 && toks[rc_idx].type == JT_OBJ) {
+		bool bv;
+		if ((v = jfind(buf, toks, n, rc_idx, "enabled")) >= 0 &&
+		    jbool(buf, &toks[v], &bv) == 0)
+			c->recovery_cmd_enabled = bv;
+		if ((v = jfind(buf, toks, n, rc_idx, "tunnel")) >= 0)
+			jstr(buf, &toks[v], c->recovery_cmd_tunnel, sizeof(c->recovery_cmd_tunnel));
 	}
 
 	/* telemetry logger (Phase 5): in-process udp->sqlite capture, replacing the
@@ -2421,6 +2438,11 @@ uint64_t g_wcmd_emit_failed     = 0; /* sendto failed entirely (no copy on the w
  * unique seq (the vehicle dedups the 3-frame burst per (key, seq)). */
 uint64_t g_logsync_emit_total = 0;   /* markers emitted (≥1 copy on the wire) */
 
+/* Recovery-backdoor emit counters (GET /api/v1/recovery onto the open -xx
+ * recovery tunnel). Separate from the keyed WCMD counters above. */
+uint64_t g_recovery_emit_total  = 0; /* recovery commands emitted (≥1 copy sent) */
+uint64_t g_recovery_emit_failed = 0; /* sendto failed entirely */
+
 int wcmd_key_from_str(const char *s, size_t n)
 {
 	if (n == 12 && !strncmp(s, "bitrate_kbps",  12)) return WCMD_KEY_BITRATE_KBPS;
@@ -2576,6 +2598,59 @@ static void logsync_emit(const Config *c)
 	}
 	close(s);
 	if (sent > 0) g_logsync_emit_total++;
+}
+
+/* Emit a recovery-backdoor command (WCMD_KEY_RECOVERY_APFPV) onto the named
+ * keyless/open (-xx) recovery tx tunnel.  SEPARATE from wcmd_emit's keyed
+ * uplink: this is the one path that still reaches a vehicle whose drone.key is
+ * wrong/lost.  Heavier burst (WCMD_RECOVERY_BURST_FRAMES) since the open link
+ * has no ARQ; the vehicle's arm-count gate + cooldown make the idempotent,
+ * deferred action fire once per press.  Returns 0 if ≥1 copy hit the wire, -1
+ * if recovery is disabled / the tunnel is missing, else errno. */
+int recovery_emit(const Config *c, uint16_t *seq_out)
+{
+	if (!c->recovery_cmd_enabled) return -1;
+	const Tunnel *tx = NULL;
+	for (int i = 0; i < c->tunnel_count; i++) {
+		if (!strcmp(c->tunnels[i].name, c->recovery_cmd_tunnel) &&
+		    !strcmp(c->tunnels[i].role, "tx")) {
+			tx = &c->tunnels[i];
+			break;
+		}
+	}
+	if (!tx || tx->udp_in_port <= 0) return -1;
+
+	int s = socket(AF_INET, SOCK_DGRAM, 0);
+	if (s < 0) return errno;
+	struct sockaddr_in dst = {
+		.sin_family = AF_INET,
+		.sin_port   = htons((uint16_t)tx->udp_in_port),
+	};
+	dst.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+
+	uint16_t seq = ++g_wcmd_seq;
+	if (seq_out) *seq_out = seq;
+	WcmdReq req = {
+		.magic    = htonl(WCMD_MAGIC),
+		.version  = WCMD_VERSION,
+		.msg_type = WCMD_MSG_REQ,
+		.seq      = htons(seq),
+		.key      = WCMD_KEY_RECOVERY_APFPV,
+		.flags    = 0,
+		._pad     = 0,
+		.value    = 0,
+	};
+	int sent = 0, last_err = 0;
+	for (int i = 0; i < WCMD_RECOVERY_BURST_FRAMES; i++) {
+		ssize_t w = sendto(s, &req, sizeof(req), 0,
+		                   (struct sockaddr *)&dst, sizeof(dst));
+		if (w == sizeof(req)) sent++;
+		else                  last_err = errno;
+	}
+	close(s);
+	if (sent > 0) { g_recovery_emit_total++; return 0; }
+	g_recovery_emit_failed++;
+	return last_err ? last_err : -1;
 }
 
 

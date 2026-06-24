@@ -534,6 +534,21 @@ typedef struct {
 		char     wfb_iface[IFNAMSIZ];
 	} cmd;
 
+	/* ── Recovery backdoor (separate keyless/open -xx link) ──
+	 * UNAUTHENTICATED command channel handled by recovery_dispatch() on its
+	 * OWN UDP listener — entirely separate from the keyed rx_ant/cmd path.
+	 * It accepts a single key (WCMD_KEY_RECOVERY_APFPV) and nothing else, so
+	 * the open link can only arm a SAFE deferred action: boot-into-APFPV on
+	 * the next reboot (a fork+exec of apfpv_cmd). See shared/wcmd_proto.h. */
+	struct {
+		bool     enabled;          /* master switch (default true) */
+		int      listen_port;      /* UDP listener the keyless wfb_rx forwards to (default 5802) */
+		int      arm_count;        /* identical frames needed within arm_window_ms before exec (default 3) */
+		int      arm_window_ms;    /* arming window (default 2000) */
+		int      cooldown_ms;      /* min interval between executions (default 10000) */
+		char     apfpv_cmd[256];   /* shell command fork+exec'd to arm APFPV-next-boot */
+	} recovery;
+
 	/* ── Common ── */
 	char     wfb_host[64];           /* shared wfb_tx control endpoint */
 	uint16_t wfb_port;
@@ -1701,6 +1716,27 @@ static int wfb_run_ip_link_mtu(const char *iface, int mtu)
 	return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
 }
 
+/* fork+exec the recovery hook via `/bin/sh -c <cmd>`; returns the hook's exit
+ * status (0 on success). The command string is admin-configured
+ * (recovery.apfpv_cmd) — NOT attacker-controlled — so a shell is safe and lets
+ * the operator point it at whatever the firmware uses to arm APFPV-next-boot
+ * (e.g. `fw_setenv ...; sync`). Synchronous, mirroring the iw/ip helpers; the
+ * hook is expected to be a quick flag write, not a long-running task. */
+static int wfb_run_recovery_cmd(const char *cmd)
+{
+	if (!cmd || !cmd[0]) return -1;
+	pid_t pid = fork();
+	if (pid < 0) return -1;
+	if (pid == 0) {
+		execl("/bin/sh", "sh", "-c", cmd, (char*)NULL);
+		_exit(127);
+	}
+	int st, wr;
+	while ((wr = waitpid(pid, &st, 0)) < 0 && errno == EINTR) {}
+	if (wr < 0) return -1;   /* waitpid failed for a non-EINTR reason */
+	return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+}
+
 #define WCMD_NUM_KEYS 19   /* highest defined WCMD_KEY_* value (incl. peek 16/17, log_sync 18, log_control 19) */
 
 /* Burst-dedup window: GS may send 3 redundant copies of the same WCMD
@@ -1747,6 +1783,25 @@ typedef struct {
 	bool      radio_written;
 	RadioBody radio_written_body;
 } WcmdState;
+
+/* Recovery backdoor state (open -xx channel; see Config.recovery and
+ * recovery_dispatch).  Single poll thread → plain global is safe.  Arming:
+ * arm_count frames of the same seq within arm_window_ms must arrive before the
+ * hook runs; cooldown_ms gates re-execution so the redundant burst tail, a held
+ * button, or a hostile flood can't re-fire.  A lone stray decode (1 frame)
+ * never reaches the threshold. */
+static struct {
+	uint64_t recv_total;     /* frames passing magic + recovery key */
+	uint64_t rejected;       /* disabled / wrong key */
+	uint64_t armed;          /* threshold reached → hook invoked */
+	uint64_t executed;       /* hook exited 0 */
+	uint64_t last_recv_us;
+	uint64_t last_exec_us;
+	int      last_exec_rc;
+	uint16_t arm_seq;        /* seq of the in-progress arming burst */
+	int      arm_hits;       /* frames seen for arm_seq inside the window */
+	uint64_t arm_first_us;   /* start of the current arming window */
+} g_recovery = { 0 };
 
 /* Most-recent logging-sync marker (WCMD_KEY_LOG_SYNC).  Updated in
  * wcmd_dispatch on the main poll thread, read by status_to_json on the same
@@ -2509,6 +2564,99 @@ static int wcmd_dispatch(Config *cfg, const WcmdReq *req,
 	st->last_http_status = http_status;
 	(void)clamp_rc;
 	return 0;
+}
+
+/* ── Recovery backdoor dispatch ──────────────────────────────────────────
+ *
+ * Handles datagrams arriving on the SEPARATE recovery listener (fed by the
+ * keyless/open -xx wfb_rx, link `links.recovery`).  This is intentionally NOT
+ * wcmd_dispatch: the open, unauthenticated channel must reach only ONE safe,
+ * deferred action and can never touch the operator key space (MCS / channel /
+ * CSA / txpower / FEC / venc HTTP all live in wcmd_dispatch, which this never
+ * calls).  Accepts exactly WCMD_KEY_RECOVERY_APFPV; everything else is rejected.
+ *
+ * Anti-stray / anti-flood: requires recovery.arm_count frames of the same seq
+ * within recovery.arm_window_ms before the hook runs, then recovery.cooldown_ms
+ * gates re-execution (so the redundant burst tail / a held button / a flood
+ * can't re-fire).  Fills `resp` for best-effort local observability; like WCMD
+ * the GS does not bind the return path. */
+static void recovery_dispatch(const Config *cfg, const WcmdReq *req,
+                              uint64_t now, WcmdResp *resp)
+{
+	memset(resp, 0, sizeof(*resp));
+	resp->magic    = htonl(WCMD_MAGIC);
+	resp->version  = WCMD_VERSION;
+	resp->msg_type = WCMD_MSG_RESP;
+	resp->seq      = req->seq;        /* echo, already network-order */
+	resp->key      = req->key;
+
+	g_recovery.recv_total++;
+	g_recovery.last_recv_us = now;
+
+	if (!cfg->recovery.enabled) {
+		resp->status = WCMD_STATUS_DISABLED;
+		g_recovery.rejected++;
+		return;
+	}
+	if (req->key != WCMD_KEY_RECOVERY_APFPV) {
+		resp->status = WCMD_STATUS_UNKNOWN_KEY;
+		g_recovery.rejected++;
+		return;
+	}
+
+	uint16_t req_seq      = ntohs(req->seq);
+	uint64_t cooldown_us  = (uint64_t)(cfg->recovery.cooldown_ms > 0 ?
+	                                    cfg->recovery.cooldown_ms : 10000) * 1000ULL;
+	uint64_t window_us    = (uint64_t)(cfg->recovery.arm_window_ms > 0 ?
+	                                    cfg->recovery.arm_window_ms : 2000) * 1000ULL;
+	int      arm_count    = cfg->recovery.arm_count > 0 ? cfg->recovery.arm_count : 3;
+
+	/* Already acted recently — ack OK without re-running (covers the burst
+	 * tail of the seq we just executed AND any flood). */
+	if (g_recovery.last_exec_us != 0 && now - g_recovery.last_exec_us < cooldown_us) {
+		resp->status        = WCMD_STATUS_OK;
+		resp->applied_value = htonl((uint32_t)g_recovery.last_exec_rc);
+		return;
+	}
+
+	/* Arming window: count frames carrying the same seq.  Start fresh on a
+	 * new seq, the first frame, or an expired window. */
+	if (g_recovery.arm_hits == 0 ||
+	    g_recovery.arm_seq != req_seq ||
+	    now - g_recovery.arm_first_us > window_us) {
+		g_recovery.arm_seq     = req_seq;
+		g_recovery.arm_hits    = 1;
+		g_recovery.arm_first_us = now;
+	} else {
+		g_recovery.arm_hits++;
+	}
+
+	if (g_recovery.arm_hits < arm_count) {
+		/* Armed-in-progress: acknowledge receipt, not yet executed. */
+		resp->status        = WCMD_STATUS_OK;
+		resp->applied_value = htonl(0);
+		return;
+	}
+
+	/* Threshold reached — run the hook. */
+	g_recovery.armed++;
+	g_recovery.arm_hits   = 0;          /* close this arming window */
+	int rc = cfg->dry_run ? 0 : wfb_run_recovery_cmd(cfg->recovery.apfpv_cmd);
+	g_recovery.last_exec_us = now;
+	g_recovery.last_exec_rc = rc;
+
+	LOG_COMMON("recovery: APFPV-next-boot armed (seq=%u hits=%d) — hook \"%s\" rc=%d",
+	         req_seq, arm_count, cfg->recovery.apfpv_cmd[0] ? cfg->recovery.apfpv_cmd : "(unset)", rc);
+
+	if (rc == 0) {
+		g_recovery.executed++;
+		resp->status        = WCMD_STATUS_OK;
+		resp->applied_value = htonl(0);
+	} else {
+		uint16_t hs = (rc > 0 && rc <= 0xFFFF) ? (uint16_t)rc : 0;
+		resp->status      = WCMD_STATUS_HTTP_ERROR;   /* generic "action failed" */
+		resp->http_status = htons(hs);
+	}
 }
 
 static int sidecar_open_and_bind(void)
@@ -4245,6 +4393,20 @@ static int status_to_json(const ApiSnapshot *s, char *buf, size_t cap)
 		pos += w;
 	}
 
+	/* Recovery backdoor counters (open/keyless -xx APFPV channel). executed>0
+	 * means the hook ran; last_rc is its exit status. Read from the same poll
+	 * thread that updates g_recovery, like logsync above. */
+	w = snprintf(buf + pos, cap - pos,
+		",\"recovery\":{\"recv\":%llu,\"rejected\":%llu,\"armed\":%llu,"
+		"\"executed\":%llu,\"last_rc\":%d}",
+		(unsigned long long)g_recovery.recv_total,
+		(unsigned long long)g_recovery.rejected,
+		(unsigned long long)g_recovery.armed,
+		(unsigned long long)g_recovery.executed,
+		g_recovery.last_exec_rc);
+	if (w < 0 || (size_t)w >= cap - pos) return -1;
+	pos += w;
+
 	w = snprintf(buf + pos, cap - pos, "}");
 	if (w < 0 || (size_t)w >= cap - pos) return -1;
 	pos += w;
@@ -5438,6 +5600,17 @@ static void config_defaults(Config *c)
 	c->cmd.wfb_txpower_min   = 50;
 	c->cmd.wfb_txpower_max   = 3000;
 	c->cmd.wfb_iface[0]      = '\0';
+
+	/* Recovery backdoor: enabled by default (field-recoverable out of the
+	 * box; disable with --no-recovery for hardened deployments). The hook
+	 * defaults to a firmware-provided script that arms APFPV-next-boot. */
+	c->recovery.enabled       = true;
+	c->recovery.listen_port   = 5802;
+	c->recovery.arm_count     = 3;
+	c->recovery.arm_window_ms = 2000;
+	c->recovery.cooldown_ms   = 10000;
+	snprintf(c->recovery.apfpv_cmd, sizeof(c->recovery.apfpv_cmd),
+	         "%s", "/etc/wfb/recovery-apfpv.sh");
 }
 
 /* ─────────────────────────────────────────────────────────────────────
@@ -5485,6 +5658,8 @@ int main(int argc, char **argv)
 		OPT_LOG_DIR, OPT_NO_LOG,
 		/* key management (WebUI) */
 		OPT_KEY_FILE,
+		/* recovery backdoor (separate keyless/open -xx link) */
+		OPT_NO_RECOVERY, OPT_RECOVERY_PORT, OPT_RECOVERY_CMD, OPT_RECOVERY_ARM_COUNT,
 	};
 	static const struct option longopts[] = {
 		{"wfb",            required_argument, 0, OPT_WFB},
@@ -5506,6 +5681,10 @@ int main(int argc, char **argv)
 		{"log-dir",        required_argument, 0, OPT_LOG_DIR},
 		{"no-log",         no_argument,       0, OPT_NO_LOG},
 		{"key-file",       required_argument, 0, OPT_KEY_FILE},
+		{"no-recovery",        no_argument,       0, OPT_NO_RECOVERY},
+		{"recovery-port",      required_argument, 0, OPT_RECOVERY_PORT},
+		{"recovery-cmd",       required_argument, 0, OPT_RECOVERY_CMD},
+		{"recovery-arm-count", required_argument, 0, OPT_RECOVERY_ARM_COUNT},
 		{"verbose",        no_argument,       0, 'v'},
 		{"help",           no_argument,       0, 'h'},
 		{0, 0, 0, 0},
@@ -5531,6 +5710,26 @@ int main(int argc, char **argv)
 		case OPT_KEY_FILE:
 			snprintf(cfg.key_file, sizeof(cfg.key_file), "%s", optarg);
 			break;
+		case OPT_NO_RECOVERY: cfg.recovery.enabled = false; break;
+		case OPT_RECOVERY_PORT: {
+			int p = atoi(optarg);
+			if (p < 0 || p > 65535) {
+				fprintf(stderr, "invalid --recovery-port (0..65535)\n"); return 1;
+			}
+			cfg.recovery.listen_port = p;
+			break;
+		}
+		case OPT_RECOVERY_CMD:
+			snprintf(cfg.recovery.apfpv_cmd, sizeof(cfg.recovery.apfpv_cmd), "%s", optarg);
+			break;
+		case OPT_RECOVERY_ARM_COUNT: {
+			int a = atoi(optarg);
+			if (a < 1 || a > 64) {
+				fprintf(stderr, "invalid --recovery-arm-count (1..64)\n"); return 1;
+			}
+			cfg.recovery.arm_count = a;
+			break;
+		}
 		case OPT_DRY_RUN: cfg.dry_run = true; break;
 		case OPT_NO_FEC:  cfg.fec.enabled = false; break;
 		case OPT_NO_MCS:  cfg.mcs.enabled = false; break;
@@ -5753,6 +5952,24 @@ int main(int argc, char **argv)
 		} else {
 			LOG_COMMON("uplink-rx: listening on udp:%u for vehicle wfb_rx -Y (GS->vehicle reception; diagnostic only)",
 			    cfg.uplink_stats_port);
+		}
+	}
+
+	/* ── Recovery backdoor listener ──
+	 * Bound on its OWN UDP port (separate from rx_ant/cmd), fed by the keyless
+	 * (-x, no -K) recovery wfb_rx that S99wfb spawns on links.recovery. Frames
+	 * here are dispatched ONLY by recovery_dispatch() — the open channel never
+	 * reaches the operator key space. */
+	int recovery_fd = -1;
+	if (cfg.recovery.enabled && cfg.recovery.listen_port != 0) {
+		recovery_fd = udp_listen_open((uint16_t)cfg.recovery.listen_port);
+		if (recovery_fd < 0) {
+			LOG_COMMON("recovery: bind on udp:%d failed (%s) — recovery backdoor disabled",
+			    cfg.recovery.listen_port, strerror(errno));
+		} else {
+			LOG_COMMON("recovery: listening on udp:%d (open/keyless APFPV-recovery; hook=\"%s\")",
+			    cfg.recovery.listen_port,
+			    cfg.recovery.apfpv_cmd[0] ? cfg.recovery.apfpv_cmd : "(unset)");
 		}
 	}
 
@@ -6371,10 +6588,10 @@ int main(int argc, char **argv)
 		}
 
 		/* --- Build pollfd set --- */
-		struct pollfd pfds[4 + API_MAX_CLIENTS];
+		struct pollfd pfds[6 + API_MAX_CLIENTS];
 		int npfds = 0;
 		int sidecar_idx = -1, wfb_stats_idx = -1, rx_ant_idx = -1;
-		int uplink_rx_idx = -1;
+		int uplink_rx_idx = -1, recovery_idx = -1;
 		int api_listen_idx = -1;
 		int api_client_idx[API_MAX_CLIENTS];
 		for (int i = 0; i < API_MAX_CLIENTS; i++) api_client_idx[i] = -1;
@@ -6398,6 +6615,11 @@ int main(int argc, char **argv)
 			pfds[npfds].fd = uplink_rx_fd;
 			pfds[npfds].events = POLLIN;
 			uplink_rx_idx = npfds++;
+		}
+		if (recovery_fd >= 0) {
+			pfds[npfds].fd = recovery_fd;
+			pfds[npfds].events = POLLIN;
+			recovery_idx = npfds++;
 		}
 		if (api_fd >= 0) {
 			pfds[npfds].fd = api_fd;
@@ -6640,6 +6862,33 @@ int main(int argc, char **argv)
 				uplink_pkt_total += (unsigned long long)u_uniq;
 				if (u_lost > 0)
 					uplink_lost_total += (unsigned long long)u_lost;
+			}
+		}
+
+		/* --- Drain recovery backdoor (open/keyless -xx link) ---
+		 * Separate listener, separate dispatch. Only WcmdReq frames carrying
+		 * WCMD_KEY_RECOVERY_APFPV do anything; recovery_dispatch() rejects all
+		 * else. This path can never reach the operator key space. */
+		if (recovery_idx >= 0 && (pfds[recovery_idx].revents & POLLIN)) {
+			char dgram[512];
+			for (int drained = 0; drained < 32; drained++) {
+				struct sockaddr_in peer;
+				socklen_t plen = sizeof(peer);
+				ssize_t n = recvfrom(recovery_fd, dgram, sizeof(dgram), 0,
+				                     (struct sockaddr *)&peer, &plen);
+				if (n <= 0) break;
+				if ((size_t)n < sizeof(WcmdReq)) continue;
+				const WcmdReq *req = (const WcmdReq *)dgram;
+				if (ntohl(req->magic) != WCMD_MAGIC ||
+				    req->version != WCMD_VERSION ||
+				    req->msg_type != WCMD_MSG_REQ)
+					continue;
+				WcmdResp resp;
+				recovery_dispatch(&cfg, req, now_us(), &resp);
+				if (plen >= sizeof(struct sockaddr_in) &&
+				    peer.sin_family == AF_INET)
+					(void)sendto(recovery_fd, &resp, sizeof(resp), 0,
+					             (const struct sockaddr *)&peer, sizeof(peer));
 			}
 		}
 
@@ -7205,6 +7454,7 @@ int main(int argc, char **argv)
 	if (wfb_stats_fd >= 0) close(wfb_stats_fd);
 	if (rx_ant_fd >= 0) close(rx_ant_fd);
 	if (uplink_rx_fd >= 0) close(uplink_rx_fd);
+	if (recovery_fd >= 0) close(recovery_fd);
 	if (probe_feed_fd >= 0) close(probe_feed_fd);
 	if (api_fd >= 0) close(api_fd);
 	g_api_clients = NULL;

@@ -432,6 +432,11 @@ select{cursor:pointer;-webkit-appearance:none;appearance:none;background-image:u
         <button class="btn-mini btn-stop"    onclick="cmdQuick('record',0)">record stop</button>
       </div>
       <div class="quick-row">
+        <span class="qlabel">recovery</span>
+        <button class="btn-mini btn-stop" onclick="recoveryFire()"
+          title="Arm boot-into-APFPV on the vehicle's NEXT reboot over the separate keyless/open (-xx) recovery link. Unauthenticated by design so it still works when the keyed uplink is dead (lost/mismatched drone.key). Deferred + idempotent — no immediate effect.">arm boot-APFPV</button>
+      </div>
+      <div class="quick-row">
         <span class="qlabel">bitrate</span>
         <span id="bitrate-presets-row" style="display:contents"></span>
       </div>
@@ -1190,6 +1195,19 @@ async function cmdQuick(key, value){
     setReply(replyId, j, j.ok);
     toast(`${key}${value!==undefined?'='+value:''}: ${j.ok?'sent':j.error}`, j.ok?'ok':'err');
   }catch(e){ toast(`cmd failed: ${e.message||e}`,'err'); }
+}
+
+async function recoveryFire(){
+  /* Arm boot-into-APFPV on the vehicle's NEXT reboot over the keyless/open
+   * (-xx) recovery link. Works even when the keyed uplink is dead. Deferred +
+   * idempotent; confirm() because it changes the vehicle's next-boot mode. */
+  if(!confirm("Arm boot-into-APFPV on the vehicle's NEXT reboot?\n\nSent over the open recovery link (works even with a broken/mismatched key). No immediate effect — takes hold only after the vehicle reboots.")) return;
+  try{
+    const r=await fetchT('/api/v1/recovery');
+    const j=await r.json();
+    setReply('#reply-quick', j, j.ok);
+    toast(j.ok?`recovery armed (seq ${j.seq})`:`recovery: ${j.error}`, j.ok?'ok':'err');
+  }catch(e){ toast(`recovery failed: ${e.message||e}`,'err'); }
 }
 
 function pickReplyPane(key){
