@@ -162,7 +162,8 @@ below):
 | Flag | Default | Purpose |
 |------|---------|---------|
 | `-T MS` | `0` | FEC safety-net timeout in ms (`0` = disabled). Closes the open block with FEC_ONLY padding when no input arrives for that long. Frame boundaries are not detected — `-T` is a coarse timeout, not a per-frame close. |
-| `-x` | off | Plaintext data fragments (video only — session still signed) |
+| `-x` | off | Plaintext data fragments (video only — session still signed, key required) |
+| `-xx` | off | Open/keyless: plaintext data **and** cleartext session (`WFB_PACKET_SESSION_PLAIN`); no keypair needed, viewable by anyone. Default on the vehicle video downlink. See [Open / keyless session mode](#open--keyless-session-mode--xx) |
 | `-Y host:port` | off | Push tx_stats JSON to a UDP target every `-l` interval |
 
 `-T` is also runtime-tunable: `wfb_tx_cmd <port> set_fec -T <ms>`
@@ -416,6 +417,93 @@ If modes disagree, RX log will include per-interval:
 ```
 N packets dropped (AEAD-mode mismatch, check -x flag on both sides)
 ```
+
+## Open / keyless session mode (`-xx`)
+
+**Default on the vehicle video downlink (`init/S99wfb`).** A second `-x`
+on the TX (`-xx`) escalates plain-data mode to a *fully open, keyless*
+link: it ALSO drops the `crypto_box` on the session announce.
+
+`-x` keeps the session packet authenticated (the one thing standing
+between the link and a spoofed `fec_k`/`fec_n`/`epoch`/`channel_id`), so
+`-x` still needs the keypair. `-xx` removes that last layer so the camera
+stream is **viewable by anyone** with no key at all on either side.
+
+**Wire format change (session plane):**
+
+- `-x`  session: `wsession_hdr_t` → `crypto_box`(wsession_data_t) + 16 B MAC,
+  packet_type `WFB_PACKET_SESSION` (0x2)
+- `-xx` session: `wsession_hdr_t` → wsession_data_t (cleartext, no MAC),
+  packet_type `WFB_PACKET_SESSION_PLAIN` (0x4)
+
+The `session_key` field still rides inside the plain announce but is dead
+weight — `-xx` implies `-x`, so the data plane is already AEAD-free.
+
+### TX (`-xx`)
+
+- **No keypair required.** The `Transmitter` ctor skips loading `-K`
+  entirely; the flag may be omitted. (`init/S99wfb` still passes `-K` so
+  the same key drives the *encrypted* uplink rx — it's ignored here.)
+- Emits `WFB_PACKET_SESSION_PLAIN`. The startup banner reads
+  `session=PLAIN (-xx, open/keyless)` plus an explicit open-mode warning.
+
+### RX (auto, key optional)
+
+The RX needs **only `-x`** — there is no `-xx` on the RX. The session
+plane auto-detects by packet type, independent of `-x`:
+
+- `WFB_PACKET_SESSION` → opened with the keypair, as before (needs a key)
+- `WFB_PACKET_SESSION_PLAIN` → parsed in clear, **no key**
+
+`-K` is now **optional** on the RX. With no readable key file the RX runs
+keyless: it still receives any `-xx` open stream and only drops encrypted
+`WFB_PACKET_SESSION` announces (logged once, counted as `dec_err`). A key,
+if present, is still loaded so an authenticated link works in parallel.
+
+So an open vehicle (`-xx`) is received by any ground RX on `-x`, whether
+or not it holds the key — that is what "viewable by anyone" means.
+
+### What `-xx` removes (on top of `-x`)
+
+- **Session authentication.** `fec_k`/`fec_n`/`epoch`/`channel_id` are no
+  longer tamper-proof — anyone in RF range can inject or spoof a session
+  announce and reconfigure/disrupt the RX. Use only where the stream is
+  intentionally public.
+
+### Stats
+
+A new `count_p_session_plain` counter (RX) tracks accepted open announces,
+split out from `count_p_session` so an operator can tell an intentionally
+open link from an authenticated one:
+
+- PKT IPC line: appended as field 13 (after `adapters`)
+- `-Y` JSON: `pkt.session_plain`
+
+### Usage
+
+```bash
+# Fully open TX — no key anywhere:
+wfb_tx -H venc_wfb -M 1 -B 20 -k 8 -n 12 -p 0 -xx wlan0
+
+# RX, keyless (any wfb_rx with -x; -K optional):
+sudo wfb_rx -i 0 -p 0 -x wlxHHHHHHHHHHHH
+```
+
+TX startup logs:
+
+```
+Startup: AEAD=off (DATA_PLAIN), session=PLAIN (-xx, open/keyless), k=8, n=12, ...
+Note: -xx OPEN MODE — session announce is cleartext and unauthenticated; no keypair used. Anyone can receive or spoof this link.
+```
+
+Keyless RX startup log:
+
+```
+No keypair 'rx.key' (...); running keyless — only WFB_PACKET_SESSION_PLAIN (open) streams will be accepted.
+```
+
+As with `-x`, there is no `wfb_tx_cmd` toggle — the session crypto level
+is chosen at startup.
 
 ## UDP stats push (`-Y host:port`)
 

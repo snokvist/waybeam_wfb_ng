@@ -1,5 +1,5 @@
 diff --git a/src/rx.cpp b/src/rx.cpp
-index 1603b6e..136d16d 100644
+index 1603b6e..629a18e 100644
 --- a/src/rx.cpp
 +++ b/src/rx.cpp
 @@ -52,6 +52,101 @@ extern "C"
@@ -121,15 +121,61 @@ index 1603b6e..136d16d 100644
          } else {
              WFB_ERR("Short packet (ieee header)\n");
              continue;
-@@ -270,6 +375,7 @@ void Receiver::loop_iter(void)
+@@ -268,30 +373,43 @@ void Receiver::loop_iter(void)
+ 
+ 
  Aggregator::Aggregator(const string &keypair, uint64_t epoch, uint32_t channel_id) : \
-     count_p_all(0), count_b_all(0), count_p_dec_err(0), count_p_session(0), count_p_data(0), count_p_fec_recovered(0),
+-    count_p_all(0), count_b_all(0), count_p_dec_err(0), count_p_session(0), count_p_data(0), count_p_fec_recovered(0),
++    count_p_all(0), count_b_all(0), count_p_dec_err(0), count_p_session(0), count_p_session_plain(0), count_p_data(0), count_p_fec_recovered(0),
      count_p_lost(0), count_p_bad(0), count_p_override(0), count_p_outgoing(0), count_b_outgoing(0),
 +    count_p_mode_mismatch(0), count_p_diversity(0), wlan_idx_mask(0),
      fec_p(NULL), fec_k(-1), fec_n(-1), seq(0), rx_ring{}, rx_ring_front(0), rx_ring_alloc(0),
      last_known_block((uint64_t)-1), epoch(epoch), channel_id(channel_id)
  {
-@@ -498,14 +604,23 @@ void Aggregator::dump_stats(void)
+     memset(session_key, '\0', sizeof(session_key));
+     memset(session_hash, '\0', sizeof(session_hash));
+-
+-    FILE *fp;
+-    if((fp = fopen(keypair.c_str(), "r")) == NULL)
++    memset(rx_secretkey, '\0', sizeof(rx_secretkey));
++    memset(tx_publickey, '\0', sizeof(tx_publickey));
++
++    // Keypair is OPTIONAL.  A WFB_PACKET_SESSION_PLAIN (-xx open) transmitter
++    // needs no key, so the RX must be able to start without one and still
++    // receive the open stream.  If a key file is given and readable we load it
++    // (have_key = true) and can additionally decrypt encrypted WFB_PACKET_SESSION
++    // announces; if it is absent/short we run keyless and silently ignore
++    // encrypted sessions (they would just count as dec_err otherwise).
++    FILE *fp = fopen(keypair.c_str(), "r");
++    if (fp == NULL)
+     {
+-        throw runtime_error(string_format("Unable to open %s: %s", keypair.c_str(), strerror(errno)));
++        WFB_INFO("No keypair '%s' (%s); running keyless — only WFB_PACKET_SESSION_PLAIN (open) streams will be accepted.\n",
++                 keypair.c_str(), strerror(errno));
+     }
+-    if (fread(rx_secretkey, crypto_box_SECRETKEYBYTES, 1, fp) != 1)
++    else if (fread(rx_secretkey, crypto_box_SECRETKEYBYTES, 1, fp) != 1 ||
++             fread(tx_publickey, crypto_box_PUBLICKEYBYTES, 1, fp) != 1)
+     {
+         fclose(fp);
+-        throw runtime_error(string_format("Unable to read rx secret key: %s", strerror(errno)));
++        WFB_INFO("Keypair '%s' is short/unreadable; running keyless — only open (plain-session) streams will be accepted.\n",
++                 keypair.c_str());
++        memset(rx_secretkey, '\0', sizeof(rx_secretkey));
++        memset(tx_publickey, '\0', sizeof(tx_publickey));
+     }
+-    if (fread(tx_publickey, crypto_box_PUBLICKEYBYTES, 1, fp) != 1)
++    else
+     {
+         fclose(fp);
+-        throw runtime_error(string_format("Unable to read tx public key: %s", strerror(errno)));
++        have_key = true;
+     }
+-    fclose(fp);
+ }
+ 
+ 
+@@ -498,14 +616,26 @@ void Aggregator::dump_stats(void)
                  it->second.snr_min, it->second.snr_sum / it->second.count_all, it->second.snr_max);
      }
  
@@ -138,10 +184,12 @@ index 1603b6e..136d16d 100644
 +     *   0:count_p_all  1:count_b_all  2:count_p_dec_err  3:count_p_session
 +     *   4:count_p_data 5:count_p_uniq 6:count_p_fec_recovered  7:count_p_lost
 +     *   8:count_p_bad  9:count_p_outgoing 10:count_b_outgoing 11:count_p_diversity
-+     * Fields 11 (diversity) and 12 (adapters) were appended at the end so
-+     * existing parsers that read the first 11 fields by index continue to
-+     * work unchanged.  adapters = popcount(wlan_idx_mask). */
-+    IPC_MSG("%" PRIu64 "\tPKT\t%u:%u:%u:%u:%u:%u:%u:%u:%u:%u:%u:%u:%u\n", ts,
++     *   12:adapters    13:count_p_session_plain
++     * Fields 11 (diversity), 12 (adapters) and 13 (session_plain) were appended
++     * at the end so existing parsers that read the earlier fields by index
++     * continue to work unchanged.  adapters = popcount(wlan_idx_mask).
++     * session_plain counts cleartext (-xx open) session announces. */
++    IPC_MSG("%" PRIu64 "\tPKT\t%u:%u:%u:%u:%u:%u:%u:%u:%u:%u:%u:%u:%u:%u\n", ts,
              count_p_all, count_b_all,                    // incoming
              count_p_dec_err,                             // decryption
              count_p_session, count_p_data,               // classification
@@ -151,11 +199,12 @@ index 1603b6e..136d16d 100644
 -            count_p_outgoing, count_b_outgoing);         // outgoing
 +            count_p_outgoing, count_b_outgoing,          // outgoing
 +            count_p_diversity,                           // diversity overlap
-+            (uint32_t)__builtin_popcount(wlan_idx_mask));// adapters seen
++            (uint32_t)__builtin_popcount(wlan_idx_mask), // adapters seen
++            count_p_session_plain);                      // open (-xx) sessions
      IPC_MSG_SEND();
  
      if(count_p_override)
-@@ -518,6 +633,89 @@ void Aggregator::dump_stats(void)
+@@ -518,6 +648,89 @@ void Aggregator::dump_stats(void)
          WFB_ERR("%u packets lost\n", count_p_lost);
      }
  
@@ -223,13 +272,13 @@ index 1603b6e..136d16d 100644
 +            uint32_t adapters_now = (uint32_t)__builtin_popcount(wlan_idx_mask);
 +            n = snprintf(dgram + pos, sizeof(dgram) - pos,
 +                         "],\"pkt\":{\"all\":%u,\"bytes\":%u,\"dec_err\":%u,"
-+                         "\"session\":%u,\"data\":%u,\"uniq\":%u,"
++                         "\"session\":%u,\"session_plain\":%u,\"data\":%u,\"uniq\":%u,"
 +                         "\"fec_recovered\":%u,\"lost\":%u,\"bad\":%u,"
 +                         "\"outgoing\":%u,\"outgoing_bytes\":%u,"
 +                         "\"diversity\":%u,\"mode_mismatch\":%u,"
 +                         "\"adapters\":%u}}\n",
 +                         count_p_all, count_b_all, count_p_dec_err,
-+                         count_p_session, count_p_data,
++                         count_p_session, count_p_session_plain, count_p_data,
 +                         (uint32_t)count_p_uniq.size(),
 +                         count_p_fec_recovered, count_p_lost, count_p_bad,
 +                         count_p_outgoing, count_b_outgoing,
@@ -245,7 +294,16 @@ index 1603b6e..136d16d 100644
      clear_stats();
  }
  
-@@ -592,6 +790,10 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
+@@ -574,7 +787,7 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
+     uint8_t session_tmp[MAX_SESSION_PACKET_SIZE - crypto_box_MACBYTES - sizeof(wsession_hdr_t)];
+     uint8_t new_session_hash[sizeof(session_hash)];
+ 
+-    wsession_data_t* new_session_data = NULL;
++    const wsession_data_t* new_session_data = NULL;
+     //size_t new_session_tags_size = 0;
+ 
+     count_p_all += 1;
+@@ -592,6 +805,10 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
      switch(buf[0])
      {
      case WFB_PACKET_DATA:
@@ -256,10 +314,12 @@ index 1603b6e..136d16d 100644
          if(size < sizeof(wblock_hdr_t) + crypto_aead_chacha20poly1305_ABYTES + sizeof(wpacket_hdr_t))
          {
              WFB_ERR("Short packet (fec header)\n");
-@@ -600,6 +802,18 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
+@@ -600,10 +817,30 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
          }
          break;
  
+-    case WFB_PACKET_SESSION:
+-        new_session_data = (wsession_data_t*)session_tmp;
 +    case WFB_PACKET_DATA_PLAIN:
 +        // Mode mismatch: TX is plaintext but we require AEAD.  See above.
 +        if (encrypt_data) { count_p_mode_mismatch += 1; return; }
@@ -271,11 +331,93 @@ index 1603b6e..136d16d 100644
 +            return;
 +        }
 +        break;
-+
-     case WFB_PACKET_SESSION:
-         new_session_data = (wsession_data_t*)session_tmp;
  
-@@ -714,19 +928,40 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
+-        if(size < sizeof(wsession_hdr_t) + sizeof(wsession_data_t) + crypto_box_MACBYTES || \
++    case WFB_PACKET_SESSION:
++    case WFB_PACKET_SESSION_PLAIN:
++    {
++        // WFB_PACKET_SESSION_PLAIN (-xx open mode) carries the wsession_data_t
++        // in clear, with no crypto_box MAC and no keypair.  We accept it
++        // regardless of the -x data-plane setting and regardless of whether a
++        // key was loaded.  WFB_PACKET_SESSION stays authenticated as before and
++        // is only decryptable when we actually hold a key.
++        const bool plain = (buf[0] == WFB_PACKET_SESSION_PLAIN);
++        const size_t mac_overhead = plain ? 0 : crypto_box_MACBYTES;
++
++        if(size < sizeof(wsession_hdr_t) + sizeof(wsession_data_t) + mac_overhead || \
+            size > MAX_SESSION_PACKET_SIZE)
+         {
+             WFB_ERR("Invalid session key packet\n");
+@@ -625,22 +862,41 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
+         if (memcmp(session_hash, new_session_hash, sizeof(session_hash)) == 0)
+         {
+             // Session is equal to current so we can ignore it
+-            count_p_session += 1;
++            if (plain) count_p_session_plain += 1; else count_p_session += 1;
+             return;
+         }
+ 
+-        if(crypto_box_open_easy((uint8_t*)session_tmp,
+-                                buf + sizeof(wsession_hdr_t),
+-                                size - sizeof(wsession_hdr_t),
+-                                ((wsession_hdr_t*)buf)->session_nonce,
+-                                tx_publickey, rx_secretkey) != 0)
++        if (plain)
+         {
+-            WFB_ERR("Unable to decrypt session key\n");
+-            count_p_dec_err += 1;
+-            return;
++            // No MAC, no key: read the announce straight out of the packet.
++            new_session_data = (const wsession_data_t*)(buf + sizeof(wsession_hdr_t));
++        }
++        else
++        {
++            // Encrypted announce but we hold no key — can't open it.  Drop
++            // silently as a decrypt error rather than aborting; an open (-xx)
++            // TX on the same channel is still receivable in parallel.
++            if (!have_key)
++            {
++                count_p_dec_err += 1;
++                return;
++            }
++
++            if(crypto_box_open_easy((uint8_t*)session_tmp,
++                                    buf + sizeof(wsession_hdr_t),
++                                    size - sizeof(wsession_hdr_t),
++                                    ((wsession_hdr_t*)buf)->session_nonce,
++                                    tx_publickey, rx_secretkey) != 0)
++            {
++                WFB_ERR("Unable to decrypt session key\n");
++                count_p_dec_err += 1;
++                return;
++            }
++
++            new_session_data = (const wsession_data_t*)session_tmp;
+         }
+ 
+-        //new_session_tags_size = size - (sizeof(wsession_hdr_t) + sizeof(wsession_data_t) + crypto_box_MACBYTES);
++        //new_session_tags_size = size - (sizeof(wsession_hdr_t) + sizeof(wsession_data_t) + mac_overhead);
+ 
+         if (be64toh(new_session_data->epoch) < epoch)
+         {
+@@ -677,7 +933,7 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
+             return;
+         }
+ 
+-        count_p_session += 1;
++        if (plain) count_p_session_plain += 1; else count_p_session += 1;
+ 
+         // Ignore RSSI (and per-card rx counters) for session packets to simplify calculation
+         // of lost packets because session packets doesn't have any serial number and it is
+@@ -703,6 +959,7 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
+         memcpy(session_hash, new_session_hash, sizeof(session_hash));
+ 
+         return;
++    }
+ 
+     default:
+         WFB_ERR("Unknown packet type 0x%x\n", buf[0]);
+@@ -714,19 +971,40 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
      unsigned long long decrypted_len;
      wblock_hdr_t *block_hdr = (wblock_hdr_t*)buf;
  
@@ -325,7 +467,7 @@ index 1603b6e..136d16d 100644
      log_rssi(sockaddr, wlan_idx, antenna, rssi, noise, freq, mcs_index, bandwidth);
  
      assert(decrypted_len >= sizeof(wpacket_hdr_t));
-@@ -735,7 +970,15 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
+@@ -735,7 +1013,15 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
      uint64_t block_idx = be64toh(block_hdr->data_nonce) >> 8;
      uint8_t fragment_idx = (uint8_t)(be64toh(block_hdr->data_nonce) & 0xff);
  
@@ -342,7 +484,7 @@ index 1603b6e..136d16d 100644
  
      // Should never happend due to generating new session key on tx side
      if (block_idx > MAX_BLOCK_IDX)
-@@ -745,6 +988,19 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
+@@ -745,6 +1031,19 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
          return;
      }
  
@@ -362,7 +504,7 @@ index 1603b6e..136d16d 100644
      if (fragment_idx >= fec_n)
      {
          WFB_ERR("Invalid fragment_idx: %d\n", fragment_idx);
-@@ -825,17 +1081,37 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
+@@ -825,17 +1124,37 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
                  //Recover missed fragments using FEC
                  apply_fec(ring_idx);
  
@@ -402,7 +544,7 @@ index 1603b6e..136d16d 100644
                      count_p_fec_recovered += fec_count;
                      WFB_DBG("FEC recovered %u packets\n", fec_count);
                  }
-@@ -1147,8 +1423,10 @@ int main(int argc, char* const *argv)
+@@ -1147,8 +1466,10 @@ int main(int argc, char* const *argv)
  
      string keypair = "rx.key";
      string unix_socket = "";
@@ -414,7 +556,7 @@ index 1603b6e..136d16d 100644
          switch (opt) {
          case 'K':
              keypair = optarg;
-@@ -1187,15 +1465,35 @@ int main(int argc, char* const *argv)
+@@ -1187,15 +1508,35 @@ int main(int argc, char* const *argv)
          case 'e':
              epoch = atoll(optarg);
              break;
@@ -454,7 +596,7 @@ index 1603b6e..136d16d 100644
              WFB_INFO("WFB-ng version %s, FEC: %s\n", WFB_VERSION, zfex_opt);
              WFB_INFO("WFB-ng home page: <http://wfb-ng.org>\n");
              exit(1);
-@@ -1223,6 +1521,9 @@ int main(int argc, char* const *argv)
+@@ -1223,6 +1564,9 @@ int main(int argc, char* const *argv)
          return 1;
      }
  
@@ -464,7 +606,7 @@ index 1603b6e..136d16d 100644
      try
      {
          uint32_t channel_id = (link_id << 8) + radio_port;
-@@ -1239,21 +1540,41 @@ int main(int argc, char* const *argv)
+@@ -1239,21 +1583,41 @@ int main(int argc, char* const *argv)
  
          unique_ptr<BaseAggregator> agg;
  
@@ -509,7 +651,7 @@ index 1603b6e..136d16d 100644
              break;
  
 diff --git a/src/rx.hpp b/src/rx.hpp
-index 856248e..18858b9 100644
+index 856248e..a747687 100644
 --- a/src/rx.hpp
 +++ b/src/rx.hpp
 @@ -179,6 +179,14 @@ public:
@@ -527,7 +669,15 @@ index 856248e..18858b9 100644
      // Make stats public for android userspace receiver
      void clear_stats(void)
      {
-@@ -195,6 +203,9 @@ public:
+@@ -187,6 +195,7 @@ public:
+         count_b_all = 0;
+         count_p_dec_err = 0;
+         count_p_session = 0;
++        count_p_session_plain = 0;
+         count_p_data = 0;
+         count_p_uniq.clear();
+         count_p_fec_recovered = 0;
+@@ -195,6 +204,9 @@ public:
          count_p_override = 0;
          count_p_outgoing = 0;
          count_b_outgoing = 0;
@@ -537,7 +687,18 @@ index 856248e..18858b9 100644
      }
  
      rx_antenna_stat_t antenna_stat;
-@@ -210,6 +221,22 @@ public:
+@@ -202,6 +214,10 @@ public:
+     uint32_t count_b_all;
+     uint32_t count_p_dec_err;
+     uint32_t count_p_session;
++    // Cleartext (WFB_PACKET_SESSION_PLAIN, -xx open) announces accepted.
++    // Split out from count_p_session so an operator/UI can tell an
++    // intentionally-open link from an authenticated one at a glance.
++    uint32_t count_p_session_plain;
+     uint32_t count_p_data;
+     std::set<uint64_t> count_p_uniq;
+     uint32_t count_p_fec_recovered;
+@@ -210,6 +226,22 @@ public:
      uint32_t count_p_override;
      uint32_t count_p_outgoing;
      uint32_t count_b_outgoing;
@@ -560,10 +721,15 @@ index 856248e..18858b9 100644
  
  protected:
      virtual void send_to_socket(const uint8_t *payload, uint16_t packet_size) = 0;
-@@ -247,6 +274,9 @@ private:
+@@ -247,6 +279,14 @@ private:
      uint8_t tx_publickey[crypto_box_PUBLICKEYBYTES];
      uint8_t session_key[crypto_aead_chacha20poly1305_KEYBYTES];
  
++    // True if a usable keypair was loaded.  When false the RX runs keyless:
++    // it can still accept WFB_PACKET_SESSION_PLAIN (-xx open) streams but
++    // drops encrypted WFB_PACKET_SESSION announces (can't open them).
++    bool have_key = false;
++
 +    // Cleartext-mode flag (see set_encrypt_data).
 +    bool encrypt_data = true;
 +
@@ -571,7 +737,7 @@ index 856248e..18858b9 100644
      PacketLossListener* packet_loss_listener_ = nullptr;
  };
 diff --git a/src/tx.cpp b/src/tx.cpp
-index 0dec131..3754dd2 100644
+index 5aac75d..ba59304 100644
 --- a/src/tx.cpp
 +++ b/src/tx.cpp
 @@ -29,6 +29,7 @@
@@ -582,7 +748,7 @@ index 0dec131..3754dd2 100644
  #include <net/if.h>
  #include <linux/if_packet.h>
  #include <linux/if_ether.h>
-@@ -42,16 +43,125 @@
+@@ -42,16 +43,126 @@
  
  #include "zfex.h"
  
@@ -598,6 +764,7 @@ index 0dec131..3754dd2 100644
  #include "wifibroadcast.hpp"
  #include "tx.hpp"
  
+-Transmitter::Transmitter(int k, int n, const string &keypair, uint64_t epoch, uint32_t channel_id, uint32_t fec_delay, vector<tags_item_t> &tags) : \
 +// --- UDP stats push (-Y host:port) ---
 +//
 +// Optional: emit one JSON datagram per -l log_interval to a fixed UDP
@@ -700,15 +867,122 @@ index 0dec131..3754dd2 100644
 +}
 +// --- end stats push ---
 +
- Transmitter::Transmitter(int k, int n, const string &keypair, uint64_t epoch, uint32_t channel_id, uint32_t fec_delay, vector<tags_item_t> &tags) : \
++Transmitter::Transmitter(int k, int n, const string &keypair, uint64_t epoch, uint32_t channel_id, uint32_t fec_delay, vector<tags_item_t> &tags, bool encrypt_session) : \
      fec_p(NULL), fec_k(-1), fec_n(-1),
      block_idx(0), fragment_idx(0),
      max_packet_size(0),
 +    encrypt_data(true),     /* AEAD on by default; -x disables per-fragment AEAD */
++    encrypt_session(encrypt_session),  /* crypto_box on the session announce; -xx disables it */
      epoch(epoch),
      channel_id(channel_id),
      fec_delay(fec_delay),
-@@ -627,16 +737,29 @@ void Transmitter::send_block_fragment(size_t packet_size)
+@@ -63,22 +174,28 @@ Transmitter::Transmitter(int k, int n, const string &keypair, uint64_t epoch, ui
+     tags(tags)
+ {
+ 
+-    FILE *fp;
+-    if ((fp = fopen(keypair.c_str(), "r")) == NULL)
+-    {
+-        throw runtime_error(string_format("Unable to open %s: %s", keypair.c_str(), strerror(errno)));
+-    }
+-    if (fread(tx_secretkey, crypto_box_SECRETKEYBYTES, 1, fp) != 1)
+-    {
+-        fclose(fp);
+-        throw runtime_error(string_format("Unable to read tx secret key: %s", strerror(errno)));
+-    }
+-    if (fread(rx_publickey, crypto_box_PUBLICKEYBYTES, 1, fp) != 1)
++    // -xx (encrypt_session == false): emit a cleartext WFB_PACKET_SESSION_PLAIN
++    // announce and require NO keypair at all.  Skip loading the key entirely so
++    // an open transmitter runs without -K / without any key file present.
++    if (encrypt_session)
+     {
++        FILE *fp;
++        if ((fp = fopen(keypair.c_str(), "r")) == NULL)
++        {
++            throw runtime_error(string_format("Unable to open %s: %s", keypair.c_str(), strerror(errno)));
++        }
++        if (fread(tx_secretkey, crypto_box_SECRETKEYBYTES, 1, fp) != 1)
++        {
++            fclose(fp);
++            throw runtime_error(string_format("Unable to read tx secret key: %s", strerror(errno)));
++        }
++        if (fread(rx_publickey, crypto_box_PUBLICKEYBYTES, 1, fp) != 1)
++        {
++            fclose(fp);
++            throw runtime_error(string_format("Unable to read rx public key: %s", strerror(errno)));
++        }
+         fclose(fp);
+-        throw runtime_error(string_format("Unable to read rx public key: %s", strerror(errno)));
+     }
+-    fclose(fp);
+ 
+     init_session(k, n);
+ }
+@@ -144,7 +261,7 @@ void Transmitter::init_session(int k, int n)
+ 
+     // fill packet header
+     wsession_hdr_t *session_hdr = (wsession_hdr_t *)session_packet;
+-    session_hdr->packet_type = WFB_PACKET_SESSION;
++    session_hdr->packet_type = encrypt_session ? WFB_PACKET_SESSION : WFB_PACKET_SESSION_PLAIN;
+ 
+     randombytes_buf(session_hdr->session_nonce, sizeof(session_hdr->session_nonce));
+ 
+@@ -181,22 +298,35 @@ void Transmitter::init_session(int k, int n)
+         memcpy(tlv->value, &it->value[0], it->value.size());
+     }
+ 
+-    if (crypto_box_easy(session_packet + sizeof(wsession_hdr_t),
+-                        (uint8_t*)tmp, session_data_size,
+-                        session_hdr->session_nonce, rx_publickey, tx_secretkey) != 0)
++    if (encrypt_session)
++    {
++        if (crypto_box_easy(session_packet + sizeof(wsession_hdr_t),
++                            (uint8_t*)tmp, session_data_size,
++                            session_hdr->session_nonce, rx_publickey, tx_secretkey) != 0)
++        {
++            throw runtime_error("Unable to make session key!");
++        }
++
++        session_packet_size = sizeof(wsession_hdr_t) + session_data_size + crypto_box_MACBYTES;
++    }
++    else
+     {
+-        throw runtime_error("Unable to make session key!");
++        // -xx open mode: copy the wsession_data_t (+ tags) in clear, no MAC.
++        // session_nonce stays random — it is cosmetic here but still feeds the
++        // RX-side dedup hash so identical announces are collapsed as usual.
++        memcpy(session_packet + sizeof(wsession_hdr_t), tmp, session_data_size);
++        session_packet_size = sizeof(wsession_hdr_t) + session_data_size;
+     }
+ 
+-    session_packet_size = sizeof(wsession_hdr_t) + session_data_size + crypto_box_MACBYTES;
+     assert(session_packet_size <= MAX_SESSION_PACKET_SIZE);
+ }
+ 
+ 
+ RawSocketTransmitter::RawSocketTransmitter(int k, int n, const string &keypair, uint64_t epoch, uint32_t channel_id, uint32_t fec_delay,
+                                            vector<tags_item_t> &tags, const vector<string> &wlans, radiotap_header_t &radiotap_header,
+-                                           uint8_t frame_type, bool use_qdisc, uint32_t fwmark_base, uint32_t inject_retries, uint32_t inject_retry_delay) : \
+-    Transmitter(k, n, keypair, epoch, channel_id, fec_delay, tags),
++                                           uint8_t frame_type, bool use_qdisc, uint32_t fwmark_base, uint32_t inject_retries, uint32_t inject_retry_delay,
++                                           bool encrypt_session) : \
++    Transmitter(k, n, keypair, epoch, channel_id, fec_delay, tags, encrypt_session),
+     channel_id(channel_id),
+     current_output(0),
+     ieee80211_seq(0),
+@@ -457,8 +587,9 @@ RawSocketTransmitter::~RawSocketTransmitter()
+ 
+ RemoteTransmitter::RemoteTransmitter(int k, int n, const string &keypair, uint64_t epoch, uint32_t channel_id, uint32_t fec_delay,
+                                      vector<tags_item_t> &tags, const vector<pair<string, vector<uint16_t>>> &remote_hosts, radiotap_header_t &radiotap_header,
+-                                     uint8_t frame_type, bool use_qdisc, uint32_t fwmark_base, int snd_buf_size) : \
+-    Transmitter(k, n, keypair, epoch, channel_id, fec_delay, tags),
++                                     uint8_t frame_type, bool use_qdisc, uint32_t fwmark_base, int snd_buf_size,
++                                     bool encrypt_session) : \
++    Transmitter(k, n, keypair, epoch, channel_id, fec_delay, tags, encrypt_session),
+     channel_id(channel_id),
+     current_output(0),
+     ieee80211_seq(0),
+@@ -627,16 +758,29 @@ void Transmitter::send_block_fragment(size_t packet_size)
  
      assert(packet_size <= MAX_FEC_PAYLOAD);
  
@@ -725,7 +999,8 @@ index 0dec131..3754dd2 100644
 -                                             (uint8_t*)block_hdr, sizeof(wblock_hdr_t),
 -                                             NULL, (uint8_t*)(&(block_hdr->data_nonce)), session_key) < 0)
 +    if (encrypt_data)
-+    {
+     {
+-        throw runtime_error("Unable to encrypt packet!");
 +        // AEAD: ChaCha20-Poly1305 encrypts plaintext + appends 16 B tag.
 +        if (crypto_aead_chacha20poly1305_encrypt(ciphertext + sizeof(wblock_hdr_t), &ciphertext_len,
 +                                                 block[fragment_idx], packet_size,
@@ -736,8 +1011,7 @@ index 0dec131..3754dd2 100644
 +        }
 +    }
 +    else
-     {
--        throw runtime_error("Unable to encrypt packet!");
++    {
 +        // Plaintext: copy the block slot directly.  No tag, no MAC.  RX
 +        // reads it as-is.  Saves ABYTES (16) on wire + ChaCha20 CPU.
 +        memcpy(ciphertext + sizeof(wblock_hdr_t), block[fragment_idx], packet_size);
@@ -745,7 +1019,7 @@ index 0dec131..3754dd2 100644
      }
  
      inject_packet(ciphertext, sizeof(wblock_hdr_t) + ciphertext_len);
-@@ -739,10 +862,22 @@ uint32_t extract_rxq_overflow(struct msghdr *msg)
+@@ -739,10 +883,22 @@ uint32_t extract_rxq_overflow(struct msghdr *msg)
      return 0;
  }
  
@@ -770,7 +1044,7 @@ index 0dec131..3754dd2 100644
  
      struct pollfd fds[nfds + 1];
      memset(fds, '\0', sizeof(fds));
-@@ -769,6 +904,43 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
+@@ -769,6 +925,43 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
      uint32_t count_p_truncated = 0; // injected large packets that were truncated
      int start_fd_idx = 0;
  
@@ -814,7 +1088,7 @@ index 0dec131..3754dd2 100644
      for(;;)
      {
          uint64_t cur_ts = get_time_ms();
-@@ -779,7 +951,55 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
+@@ -779,7 +972,55 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
              poll_timeout = std::min(poll_timeout, (int)(fec_close_ts > cur_ts ? fec_close_ts - cur_ts : 0));
          }
  
@@ -871,7 +1145,7 @@ index 0dec131..3754dd2 100644
  
          if (rc < 0)
          {
-@@ -797,6 +1017,25 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
+@@ -797,6 +1038,25 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
                      cur_ts, count_p_fec_timeouts, count_p_incoming, count_b_incoming, count_p_injected, count_b_injected, count_p_dropped, count_p_truncated);
              IPC_MSG_SEND();
  
@@ -897,7 +1171,7 @@ index 0dec131..3754dd2 100644
              if(count_p_dropped)
              {
                  WFB_ERR("%u packets dropped\n", count_p_dropped);
-@@ -859,8 +1098,9 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
+@@ -859,8 +1119,9 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
                          continue;
                      }
  
@@ -909,7 +1183,7 @@ index 0dec131..3754dd2 100644
  
                      if(!(fec_k <= fec_n && fec_k >=1 && fec_n >= 1 && fec_n < 256))
                      {
-@@ -870,6 +1110,15 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
+@@ -870,6 +1131,15 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
                          continue;
                      }
  
@@ -925,7 +1199,7 @@ index 0dec131..3754dd2 100644
                      // Close open FEC block if any
                      while(t->send_packet(NULL, 0, WFB_PACKET_FEC_ONLY));
  
-@@ -882,7 +1131,10 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
+@@ -882,7 +1152,10 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
                      }
  
                      sendto(fd, &resp, offsetof(cmd_resp_t, u), MSG_DONTWAIT, (sockaddr*)&from_addr, addr_size);
@@ -937,7 +1211,7 @@ index 0dec131..3754dd2 100644
                  }
                  break;
  
-@@ -941,6 +1193,12 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
+@@ -941,6 +1214,12 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
  
                      resp.u.cmd_get_fec.k = fec_k;
                      resp.u.cmd_get_fec.n = fec_n;
@@ -950,7 +1224,7 @@ index 0dec131..3754dd2 100644
  
                      sendto(fd, &resp, offsetof(cmd_resp_t, u) + sizeof(resp.u.cmd_get_fec), MSG_DONTWAIT, (sockaddr*)&from_addr, addr_size);
                  }
-@@ -980,7 +1238,7 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
+@@ -980,7 +1259,7 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
              }
          }
  
@@ -959,7 +1233,7 @@ index 0dec131..3754dd2 100644
          {
              // close fec only if no data packets and fec timeout expired
              if (fec_timeout > 0 && cur_ts >= fec_close_ts)
-@@ -994,6 +1252,161 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
+@@ -994,6 +1273,161 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
              continue;
          }
  
@@ -1121,17 +1395,29 @@ index 0dec131..3754dd2 100644
          // rc > 0: events detected
          // start from last fd index and reset it to zero
          int _tmp = start_fd_idx;
-@@ -1428,7 +1841,8 @@ void local_loop_udp(int argc, char* const* argv, int optind, int rcv_buf, int lo
+@@ -1428,7 +1862,8 @@ void local_loop_udp(int argc, char* const* argv, int optind, int rcv_buf, int lo
                      int udp_port, int debug_port, int k, int n, const string &keypair, int fec_timeout,
                      uint64_t epoch, uint32_t channel_id, uint32_t fec_delay, bool use_qdisc, uint32_t fwmark,
                      radiotap_header_t &radiotap_header, uint8_t frame_type, int control_port, bool mirror,
 -                    int snd_buf_size, uint32_t inject_retries, uint32_t inject_retry_delay)
 +                    int snd_buf_size, uint32_t inject_retries, uint32_t inject_retry_delay,
-+                    int encrypt_data)
++                    int encrypt_data, int encrypt_session)
  {
      vector<int> rx_fd;
      vector<string> wlans;
-@@ -1478,14 +1892,15 @@ void local_loop_udp(int argc, char* const* argv, int optind, int rcv_buf, int lo
+@@ -1468,24 +1903,25 @@ void local_loop_udp(int argc, char* const* argv, int optind, int rcv_buf, int lo
+     {
+         WFB_INFO("Using %zu ports from %d for wlan emulation\n", wlans.size(), debug_port);
+         t = unique_ptr<UdpTransmitter>(new UdpTransmitter(k, n, keypair, "127.0.0.1", debug_port, epoch, channel_id,
+-                                                          fec_delay, tags, use_qdisc, fwmark, snd_buf_size));
++                                                          fec_delay, tags, use_qdisc, fwmark, snd_buf_size, encrypt_session != 0));
+     }
+     else
+     {
+         t = unique_ptr<RawSocketTransmitter>(new RawSocketTransmitter(k, n, keypair, epoch, channel_id, fec_delay, tags,
+                                                                       wlans, radiotap_header, frame_type, use_qdisc, fwmark,
+-                                                                      inject_retries, inject_retry_delay));
++                                                                      inject_retries, inject_retry_delay, encrypt_session != 0));
      }
  
      int control_fd = open_control_fd(control_port);
@@ -1145,19 +1431,29 @@ index 0dec131..3754dd2 100644
                       radiotap_header_t &radiotap_header, uint8_t frame_type, int control_port, bool mirror,
 -                     int snd_buf_size, uint32_t inject_retries, uint32_t inject_retry_delay)
 +                     int snd_buf_size, uint32_t inject_retries, uint32_t inject_retry_delay,
-+                     int encrypt_data)
++                     int encrypt_data, int encrypt_session)
  {
      vector<int> rx_fd;
      vector<string> wlans;
-@@ -1522,15 +1937,61 @@ void local_loop_unix(int argc, char* const* argv, int optind, int rcv_buf, int l
-     }
- 
-     int control_fd = open_control_fd(control_port);
--    data_source(t, rx_fd, control_fd, fec_timeout, mirror, log_interval);
+@@ -1512,25 +1948,71 @@ void local_loop_unix(int argc, char* const* argv, int optind, int rcv_buf, int l
+     {
+         WFB_INFO("Using %zu ports from %d for wlan emulation\n", wlans.size(), debug_port);
+         t = unique_ptr<UdpTransmitter>(new UdpTransmitter(k, n, keypair, "127.0.0.1", debug_port, epoch, channel_id,
+-                                                          fec_delay, tags, use_qdisc, fwmark, snd_buf_size));
++                                                          fec_delay, tags, use_qdisc, fwmark, snd_buf_size, encrypt_session != 0));
++    }
++    else
++    {
++        t = unique_ptr<RawSocketTransmitter>(new RawSocketTransmitter(k, n, keypair, epoch, channel_id, fec_delay, tags,
++                                                                      wlans, radiotap_header, frame_type, use_qdisc, fwmark,
++                                                                      inject_retries, inject_retry_delay, encrypt_session != 0));
++    }
++
++    int control_fd = open_control_fd(control_port);
 +    data_source(t, rx_fd, control_fd, fec_timeout, mirror, log_interval, NULL, encrypt_data);
- }
- 
- 
++}
++
++
 +// --- SHM ring input mode ---
 +void local_loop_shm(int argc, char* const* argv, int optind, int log_interval,
 +                    const char *shm_name, int debug_port, int k, int n, const string &keypair,
@@ -1165,7 +1461,7 @@ index 0dec131..3754dd2 100644
 +                    bool use_qdisc, uint32_t fwmark,
 +                    radiotap_header_t &radiotap_header, uint8_t frame_type, int control_port,
 +                    bool mirror, int snd_buf_size, uint32_t inject_retries,
-+                    uint32_t inject_retry_delay, int encrypt_data)
++                    uint32_t inject_retry_delay, int encrypt_data, int encrypt_session)
 +{
 +    vector<int> rx_fd;
 +    vector<string> wlans;
@@ -1181,16 +1477,18 @@ index 0dec131..3754dd2 100644
 +    {
 +        WFB_INFO("Using %zu ports from %d for wlan emulation\n", wlans.size(), debug_port);
 +        t = unique_ptr<UdpTransmitter>(new UdpTransmitter(k, n, keypair, "127.0.0.1", debug_port, epoch, channel_id,
-+                                                          fec_delay, tags, use_qdisc, fwmark, snd_buf_size));
-+    }
-+    else
-+    {
-+        t = unique_ptr<RawSocketTransmitter>(new RawSocketTransmitter(k, n, keypair, epoch, channel_id, fec_delay, tags,
-+                                                                      wlans, radiotap_header, frame_type, use_qdisc, fwmark,
-+                                                                      inject_retries, inject_retry_delay));
-+    }
-+
-+    int control_fd = open_control_fd(control_port);
++                                                          fec_delay, tags, use_qdisc, fwmark, snd_buf_size, encrypt_session != 0));
+     }
+     else
+     {
+         t = unique_ptr<RawSocketTransmitter>(new RawSocketTransmitter(k, n, keypair, epoch, channel_id, fec_delay, tags,
+                                                                       wlans, radiotap_header, frame_type, use_qdisc, fwmark,
+-                                                                      inject_retries, inject_retry_delay));
++                                                                      inject_retries, inject_retry_delay, encrypt_session != 0));
+     }
+ 
+     int control_fd = open_control_fd(control_port);
+-    data_source(t, rx_fd, control_fd, fec_timeout, mirror, log_interval);
 +    WFB_INFO("SHM input mode: reading from ring '%s'\n", shm_name);
 +    data_source(t, rx_fd, control_fd, fec_timeout, mirror, log_interval, shm_name, encrypt_data);
 +
@@ -1200,21 +1498,25 @@ index 0dec131..3754dd2 100644
 +        venc_ring_destroy(g_shm_ring);
 +        g_shm_ring = NULL;
 +    }
-+}
+ }
 +// --- end SHM ring input mode ---
-+
-+
+ 
+ 
  void distributor_loop(int argc, char* const* argv, int optind, int rcv_buf, int log_interval,
                        int udp_port, int k, int n, const string &keypair, int fec_timeout,
                        uint64_t epoch, uint32_t channel_id, uint32_t fec_delay, bool use_qdisc, uint32_t fwmark,
                        radiotap_header_t &radiotap_header, uint8_t frame_type, int control_port, bool mirror,
 -                      int snd_buf_size)
-+                      int snd_buf_size, int encrypt_data)
++                      int snd_buf_size, int encrypt_data, int encrypt_session)
  {
      vector<int> rx_fd;
      vector<pair<string, vector<uint16_t>>> remote_hosts;
-@@ -1598,7 +2059,7 @@ void distributor_loop(int argc, char* const* argv, int optind, int rcv_buf, int
-                                                                                     fwmark, snd_buf_size));
+@@ -1595,10 +2077,10 @@ void distributor_loop(int argc, char* const* argv, int optind, int rcv_buf, int
+     vector<tags_item_t> tags;
+     unique_ptr<Transmitter> t = unique_ptr<RemoteTransmitter>(new RemoteTransmitter(k, n, keypair, epoch, channel_id, fec_delay, tags,
+                                                                                     remote_hosts, radiotap_header, frame_type, use_qdisc,
+-                                                                                    fwmark, snd_buf_size));
++                                                                                    fwmark, snd_buf_size, encrypt_session != 0));
  
      int control_fd = open_control_fd(control_port);
 -    data_source(t, rx_fd, control_fd, fec_timeout, mirror, log_interval);
@@ -1222,17 +1524,21 @@ index 0dec131..3754dd2 100644
  }
  
  
-@@ -1606,7 +2067,7 @@ void distributor_loop_unix(int argc, char* const* argv, int optind, int rcv_buf,
+@@ -1606,7 +2088,7 @@ void distributor_loop_unix(int argc, char* const* argv, int optind, int rcv_buf,
                             const char* unix_socket, int k, int n, const string &keypair, int fec_timeout,
                             uint64_t epoch, uint32_t channel_id, uint32_t fec_delay, bool use_qdisc, uint32_t fwmark,
                             radiotap_header_t &radiotap_header, uint8_t frame_type, int control_port, bool mirror,
 -                           int snd_buf_size)
-+                           int snd_buf_size, int encrypt_data)
++                           int snd_buf_size, int encrypt_data, int encrypt_session)
  {
      vector<int> rx_fd;
      vector<pair<string, vector<uint16_t>>> remote_hosts;
-@@ -1660,7 +2121,7 @@ void distributor_loop_unix(int argc, char* const* argv, int optind, int rcv_buf,
-                                                                                     fwmark, snd_buf_size));
+@@ -1657,10 +2139,10 @@ void distributor_loop_unix(int argc, char* const* argv, int optind, int rcv_buf,
+     vector<tags_item_t> tags;
+     unique_ptr<Transmitter> t = unique_ptr<RemoteTransmitter>(new RemoteTransmitter(k, n, keypair, epoch, channel_id, fec_delay, tags,
+                                                                                     remote_hosts, radiotap_header, frame_type, use_qdisc,
+-                                                                                    fwmark, snd_buf_size));
++                                                                                    fwmark, snd_buf_size, encrypt_session != 0));
  
      int control_fd = open_control_fd(control_port);
 -    data_source(t, rx_fd, control_fd, fec_timeout, mirror, log_interval);
@@ -1240,7 +1546,7 @@ index 0dec131..3754dd2 100644
  }
  
  
-@@ -1669,6 +2130,7 @@ int main(int argc, char * const *argv)
+@@ -1669,6 +2151,7 @@ int main(int argc, char * const *argv)
      int opt;
      uint8_t k=8, n=12, radio_port=0;
      uint32_t fec_delay = 0;
@@ -1248,10 +1554,11 @@ index 0dec131..3754dd2 100644
      uint32_t link_id = 0x0;
      uint64_t epoch = 0;
      int srv_port = 10000;
-@@ -1696,8 +2158,10 @@ int main(int argc, char * const *argv)
+@@ -1696,8 +2179,11 @@ int main(int argc, char * const *argv)
      char *unix_socket = NULL;
      uint32_t inject_retries = 0;
      uint32_t inject_retry_delay = 5000; // 5ms
++    int encrypt_session = 1;        // second -x (-xx) flips to 0 -> open, keyless session
 +    int encrypt_data = 1;           // -x (no-AEAD flag) flips to 0
 +    const char *stats_udp_target = NULL;  // -Y host:port; NULL = disabled
  
@@ -1260,7 +1567,7 @@ index 0dec131..3754dd2 100644
          switch (opt) {
          case 'I':
              tx_mode = INJECTOR;
-@@ -1710,11 +2174,32 @@ int main(int argc, char * const *argv)
+@@ -1710,11 +2196,32 @@ int main(int argc, char * const *argv)
              keypair = optarg;
              break;
          case 'k':
@@ -1295,7 +1602,7 @@ index 0dec131..3754dd2 100644
          case 'u':
              udp_port = atoi(optarg);
              break;
-@@ -1814,22 +2299,46 @@ int main(int argc, char * const *argv)
+@@ -1814,22 +2321,52 @@ int main(int argc, char * const *argv)
              inject_retry_delay = atoi(optarg);
              break;
  
@@ -1304,10 +1611,16 @@ index 0dec131..3754dd2 100644
 +            break;
 +
 +        case 'x':
-+            /* Disable per-fragment AEAD (plaintext video mode).
-+             * Session packets remain authenticated so fec_k/fec_n/epoch
-+             * can't be spoofed.  RX must also run with -x or it will
-+             * silently drop our DATA_PLAIN packets. */
++            /* Escalating flag:
++             *   -x   disable per-fragment AEAD (plaintext video mode).  The
++             *        session announce stays authenticated so fec_k/fec_n/epoch
++             *        can't be spoofed; RX must also run with -x or it silently
++             *        drops our DATA_PLAIN packets.
++             *   -xx  ALSO disable the session crypto_box: emit a cleartext
++             *        WFB_PACKET_SESSION_PLAIN and require no keypair at all.
++             *        Fully open / keyless link (viewable by anyone).  fec_k/
++             *        fec_n/epoch/channel_id are no longer tamper-proof. */
++            if (!encrypt_data) encrypt_session = 0;  // second -x -> -xx
 +            encrypt_data = 0;
 +            break;
 +
@@ -1347,7 +1660,7 @@ index 0dec131..3754dd2 100644
              WFB_INFO("Radio MTU: %lu\n", (unsigned long)MAX_PAYLOAD_SIZE);
              WFB_INFO("WFB-ng version %s, FEC: %s\n", WFB_VERSION, zfex_opt);
              WFB_INFO("WFB-ng home page: <http://wfb-ng.org>\n");
-@@ -1841,6 +2350,17 @@ int main(int argc, char * const *argv)
+@@ -1841,6 +2378,17 @@ int main(int argc, char * const *argv)
          goto show_usage;
      }
  
@@ -1365,7 +1678,7 @@ index 0dec131..3754dd2 100644
      {
          int fd;
          int c;
-@@ -1862,11 +2382,23 @@ int main(int argc, char * const *argv)
+@@ -1862,11 +2410,28 @@ int main(int argc, char * const *argv)
          return 1;
      }
  
@@ -1378,24 +1691,29 @@ index 0dec131..3754dd2 100644
  
 +        // Startup banner.  Surfaces an AEAD-mode mismatch (RX missing -x)
 +        // as a clear log line instead of a silent "no traffic" symptom.
-+        WFB_INFO("Startup: AEAD=%s, k=%d, n=%d, fec_timeout=%d, channel_id=0x%06x\n",
++        WFB_INFO("Startup: AEAD=%s, session=%s, k=%d, n=%d, fec_timeout=%d, channel_id=0x%06x\n",
 +                 encrypt_data ? "on" : "off (DATA_PLAIN)",
++                 encrypt_session ? "encrypted" : "PLAIN (-xx, open/keyless)",
 +                 k, n, fec_timeout, channel_id);
 +        if (!encrypt_data)
 +        {
 +            WFB_INFO("Note: RX must run with -x too; DATA_PLAIN packets are silently dropped in AEAD mode.\n");
 +        }
++        if (!encrypt_session)
++        {
++            WFB_INFO("Note: -xx OPEN MODE — session announce is cleartext and unauthenticated; no keypair used. Anyone can receive or spoof this link.\n");
++        }
 +
          switch(tx_mode)
          {
          case INJECTOR:
-@@ -1880,7 +2412,17 @@ int main(int argc, char * const *argv)
+@@ -1880,7 +2445,17 @@ int main(int argc, char * const *argv)
                                  unix_socket, debug_port, k, n, keypair, fec_timeout,
                                  epoch, channel_id, fec_delay, use_qdisc, fwmark,
                                  radiotap_header, frame_type, control_port, mirror,
 -                                snd_buf, inject_retries, inject_retry_delay);
 +                                snd_buf, inject_retries, inject_retry_delay,
-+                                encrypt_data);
++                                encrypt_data, encrypt_session);
 +            }
 +            else if (shm_name != NULL)
 +            {
@@ -1404,43 +1722,49 @@ index 0dec131..3754dd2 100644
 +                               epoch, channel_id, fec_delay, use_qdisc, fwmark,
 +                               radiotap_header, frame_type, control_port, mirror,
 +                               snd_buf, inject_retries, inject_retry_delay,
-+                               encrypt_data);
++                               encrypt_data, encrypt_session);
              }
              else
              {
-@@ -1888,7 +2430,8 @@ int main(int argc, char * const *argv)
+@@ -1888,7 +2463,8 @@ int main(int argc, char * const *argv)
                                 udp_port, debug_port, k, n, keypair, fec_timeout,
                                 epoch, channel_id, fec_delay, use_qdisc, fwmark,
                                 radiotap_header, frame_type, control_port, mirror,
 -                               snd_buf, inject_retries, inject_retry_delay);
 +                               snd_buf, inject_retries, inject_retry_delay,
-+                               encrypt_data);
++                               encrypt_data, encrypt_session);
              }
              break;
  
-@@ -1899,7 +2442,7 @@ int main(int argc, char * const *argv)
+@@ -1899,7 +2475,7 @@ int main(int argc, char * const *argv)
                                        unix_socket, k, n, keypair, fec_timeout,
                                        epoch, channel_id, fec_delay, use_qdisc, fwmark,
                                        radiotap_header, frame_type, control_port, mirror,
 -                                      snd_buf);
-+                                      snd_buf, encrypt_data);
++                                      snd_buf, encrypt_data, encrypt_session);
              }
              else
              {
-@@ -1907,7 +2450,7 @@ int main(int argc, char * const *argv)
+@@ -1907,7 +2483,7 @@ int main(int argc, char * const *argv)
                                   udp_port, k, n, keypair, fec_timeout,
                                   epoch, channel_id, fec_delay, use_qdisc, fwmark,
                                   radiotap_header, frame_type, control_port, mirror,
 -                                 snd_buf);
-+                                 snd_buf, encrypt_data);
++                                 snd_buf, encrypt_data, encrypt_session);
              }
              break;
  
 diff --git a/src/tx.hpp b/src/tx.hpp
-index 39506e6..e7a2cdc 100644
+index 39506e6..b9bff4a 100644
 --- a/src/tx.hpp
 +++ b/src/tx.hpp
-@@ -77,6 +77,14 @@ public:
+@@ -72,11 +72,19 @@ typedef enum {
+ class Transmitter
+ {
+ public:
+-    Transmitter(int k, int n, const std::string &keypair, uint64_t epoch, uint32_t channel_id, uint32_t fec_delay, std::vector<tags_item_t> &tags);
++    Transmitter(int k, int n, const std::string &keypair, uint64_t epoch, uint32_t channel_id, uint32_t fec_delay, std::vector<tags_item_t> &tags, bool encrypt_session = true);
+     virtual ~Transmitter();
      bool send_packet(const uint8_t *buf, size_t size, uint8_t flags);
      void send_session_key(void);
      void init_session(int k, int n);
@@ -1455,7 +1779,7 @@ index 39506e6..e7a2cdc 100644
      void get_fec(int &k, int &n) { k = fec_k; n = fec_n; }
      virtual void select_output(int idx) = 0;
      virtual void dump_stats(uint64_t ts, uint32_t &injected_packets, uint32_t &dropped_packets, uint32_t &injected_bytes) = 0;
-@@ -99,6 +107,10 @@ private:
+@@ -99,6 +107,14 @@ private:
      uint8_t fragment_idx;
      uint8_t** block;
      size_t max_packet_size;
@@ -1463,9 +1787,44 @@ index 39506e6..e7a2cdc 100644
 +    // Poly1305 on each data fragment; false = plaintext with a
 +    // WFB_PACKET_DATA_PLAIN header (skips encrypt + 16 B tag on wire).
 +    bool     encrypt_data;
++    // Session-announce crypto (startup-only).  True = crypto_box_easy'd
++    // WFB_PACKET_SESSION (needs the keypair); false = cleartext
++    // WFB_PACKET_SESSION_PLAIN, no keypair required (open link, -xx).
++    const bool encrypt_session;
      const uint64_t epoch; // Packets from old epoch will be discarded
      const uint32_t channel_id; // (link_id << 8) + port_number
      const uint32_t fec_delay; // fec packet delay [us]
+@@ -158,7 +174,8 @@ class RawSocketTransmitter : public Transmitter
+ public:
+     RawSocketTransmitter(int k, int n, const std::string &keypair, uint64_t epoch, uint32_t channel_id, uint32_t fec_delay, std::vector<tags_item_t> &tags,
+                          const std::vector<std::string> &wlans, radiotap_header_t &radiotap_header,
+-                         uint8_t frame_type, bool use_qdisc, uint32_t fwmark_base, uint32_t inject_retries, uint32_t inject_retry_delay);
++                         uint8_t frame_type, bool use_qdisc, uint32_t fwmark_base, uint32_t inject_retries, uint32_t inject_retry_delay,
++                         bool encrypt_session = true);
+     virtual ~RawSocketTransmitter();
+ 
+     virtual void select_output(int idx)
+@@ -205,8 +222,8 @@ class UdpTransmitter : public Transmitter
+ {
+ public:
+     UdpTransmitter(int k, int n, const std::string &keypair, const std::string &client_addr, int base_port, uint64_t epoch, uint32_t channel_id,
+-                   uint32_t fec_delay, std::vector<tags_item_t> &tags, bool use_qdisc, uint32_t fwmark_base, int snd_buf_size): \
+-        Transmitter(k, n, keypair, epoch, channel_id, fec_delay, tags), radiotap_header({}), base_port(base_port), use_qdisc(use_qdisc), fwmark_base(fwmark_base)
++                   uint32_t fec_delay, std::vector<tags_item_t> &tags, bool use_qdisc, uint32_t fwmark_base, int snd_buf_size, bool encrypt_session = true): \
++        Transmitter(k, n, keypair, epoch, channel_id, fec_delay, tags, encrypt_session), radiotap_header({}), base_port(base_port), use_qdisc(use_qdisc), fwmark_base(fwmark_base)
+     {
+         sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+         if (sockfd < 0) throw std::runtime_error(string_format("Error opening socket: %s", strerror(errno)));
+@@ -311,7 +328,8 @@ class RemoteTransmitter : public Transmitter
+ public:
+     RemoteTransmitter(int k, int n, const std::string &keypair, uint64_t epoch, uint32_t channel_id, uint32_t fec_delay, std::vector<tags_item_t> &tags,
+                       const std::vector<std::pair<std::string, std::vector<uint16_t>>> &remote_hosts, radiotap_header_t &radiotap_header,
+-                      uint8_t frame_type, bool use_qdisc, uint32_t fwmark_base, int snd_buf_size);
++                      uint8_t frame_type, bool use_qdisc, uint32_t fwmark_base, int snd_buf_size,
++                      bool encrypt_session = true);
+     virtual ~RemoteTransmitter()
+     {
+         close(sockfd);
 diff --git a/src/tx_cmd.c b/src/tx_cmd.c
 index 7549e44..d963aeb 100644
 --- a/src/tx_cmd.c
@@ -1600,10 +1959,10 @@ index 5e30e52..a992d0d 100644
  
          struct
 diff --git a/src/wifibroadcast.hpp b/src/wifibroadcast.hpp
-index 7e9e001..0d746d3 100644
+index 7e9e001..2e37eba 100644
 --- a/src/wifibroadcast.hpp
 +++ b/src/wifibroadcast.hpp
-@@ -186,8 +186,18 @@ static const uint8_t ieee80211_header[] __attribute__((unused)) = {
+@@ -186,8 +186,30 @@ static const uint8_t ieee80211_header[] __attribute__((unused)) = {
  #define MAX_BLOCK_IDX ((1LLU << 55) - 1)
  
  // packet types
@@ -1621,6 +1980,18 @@ index 7e9e001..0d746d3 100644
 +                                       * with the pre-shared tx/rx keypair) so
 +                                       * fec_k, fec_n, epoch and channel_id remain
 +                                       * tamper-proof regardless of -x. */
++#define WFB_PACKET_SESSION_PLAIN 0x4  /* Session announce with NO crypto_box: the
++                                       * wsession_data_t (epoch, channel_id, fec_k,
++                                       * fec_n, unused session_key) follows
++                                       * wsession_hdr directly, in clear.  Selected
++                                       * on TX by -xx (a second -x on top of
++                                       * DATA_PLAIN) for a fully keyless, open
++                                       * link.  RX accepts it regardless of -x and
++                                       * needs no keypair.  Trade-off: fec_k/fec_n/
++                                       * epoch/channel_id are no longer
++                                       * tamper-proof — anyone can inject or spoof
++                                       * the session.  Use only where the stream is
++                                       * intentionally public (e.g. open video). */
  
  // FEC types
  #define WFB_FEC_VDM_RS  0x1  //Reed-Solomon on Vandermonde matrix

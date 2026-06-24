@@ -12,7 +12,7 @@
 #   ./build_wfb_tx.sh --deploy   # build + scp to device
 #
 # Output (all in build/):
-#   wfb_tx             - patched wfb_tx with -H (SHM), -x, -Y flags
+#   wfb_tx             - patched wfb_tx with -H (SHM), -x/-xx, -Y flags
 #                        (cross, dynamic — libsodium/libstdc++ from device rootfs)
 #   wfb_tx_cmd         - runtime control client (set_fec [-T fec_timeout_ms],
 #                        set_radio, get_fec, get_radio) (cross, dynamic)

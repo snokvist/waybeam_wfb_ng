@@ -157,11 +157,19 @@ start_wfb() {
     # wfb_tx (SHM input from venc).  -T sizes the FEC safety-net timeout
     # to the typical frame period (60 fps ≈ 16 ms); fec_controller can
     # rewrite this at runtime via CMD_SET_FEC's fec_timeout_ms field.
+    #
+    # -xx = OPEN VIDEO (default): plaintext data + cleartext, keyless session
+    # announce (WFB_PACKET_SESSION_PLAIN).  No keypair is required and the
+    # camera stream is viewable by any wfb_rx running -x — including receivers
+    # that hold no key.  -K is still passed (harmless; the ctor ignores the key
+    # in -xx mode) so the same KEY drives the encrypted uplink rx below.
+    # Drop one x (-x) for an authenticated session, or remove both for full
+    # AEAD, if a private link is ever wanted.
     $WFB_TX -K "$KEY" -M $WFB_MCS -B $WFB_BW -k $WFB_K -n $WFB_N \
            -P 1 -Q -S 1 -L 1 -C $WFB_CTRL -T 16 \
            -H "$SHM_RING" -R 2097152 -s 2097152 \
            --peek-profile "$WFB_PEEK_PROFILE" \
-           -l 1000 -i $WFB_TX_LINK -p 0 -x "$WFB_IFACE" \
+           -l 1000 -i $WFB_TX_LINK -p 0 -xx "$WFB_IFACE" \
            >> "$LOG" 2>&1 &
     echo $! > "$PID_TX"
     log "video wfb_tx up (peek-profile=$WFB_PEEK_PROFILE)"

@@ -131,10 +131,10 @@ index 0000000..65e9762
 +
 +#endif // WFB_PEEK_HPP
 diff --git a/src/rx.cpp b/src/rx.cpp
-index 136d16d..2213e27 100644
+index 629a18e..69c526c 100644
 --- a/src/rx.cpp
 +++ b/src/rx.cpp
-@@ -967,8 +967,9 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
+@@ -1010,8 +1010,9 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
      assert(decrypted_len >= sizeof(wpacket_hdr_t));
      assert(decrypted_len <= MAX_FEC_PAYLOAD);
  
@@ -146,7 +146,7 @@ index 136d16d..2213e27 100644
  
      /* set::insert returns (iterator, inserted_bool).  When inserted_bool is
       * false the same data_nonce was already in the dedup set — i.e. this
-@@ -1047,8 +1048,11 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
+@@ -1090,8 +1091,11 @@ void Aggregator::process_packet(const uint8_t *buf, size_t size, uint8_t wlan_id
          }
      }
  
@@ -160,7 +160,7 @@ index 136d16d..2213e27 100644
      {
          // send all queued packets in all unfinished blocks before current
          // and then remove that blocks
-@@ -1196,7 +1200,14 @@ void Aggregator::apply_fec(int ring_idx)
+@@ -1239,7 +1243,14 @@ void Aggregator::apply_fec(int ring_idx)
                  j++;
              }
  
@@ -177,7 +177,7 @@ index 136d16d..2213e27 100644
              max_packet_size = max(max_packet_size, rx_ring[ring_idx].fragment_map[j]);
              in_blocks[i] = rx_ring[ring_idx].fragments[j];
 diff --git a/src/tx.cpp b/src/tx.cpp
-index 2dc86ea..de99b5d 100644
+index ba59304..fc41fb4 100644
 --- a/src/tx.cpp
 +++ b/src/tx.cpp
 @@ -22,6 +22,7 @@
@@ -278,10 +278,10 @@ index 2dc86ea..de99b5d 100644
 +}
 +// --- end peek ---
 +
- Transmitter::Transmitter(int k, int n, const string &keypair, uint64_t epoch, uint32_t channel_id, uint32_t fec_delay, vector<tags_item_t> &tags) : \
+ Transmitter::Transmitter(int k, int n, const string &keypair, uint64_t epoch, uint32_t channel_id, uint32_t fec_delay, vector<tags_item_t> &tags, bool encrypt_session) : \
      fec_p(NULL), fec_k(-1), fec_n(-1),
      block_idx(0), fragment_idx(0),
-@@ -384,11 +433,13 @@ void RawSocketTransmitter::inject_packet(const uint8_t *buf, size_t size)
+@@ -404,11 +453,13 @@ void RawSocketTransmitter::inject_packet(const uint8_t *buf, size_t size)
      ieee_hdr[FRAME_SEQ_HB] = (ieee80211_seq >> 8) & 0xff;
      ieee80211_seq += 16;
  
@@ -297,7 +297,7 @@ index 2dc86ea..de99b5d 100644
              },
              // ieee80211 header
              { .iov_base = (void*)ieee_hdr,
-@@ -741,7 +792,8 @@ void Transmitter::send_block_fragment(size_t packet_size)
+@@ -762,7 +813,8 @@ void Transmitter::send_block_fragment(size_t packet_size)
      // still dedupe by (block_idx, fragment_idx) and FEC decoding keeps
      // working identically.
      block_hdr->packet_type = encrypt_data ? WFB_PACKET_DATA : WFB_PACKET_DATA_PLAIN;
@@ -307,7 +307,7 @@ index 2dc86ea..de99b5d 100644
  
      if (encrypt_data)
      {
-@@ -902,6 +954,7 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
+@@ -923,6 +975,7 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
      uint32_t count_b_injected = 0;  // successfully injected bytes (include additional fec packets)
      uint32_t count_p_dropped = 0;   // dropped due to rxq overflows or injection timeout
      uint32_t count_p_truncated = 0; // injected large packets that were truncated
@@ -315,7 +315,7 @@ index 2dc86ea..de99b5d 100644
      int start_fd_idx = 0;
  
      // --- SHM ring attach (non-fatal: retry loop handles producer lifecycle) ---
-@@ -1033,7 +1086,9 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
+@@ -1054,7 +1107,9 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
                                    count_p_dropped, count_p_truncated,
                                    count_p_fec_timeouts,
                                    fec_k_now, fec_n_now,
@@ -326,7 +326,7 @@ index 2dc86ea..de99b5d 100644
              }
  
              if(count_p_dropped)
-@@ -1046,6 +1101,11 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
+@@ -1067,6 +1122,11 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
                  WFB_ERR("%u packets truncated\n", count_p_truncated);
              }
  
@@ -338,7 +338,7 @@ index 2dc86ea..de99b5d 100644
              count_p_fec_timeouts = 0;
              count_p_incoming = 0;
              count_b_incoming = 0;
-@@ -1053,6 +1113,7 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
+@@ -1074,6 +1134,7 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
              count_b_injected = 0;
              count_p_dropped = 0;
              count_p_truncated = 0;
@@ -346,7 +346,7 @@ index 2dc86ea..de99b5d 100644
  
              log_send_ts = cur_ts + log_interval - ((cur_ts - log_send_ts) % log_interval);
          }
-@@ -1227,6 +1288,39 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
+@@ -1248,6 +1309,39 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
                  }
                  break;
  
@@ -386,7 +386,7 @@ index 2dc86ea..de99b5d 100644
                  default:
                  {
                      resp.rc = htonl(ENOTSUP);
-@@ -1346,7 +1440,8 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
+@@ -1367,7 +1461,8 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
                      session_key_announce_ts = cur_ts + SESSION_KEY_ANNOUNCE_MSEC;
                  }
  
@@ -396,7 +396,7 @@ index 2dc86ea..de99b5d 100644
  
                  if (cur_ts >= log_send_ts)
                  {
-@@ -1482,7 +1577,8 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
+@@ -1503,7 +1598,8 @@ void data_source(unique_ptr<Transmitter> &t, vector<int> &rx_fd, int control_fd,
                          session_key_announce_ts = cur_ts + SESSION_KEY_ANNOUNCE_MSEC;
                      }
  
@@ -406,7 +406,7 @@ index 2dc86ea..de99b5d 100644
  
                      if (cur_ts >= log_send_ts)  // log timeout expired
                      {
-@@ -2161,8 +2257,25 @@ int main(int argc, char * const *argv)
+@@ -2183,8 +2279,25 @@ int main(int argc, char * const *argv)
      int encrypt_data = 1;           // -x (no-AEAD flag) flips to 0
      const char *stats_udp_target = NULL;  // -Y host:port; NULL = disabled
  
@@ -433,7 +433,7 @@ index 2dc86ea..de99b5d 100644
          case 'I':
              tx_mode = INJECTOR;
              srv_port = atoi(optarg);
-@@ -2337,6 +2450,10 @@ int main(int argc, char * const *argv)
+@@ -2365,6 +2478,10 @@ int main(int argc, char * const *argv)
              WFB_INFO("\nAEAD option:\n"
                       "  -x   disable per-fragment AEAD (emit WFB_PACKET_DATA_PLAIN; session still signed).\n"
                       "       RX must run with -x too or DATA_PLAIN packets are dropped.\n");
@@ -445,7 +445,7 @@ index 2dc86ea..de99b5d 100644
                       keypair.c_str(), k, n, fec_delay, udp_port, link_id, radio_port, epoch, bandwidth, short_gi ? "short" : "long", stbc, ldpc, mcs_index, vht_nss, vht_mode, fec_timeout, log_interval, fwmark, control_port, inject_retries, inject_retry_delay, encrypt_data ? "on" : "off");
              WFB_INFO("Radio MTU: %lu\n", (unsigned long)MAX_PAYLOAD_SIZE);
 diff --git a/src/tx.hpp b/src/tx.hpp
-index e7a2cdc..7f3af5c 100644
+index 704503d..a0afa48 100644
 --- a/src/tx.hpp
 +++ b/src/tx.hpp
 @@ -90,6 +90,13 @@ public:
