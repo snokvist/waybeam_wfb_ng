@@ -14,18 +14,26 @@
 #   - Should be quick (link_controller waits on it synchronously).
 #   - Exit 0 on success (surfaced as /status recovery.last_rc).
 #
-# Wire it to whatever your firmware uses to boot into AP-FPV next time, e.g.:
+# Wire it to whatever your firmware uses to boot into AP-FPV next time.
 #
-#   fw_setenv boot_mode apfpv   # OpenIPC u-boot env flag read by the init layer
-#   sync
+# VERIFIED on OpenIPC ssc338q (Infinity6E, waybeam image): the boot mode is the
+# u-boot env var `wfbmode`. wfbmode=1 -> S99wfb starts wfb broadcast; wfbmode!=1
+# -> APFPV: S99wfb skips wfb, S95waybeam switches venc to udp:// output, and the
+# box comes up as the `waybeam-03` AP (wlanmode=ap). So arming APFPV is just:
 #
-# The default below just drops a marker so the path is testable on a stock image.
+#   fw_setenv wfbmode 0 && sync
+#
+# Device-confirmed: recovery channel -> this hook -> reboot -> wlan0 type AP
+# (ssid waybeam-03), venc outgoing.server=udp://127.0.0.1:5600, wfb absent.
+#
+# The active line below is the real action; swap it for a marker if you only
+# want to smoke-test the recovery path on a bench image.
 
-set -e
-MARKER="/tmp/recovery-apfpv-armed"
-echo "armed at $(date 2>/dev/null || echo unknown)" > "$MARKER"
-
-# --- replace the line below with the real firmware boot-mode switch ---
-# fw_setenv boot_mode apfpv && sync
-
+logger -t recovery "arming APFPV-next-boot (fw_setenv wfbmode 0)" 2>/dev/null
+fw_setenv wfbmode 0
+sync
 exit 0
+
+# --- smoke-test alternative (no real boot-mode change) ---
+# echo "armed at $(date 2>/dev/null || echo unknown)" > /tmp/recovery-apfpv-armed
+# exit 0
