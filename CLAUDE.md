@@ -22,6 +22,12 @@ mcs_selector) is the historical predecessor.  It's no longer deployed.
 - **Control path**:
   - vehicle: venc sidecar (UDP) → link_controller → wfb_tx CMD_SET_FEC + venc HTTP
   - ground: gs_supervisor → uplink wfb_tx (WCMD on udp_in_port) → vehicle link_controller
+  - **recovery backdoor**: a SEPARATE keyless/open (`-xx`) ground→vehicle link
+    (default id 209). gs_supervisor `GET /api/v1/recovery` → recovery wfb_tx →
+    vehicle keyless wfb_rx → link_controller `recovery_dispatch()` (single-key
+    whitelist, arm/cooldown gated) → fork+exec `recovery.apfpv_cmd`. Works even
+    when the keyed uplink/`drone.key` is dead; arms boot-into-APFPV next reboot
+    only. See `docs/protocols/recovery-backdoor.md`.
 - **CSA**: ground arms, sends 5 csa_commit JSON frames @ 20 ms cadence
   → vehicle csa_feed schedules iw set channel → both sides hop in lockstep
 - **Stateless FEC sizing**: k from EWMA × bounded headroom; the peek

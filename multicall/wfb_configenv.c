@@ -184,6 +184,15 @@ int wfb_configenv_main(int argc, char **argv, int role)
 	emit_int("WFB_PROBE_CTRL",     ce_int(js, toks, ntok, "ports", "probe_ctrl", 8001));
 	emit_int("WFB_PROBE_FEED",     ce_int(js, toks, ntok, "ports", "probe_feed", 5750));
 
+	/* Recovery backdoor (AIR-only). Separate keyless/open -xx link so a lost or
+	 * mismatched drone.key still leaves a way to arm APFPV-next-boot. enabled
+	 * defaults ON; the hook command is fork+exec'd by link_controller. */
+	emit_b01("WFB_RECOVERY",      ce_bool01(js, toks, ntok, "recovery", "enabled", 1));
+	emit_int("WFB_RECOVERY_LINK", ce_int(js, toks, ntok, "links", "recovery", 209));
+	emit_int("WFB_RECOVERY_PORT", ce_int(js, toks, ntok, "ports", "recovery", 5802));
+	ce_str(js, toks, ntok, "recovery", "apfpv_cmd", "/etc/wfb/recovery-apfpv.sh", s, sizeof(s));
+	emit_str("WFB_RECOVERY_CMD", s);
+
 	free(buf);
 	return 0;
 }

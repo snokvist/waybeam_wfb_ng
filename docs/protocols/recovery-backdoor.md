@@ -1,0 +1,102 @@
+# Recovery Backdoor (open/keyless APFPV channel)
+
+A separate, **always-listening, unauthenticated** ground→vehicle command
+channel whose sole purpose is to let a field operator recover a vehicle that
+has become **uncommandable over the normal keyed uplink** — typically a
+lost/mismatched `drone.key`, but also any keyed-uplink breakage. It can trigger
+exactly **one** safe, deferred action: **arm boot-into-APFPV on the next
+reboot**.
+
+It is the mirror image of the `-xx` open *video downlink*: where that is a
+keyless vehicle→ground TX that any `-x` RX can view, this is a keyless
+ground→vehicle TX (`-xx`) decoded by a keyless (`-x`) vehicle RX.
+
+```
+ GS:      wfb_tx  -xx   link 209 port 0   ← gs_supervisor GET /api/v1/recovery
+ Vehicle: wfb_rx  -x  (no -K)  link 209   → link_controller :5802 → recovery_dispatch()
+                                            → fork+exec recovery.apfpv_cmd
+
+ EXISTING (unchanged): keyed uplink link 208 (WCMD) · video 207 (-xx) · probe 50
+```
+
+## Why this is safe despite being unauthenticated
+
+`-xx` carries no key and no session crypto, so anyone within RF range can
+transmit recovery frames. The blast radius is contained **by construction**, not
+by a secret:
+
+1. **Separate listener + separate dispatcher.** Recovery frames arrive on their
+   own `wfb_rx` → their own `link_controller` UDP port → `recovery_dispatch()`,
+   which is *not* `wcmd_dispatch()`. The open path never calls the operator
+   command code, so it can never reach MCS / channel / CSA / txpower / FEC /
+   venc-HTTP — those all live in `wcmd_dispatch()`.
+2. **Single-key whitelist.** `recovery_dispatch()` accepts only
+   `WCMD_KEY_RECOVERY_APFPV` (64) and rejects everything else.
+3. **Mutual key-space exclusion (defense in depth).** Key 64 is numbered above
+   the keyed path's `WCMD_NUM_KEYS` (19), so a recovery frame that somehow hit
+   the keyed rx_ant listener is rejected as `UNKNOWN_KEY`, and an operator key
+   sent on the recovery listener is rejected by the whitelist. The two command
+   spaces cannot cross-trigger.
+4. **N-frame arming + seq-dedup + cooldown.** The vehicle requires
+   `recovery.arm_count` (default 3) frames carrying the same `seq` within
+   `recovery.arm_window_ms` (default 2000) before running the hook, then
+   `recovery.cooldown_ms` (default 10000) gates re-execution. A lone stray
+   decode can't trip it; a held button / hostile flood can't re-fire it. The GS
+   emits a heavy `WCMD_RECOVERY_BURST_FRAMES` (8) burst (one `seq`) to ride out
+   loss on the open, ARQ-less link.
+5. **Deferred + idempotent action only.** Worst case an attacker forces a
+   *next-reboot* mode change — no immediate effect, no reboot-loop DoS.
+
+## Wire format
+
+Reuses the 16-byte `WcmdReq` from `shared/wcmd_proto.h` verbatim, with
+`key = WCMD_KEY_RECOVERY_APFPV` (64) and `value` ignored. `recovery_dispatch()`
+fills a best-effort `WcmdResp` back to the peer for local observability; like
+WCMD the GS does not bind the return path.
+
+## The APFPV action (the `apfpv_cmd` hook)
+
+`link_controller` does **not** know how the firmware selects APFPV at boot —
+that lives in the OpenIPC/builder init layer. On arming it simply
+`fork+exec`s `/bin/sh -c "<recovery.apfpv_cmd>"` (admin-configured, *not*
+attacker-controlled). The hook is firmware-provided and wires to the real
+boot-mode switch (e.g. `fw_setenv`). A reference stub ships at
+`vehicle/scripts/recovery-apfpv.sh.example`. Keep `apfpv_cmd` a single token
+(a script path); put any multi-step logic inside the script.
+
+## Configuration
+
+Vehicle (`/etc/wfb-link.json`, rendered to env by `config-env`):
+
+```json
+"links":    { "recovery": 209 },
+"ports":    { "recovery": 5802 },
+"recovery": { "enabled": true, "apfpv_cmd": "/etc/wfb/recovery-apfpv.sh" }
+```
+
+→ `WFB_RECOVERY`, `WFB_RECOVERY_LINK`, `WFB_RECOVERY_PORT`, `WFB_RECOVERY_CMD`,
+consumed by `S99wfb`, which spawns the keyless recovery `wfb_rx` and passes
+`--recovery-port` / `--recovery-cmd` (or `--no-recovery`) to `link_controller`.
+`--recovery-arm-count` tunes the arming threshold; window/cooldown default in
+`config_defaults()`.
+
+Ground (`gs_supervisor.json`): a `tx` tunnel named `recovery` (link 209,
+`extra_args: ["-xx"]`, robust low MCS) plus
+`"recovery_cmd": { "enabled": true, "tunnel": "recovery" }`.
+
+Enabled by default on both ends (field-recoverable out of the box); set
+`recovery.enabled=false` (vehicle) or `recovery_cmd.enabled=false` (ground) on
+hardened deployments to remove the open attack surface.
+
+## Observability
+
+- Vehicle `link_controller /status` → `"recovery": {recv, rejected, armed,
+  executed, last_rc}`. `executed>0` means the hook ran; `last_rc` is its exit.
+- Ground `gs_supervisor /api/v1/status` → `"recovery": {emit_total, emit_failed,
+  burst_frames}`.
+
+## Operator flow
+
+GS WebUI → Vehicle Control → **recovery: arm boot-APFPV** (behind a `confirm()`
+dialog) → `GET /api/v1/recovery`. After the vehicle reboots it comes up in
+AP-FPV, reachable directly even though the wfb link/key was broken.

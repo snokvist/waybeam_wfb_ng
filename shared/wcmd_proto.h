@@ -150,6 +150,26 @@
  */
 #define WCMD_KEY_LOG_CONTROL    19   /* value: 1=start/roll new SD log, 0=stop */
 
+/*
+ * RECOVERY BACKDOOR key — NOT an operator command and NOT carried on the keyed
+ * uplink.  This key travels ONLY on the separate keyless/open (-xx) recovery
+ * link (its own link_id + its own link_controller UDP listener) and is handled
+ * by a dedicated recovery_dispatch() that accepts this key and nothing else.
+ *
+ * It is deliberately numbered ABOVE WCMD_NUM_KEYS (the keyed-path bound, 19) so
+ * the two command spaces are mutually exclusive by construction:
+ *   - a recovery frame that somehow reached the keyed rx_ant listener is
+ *     rejected by wcmd_dispatch() as UNKNOWN_KEY (key > WCMD_NUM_KEYS), and
+ *   - an operator key sent on the open recovery listener is rejected by the
+ *     recovery whitelist.
+ * Because this channel is UNAUTHENTICATED (-xx: no key, no session crypto), it
+ * may only trigger a SAFE, DEFERRED action — arm boot-into-APFPV on the NEXT
+ * reboot (vehicle-side `recovery.apfpv_cmd` hook).  value is ignored.
+ *
+ * Never add this to cmd.allow_keys_mask; never dispatch it from wcmd_dispatch.
+ */
+#define WCMD_KEY_RECOVERY_APFPV 64   /* open recovery channel: arm boot-APFPV next reboot */
+
 /* Status codes returned in CMD_RESP */
 #define WCMD_STATUS_OK           0
 #define WCMD_STATUS_DISABLED     1   /* cmd subsystem off (cmd.enabled=false) */
