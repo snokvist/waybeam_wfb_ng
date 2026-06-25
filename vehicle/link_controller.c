@@ -5513,7 +5513,9 @@ static void config_defaults(Config *c)
 	c->mcs.enabled = true;
 	strcpy(c->mcs.stats_host, "127.0.0.1"); c->mcs.stats_port = 5801;
 	c->mcs.rssi_ewma_alpha = 0.3f;
-	c->mcs.loss_ewma_alpha = 0.5f;
+	c->mcs.loss_ewma_alpha = 0.3f;   /* slower loss EWMA: a single bad sample
+	                                  * no longer trips the reactive demote;
+	                                  * the spike must persist a few samples */
 	c->mcs.rssi_aggregator = AGG_BEST_AVG;
 	c->mcs.down_cooldown_s  = 0.2f;
 	c->mcs.failsafe_timeout_s   = 0.5f;
@@ -5535,7 +5537,9 @@ static void config_defaults(Config *c)
 	 * approaching cliff reads 500-1000‰ within a window, so 200 keeps
 	 * the early-warning intact while reading "marginal" as hold. */
 	c->mcs.probe_fail_milli  = 200;   /* >=20% -> +2 fail  -> pre-empt demote*/
-	c->mcs.demote_per_milli  = 30;    /* >=3% live video PER -> reactive down*/
+	c->mcs.demote_per_milli  = 80;    /* >=8% live video PER -> reactive down
+	                                   * (was 3% — too eager; the V+2 probe is
+	                                   * the primary law, this is the backstop) */
 	c->mcs.promote_dwell_s   = 0.5f;
 	c->mcs.probe_window_s    = 0.5f;
 	c->mcs.probe_stale_age_s = 1.0f; /* matches ~10 Hz single-stream freshness
