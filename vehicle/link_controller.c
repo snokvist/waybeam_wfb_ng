@@ -755,7 +755,7 @@ typedef struct { int k; float r; } RedundancyPoint;
 static const RedundancyPoint REDUNDANCY_CURVE[] = {
 	/* k=4 (the MCS0 floor, ~4-packet frames) trimmed 0.40->0.33 so the block
 	 * is 4/6 (≈5/7, 2 parity pkts) instead of 4/7 (3 parity) — less overhead
-	 * at the bottom rung, paired with the raised bitrate_min floor. */
+	 * at the bottom rung, paired with the bitrate_min floor. */
 	{  1, 0.50f }, {  4, 0.33f }, {  8, 0.33f },
 	{ 16, 0.30f }, { 32, 0.27f }, { 48, 0.25f },
 };
@@ -1188,8 +1188,8 @@ static float phy_mbps(int mcs, int bw_mhz, int short_gi,
  *
  * MCS 0/1/2 are pps-limited but the bitrate they'll sustain (≤ ~7 Mbps
  * post-FEC at 50 % safety) lands them in the 1000/1000/1200 tiers, well
- * under their pps cliffs. (MCS0 is held at the 2800 kbps bitrate_min floor,
- * so it uses the <4000→1000 B tier ≈ 350 pps, not the 800 B tier.) MCS 3+
+ * under their pps cliffs. (MCS0 is held at the 2200 kbps bitrate_min floor,
+ * so it uses the <4000→1000 B tier ≈ 275 pps, not the 800 B tier.) MCS 3+
  * sustains ≥ 1100 pps so the high tiers are also safe. */
 typedef struct {
 	long bitrate_lt_kbps;  /* tier matches when bitrate < this (last entry: LONG_MAX) */
@@ -5405,6 +5405,9 @@ static void usage(const char *prog)
 		"  --sidecar HOST:PORT      venc sidecar (default 127.0.0.1:5602)\n"
 		"  --venc HOST:PORT         venc HTTP API (default 127.0.0.1:80)\n"
 		"  --safe-startup-bitrate N override safe-startup bitrate kbps (default 1500)\n"
+		"  --bitrate-min N          adaptive bitrate floor kbps [100,200000] (default 2200).\n"
+		"                           Bites only at MCS0 (its honest budget). Also live via\n"
+		"                           /set fec.bitrate_min_kbps.\n"
 		"  --max-payload N          adaptive RTP payload ceiling bytes: 0=off (default),\n"
 		"                           else [576,4000]. Drives venc outgoing.maxPayloadSize\n"
 		"                           by bitrate tier. Also live via /set fec.payload_max.\n"
@@ -5572,10 +5575,15 @@ static void config_defaults(Config *c)
 	/* Bitrate floor. Bites only where the safe budget (phy*k/n*margin) is
 	 * below it — i.e. only MCS0; MCS1+ compute well above this and keep
 	 * margin 0.5 (MCS1's safe budget is >=4333 kbps for every reachable k/n).
-	 * Set to 2800 so MCS0 runs an aggressive ~65% airtime (2800*(6/4)=4200
-	 * kbps on-air of the 6500 kbps MCS0 channel) instead of the 50%-margin
-	 * 2167 (=6500*0.5*4/6 for the current 4/6 block). */
-	c->fec.bitrate_min_kbps = 2800;
+	 * Set to 2200 so MCS0 settles at its honest ~50% margin budget (the 4/6
+	 * block computes 2167 = 6500*0.5*4/6; 2200 keeps a guaranteed-watchable
+	 * minimum without forcing the channel hot). Measured ~52% on-air airtime
+	 * at MCS0 vs ~65% at the old 2800 floor — the extra headroom removes the
+	 * fps fluctuation that the over-budget 2800 caused on the bottom rung.
+	 * The airtime guard (airtime_max_pct, default 80) stays as an orthogonal
+	 * physical backstop. Persistable via wfb-link.json fec.bitrate_min_kbps
+	 * (→ --bitrate-min); also live via /set fec.bitrate_min_kbps. */
+	c->fec.bitrate_min_kbps = 2200;
 	c->fec.bitrate_max_kbps = 0;
 	c->fec.bitrate_tolerance = 0.15f;
 	c->fec.bitrate_grace_s = 2.0f;
@@ -5781,6 +5789,7 @@ int main(int argc, char **argv)
 		OPT_WFB = 256, OPT_API_PORT, OPT_DRY_RUN,
 		/* fec */
 		OPT_NO_FEC, OPT_SIDECAR, OPT_VENC, OPT_SAFE_STARTUP_BITRATE,
+		OPT_BITRATE_MIN,
 		OPT_MAX_PAYLOAD, OPT_PAYLOAD_MIN,
 		OPT_AIRTIME_MAX_PCT, OPT_AIRTIME_PREAMBLE_US,
 		/* mcs */
@@ -5806,6 +5815,7 @@ int main(int argc, char **argv)
 		{"sidecar",        required_argument, 0, OPT_SIDECAR},
 		{"venc",           required_argument, 0, OPT_VENC},
 		{"safe-startup-bitrate", required_argument, 0, OPT_SAFE_STARTUP_BITRATE},
+		{"bitrate-min",    required_argument, 0, OPT_BITRATE_MIN},
 		{"max-payload",    required_argument, 0, OPT_MAX_PAYLOAD},
 		{"payload-min",    required_argument, 0, OPT_PAYLOAD_MIN},
 		{"airtime-max-pct",     required_argument, 0, OPT_AIRTIME_MAX_PCT},
@@ -5894,6 +5904,16 @@ int main(int argc, char **argv)
 				return 1;
 			}
 			cfg.fec.safe_startup_bitrate_kbps = v;
+			break;
+		}
+		case OPT_BITRATE_MIN: {
+			long v = atol(optarg);
+			if (v < 100 || v > 200000) {
+				fprintf(stderr,
+				    "invalid --bitrate-min %ld: must be in [100, 200000] kbps\n", v);
+				return 1;
+			}
+			cfg.fec.bitrate_min_kbps = v;
 			break;
 		}
 		case OPT_MAX_PAYLOAD: {

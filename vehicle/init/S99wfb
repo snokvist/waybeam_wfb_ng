@@ -29,7 +29,7 @@ fi
 #   radio:    WFB_CHANNEL WFB_HTMODE WFB_BW WFB_TXPOWER WFB_IFACE
 #   key:      KEY WFB_KEY_SEED WFB_VIDEO_OPEN
 #   links:    WFB_TX_LINK WFB_RX_LINK WFB_PROBE_LINK WFB_PROBE_PORT
-#   fec/mcs:  WFB_K WFB_N WFB_MCS WFB_MCS_MIN WFB_MCS_MAX
+#   fec/mcs:  WFB_K WFB_N WFB_MCS WFB_MCS_MIN WFB_MCS_MAX WFB_BITRATE_MIN
 #   policy:   WFB_PROBE WFB_PEEK_PROFILE WFB_LOG
 #   venc:     SHM_RING WFB_VENC_AUTOWIRE WFB_VENC_HOST SAFE_BITRATE
 #   failsafe: WFB_FAILSAFE_S   (link_controller uplink-loss watchdog, seconds)
@@ -88,6 +88,7 @@ else
     : "${WFB_K:=8}"  "${WFB_N:=12}"  "${WFB_MCS:=2}"  "${WFB_MCS_MIN:=1}"  "${WFB_MCS_MAX:=7}"
     : "${WFB_PAYLOAD_MAX:=0}"  "${WFB_PAYLOAD_MIN:=576}"
     : "${WFB_AIRTIME_MAX_PCT:=80}"  "${WFB_AIRTIME_PREAMBLE_US:=40}"
+    : "${WFB_BITRATE_MIN:=2200}"
     : "${WFB_PROBE:=1}"  "${WFB_PEEK_PROFILE:=close}"  "${WFB_LOG:=1}"  "${WFB_VIDEO_OPEN:=1}"
     : "${SHM_RING:=local_shm}"  "${WFB_VENC_AUTOWIRE:=1}"  "${WFB_VENC_HOST:=127.0.0.1:80}"
     : "${SAFE_BITRATE:=4096}"  "${WFB_FAILSAFE_S:=2.0}"
@@ -308,6 +309,22 @@ start_wfb() {
                 log "WFB_AIRTIME_MAX_PCT=$WFB_AIRTIME_MAX_PCT out of [0,100]; using daemon default"
             fi ;;
     esac
+
+    # Bitrate floor (MCS0 setpoint). Validate the config->CLI boundary: a clean
+    # [100,200000] integer is passed, anything else is dropped so the daemon
+    # falls back to its safe compiled default (2200) rather than exit-1 bricking
+    # the boot.
+    BITRATE_MIN_ARGS=""
+    case "$WFB_BITRATE_MIN" in
+        ''|*[!0-9]*)
+            log "WFB_BITRATE_MIN='$WFB_BITRATE_MIN' not numeric; using daemon default 2200" ;;
+        *)
+            if [ "$WFB_BITRATE_MIN" -ge 100 ] && [ "$WFB_BITRATE_MIN" -le 200000 ]; then
+                BITRATE_MIN_ARGS="--bitrate-min $WFB_BITRATE_MIN"
+            else
+                log "WFB_BITRATE_MIN=$WFB_BITRATE_MIN out of [100,200000]; using daemon default 2200"
+            fi ;;
+    esac
     $LINK_CONTROLLER \
         --wfb 127.0.0.1:$WFB_CTRL \
         --venc "$WFB_VENC_HOST" \
@@ -317,7 +334,7 @@ start_wfb() {
         --failsafe $WFB_FAILSAFE_S \
         --wfb-iface "$WFB_IFACE" \
         --key-file "$KEY" \
-        $PROBE_ARGS $LOG_ARGS $RECOVERY_ARGS $PAYLOAD_ARGS $AIRTIME_ARGS \
+        $PROBE_ARGS $LOG_ARGS $RECOVERY_ARGS $PAYLOAD_ARGS $AIRTIME_ARGS $BITRATE_MIN_ARGS \
         >> "$LOG" 2>&1 &
     echo $! > "$PID_LC"
 
