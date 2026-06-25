@@ -284,6 +284,47 @@ int main(void)
 		      "payload_max=500 -> clamped up to the 576 venc API floor");
 	}
 
+	/* ── airtime guard: per-MCS pps/airslot bitrate ceiling ──
+	 * airtime_safe_bitrate_kbps() caps the bitrate so on-air airtime
+	 * (coded data + per-packet preamble) stays under airtime_max_pct of the
+	 * channel at the given phy. Binding at low MCS (airtime-limited), non-
+	 * binding at high MCS (host-pps governs via the static table). */
+	{
+		printf("[airtime — per-MCS pps/airslot bitrate guard]\n");
+
+		/* disabled: max_pct<=0 -> no cap */
+		CHECK(airtime_safe_bitrate_kbps(6.5f, 1000, 6, 9, 0, 40) < 0,
+		      "airtime_max_pct=0 -> guard off (-1)");
+
+		/* degenerate inputs -> no cap */
+		CHECK(airtime_safe_bitrate_kbps(0.0f, 1000, 6, 9, 80, 40) < 0,
+		      "phy<=0 -> -1 (no cap)");
+
+		/* MCS0 (6.5 Mbps HT20) @80%: cap ~3.4 Mbps — above the 2800 floor,
+		 * so non-binding in normal operation but close (low rung is tight) */
+		long c0 = airtime_safe_bitrate_kbps(6.5f, 1000, 6, 9, 80, 40);
+		CHECK(c0 > 2800 && c0 < 4500,
+		      "MCS0 6.5Mbps @80% -> ~3.4 Mbps cap (just above the 2800 floor)");
+
+		/* tightening to 50% drops the cap below the 2800 floor (would clamp) */
+		long c0b = airtime_safe_bitrate_kbps(6.5f, 1000, 6, 9, 50, 40);
+		CHECK(c0b > 0 && c0b < c0 && c0b < 2800,
+		      "MCS0 @50% -> tighter cap, below the floor (engages)");
+
+		/* MCS7 (65 Mbps): cap is tens of Mbps -> airtime never binds up top */
+		CHECK(airtime_safe_bitrate_kbps(65.0f, 2800, 35, 48, 80, 40) > 25000,
+		      "MCS7 65Mbps @80% -> >25 Mbps cap (host-pps governs, not airtime)");
+
+		/* monotonic in phy: a higher rung lifts the cap */
+		CHECK(airtime_safe_bitrate_kbps(13.0f, 1000, 6, 9, 80, 40) > c0,
+		      "higher phy raises the airtime cap");
+
+		/* heavier FEC parity (n/k up) lowers the cap at fixed phy */
+		CHECK(airtime_safe_bitrate_kbps(6.5f, 1000, 4, 12, 80, 40) <
+		      airtime_safe_bitrate_kbps(6.5f, 1000, 8, 12, 80, 40),
+		      "more parity (lower k/n) tightens the airtime cap");
+	}
+
 	printf(g_fail ? "\nFAILED (%d failures)\n" : "\nPASSED (0 failures)\n", g_fail);
 	return g_fail ? 1 : 0;
 }

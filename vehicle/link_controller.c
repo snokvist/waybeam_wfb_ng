@@ -308,6 +308,17 @@ typedef struct {
 		int      payload_max;        /* 0 = feature off (no setter today) */
 		int      payload_min;        /* clamped against the venc API floor (576) */
 
+		/* Airtime guard — cap the target bitrate so total on-air airtime
+		 * (FEC-coded data bits + per-packet PHY preamble) stays under
+		 * airtime_max_pct of the channel at the live phy_mbps. This is the
+		 * binding ceiling at LOW MCS (where airtime, not host pps, is the
+		 * wall: a ~1 ms/pkt MCS0 frame caps the radio near ~750 pps, so the
+		 * static ~1100-pps table is the wrong limit there) and is
+		 * non-binding at high MCS by construction. 0 = off. preamble_us is
+		 * the fixed per-packet PHY preamble (~36-40 us, HT-mixed 1SS). */
+		int      airtime_max_pct;
+		int      airtime_preamble_us;
+
 		/* Safe-startup: write a known-safe (bitrate, payload) pair to
 		 * venc once at controller start, before the main loop runs.
 		 * Bridges the gap between previous-controller's last-written
@@ -1233,6 +1244,47 @@ static long payload_safe_bitrate_kbps(int payload_bytes)
 	return best;
 }
 
+/* Airtime-aware bitrate ceiling — the per-MCS pps / "airslot" guard.
+ *
+ * payload_safe_bitrate_kbps() above bounds the *host* packet rate against a
+ * roughly flat ~1100-pps table. That is the right limit at HIGH MCS, where a
+ * packet costs almost no airtime and the SoC softirq / TX ring is the wall
+ * (verified: MCS7 + 800 B + 21 Mbps -> ~3300 pps -> kernel watchdog reboot).
+ * At LOW MCS it is the WRONG limit: the binding ceiling is channel airtime,
+ * not packet count. A ~1050 B frame at MCS0 (6.5 Mbps PHY, HT20) occupies
+ * ~1.3 ms on air, so the radio tops out near ~750 pps — 3300 pps is
+ * physically impossible there. This caps the target bitrate so the *total*
+ * on-air airtime stays under airtime_max_pct of the channel, derived from the
+ * live phy_mbps the MCS selector already tracks:
+ *
+ *   airtime = bitrate_bps * (n/k) * [ 1/phy_bps + T_pre/(8*payload) ]
+ *             \____ coded data airtime ____/   \__ per-packet preamble __/
+ *
+ * Solving airtime = A for bitrate gives the cap. Returns kbps, or -1 when the
+ * guard is off (airtime_max_pct <= 0) or inputs are degenerate. Non-binding
+ * at high MCS by design (the cap there is tens of Mbps, so the static table /
+ * host-pps limit governs the top rungs and airtime governs the low ones).
+ * payload <= 0 (sizing off) assumes a typical 1400 B frame for the preamble
+ * term; the dominant data term needs no payload. */
+static long airtime_safe_bitrate_kbps(float phy_mbps, int payload,
+                                      int k, int n,
+                                      int airtime_max_pct, int preamble_us)
+{
+	if (airtime_max_pct <= 0) return -1;          /* guard disabled        */
+	if (phy_mbps <= 0.0f || k <= 0 || n <= 0) return -1;
+	if (payload < 1) payload = 1400;              /* sizing off: assume     */
+
+	double A       = (double)airtime_max_pct / 100.0;
+	double r       = (double)n / (double)k;       /* on-air / data packets  */
+	double phy_bps = (double)phy_mbps * 1e6;
+	double t_pre   = (double)preamble_us * 1e-6;  /* seconds                */
+	/* airtime seconds consumed per bit/s of target bitrate (× r for FEC) */
+	double cost    = r * (1.0 / phy_bps + t_pre / (8.0 * (double)payload));
+	if (cost <= 0.0) return -1;
+	long kbps = (long)((A / cost) / 1000.0);
+	return kbps > 0 ? kbps : 1;
+}
+
 /* Apply a fresh radio observation: update RadioState, detect external
  * changes vs the previous snapshot, log them, and arm the fec settle
  * window (mcs_settle_s) on any change. */
@@ -1418,6 +1470,27 @@ static void bitrate_assert(const RadioState *radio, Controller *ctrl,
 		}
 	}
 
+	/* Airtime guard (per-MCS pps / airslot ceiling). Generalises the static
+	 * pps cap above: caps target so on-air airtime stays under
+	 * fec.airtime_max_pct of the channel at the live phy. Applies whether or
+	 * not payload sizing is on (coded-data airtime dominates and needs no
+	 * payload); uses the selected payload for the preamble term when known.
+	 * Non-binding at every rung's normal operating point (the cap sits well
+	 * above target there) — it only bites when a low-MCS / small-payload /
+	 * heavy-parity combination would otherwise saturate the air. Airtime is a
+	 * hard physical limit, so unlike bitrate_min this clamp is honoured even
+	 * below the floor (a throttled-but-flowing link beats a wedged one). */
+	long airtime_cap_kbps = -1;
+	if (cfg->fec.airtime_max_pct > 0) {
+		long ac = airtime_safe_bitrate_kbps(radio->phy_mbps, target_payload,
+		            ctrl->current.k, ctrl->current.n,
+		            cfg->fec.airtime_max_pct, cfg->fec.airtime_preamble_us);
+		if (ac > 0 && target > ac) {
+			airtime_cap_kbps = ac;
+			target = ac;
+		}
+	}
+
 	long ref = (*last_written_kbps > 0) ? *last_written_kbps : 0;
 	long dev = ref - target;
 	long adev = dev < 0 ? -dev : dev;
@@ -1442,11 +1515,11 @@ static void bitrate_assert(const RadioState *radio, Controller *ctrl,
 		bitrate_changed = false;
 	}
 
-	LOGV_FEC(cfg, "bitrate: target=%ld last_written=%ld safe=%ld min=%ld max=%ld (phy=%.1f k/n=%d/%d) payload=%d clipped=%d pps_cap=%ld",
+	LOGV_FEC(cfg, "bitrate: target=%ld last_written=%ld safe=%ld min=%ld max=%ld (phy=%.1f k/n=%d/%d) payload=%d clipped=%d pps_cap=%ld airtime_cap=%ld",
 	     target, *last_written_kbps, safe_kbps,
 	     cfg->fec.bitrate_min_kbps, cfg->fec.bitrate_max_kbps,
 	     radio->phy_mbps, ctrl->current.k, ctrl->current.n,
-	     target_payload, table_clipped ? 1 : 0, pps_cap_kbps);
+	     target_payload, table_clipped ? 1 : 0, pps_cap_kbps, airtime_cap_kbps);
 
 	if (bitrate_changed) {
 		const char *dir = (*last_written_kbps < 0)
@@ -3758,6 +3831,8 @@ static const TunableDesc TUNABLES[] = {
 	 * table itself is hard-coded (operator-empirical). */
 	{"fec.payload_max",             SUB_FEC, TF_INT,   OFF_FEC(payload_max),             0, 4000, "adaptive payload ceiling (bytes); 0=off, else clamped to [576,4000]", 1},
 	{"fec.payload_min",             SUB_FEC, TF_INT,   OFF_FEC(payload_min),             576, 4000, "adaptive payload floor (bytes); venc API floor is 576", 1},
+	{"fec.airtime_max_pct",         SUB_FEC, TF_INT,   OFF_FEC(airtime_max_pct),         0, 100,    "cap on-air airtime to this % of channel (0=off); per-MCS pps/airslot guard", 1},
+	{"fec.airtime_preamble_us",     SUB_FEC, TF_INT,   OFF_FEC(airtime_preamble_us),     0, 200,    "per-packet PHY preamble (us) used in the airtime estimate", 0},
 	{"fec.skip_on_backpressure",    SUB_FEC, TF_BOOL,  OFF_FEC(skip_on_backpressure),    0, 0,      "suppress FEC update for one tick when sidecar reports producer backpressure"},
 	{"fec.backpressure_fill_pct",   SUB_FEC, TF_INT,   OFF_FEC(backpressure_fill_pct),   0, 100,    "skip-FEC threshold (output queue fill %)"},
 	{"fec.desync_probe",            SUB_FEC, TF_BOOL,  OFF_FEC(desync_probe),            0, 0,      "diagnostic: per-frame trace of sidecar frame size vs committed k vs grace + peek coalescing factor"},
@@ -4195,6 +4270,29 @@ static int append_fec_json(char *buf, size_t cap, size_t pos,
 		if (sb > 0) pps_cap = sb;
 	}
 
+	/* Airtime estimate + guard (see airtime_safe_bitrate_kbps). est_pct is
+	 * the on-air channel occupancy the current (bitrate, payload, k/n, phy)
+	 * operating point implies; cap_kbps is the bitrate ceiling that keeps it
+	 * under fec.airtime_max_pct. Both -1 when not computable / guard off. */
+	int  airtime_est_pct = -1;
+	long airtime_cap     = -1;
+	if (s->cfg->fec.airtime_max_pct > 0 && s->radio->valid &&
+	    s->ctrl->have_current && s->ctrl->current.k > 0 &&
+	    s->ctrl->current.n > 0 && br_for_sel > 0) {
+		int    pp      = sel_payload > 0 ? sel_payload : 1400;
+		double r       = (double)s->ctrl->current.n / (double)s->ctrl->current.k;
+		double phy_bps = (double)s->radio->phy_mbps * 1e6;
+		double t_pre   = (double)s->cfg->fec.airtime_preamble_us * 1e-6;
+		double frac    = (double)br_for_sel * 1000.0 * r *
+		                 (1.0 / phy_bps + t_pre / (8.0 * (double)pp));
+		airtime_est_pct = (int)(frac * 100.0 + 0.5);
+		airtime_cap = airtime_safe_bitrate_kbps(s->radio->phy_mbps, sel_payload,
+		                  s->ctrl->current.k, s->ctrl->current.n,
+		                  s->cfg->fec.airtime_max_pct,
+		                  s->cfg->fec.airtime_preamble_us);
+	}
+	bool airtime_capped = (airtime_cap > 0 && br_for_sel > airtime_cap);
+
 	int n = snprintf(buf + pos, cap - pos,
 		"\"fec\":{\"enabled\":%s,\"have_current\":%s,\"k\":%d,\"n\":%d,"
 		"\"avg_frame_size\":%.1f,\"update_count\":%u,\"fps\":%.2f,"
@@ -4206,7 +4304,9 @@ static int append_fec_json(char *buf, size_t cap, size_t pos,
 		"\"payload\":{\"enabled\":%s,\"max\":%d,\"min\":%d,"
 		"\"last_written\":%d,\"selected\":%d,"
 		"\"table_clipped\":%s,\"pps_capped_kbps\":%ld,"
-		"\"would_fragment_on_1500_mtu\":%s}",
+		"\"would_fragment_on_1500_mtu\":%s},"
+		"\"airtime\":{\"max_pct\":%d,\"est_pct\":%d,"
+		"\"cap_kbps\":%ld,\"capped\":%s}",
 		s->cfg->fec.enabled ? "true" : "false",
 		s->ctrl->have_current ? "true" : "false",
 		s->ctrl->current.k, s->ctrl->current.n,
@@ -4222,7 +4322,9 @@ static int append_fec_json(char *buf, size_t cap, size_t pos,
 		s->cfg->fec.payload_max, s->cfg->fec.payload_min,
 		s->last_written_payload, sel_payload,
 		sel_clipped ? "true" : "false", pps_cap,
-		would_fragment ? "true" : "false");
+		would_fragment ? "true" : "false",
+		s->cfg->fec.airtime_max_pct, airtime_est_pct,
+		airtime_cap, airtime_capped ? "true" : "false");
 	if (n < 0 || (size_t)n >= cap - pos) return -1;
 	return n;
 }
@@ -5484,6 +5586,16 @@ static void config_defaults(Config *c)
 	 * via /set fec.payload_max. */
 	c->fec.payload_max          = 0;
 	c->fec.payload_min          = 576;
+
+	/* Airtime guard ON by default at 80% — a wedge-prevention ceiling, not
+	 * an aggressive limiter: it is non-binding at every rung's normal
+	 * operating point (the cap sits well above target) and only engages if a
+	 * low-MCS / small-payload / heavy-parity combination would otherwise
+	 * saturate the channel. Lower it to trade video bitrate for airtime
+	 * headroom at the low rungs; 0 disables. 40 us ~ HT20 / HT-mixed 1SS
+	 * preamble. See airtime_safe_bitrate_kbps(). */
+	c->fec.airtime_max_pct      = 80;
+	c->fec.airtime_preamble_us  = 40;
 
 	/* Safe-startup defaults: 1500 kbps + 1400 B = ~134 pps. Bulletproof
 	 * at MCS 0 (post-FEC ~1.6 Mbps fits 1500); 1400 B sits in the
