@@ -248,6 +248,42 @@ int main(void)
 		      "anchor follows down to the new operating point");
 	}
 
+	/* ── adaptive payload sizing: tier table + enable/clamp gating ──
+	 * payload_select() returns 0 when the feature is off (payload_max==0),
+	 * otherwise the PAYLOAD_TABLE tier for the target bitrate, clamped to
+	 * [payload_min, min(payload_max,4000)] and floored to the venc API 576. */
+	{
+		printf("[payload — adaptive sizing enable/tier/clamp]\n");
+		Config pc = cfg;
+
+		/* off by default: payload_max==0 -> sizer returns 0 (no write) */
+		bool clip = false;
+		CHECK(pc.fec.payload_max == 0, "payload_max defaults to 0 (feature off)");
+		CHECK(payload_select(&pc, 6000, &clip) == 0,
+		      "payload_max=0 -> select returns 0 (controller skips the write)");
+
+		/* enable wide open: tier table drives the pick by bitrate */
+		pc.fec.payload_max = 4000;
+		pc.fec.payload_min = 576;
+		CHECK(payload_select(&pc, 1500,  &clip) == 800,
+		      "1500 kbps -> 800 B tier (<2000)");
+		CHECK(payload_select(&pc, 6000,  &clip) == 1200,
+		      "6000 kbps -> 1200 B tier (<8000)");
+		CHECK(payload_select(&pc, 30000, &clip) == 3200,
+		      ">=25000 kbps -> 3200 B tier ceiling");
+
+		/* operator ceiling clips the tier and flags table_clipped */
+		pc.fec.payload_max = 1400;
+		clip = false;
+		CHECK(payload_select(&pc, 30000, &clip) == 1400 && clip,
+		      "payload_max=1400 caps the 3200 tier and sets table_clipped");
+
+		/* sub-576 ceiling (reachable via live /set) clamps up to venc floor */
+		pc.fec.payload_max = 500;
+		CHECK(payload_select(&pc, 1500, &clip) == 576,
+		      "payload_max=500 -> clamped up to the 576 venc API floor");
+	}
+
 	printf(g_fail ? "\nFAILED (%d failures)\n" : "\nPASSED (0 failures)\n", g_fail);
 	return g_fail ? 1 : 0;
 }

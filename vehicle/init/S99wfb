@@ -86,6 +86,7 @@ else
     : "${KEY:=/etc/drone.key}"  "${WFB_KEY_SEED:=Waybeam}"
     : "${WFB_TX_LINK:=207}"  "${WFB_RX_LINK:=208}"  "${WFB_PROBE_LINK:=50}"  "${WFB_PROBE_PORT:=50}"
     : "${WFB_K:=8}"  "${WFB_N:=12}"  "${WFB_MCS:=2}"  "${WFB_MCS_MIN:=1}"  "${WFB_MCS_MAX:=7}"
+    : "${WFB_PAYLOAD_MAX:=0}"  "${WFB_PAYLOAD_MIN:=576}"
     : "${WFB_PROBE:=1}"  "${WFB_PEEK_PROFILE:=close}"  "${WFB_LOG:=1}"  "${WFB_VIDEO_OPEN:=1}"
     : "${SHM_RING:=local_shm}"  "${WFB_VENC_AUTOWIRE:=1}"  "${WFB_VENC_HOST:=127.0.0.1:80}"
     : "${SAFE_BITRATE:=4096}"  "${WFB_FAILSAFE_S:=2.0}"
@@ -240,6 +241,31 @@ start_wfb() {
     # when WFB_LOG=0). It logs to /mnt/mmcblk0p1 and self-disables if absent.
     LOG_ARGS=""
     [ "$WFB_LOG" = "1" ] || LOG_ARGS="--no-log"
+    # Adaptive RTP payload sizing (fec.payload_max in wfb-link.json; 0 = off).
+    # Persists the operator's path-MTU ceiling across reboots; the controller
+    # then sizes venc outgoing.maxPayloadSize by bitrate tier. Also live-tunable
+    # via the link_controller /set API (fec.payload_max / fec.payload_min).
+    # The daemon rejects an out-of-range --max-payload with exit 1, so a bad
+    # wfb-link.json value must NOT reach the CLI or it would brick the boot
+    # link. Validate here at the config->CLI boundary: anything not 0 and not a
+    # clean [576,4000] integer degrades to "sizing off" with a log line.
+    PAYLOAD_ARGS=""
+    case "$WFB_PAYLOAD_MAX" in
+        0) ;;                                   # feature off
+        ''|*[!0-9]*)
+            log "WFB_PAYLOAD_MAX='$WFB_PAYLOAD_MAX' not numeric; payload sizing off" ;;
+        *)
+            if [ "$WFB_PAYLOAD_MAX" -ge 576 ] && [ "$WFB_PAYLOAD_MAX" -le 4000 ]; then
+                # Floor must also be sane; fall back to 576 if not.
+                case "$WFB_PAYLOAD_MIN" in
+                    ''|*[!0-9]*) WFB_PAYLOAD_MIN=576 ;;
+                esac
+                [ "$WFB_PAYLOAD_MIN" -ge 576 ] && [ "$WFB_PAYLOAD_MIN" -le 4000 ] || WFB_PAYLOAD_MIN=576
+                PAYLOAD_ARGS="--max-payload $WFB_PAYLOAD_MAX --payload-min $WFB_PAYLOAD_MIN"
+            else
+                log "WFB_PAYLOAD_MAX=$WFB_PAYLOAD_MAX out of [576,4000]; payload sizing off"
+            fi ;;
+    esac
     $LINK_CONTROLLER \
         --wfb 127.0.0.1:$WFB_CTRL \
         --venc "$WFB_VENC_HOST" \
@@ -249,7 +275,7 @@ start_wfb() {
         --failsafe $WFB_FAILSAFE_S \
         --wfb-iface "$WFB_IFACE" \
         --key-file "$KEY" \
-        $PROBE_ARGS $LOG_ARGS $RECOVERY_ARGS \
+        $PROBE_ARGS $LOG_ARGS $RECOVERY_ARGS $PAYLOAD_ARGS \
         >> "$LOG" 2>&1 &
     echo $! > "$PID_LC"
 
