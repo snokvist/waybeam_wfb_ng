@@ -150,6 +150,13 @@ int wfb_configenv_main(int argc, char **argv, int role)
 	ce_str(js, toks, ntok, "radio", "htmode", "HT20", s, sizeof(s)); emit_str("WFB_HTMODE", s);
 	emit_int("WFB_BW",      ce_int(js, toks, ntok, "radio", "bw", 20));
 	emit_int("WFB_TXPOWER", ce_int(js, toks, ntok, "radio", "txpower_mbm", 2000));
+	/* Monitor-iface MTU. Default 4052 = WLAN_DATA_MAXLEN, the rtl88x2eu
+	 * driver's hard max (rtl88x2eu/include/wifi.h). Larger RTP payloads from
+	 * adaptive payload sizing plus wfb_tx/radiotap framing must not exceed the
+	 * link MTU or injection wedges; the adaptive sizer caps at the 3200 tier
+	 * so 4052 is ample. S99wfb sets it after monitor mode; clamps to
+	 * [1500,4052] (this old kernel does not enforce max_mtu itself). */
+	emit_int("WFB_MTU",     ce_int(js, toks, ntok, "radio", "mtu", 4052));
 	ce_str(js, toks, ntok, "radio", "iface", "wlan0", s, sizeof(s)); emit_str("WFB_IFACE", s);
 	ce_str(js, toks, ntok, "key", "file", key_def, s, sizeof(s)); emit_str("KEY", s);
 	ce_str(js, toks, ntok, "key", "seed", "Waybeam", s, sizeof(s)); emit_str("WFB_KEY_SEED", s);

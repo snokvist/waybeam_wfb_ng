@@ -82,7 +82,7 @@ else
     # Standalone fallback (no mega binary => no config-env applet). These
     # MUST mirror the defaults in multicall/wfb_configenv.c, which stays
     # authoritative. Standalone is a legacy path — prefer the mega binary.
-    : "${WFB_CHANNEL:=161}"  "${WFB_HTMODE:=HT20}"  "${WFB_BW:=20}"  "${WFB_TXPOWER:=2000}"  "${WFB_IFACE:=wlan0}"
+    : "${WFB_CHANNEL:=161}"  "${WFB_HTMODE:=HT20}"  "${WFB_BW:=20}"  "${WFB_TXPOWER:=2000}"  "${WFB_IFACE:=wlan0}"  "${WFB_MTU:=4052}"
     : "${KEY:=/etc/drone.key}"  "${WFB_KEY_SEED:=Waybeam}"
     : "${WFB_TX_LINK:=207}"  "${WFB_RX_LINK:=208}"  "${WFB_PROBE_LINK:=50}"  "${WFB_PROBE_PORT:=50}"
     : "${WFB_K:=8}"  "${WFB_N:=12}"  "${WFB_MCS:=2}"  "${WFB_MCS_MIN:=1}"  "${WFB_MCS_MAX:=7}"
@@ -141,6 +141,25 @@ start_wfb() {
     ip link set "$WFB_IFACE" up
     iw dev "$WFB_IFACE" set channel $WFB_CHANNEL $WFB_HTMODE >> "$LOG" 2>&1
     iw dev "$WFB_IFACE" set txpower fixed $WFB_TXPOWER >> "$LOG" 2>&1
+
+    # Raise the monitor-iface MTU. The default 1500 caps wfb_tx injection
+    # frames, so any RTP payload above ~1500 (adaptive payload sizing,
+    # fec.payload_max) overflows the link MTU and wedges the TX path (ring
+    # backpressure -> MCS0 failsafe). Set it AFTER monitor mode is established
+    # (the iw/ip steps above can reset it) and BEFORE wfb_tx starts. WFB_MTU
+    # comes from wfb-link.json radio.mtu (config-env), default 4052 =
+    # WLAN_DATA_MAXLEN, the rtl88x2eu driver's hard max (include/wifi.h; the
+    # driver's TX buffers are sized for it and this old kernel does NOT enforce
+    # max_mtu, so we must cap here). The adaptive sizer never selects above the
+    # 3200 tier ceiling, so 4052 leaves comfortable framing headroom. Clamp to
+    # [1500,4052] so a bad value can't brick start or exceed the driver max.
+    case "$WFB_MTU" in ''|*[!0-9]*) WFB_MTU=4052 ;; esac
+    [ "$WFB_MTU" -ge 1500 ] && [ "$WFB_MTU" -le 4052 ] || WFB_MTU=4052
+    if ip link set dev "$WFB_IFACE" mtu "$WFB_MTU" >> "$LOG" 2>&1; then
+        log "$WFB_IFACE mtu set to $WFB_MTU"
+    else
+        log "WARN: failed to set $WFB_IFACE mtu=$WFB_MTU (payloads >1500 may wedge)"
+    fi
 
     # Make the encoder publish into the SHM ring our video wfb_tx reads from.
     # Only rewires + SIGHUPs the encoder if it isn't already on shm://$SHM_RING
