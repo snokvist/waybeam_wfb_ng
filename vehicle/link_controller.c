@@ -5409,6 +5409,11 @@ static void usage(const char *prog)
 		"                           else [576,4000]. Drives venc outgoing.maxPayloadSize\n"
 		"                           by bitrate tier. Also live via /set fec.payload_max.\n"
 		"  --payload-min N          adaptive RTP payload floor bytes [576,4000] (default 576)\n"
+		"  --airtime-max-pct N      cap on-air airtime to N%% of channel [0,100], 0=off\n"
+		"                           (default 80). Per-MCS pps/airslot guard; also live\n"
+		"                           via /set fec.airtime_max_pct.\n"
+		"  --airtime-preamble-us N  per-packet PHY preamble us for the airtime calc [0,200]\n"
+		"                           (default 40)\n"
 		"\n"
 		"MCS subsystem — unified PER-probe law (disable with --no-mcs):\n"
 		"  Promotes when the V+2 probe rung reads clean; demotes on live\n"
@@ -5777,6 +5782,7 @@ int main(int argc, char **argv)
 		/* fec */
 		OPT_NO_FEC, OPT_SIDECAR, OPT_VENC, OPT_SAFE_STARTUP_BITRATE,
 		OPT_MAX_PAYLOAD, OPT_PAYLOAD_MIN,
+		OPT_AIRTIME_MAX_PCT, OPT_AIRTIME_PREAMBLE_US,
 		/* mcs */
 		OPT_NO_MCS, OPT_STATS, OPT_UPLINK_STATS, OPT_FAILSAFE, OPT_PROBE, OPT_PROBE_FEED,
 		/* csa */
@@ -5802,6 +5808,8 @@ int main(int argc, char **argv)
 		{"safe-startup-bitrate", required_argument, 0, OPT_SAFE_STARTUP_BITRATE},
 		{"max-payload",    required_argument, 0, OPT_MAX_PAYLOAD},
 		{"payload-min",    required_argument, 0, OPT_PAYLOAD_MIN},
+		{"airtime-max-pct",     required_argument, 0, OPT_AIRTIME_MAX_PCT},
+		{"airtime-preamble-us", required_argument, 0, OPT_AIRTIME_PREAMBLE_US},
 		{"no-mcs",         no_argument,       0, OPT_NO_MCS},
 		{"stats",          required_argument, 0, OPT_STATS},
 		{"uplink-stats",   required_argument, 0, OPT_UPLINK_STATS},
@@ -5906,6 +5914,26 @@ int main(int argc, char **argv)
 				return 1;
 			}
 			cfg.fec.payload_min = v;
+			break;
+		}
+		case OPT_AIRTIME_MAX_PCT: {
+			int v = atoi(optarg);
+			if (v < 0 || v > 100) {
+				fprintf(stderr,
+				    "invalid --airtime-max-pct %d: must be in [0, 100] (0=off)\n", v);
+				return 1;
+			}
+			cfg.fec.airtime_max_pct = v;
+			break;
+		}
+		case OPT_AIRTIME_PREAMBLE_US: {
+			int v = atoi(optarg);
+			if (v < 0 || v > 200) {
+				fprintf(stderr,
+				    "invalid --airtime-preamble-us %d: must be in [0, 200]\n", v);
+				return 1;
+			}
+			cfg.fec.airtime_preamble_us = v;
 			break;
 		}
 		case OPT_STATS:

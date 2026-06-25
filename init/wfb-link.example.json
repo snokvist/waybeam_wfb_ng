@@ -10,7 +10,8 @@
   "links": { "video": 207, "uplink": 208, "probe": 50, "probe_port": 50, "recovery": 209,
              "_comment": "wfb link ids (video/uplink/probe must match the GS supervisor). probe_port (AIR-only) = the V+2 probe wfb_tx radio port (-p). recovery = the separate keyless/open (-xx) recovery-backdoor link id (must match the GS recovery tx tunnel)." },
 
-  "fec":   { "k": 8, "n": 12, "payload_max": 0, "payload_min": 576, "_comment": "k/n boot values only (link_controller retunes within ~2s); payload_max=0 disables adaptive RTP payload sizing, >0 (576..4000) enables the bitrate->payload tier sizer (also live via /set fec.payload_max)" },
+  "fec":   { "k": 8, "n": 12, "payload_max": 0, "payload_min": 576, "airtime_max_pct": 80, "airtime_preamble_us": 40,
+             "_comment": "k/n boot values only (link_controller retunes within ~2s). payload_max=0 disables adaptive RTP payload sizing, >0 (576..4000) enables the bitrate->payload tier sizer (also live via /set fec.payload_max). airtime_max_pct caps target bitrate so on-air airtime stays under N% of the channel (0=off, default 80) — the per-MCS pps/airslot guard, non-binding at normal operating points; lower it to trade bitrate for low-MCS airtime headroom. airtime_preamble_us (default 40) = per-packet PHY preamble used in the estimate. Both also live via /set fec.airtime_max_pct / *_preamble_us; see docs/design/airtime-pps-guard.md" },
 
   "mcs":   { "boot": 2, "min": 1, "max": 7 },
 

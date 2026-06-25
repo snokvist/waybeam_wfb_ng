@@ -174,6 +174,12 @@ int wfb_configenv_main(int argc, char **argv, int role)
 	 * bitrate->payload tier sizer. Also live-tunable via /set. */
 	emit_int("WFB_PAYLOAD_MAX", ce_int(js, toks, ntok, "fec", "payload_max", 0));
 	emit_int("WFB_PAYLOAD_MIN", ce_int(js, toks, ntok, "fec", "payload_min", 576));
+	/* Airtime guard (link_controller). airtime_max_pct caps on-air airtime
+	 * to this % of channel (0=off; per-MCS pps/airslot ceiling), default 80;
+	 * airtime_preamble_us is the per-packet PHY preamble used in the calc.
+	 * Both also live-tunable via /set fec.airtime_max_pct / *_preamble_us. */
+	emit_int("WFB_AIRTIME_MAX_PCT",     ce_int(js, toks, ntok, "fec", "airtime_max_pct", 80));
+	emit_int("WFB_AIRTIME_PREAMBLE_US", ce_int(js, toks, ntok, "fec", "airtime_preamble_us", 40));
 	emit_int("WFB_MCS",     ce_int(js, toks, ntok, "mcs", "boot", 2));
 	emit_int("WFB_MCS_MIN", ce_int(js, toks, ntok, "mcs", "min", 1));
 	emit_int("WFB_MCS_MAX", ce_int(js, toks, ntok, "mcs", "max", 7));

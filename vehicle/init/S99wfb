@@ -87,6 +87,7 @@ else
     : "${WFB_TX_LINK:=207}"  "${WFB_RX_LINK:=208}"  "${WFB_PROBE_LINK:=50}"  "${WFB_PROBE_PORT:=50}"
     : "${WFB_K:=8}"  "${WFB_N:=12}"  "${WFB_MCS:=2}"  "${WFB_MCS_MIN:=1}"  "${WFB_MCS_MAX:=7}"
     : "${WFB_PAYLOAD_MAX:=0}"  "${WFB_PAYLOAD_MIN:=576}"
+    : "${WFB_AIRTIME_MAX_PCT:=80}"  "${WFB_AIRTIME_PREAMBLE_US:=40}"
     : "${WFB_PROBE:=1}"  "${WFB_PEEK_PROFILE:=close}"  "${WFB_LOG:=1}"  "${WFB_VIDEO_OPEN:=1}"
     : "${SHM_RING:=local_shm}"  "${WFB_VENC_AUTOWIRE:=1}"  "${WFB_VENC_HOST:=127.0.0.1:80}"
     : "${SAFE_BITRATE:=4096}"  "${WFB_FAILSAFE_S:=2.0}"
@@ -285,6 +286,28 @@ start_wfb() {
                 log "WFB_PAYLOAD_MAX=$WFB_PAYLOAD_MAX out of [576,4000]; payload sizing off"
             fi ;;
     esac
+    # Airtime guard (fec.airtime_max_pct in wfb-link.json; 0 = off, default 80).
+    # Caps target bitrate so on-air airtime stays under N% of the channel — the
+    # per-MCS pps/airslot ceiling. Also live-tunable via /set. The daemon
+    # rejects an out-of-range value with exit 1, so validate at the config->CLI
+    # boundary: a clean [0,100] / [0,200] integer is passed, anything else is
+    # dropped so the daemon falls back to its safe compiled default (80 / 40us).
+    AIRTIME_ARGS=""
+    case "$WFB_AIRTIME_MAX_PCT" in
+        ''|*[!0-9]*)
+            log "WFB_AIRTIME_MAX_PCT='$WFB_AIRTIME_MAX_PCT' not numeric; using daemon default" ;;
+        *)
+            if [ "$WFB_AIRTIME_MAX_PCT" -ge 0 ] && [ "$WFB_AIRTIME_MAX_PCT" -le 100 ]; then
+                AIRTIME_ARGS="--airtime-max-pct $WFB_AIRTIME_MAX_PCT"
+                case "$WFB_AIRTIME_PREAMBLE_US" in
+                    ''|*[!0-9]*) ;;                 # bad -> daemon default 40
+                    *) [ "$WFB_AIRTIME_PREAMBLE_US" -ge 0 ] && [ "$WFB_AIRTIME_PREAMBLE_US" -le 200 ] && \
+                           AIRTIME_ARGS="$AIRTIME_ARGS --airtime-preamble-us $WFB_AIRTIME_PREAMBLE_US" ;;
+                esac
+            else
+                log "WFB_AIRTIME_MAX_PCT=$WFB_AIRTIME_MAX_PCT out of [0,100]; using daemon default"
+            fi ;;
+    esac
     $LINK_CONTROLLER \
         --wfb 127.0.0.1:$WFB_CTRL \
         --venc "$WFB_VENC_HOST" \
@@ -294,7 +317,7 @@ start_wfb() {
         --failsafe $WFB_FAILSAFE_S \
         --wfb-iface "$WFB_IFACE" \
         --key-file "$KEY" \
-        $PROBE_ARGS $LOG_ARGS $RECOVERY_ARGS $PAYLOAD_ARGS \
+        $PROBE_ARGS $LOG_ARGS $RECOVERY_ARGS $PAYLOAD_ARGS $AIRTIME_ARGS \
         >> "$LOG" 2>&1 &
     echo $! > "$PID_LC"
 
