@@ -169,6 +169,10 @@ int wfb_configenv_main(int argc, char **argv, int role)
 	emit_int("WFB_PROBE_LINK", ce_int(js, toks, ntok, "links", "probe", 50));
 	emit_int("WFB_K", ce_int(js, toks, ntok, "fec", "k", 8));
 	emit_int("WFB_N", ce_int(js, toks, ntok, "fec", "n", 12));
+	/* Adaptive bitrate floor (link_controller). Bites only at MCS0 (its honest
+	 * ~50%-margin budget); MCS1+ compute above it. Default 2200. Also live via
+	 * /set fec.bitrate_min_kbps. */
+	emit_int("WFB_BITRATE_MIN", ce_int(js, toks, ntok, "fec", "bitrate_min_kbps", 2200));
 	/* Adaptive RTP payload sizing (link_controller). payload_max=0 -> off
 	 * (controller never writes outgoing.maxPayloadSize); >0 enables the
 	 * bitrate->payload tier sizer. Also live-tunable via /set. */
