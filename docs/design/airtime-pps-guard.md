@@ -26,8 +26,9 @@ which one binds flips with the rung:
 
 The static table never *models* the low-MCS airtime limit; today the low rungs
 stay safe only because `bitrate_min` couples low MCS to low bitrate. That is
-safety by coincidence, with thin margin (MCS0 at the 2800 floor already runs
-~60–66% airtime), and no guard if parity rises or the floor is raised.
+safety by coincidence, with thin margin (MCS0 at the 2200 floor runs ~52%
+airtime; it ran ~60–66% at the earlier 2800 floor), and no guard if parity
+rises or the floor is raised.
 
 ## Mechanism
 
@@ -58,7 +59,7 @@ operating point** — the cap sits well above the actual target everywhere:
 
 | MCS | operating bitrate | airtime cap @80 % | binds? |
 |----|------------------|-------------------|--------|
-| 0 | 2800 (floor) | ~3360 | no |
+| 0 | 2200 (floor) | ~3360 | no |
 | 1 | ~3900 | ~6500 | no |
 | 2 | ~6500 | ~10300 | no |
 | 5 | ~17300 | ~26800 | no |

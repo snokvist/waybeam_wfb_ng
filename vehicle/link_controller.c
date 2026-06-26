@@ -3815,7 +3815,7 @@ static const TunableDesc TUNABLES[] = {
 	{"fec.k_up_dwell_s",            SUB_FEC, TF_FLOAT, OFF_FEC(k_up_dwell_s),            0.0, 600.0,"k-up dwell (0 = legacy fast-up)"},
 	{"fec.startup_grace_s",         SUB_FEC, TF_FLOAT, OFF_FEC(startup_grace_s),         0.0, 60.0, "suppress emits for first N s"},
 	{"fec.safety_margin",           SUB_FEC, TF_FLOAT, OFF_FEC(safety_margin),           0.05, 1.0, "fraction of phy_mbps usable", 1},
-	{"fec.bitrate_min_kbps",        SUB_FEC, TF_LONG,  OFF_FEC(bitrate_min_kbps),        1, 200000, "bitrate floor (kbps)", 1},
+	{"fec.bitrate_min_kbps",        SUB_FEC, TF_LONG,  OFF_FEC(bitrate_min_kbps),        100, 200000, "bitrate floor (kbps)", 1},
 	{"fec.bitrate_max_kbps",        SUB_FEC, TF_LONG,  OFF_FEC(bitrate_max_kbps),        0, 200000, "bitrate ceiling (kbps; 0 = unlimited)", 1},
 	{"fec.bitrate_tolerance",       SUB_FEC, TF_FLOAT, OFF_FEC(bitrate_tolerance),       0.0, 1.0,  "re-apply tolerance"},
 	{"fec.bitrate_grace_s",         SUB_FEC, TF_FLOAT, OFF_FEC(bitrate_grace_s),         0.0, 60.0, "post-bitrate-write FEC suppress"},
