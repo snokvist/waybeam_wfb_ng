@@ -151,12 +151,29 @@
 #define WCMD_KEY_LOG_CONTROL    19   /* value: 1=start/roll new SD log, 0=stop */
 
 /*
+ * Authenticated Return-to-APFPV — an operator command on the KEYED uplink
+ * (unlike the keyless key-64 backdoor below).  Maskable via cmd.allow_keys_mask
+ * (bit 19); the GS emits it with wcmd_emit() (3-frame burst) from
+ * /api/v1/cmd?key=return_apfpv.  The vehicle dispatches it through the normal
+ * keyed path (allow_keys_mask gate + burst-dedup) and routes it to the SAME
+ * recovery hook as key 64 (recovery.apfpv_cmd → arm wfbmode=0 + reboot), but
+ * over the authenticated control link instead of the open -xx channel.  `value`
+ * is ignored.
+ *
+ * Numbered 20, NOT 17: 17 is reserved (retired PEEK_DROP) and 18/19 are infra.
+ * It sits ABOVE the GS WCMD_KEY_MAX (so it is not GS-rate-limited and never
+ * indexes the per-operator-key array) but WITHIN the vehicle WCMD_NUM_KEYS
+ * keyed-path bound, so wcmd_dispatch() accepts and masks it.
+ */
+#define WCMD_KEY_RETURN_APFPV   20   /* keyed uplink: authenticated arm-APFPV + reboot */
+
+/*
  * RECOVERY BACKDOOR key — NOT an operator command and NOT carried on the keyed
  * uplink.  This key travels ONLY on the separate keyless/open (-xx) recovery
  * link (its own link_id + its own link_controller UDP listener) and is handled
  * by a dedicated recovery_dispatch() that accepts this key and nothing else.
  *
- * It is deliberately numbered ABOVE WCMD_NUM_KEYS (the keyed-path bound, 19) so
+ * It is deliberately numbered ABOVE WCMD_NUM_KEYS (the keyed-path bound, 20) so
  * the two command spaces are mutually exclusive by construction:
  *   - a recovery frame that somehow reached the keyed rx_ant listener is
  *     rejected by wcmd_dispatch() as UNKNOWN_KEY (key > WCMD_NUM_KEYS), and

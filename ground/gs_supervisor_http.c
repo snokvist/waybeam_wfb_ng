@@ -495,13 +495,14 @@ void api_handle(ApiClient *cli, Config *c, uint64_t startup_us)
 			         "key must be bitrate_kbps|fps|payload_bytes|force_idr|"
 			         "wfb_fec_k|wfb_fec_n|wfb_mcs|wfb_bandwidth|"
 			         "wfb_ldpc|wfb_stbc|wfb_short_gi|"
-			         "fec_enabled|mcs_enabled|wfb_txpower\n", -1);
+			         "fec_enabled|mcs_enabled|wfb_txpower|"
+			         "record|peek_enabled|return_apfpv\n", -1);
 			return;
 		}
 		int32_t value = 0;
 		int v;
 		if (qs_get_int(qstr, "value", &v) == 0) value = (int32_t)v;
-		else if (key != WCMD_KEY_FORCE_IDR) {
+		else if (key != WCMD_KEY_FORCE_IDR && key != WCMD_KEY_RETURN_APFPV) {
 			api_send(cli->fd, 400, "text/plain",
 			         "this key requires ?value=\n", -1);
 			return;

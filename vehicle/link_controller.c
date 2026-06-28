@@ -1814,7 +1814,7 @@ static int wfb_run_recovery_cmd(const char *cmd)
 	return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
 }
 
-#define WCMD_NUM_KEYS 19   /* highest defined WCMD_KEY_* value (incl. peek 16/17, log_sync 18, log_control 19) */
+#define WCMD_NUM_KEYS 20   /* highest keyed-path WCMD_KEY_* (peek 16; 17 reserved; log_sync 18; log_control 19; return_apfpv 20) */
 
 /* Burst-dedup window: GS may send 3 redundant copies of the same WCMD
  * with the same seq to ride out single-FEC-block losses on the uplink.
@@ -2361,6 +2361,39 @@ static int wcmd_dispatch(Config *cfg, const WcmdReq *req,
 		resp->applied_value = htonl((uint32_t)st->last_value);
 		st->coalesced_burst++;
 		st->last_status = resp->status;
+		return 0;
+	}
+
+	/* Authenticated Return-to-APFPV (operator key 20) on the KEYED uplink.
+	 * Already allow_keys_mask-gated + burst-dedup'd above, so a blocked key
+	 * can't reach here and a 3-frame burst can't reboot thrice. Routes to the
+	 * SAME hook as the keyless key-64 backdoor (recovery.apfpv_cmd → arm
+	 * wfbmode=0 + reboot) but over the authenticated control link. `value` is
+	 * ignored, so this returns before the clamp/rate-limit below. */
+	if (key == WCMD_KEY_RETURN_APFPV) {
+		if (!cfg->recovery.enabled || !cfg->recovery.apfpv_cmd[0]) {
+			resp->status = WCMD_STATUS_DISABLED;
+			st->last_status = resp->status;
+			return 0;
+		}
+		int rc = cfg->dry_run ? 0 : wfb_run_recovery_cmd(cfg->recovery.apfpv_cmd);
+		LOG_COMMON("recovery: authenticated APFPV (key 20 seq=%u) — hook \"%s\" rc=%d",
+		           req_seq, cfg->recovery.apfpv_cmd, rc);
+		wcmd_mark_applied(st, key, req_seq, now);
+		resp->applied_value = htonl(0);
+		if (rc == 0) {
+			st->accepted++;
+			resp->status         = WCMD_STATUS_OK;
+			resp->http_status    = htons(0);
+			st->last_status      = resp->status;
+			st->last_value       = 0;
+			st->last_http_status = 0;
+		} else {
+			uint16_t hs = (rc > 0 && rc <= 0xFFFF) ? (uint16_t)rc : 0;
+			resp->status      = WCMD_STATUS_HTTP_ERROR;
+			resp->http_status = htons(hs);
+			st->last_status   = resp->status;
+		}
 		return 0;
 	}
 
@@ -3876,7 +3909,7 @@ static const TunableDesc TUNABLES[] = {
 	{"cmd.enabled",          SUB_COMMON, TF_BOOL, OFF_CMD(enabled),          0, 0,      "enable venc command proxy on rx_ant socket"},
 	{"cmd.loopback_only",    SUB_COMMON, TF_BOOL, OFF_CMD(loopback_only),    0, 0,      "reject WCMD requests not from 127.0.0.1"},
 	{"cmd.rate_limit_ms",    SUB_COMMON, TF_INT,  OFF_CMD(rate_limit_ms),    0, 60000,  "min ms between same-key applies (0 disables)"},
-	{"cmd.allow_keys_mask",  SUB_COMMON, TF_INT,  OFF_CMD(allow_keys_mask),  0, 0xFFFF, "bitmask of WCMD_KEY_* allowed (1=br,2=fps,4=pl,8=idr,16=fec_k,32=fec_n,64=mcs,128=bw,256=ldpc,512=stbc,1024=sgi,2048=fec_en,4096=mcs_en,8192=txpower,16384=record,32768=peek_en)"},
+	{"cmd.allow_keys_mask",  SUB_COMMON, TF_INT,  OFF_CMD(allow_keys_mask),  0, 0xFFFFF, "bitmask of WCMD_KEY_* allowed (1=br,2=fps,4=pl,8=idr,16=fec_k,32=fec_n,64=mcs,128=bw,256=ldpc,512=stbc,1024=sgi,2048=fec_en,4096=mcs_en,8192=txpower,16384=record,32768=peek_en,524288=return_apfpv)"},
 	{"cmd.bitrate_min_kbps", SUB_COMMON, TF_INT,  OFF_CMD(bitrate_min_kbps), 1, 200000, "min accepted bitrate kbps (fallback when fec disabled)"},
 	{"cmd.bitrate_max_kbps", SUB_COMMON, TF_INT,  OFF_CMD(bitrate_max_kbps), 1, 200000, "max accepted bitrate kbps (fallback when fec disabled)"},
 	{"cmd.fps_min",          SUB_COMMON, TF_INT,  OFF_CMD(fps_min),          1, 240,    "min accepted fps"},
@@ -5719,7 +5752,7 @@ static void config_defaults(Config *c)
 	c->cmd.enabled         = true;
 	c->cmd.loopback_only   = false;
 	c->cmd.rate_limit_ms   = 100;
-	c->cmd.allow_keys_mask = 0xFFFF;     /* keys 1..16 enabled (incl. peek_en 16) */
+	c->cmd.allow_keys_mask = 0x8FFFF;    /* keys 1..16 (incl. peek_en 16) + key 20 return_apfpv (bit 19) */
 	c->cmd.bitrate_min_kbps = 100;
 	c->cmd.bitrate_max_kbps = 25000;
 	c->cmd.fps_min          = 1;
