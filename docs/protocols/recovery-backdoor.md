@@ -7,6 +7,16 @@ lost/mismatched `drone.key`, but also any keyed-uplink breakage. It can trigger
 exactly **one** safe, deferred action: **arm boot-into-APFPV on the next
 reboot**.
 
+> **Planned change (mode-switch contract, lands in unified-WebUI FE Phase 2c).**
+> Under the unified mode console (`waybeam-coordination`
+> `protocols/mode-switch.md`, decision 3-1), the `apfpv_cmd` hook gains a
+> trailing `reboot`: `fw_setenv wfbmode 0 && sync && reboot`. A confirmed
+> recovery then returns the vehicle to APFPV **immediately**, instead of merely
+> arming the next manual reboot. This **relaxes the "deferred action only"
+> property** below — point 5 is re-justified for that case. **Today the hook is
+> still arm-only** (`recovery-apfpv.sh.example` forbids rebooting); this section
+> documents the agreed target, not yet-shipped behavior.
+
 It is the mirror image of the `-xx` open *video downlink*: where that is a
 keyless vehicle→ground TX that any `-x` RX can view, this is a keyless
 ground→vehicle TX (`-xx`) decoded by a keyless (`-x`) vehicle RX.
@@ -44,8 +54,20 @@ by a secret:
    decode can't trip it; a held button / hostile flood can't re-fire it. The GS
    emits a heavy `WCMD_RECOVERY_BURST_FRAMES` (8) burst (one `seq`) to ride out
    loss on the open, ARQ-less link.
-5. **Deferred + idempotent action only.** Worst case an attacker forces a
-   *next-reboot* mode change — no immediate effect, no reboot-loop DoS.
+5. **Bounded, idempotent action only.** *Arm-only hook (today):* worst case an
+   attacker forces a *next-reboot* mode change — no immediate effect, no
+   reboot-loop DoS. *Arm + reboot hook (planned, see callout above):* the worst
+   case becomes an **immediate reboot into APFPV**, but the same gate bounds it:
+   the 3-frame arm (same `seq`) + 2 s arm window admit only a deliberate
+   operator burst, and the 10 s cooldown caps re-execution to **≤1 reboot per
+   10 s** — a held button or hostile flood cannot reboot-loop the vehicle.
+   APFPV is the **safe recovery state** (AP up, directly reachable), so even the
+   abusive case lands the vehicle somewhere recoverable rather than bricked.
+   **Blast radius (arm + reboot):** a confirmed recovery tap now reboots the
+   vehicle — operators must treat the control as a reboot, and the GS UI
+   confirm-gates it accordingly. Reboot is unconditional once armed; it does
+   **not** depend on the keyed uplink, which is the point (it must work with a
+   dead `drone.key`).
 
 ## Wire format
 
@@ -98,5 +120,9 @@ hardened deployments to remove the open attack surface.
 ## Operator flow
 
 GS WebUI → Vehicle Control → **recovery: arm boot-APFPV** (behind a `confirm()`
-dialog) → `GET /api/v1/recovery`. After the vehicle reboots it comes up in
-AP-FPV, reachable directly even though the wfb link/key was broken.
+dialog) → `GET /api/v1/recovery`. With the arm-only hook the operator then
+power-cycles / reboots the vehicle; with the planned arm + reboot hook the
+vehicle reboots itself. Either way it comes up in AP-FPV, reachable directly
+even though the wfb link/key was broken. Under the unified mode console this is
+surfaced as the confirm-gated **"Return to APFPV"** control (decision 3-3,
+manual-only — it never auto-fires).

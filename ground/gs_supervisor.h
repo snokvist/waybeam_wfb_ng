@@ -118,6 +118,12 @@ extern const int GS_BACKOFF_MS[7];
  * WCMD_KEY_MAX and never indexes the per-operator-key rate-limit array.
  * value: 1=start/roll a fresh vehicle SD log session, 0=stop. */
 #define WCMD_KEY_LOG_CONTROL    19
+/* Authenticated Return-to-APFPV (see shared/wcmd_proto.h). A maskable operator
+ * command on the KEYED uplink, emitted via /api/v1/cmd?key=return_apfpv. Numbered
+ * 20 (17 reserved, 18/19 infra) and sits ABOVE WCMD_KEY_MAX, so the GS does not
+ * rate-limit it and never indexes the per-operator-key array — but the vehicle
+ * accepts + masks it (within its WCMD_NUM_KEYS keyed-path bound). */
+#define WCMD_KEY_RETURN_APFPV   20
 /* Recovery backdoor key (see shared/wcmd_proto.h). Emitted via /api/v1/recovery
  * onto the SEPARATE keyless/open (-xx) recovery tx tunnel — NOT the operator
  * /api/v1/cmd path nor the keyed uplink. Numbered above WCMD_KEY_MAX (and above
