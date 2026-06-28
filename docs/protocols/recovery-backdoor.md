@@ -48,11 +48,16 @@ by a secret:
    sent on the recovery listener is rejected by the whitelist. The two command
    spaces cannot cross-trigger.
 4. **N-frame arming + seq-dedup + cooldown.** The vehicle requires
-   `recovery.arm_count` (default 3) frames carrying the same `seq` within
+   `recovery.arm_count` (default 1) frames carrying the same `seq` within
    `recovery.arm_window_ms` (default 2000) before running the hook, then
-   `recovery.cooldown_ms` (default 10000) gates re-execution. A lone stray
-   decode can't trip it; a held button / hostile flood can't re-fire it. The GS
-   emits a heavy `WCMD_RECOVERY_BURST_FRAMES` (8) burst (one `seq`) to ride out
+   `recovery.cooldown_ms` (default 10000) gates re-execution. The default of 1
+   fires on the first surviving frame — recovery is needed exactly when the RF
+   link is worst, so a multi-frame arm gate fights the feature's own purpose, and
+   `wfb_rx` already FEC/CRC-drops corrupt frames before dispatch (so the
+   anti-stray value of a higher count is marginal). The cooldown still collapses
+   the burst tail to a single action; raise `--recovery-arm-count` on hardened
+   builds that prefer a stricter gate over worst-case reachability. The GS emits a
+   heavy `WCMD_RECOVERY_BURST_FRAMES` (8) burst (one `seq`) to ride out
    loss on the open, ARQ-less link.
 5. **Bounded, idempotent action only.** *Arm-only hook (today):* worst case an
    attacker forces a *next-reboot* mode change — no immediate effect, no

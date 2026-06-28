@@ -554,7 +554,7 @@ typedef struct {
 	struct {
 		bool     enabled;          /* master switch (default true) */
 		int      listen_port;      /* UDP listener the keyless wfb_rx forwards to (default 5802) */
-		int      arm_count;        /* identical frames needed within arm_window_ms before exec (default 3) */
+		int      arm_count;        /* identical frames needed within arm_window_ms before exec (default 1) */
 		int      arm_window_ms;    /* arming window (default 2000) */
 		int      cooldown_ms;      /* min interval between executions (default 10000) */
 		char     apfpv_cmd[256];   /* shell command fork+exec'd to arm APFPV-next-boot */
@@ -2719,7 +2719,7 @@ static void recovery_dispatch(const Config *cfg, const WcmdReq *req,
 	                                    cfg->recovery.cooldown_ms : 10000) * 1000ULL;
 	uint64_t window_us    = (uint64_t)(cfg->recovery.arm_window_ms > 0 ?
 	                                    cfg->recovery.arm_window_ms : 2000) * 1000ULL;
-	int      arm_count    = cfg->recovery.arm_count > 0 ? cfg->recovery.arm_count : 3;
+	int      arm_count    = cfg->recovery.arm_count > 0 ? cfg->recovery.arm_count : 1;
 
 	/* Already acted recently — ack OK without re-running (covers the burst
 	 * tail of the seq we just executed AND any flood). */
@@ -5782,7 +5782,15 @@ static void config_defaults(Config *c)
 	 * defaults to a firmware-provided script that arms APFPV-next-boot. */
 	c->recovery.enabled       = true;
 	c->recovery.listen_port   = 5802;
-	c->recovery.arm_count     = 3;
+	/* arm_count=1: fire on the first surviving recovery frame. Recovery is
+	 * needed exactly when the RF link is worst, so a multi-frame arm gate fights
+	 * the feature's own purpose — at low MCS under loss, requiring N same-seq
+	 * frames to survive can starve the arm. wfb_rx already FEC/CRC-drops corrupt
+	 * frames before they reach recovery_dispatch, and key 64 is whitelisted /
+	 * mutually exclusive with the keyed path, so the anti-stray value of a higher
+	 * count is marginal. The 10s cooldown still collapses the GS's burst tail to a
+	 * single action. Raise via --recovery-arm-count on hardened builds if desired. */
+	c->recovery.arm_count     = 1;
 	c->recovery.arm_window_ms = 2000;
 	c->recovery.cooldown_ms   = 10000;
 	snprintf(c->recovery.apfpv_cmd, sizeof(c->recovery.apfpv_cmd),
