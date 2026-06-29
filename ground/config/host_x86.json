@@ -1,7 +1,7 @@
 {
   "_comment": "Host x86 ground station \u2014 two RTL88x2 USB adapters, both on channel 161 HT40+. Ground initializes at HT40 (40 MHz, secondary above 161, center 5815): it decodes both 20 MHz and 40 MHz transmissions on the primary, so it works with any vehicle width. The VEHICLE (air) must stay HT20 \u2014 its rtl8812eu cannot do HT40 in monitor mode; forcing the air to HT40 corrupts its TX (verified: ~27% loss). So the live video downlink is HT20-on-HT40-channel today; HT40 ground is a strictly-more-capable, forward-compatible default. radiotap TX width (tunnel bw / SET_RADIO) stays 20 \u2014 HT40 here is purely the iw channel width.",
-  "_comment_iface_a": "wlx40a5ef2f229b \u2014 RX-only diversity adapter",
-  "_comment_iface_b": "wlx40a5ef2f2308 \u2014 RX diversity + uplink TX",
+  "_comment_iface_a": "wlx40a5ef2f229b \u2014 RX diversity + uplink/recovery TX (verified TX-healthy at 20 dBm; also the APFPV STA primary, idle in wfb_ng mode)",
+  "_comment_iface_b": "wlx40a5ef2f2308 \u2014 RX diversity adapter",
   "_comment_nm": "Both adapters are pinned NM-unmanaged in /etc/NetworkManager/conf.d/99-wfb-unmanaged.conf (by MAC), so no nmcli managed toggling is needed here \u2014 that toggling raced NM and intermittently left an adapter in 'managed' after 'ip link up'.",
   "key_file": "/etc/drone.key",
   "http": {
@@ -94,7 +94,7 @@
       "role": "tx",
       "binary": "/home/snokvist/dev/waybeam-coordination/waybeam_wfb_ng/wfb-ng/build/wfb_tx_native",
       "interfaces": [
-        "wlx40a5ef2f2308"
+        "wlx40a5ef2f229b"
       ],
       "link_id": 208,
       "radio_port": 0,
@@ -117,7 +117,7 @@
       "role": "tx",
       "binary": "/home/snokvist/dev/waybeam-coordination/waybeam_wfb_ng/wfb-ng/build/wfb_tx_native",
       "interfaces": [
-        "wlx40a5ef2f2308"
+        "wlx40a5ef2f229b"
       ],
       "link_id": 209,
       "radio_port": 0,
